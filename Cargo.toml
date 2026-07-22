@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/k10s-atlas",
+    "crates/k10s-core",
 ]
 
 [workspace.package]
@@ -13,7 +14,10 @@ repository = "https://github.com/nikolic-milos/k10s"
 
 [workspace.dependencies]
 k10s-atlas = { path = "crates/k10s-atlas" }
+k10s-core = { path = "crates/k10s-core" }
 
+arc-swap = "1.9"
+crossbeam-channel = "0.5"
 serde = "1"
 
 [profile.dev]
