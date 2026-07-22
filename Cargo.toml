@@ -4,6 +4,7 @@ members = [
     "crates/k10s-atlas",
     "crates/k10s-core",
     "crates/k10s-clustergen",
+    "crates/k10s-world",
 ]
 
 [workspace.package]
@@ -17,7 +18,9 @@ repository = "https://github.com/nikolic-milos/k10s"
 k10s-atlas = { path = "crates/k10s-atlas" }
 k10s-core = { path = "crates/k10s-core" }
 k10s-clustergen = { path = "crates/k10s-clustergen" }
+k10s-world = { path = "crates/k10s-world" }
 
+bevy_ecs = "0.19"
 arc-swap = "1.9"
 crossbeam-channel = "0.5"
 rand = "0.10"
