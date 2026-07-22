@@ -1,0 +1,18 @@
+[package]
+name = "k10s-map"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+k10s-atlas.workspace = true
+k10s-core.workspace = true
+gpui.workspace = true
+arc-swap.workspace = true
+crossbeam-channel.workspace = true
+futures.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+k10s-clustergen.workspace = true

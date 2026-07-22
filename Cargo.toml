@@ -5,6 +5,7 @@ members = [
     "crates/k10s-core",
     "crates/k10s-clustergen",
     "crates/k10s-world",
+    "crates/k10s-map",
 ]
 
 [workspace.package]
@@ -19,13 +20,19 @@ k10s-atlas = { path = "crates/k10s-atlas" }
 k10s-core = { path = "crates/k10s-core" }
 k10s-clustergen = { path = "crates/k10s-clustergen" }
 k10s-world = { path = "crates/k10s-world" }
+k10s-map = { path = "crates/k10s-map" }
+
+gpui = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
+gpui_platform = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
 
 bevy_ecs = "0.19"
 arc-swap = "1.9"
 crossbeam-channel = "0.5"
+futures = "0.3"
 rand = "0.10"
 rand_chacha = "0.10"
 serde = "1"
+serde_json = "1"
 
 [profile.dev]
 opt-level = 1

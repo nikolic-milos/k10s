@@ -1,0 +1,21 @@
+# Icon attribution
+
+`deploy.svg`, `sts.svg`, `ds.svg`, `job.svg` are derived from the official
+Kubernetes resource icons, <https://github.com/kubernetes/community>
+(`icons/svg/resources/unlabeled/`), © the Kubernetes Authors, licensed
+CC BY 4.0 <https://creativecommons.org/licenses/by/4.0/>.
+
+Modifications: Inkscape/RDF metadata removed, the opaque `#326ce5` background
+hexagon dropped, and remaining paths collapsed to a plain white fill; gpui
+rasterizes SVGs as monochrome alpha masks tinted at paint time, so only the
+hexagon outline + resource glyph survive as the mask.
+
+`pvc.svg`, `svc.svg`, `cm.svg`, `secret.svg` (satellite glyphs) are original
+k10s minimal masks, not derived from the Kubernetes icon set; no attribution
+required.
+
+`tools/*.svg` are unmodified brand icons from the simple-icons project
+(v16.27.0), <https://github.com/simple-icons/simple-icons>, released under
+CC0 1.0. The trademarks and logos they depict remain the property of their
+respective owners; k10s uses them only to identify workloads running those
+tools, with no affiliation or endorsement implied.
