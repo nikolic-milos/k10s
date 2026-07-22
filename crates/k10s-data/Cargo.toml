@@ -1,0 +1,12 @@
+[package]
+name = "k10s-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+k10s-core.workspace = true
+kube.workspace = true
+k8s-openapi.workspace = true
+tokio.workspace = true
+crossbeam-channel.workspace = true

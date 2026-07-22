@@ -6,6 +6,8 @@ members = [
     "crates/k10s-clustergen",
     "crates/k10s-world",
     "crates/k10s-map",
+    "crates/k10s-app",
+    "crates/k10s-data",
 ]
 
 [workspace.package]
@@ -21,6 +23,8 @@ k10s-core = { path = "crates/k10s-core" }
 k10s-clustergen = { path = "crates/k10s-clustergen" }
 k10s-world = { path = "crates/k10s-world" }
 k10s-map = { path = "crates/k10s-map" }
+k10s-app = { path = "crates/k10s-app" }
+k10s-data = { path = "crates/k10s-data" }
 
 gpui = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
 gpui_platform = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
@@ -33,6 +37,10 @@ rand = "0.10"
 rand_chacha = "0.10"
 serde = "1"
 serde_json = "1"
+
+kube = { version = "4.0", features = ["runtime"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macros"] }
 
 [profile.dev]
 opt-level = 1
