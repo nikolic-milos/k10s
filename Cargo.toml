@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/k10s-atlas",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+authors = ["Miloš Nikolić <milosnikolic@milosnikolic.de>"]
+repository = "https://github.com/nikolic-milos/k10s"
+
+[workspace.dependencies]
+k10s-atlas = { path = "crates/k10s-atlas" }
+
+serde = "1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = true
+lto = "thin"
