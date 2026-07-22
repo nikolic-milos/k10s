@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/k10s-atlas",
     "crates/k10s-core",
+    "crates/k10s-clustergen",
 ]
 
 [workspace.package]
@@ -15,9 +16,12 @@ repository = "https://github.com/nikolic-milos/k10s"
 [workspace.dependencies]
 k10s-atlas = { path = "crates/k10s-atlas" }
 k10s-core = { path = "crates/k10s-core" }
+k10s-clustergen = { path = "crates/k10s-clustergen" }
 
 arc-swap = "1.9"
 crossbeam-channel = "0.5"
+rand = "0.10"
+rand_chacha = "0.10"
 serde = "1"
 
 [profile.dev]
