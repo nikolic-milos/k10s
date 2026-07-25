@@ -493,7 +493,7 @@ impl PublishBench {
 
 fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (World, Schedule) {
     let lay = layout::layout(spec, mode);
-    let with_sats = !lay.sat_rects.is_empty();
+    let with_sats = mode.emits_attachments();
 
     let mut ns_labels = Vec::new();
     let mut ns_wl_range = Vec::new();

@@ -25,6 +25,13 @@ impl LayoutMode {
             LayoutMode::Dense => "dense",
         }
     }
+
+    pub fn emits_attachments(self) -> bool {
+        match self {
+            LayoutMode::Spread => true,
+            LayoutMode::Dense => false,
+        }
+    }
 }
 
 pub struct LayoutOut {
@@ -439,6 +446,14 @@ mod tests {
         dx.max(dy)
     }
 
+    fn platform(seed: u64, target_objects: u32) -> ClusterSpec {
+        generate(&GenConfig {
+            seed,
+            target_objects,
+            scenario: Scenario::Platform,
+        })
+    }
+
     #[test]
     fn namespaces_do_not_overlap_either_mode() {
         let spec = generate(&GenConfig {
@@ -585,6 +600,23 @@ mod tests {
                     pod += 1;
                 }
                 wl += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn only_attachment_modes_emit_satellite_rects() {
+        let spec = platform(42, 8_000);
+        assert!(spec.total_sats > 0);
+        for mode in [LayoutMode::Dense, LayoutMode::Spread] {
+            let out = layout(&spec, mode);
+            assert_eq!(
+                out.sat_rects.is_empty(),
+                !mode.emits_attachments(),
+                "{mode:?} disagrees with emits_attachments"
+            );
+            if mode.emits_attachments() {
+                assert_eq!(out.sat_rects.len(), spec.total_sats as usize, "{mode:?}");
             }
         }
     }
