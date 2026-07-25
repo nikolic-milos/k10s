@@ -1,3 +1,5 @@
+const MIN_DASH: f32 = 1e-3;
+
 pub fn flatten_quadratic(
     p0: (f32, f32),
     ctrl: (f32, f32),
@@ -27,7 +29,8 @@ pub fn dash_polyline(
     off: f32,
     mut emit: impl FnMut(bool, (f32, f32)),
 ) {
-    debug_assert!(on > 0.0 && off > 0.0);
+    let on = on.max(MIN_DASH);
+    let off = off.max(MIN_DASH);
     let mut prev = start;
     let mut drawing = true;
     let mut remain = on;
@@ -171,6 +174,25 @@ mod tests {
             |m, _| bent += m as usize,
         );
         assert_eq!(straight, bent);
+    }
+
+    #[test]
+    fn degenerate_dash_lengths_terminate() {
+        for (on, off) in [
+            (0.0, 0.0),
+            (0.0, 5.0),
+            (6.0, 0.0),
+            (-1.0, -1.0),
+            (-3.0, 4.0),
+            (f32::MIN_POSITIVE, f32::MIN_POSITIVE),
+        ] {
+            let mut emitted = 0usize;
+            dash_polyline((0.0, 0.0), &[(40.0, 0.0)], on, off, |_, _| emitted += 1);
+            assert!(
+                emitted <= 4 * (40.0 / MIN_DASH) as usize,
+                "on {on} off {off} emitted {emitted}"
+            );
+        }
     }
 
     #[test]
