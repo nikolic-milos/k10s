@@ -9,8 +9,10 @@ cargo run --release
 
 ```sh
 cargo test
-cargo run --release -- --bench          # local flight bench
-cargo run --release -- --bench --json   # JSON report on stdout
+cargo run --release -- --bench                            # local flight bench
+cargo run --release -- --bench --json --machine my-box     # JSON report on stdout
+cargo bench -p k10s-atlas --features testing --bench cull  # headless cull bench, no GPU
+cargo bench -p k10s-world --bench publish                  # headless layout and publish bench
 ```
 
 ## Notes
