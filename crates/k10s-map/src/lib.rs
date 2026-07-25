@@ -16,7 +16,7 @@ use gpui::{
     quad, rgb, size,
 };
 use k10s_atlas::curves::{bow_jitter, curve_ctrl, dash_quadratic};
-use k10s_atlas::{FramePacer, FrameSpans, FrameStats, StageMachine};
+use k10s_atlas::{DrawnCounts, FramePacer, FrameSpans, FrameStats, StageMachine};
 use k10s_core::layout::CARD_HEADER;
 use k10s_core::{Health, Rect, SatKind, SceneSnapshot, SharedScene, Tool, WorkloadKind, WorldCtrl};
 
@@ -988,7 +988,11 @@ fn paint_map(
         st.curves = curves;
         st.curves_dropped = curves_dropped;
         st.bg_cells = bg_hexes;
-        st.drawn = (drawn_ns, drawn_wl, drawn_pods);
+        st.drawn = DrawnCounts {
+            regions: drawn_ns,
+            blocks: drawn_wl,
+            cells: drawn_pods,
+        };
         st.labels_dropped = labels_dropped;
         st.icons_dropped = icons_dropped;
         st.end_cpu(frame_start);
@@ -1083,9 +1087,9 @@ fn paint_hud(
                 String::new()
             },
             st.bg_cells,
-            st.drawn.0,
-            st.drawn.1,
-            group(st.drawn.2 as u32),
+            st.drawn.regions,
+            st.drawn.blocks,
+            group(st.drawn.cells as u32),
         ),
         format!(
             "[c]hurn {}  [e]dges {}  [f]it",

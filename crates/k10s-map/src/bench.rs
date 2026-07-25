@@ -73,13 +73,12 @@ fn plan(a: &FlightAnchors, vw: f32, _vh: f32) -> Vec<Segment> {
     let hub_left = at(hx - pan_w2 * 0.5, hy, 2.2);
     let hub_right = at(hx + pan_w2 * 0.5, hy, 2.2);
 
-    let seg = |name, from, to, gate_frame| Segment {
+    let seg = |name, from, to| Segment {
         name,
         from,
         to,
         dur: 3.0,
         measure: true,
-        gate_frame,
         idle: false,
     };
     vec![
@@ -89,26 +88,24 @@ fn plan(a: &FlightAnchors, vw: f32, _vh: f32) -> Vec<Segment> {
             to: fit,
             dur: 2.0,
             measure: false,
-            gate_frame: false,
             idle: false,
         },
-        seg("Z0 static (island overview)", fit, fit, true),
-        seg("Z0->Z1 fly-in", fit, z1, true),
-        seg("Z1 static (workload cards)", z1, z1, true),
-        seg("Z1 cross-map pan", z1_left, z1_right, true),
-        seg("Z1->Z2 fly-in (hub)", z1, hub, true),
-        seg("Z2 static (hub + satellites)", hub, hub, true),
-        seg("Z2 hub pan", hub_left, hub_right, true),
-        seg("Z2->Z3 fly-in", hub, z3, true),
-        seg("Z3 static (pod detail)", z3, z3, true),
-        seg("Z3->Z0 fly-out", z3, fit, true),
+        seg("Z0 static (island overview)", fit, fit),
+        seg("Z0->Z1 fly-in", fit, z1),
+        seg("Z1 static (workload cards)", z1, z1),
+        seg("Z1 cross-map pan", z1_left, z1_right),
+        seg("Z1->Z2 fly-in (hub)", z1, hub),
+        seg("Z2 static (hub + satellites)", hub, hub),
+        seg("Z2 hub pan", hub_left, hub_right),
+        seg("Z2->Z3 fly-in", hub, z3),
+        seg("Z3 static (pod detail)", z3, z3),
+        seg("Z3->Z0 fly-out", z3, fit),
         Segment {
             name: "Z0 idle (no damage)",
             from: fit,
             to: fit,
             dur: 5.0,
             measure: true,
-            gate_frame: false,
             idle: true,
         },
     ]
@@ -150,7 +147,7 @@ impl Bench {
 
     fn report(&self, r: &FlightResult) -> BenchReport {
         BenchReport {
-            schema_version: 1,
+            schema_version: 2,
             machine: self.meta.machine.clone(),
             arch: self.meta.arch.clone(),
             objects: self.meta.objects,
@@ -214,19 +211,38 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
         }
         let _ = writeln!(
             out,
-            "  {:<28} frame p50 {:5.1}  p95 {:5.1}  p99 {:5.1} ms | cpu p50 {:5.2}  p99 {:5.2} ms | quads {:>6}  lines {:>4}  glyphs {:>6}  sats {:>4}  curves {:>4}  edges {:>4}",
+            "  {:<28} quads {:>6}  lines {:>4}  glyphs {:>6}  icons {:>4}  sats {:>4}  curves {:>4}  edges {:>4}  hex {:>4}  drawn ns/wl/pods {}/{}/{}  dropped {}L/{}I/{}C",
             r.name,
-            r.frame_ms.p50,
-            r.frame_ms.p95,
-            r.frame_ms.p99,
-            r.cpu_ms.p50,
-            r.cpu_ms.p99,
             r.quads,
             r.lines,
             r.glyphs,
+            r.icons,
             r.sats,
             r.curves,
             r.edges,
+            r.bg_cells,
+            r.drawn.regions,
+            r.drawn.blocks,
+            r.drawn.cells,
+            r.labels_dropped,
+            r.icons_dropped,
+            r.curves_dropped,
+        );
+        let _ = writeln!(
+            out,
+            "  {:<28} spans us  walk {:>6.0}  quads {:>5.0}  paths {:>6.0}  icons {:>5.0}  text {:>6.0}  hud {:>5.0}",
+            "",
+            r.spans.walk_us,
+            r.spans.quads_us,
+            r.spans.paths_us,
+            r.spans.icons_us,
+            r.spans.text_us,
+            r.spans.hud_us,
+        );
+        let _ = writeln!(
+            out,
+            "  {:<28} cpu p50 {:5.2}  p99 {:5.2} ms (hud excluded)  |  frame p50 {:5.1}  p95 {:5.1}  p99 {:5.1} ms (informational, vsync-bound)",
+            "", r.cpu_ms.p50, r.cpu_ms.p99, r.frame_ms.p50, r.frame_ms.p95, r.frame_ms.p99,
         );
     }
     out
@@ -235,8 +251,8 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k10s_atlas::FrameSpans;
     use k10s_atlas::flight::{CpuPercentiles, IdleResult, Percentiles};
+    use k10s_atlas::{DrawnCounts, FrameSpans};
 
     fn anchors() -> FlightAnchors {
         let mut fit = Camera::default();
@@ -254,50 +270,77 @@ mod tests {
     }
 
     #[test]
-    fn plan_matches_baseline_segment_names() {
-        let segs = plan(&anchors(), 1600.0, 1000.0);
-        let names: Vec<&str> = segs.iter().map(|s| s.name).collect();
-        assert_eq!(
-            names,
-            [
-                "warmup",
-                "Z0 static (island overview)",
-                "Z0->Z1 fly-in",
-                "Z1 static (workload cards)",
-                "Z1 cross-map pan",
-                "Z1->Z2 fly-in (hub)",
-                "Z2 static (hub + satellites)",
-                "Z2 hub pan",
-                "Z2->Z3 fly-in",
-                "Z3 static (pod detail)",
-                "Z3->Z0 fly-out",
-                "Z0 idle (no damage)",
-            ]
-        );
-        assert!(!segs[0].measure, "warmup must not report");
+    fn plan_keeps_its_shape_and_zoom_targets() {
+        let a = anchors();
+        let segs = plan(&a, 1600.0, 1000.0);
+
+        let first_measured = segs
+            .iter()
+            .position(|s| s.measure)
+            .expect("flight must measure something");
         assert!(
-            segs.last().unwrap().idle,
-            "flight must end with the idle segment"
+            first_measured >= 1,
+            "flight must warm up before it measures"
         );
-        assert_eq!(segs.iter().filter(|s| s.idle).count(), 1);
+        assert!(
+            segs[..first_measured].iter().all(|s| !s.measure && !s.idle),
+            "warmup segments must not report"
+        );
+        assert!(
+            segs[first_measured..].iter().all(|s| s.measure),
+            "warmup must precede all measurement"
+        );
+
+        let idle: Vec<usize> = segs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.idle)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            idle,
+            [segs.len() - 1],
+            "exactly one idle segment, and it closes the flight"
+        );
+
+        let measured: Vec<&str> = segs.iter().filter(|s| s.measure).map(|s| s.name).collect();
+        assert!(measured.len() >= 4, "flight is too thin to be useful");
+        let mut distinct = measured.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            measured.len(),
+            "measured segment names must be distinct: {measured:?}"
+        );
+        assert!(
+            segs.iter().all(|s| s.dur > 0.0),
+            "a zero-length segment measures nothing"
+        );
+
+        let targets: Vec<f32> = segs.iter().map(|s| s.to.zoom).collect();
+        for zoom in [a.fit.zoom, 0.12, 2.2, 4.5] {
+            assert!(targets.contains(&zoom), "zoom target {zoom} went missing");
+        }
         assert!(
             segs.iter()
-                .filter(|s| s.measure && !s.idle)
-                .all(|s| s.gate_frame),
-            "measured segments must be frame-gated"
-        );
-        assert_eq!(segs[3].to.zoom, 0.12);
-        assert_eq!(
-            segs[6].to.zoom, 2.2,
+                .any(|s| s.to.zoom == 2.2 && (s.to.cx, s.to.cy) == a.hub_center),
             "hub zoom must show two-line sat labels"
         );
-        assert_eq!(segs[9].to.zoom, 4.5);
-        assert_eq!(segs[6].to.cx, 2400.0);
-        assert_eq!(segs[6].to.cy, 1400.0);
+        assert!(
+            segs.iter()
+                .any(|s| s.to.zoom == 4.5 && (s.to.cx, s.to.cy) == a.hub_center),
+            "pod detail must sit on the hub"
+        );
+        assert!(
+            segs.iter()
+                .any(|s| s.to.zoom == 0.12 && s.from.cx != s.to.cx),
+            "flight must include a Z1 pan"
+        );
     }
 
     #[test]
-    fn report_json_keeps_schema_v1_keys() {
+    fn report_json_keeps_schema_v2_keys() {
         let meta = BenchMeta {
             machine: "m".into(),
             arch: "x".into(),
@@ -309,16 +352,22 @@ mod tests {
         let bench = Bench::new(meta);
         let seg = |idle| SegmentResult {
             name: "s".into(),
-            gate_frame: true,
-            frame_ms: Percentiles {
-                p50: 1.0,
-                p95: 2.0,
-                p99: 3.0,
+            quads: 10,
+            lines: 2,
+            glyphs: 41,
+            icons: 6,
+            sats: 5,
+            curves: 4,
+            edges: 1,
+            bg_cells: 96,
+            drawn: DrawnCounts {
+                regions: 3,
+                blocks: 20,
+                cells: 100,
             },
-            cpu_ms: CpuPercentiles {
-                p50: 0.25,
-                p99: 0.5,
-            },
+            labels_dropped: 7,
+            icons_dropped: 8,
+            curves_dropped: 9,
             spans: FrameSpans {
                 walk_us: 80.0,
                 quads_us: 14.0,
@@ -327,12 +376,15 @@ mod tests {
                 text_us: 90.0,
                 hud_us: 19.0,
             },
-            quads: 10,
-            lines: 2,
-            glyphs: 41,
-            edges: 1,
-            sats: 5,
-            curves: 4,
+            cpu_ms: CpuPercentiles {
+                p50: 0.25,
+                p99: 0.5,
+            },
+            frame_ms: Percentiles {
+                p50: 1.0,
+                p95: 2.0,
+                p99: 3.0,
+            },
             idle,
         };
         let result = FlightResult {
@@ -356,7 +408,7 @@ mod tests {
         };
         let v = serde_json::to_value(bench.report(&result)).unwrap();
 
-        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["schema_version"], 2);
         assert_eq!(v["layout"], "spread");
         let totals = v["totals"].as_object().unwrap();
         let mut keys: Vec<_> = totals.keys().map(String::as_str).collect();
@@ -369,22 +421,36 @@ mod tests {
         let s0 = v["segments"][0].as_object().unwrap();
         for key in [
             "name",
-            "gate_frame",
-            "frame_ms",
-            "cpu_ms",
-            "spans",
             "quads",
             "lines",
             "glyphs",
-            "edges",
+            "icons",
             "sats",
             "curves",
+            "edges",
+            "bg_cells",
+            "drawn",
+            "labels_dropped",
+            "icons_dropped",
+            "curves_dropped",
+            "spans",
+            "cpu_ms",
+            "frame_ms",
         ] {
             assert!(s0.contains_key(key), "segment missing {key}");
         }
+        assert!(
+            !s0.contains_key("gate_frame"),
+            "no code gates frames, so the report must not advertise it"
+        );
         assert!(!s0.contains_key("idle"), "idle must be skipped when None");
         assert_eq!(v["segments"][0]["frame_ms"]["p99"], 3.0);
         assert_eq!(v["segments"][0]["cpu_ms"]["p50"], 0.25);
+        assert_eq!(v["segments"][0]["lines"], 2);
+        assert_eq!(v["segments"][0]["glyphs"], 41);
+        assert_eq!(v["segments"][0]["labels_dropped"], 7);
+        assert_eq!(v["segments"][0]["bg_cells"], 96);
+        assert_eq!(v["segments"][0]["drawn"]["cells"], 100);
         let spans = v["segments"][0]["spans"].as_object().unwrap();
         let mut keys: Vec<_> = spans.keys().map(String::as_str).collect();
         keys.sort_unstable();

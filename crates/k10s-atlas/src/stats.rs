@@ -47,6 +47,13 @@ impl Ring {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DrawnCounts {
+    pub regions: usize,
+    pub blocks: usize,
+    pub cells: usize,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
 pub struct FrameSpans {
     pub walk_us: f32,
@@ -122,7 +129,7 @@ pub struct FrameStats {
     pub curves: usize,
     pub curves_dropped: usize,
     pub bg_cells: usize,
-    pub drawn: (usize, usize, usize),
+    pub drawn: DrawnCounts,
     pub labels_dropped: usize,
     pub icons_dropped: usize,
 }

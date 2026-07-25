@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::camera::Camera;
 use crate::scene::{Scene, Totals};
-use crate::stats::{FrameSpans, FrameStats};
+use crate::stats::{DrawnCounts, FrameSpans, FrameStats};
 
 const VIEWPORT_STABLE_SECS: f32 = 0.75;
 const MAX_RESTARTS: u32 = 5;
@@ -17,7 +17,6 @@ pub struct Segment {
     pub to: Camera,
     pub dur: f32,
     pub measure: bool,
-    pub gate_frame: bool,
     pub idle: bool,
 }
 
@@ -44,16 +43,21 @@ pub struct IdleResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct SegmentResult {
     pub name: String,
-    pub gate_frame: bool,
-    pub frame_ms: Percentiles,
-    pub cpu_ms: CpuPercentiles,
-    pub spans: FrameSpans,
     pub quads: usize,
     pub lines: usize,
     pub glyphs: usize,
-    pub edges: usize,
+    pub icons: usize,
     pub sats: usize,
     pub curves: usize,
+    pub edges: usize,
+    pub bg_cells: usize,
+    pub drawn: DrawnCounts,
+    pub labels_dropped: usize,
+    pub icons_dropped: usize,
+    pub curves_dropped: usize,
+    pub spans: FrameSpans,
+    pub cpu_ms: CpuPercentiles,
+    pub frame_ms: Percentiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle: Option<IdleResult>,
 }
@@ -262,16 +266,21 @@ impl Flight {
                 });
                 self.results.push(SegmentResult {
                     name: seg.name.to_string(),
-                    gate_frame: seg.gate_frame,
-                    frame_ms: Percentiles { p50, p95, p99 },
-                    cpu_ms: CpuPercentiles { p50: c50, p99: c99 },
-                    spans: stats.span_p50(),
                     quads: stats.quads,
                     lines: stats.lines,
                     glyphs: stats.glyphs,
-                    edges: stats.edges,
+                    icons: stats.icons,
                     sats: stats.sats,
                     curves: stats.curves,
+                    edges: stats.edges,
+                    bg_cells: stats.bg_cells,
+                    drawn: stats.drawn,
+                    labels_dropped: stats.labels_dropped,
+                    icons_dropped: stats.icons_dropped,
+                    curves_dropped: stats.curves_dropped,
+                    spans: stats.span_p50(),
+                    cpu_ms: CpuPercentiles { p50: c50, p99: c99 },
+                    frame_ms: Percentiles { p50, p95, p99 },
                     idle,
                 });
             }
@@ -389,7 +398,6 @@ mod tests {
             to: a.fit,
             dur,
             measure,
-            gate_frame: false,
             idle,
         };
         vec![
@@ -496,7 +504,6 @@ mod tests {
             idle.proc_cpu_ms
         );
         assert_eq!(idle.dur_s, 5.0);
-        assert!(!last.gate_frame);
         assert_eq!(
             result.segments.iter().filter(|s| s.idle.is_some()).count(),
             1,
