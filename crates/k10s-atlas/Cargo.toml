@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Generic 2D semantic-zoom map engine: camera, LOD policy, hierarchical culling over a flat scene, frame stats, and a scripted flight bench harness."
 
+[lints]
+workspace = true
+
 [features]
 testing = []
 
