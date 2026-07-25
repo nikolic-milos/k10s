@@ -8,7 +8,6 @@ license.workspace = true
 k10s-core.workspace = true
 k10s-clustergen.workspace = true
 bevy_ecs.workspace = true
-arc-swap.workspace = true
 crossbeam-channel.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

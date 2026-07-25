@@ -653,6 +653,7 @@ fn spawn_world_boxed(
         .name("k10s-world".into())
         .spawn(move || {
             let (mut world, mut schedule) = build_world(&spec, scene, mode);
+            drop(spec);
             let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xC0FFEE);
             let tick = Duration::from_secs_f32(1.0 / TICK_HZ);
             let mut churn_on = true;
