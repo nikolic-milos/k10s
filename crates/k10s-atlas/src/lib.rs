@@ -6,6 +6,8 @@ pub mod lod;
 pub mod pacing;
 pub mod scene;
 pub mod stats;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use camera::{Camera, MAX_ZOOM, MIN_ZOOM};
 pub use cull::{CullStats, cull, walk_edges};
