@@ -52,6 +52,7 @@ pub struct FrameStats {
     cpu: Ring,
     frames: u64,
     pub quads: usize,
+    pub lines: usize,
     pub glyphs: usize,
     pub edges: usize,
     pub icons: usize,

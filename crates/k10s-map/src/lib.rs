@@ -386,6 +386,19 @@ enum IconJob {
     Sat(SatKind, Bounds<Pixels>),
 }
 
+#[derive(Default, Clone, Copy)]
+struct LabelCounts {
+    lines: usize,
+    glyphs: usize,
+}
+
+impl LabelCounts {
+    fn count(&mut self, text: &str) {
+        self.lines += 1;
+        self.glyphs += text.chars().count();
+    }
+}
+
 #[expect(clippy::too_many_arguments)]
 fn paint_map(
     bounds: Bounds<Pixels>,
@@ -894,7 +907,7 @@ fn paint_map(
     }
 
     let font = gpui::font("Noto Sans");
-    let mut glyph_runs = 0usize;
+    let mut label_counts = LabelCounts::default();
     for job in labels.iter() {
         let run = TextRun {
             len: job.text.len(),
@@ -918,7 +931,7 @@ fn paint_map(
             )
             .is_ok()
         {
-            glyph_runs += 1;
+            label_counts.count(&job.text);
         }
     }
 
@@ -960,7 +973,8 @@ fn paint_map(
     {
         let mut st = stats.borrow_mut();
         st.quads = quads;
-        st.glyphs = glyph_runs;
+        st.lines = label_counts.lines;
+        st.glyphs = label_counts.glyphs;
         st.edges = drawn_edges;
         st.icons = icons.len();
         st.sats = drawn_sats;
@@ -1022,14 +1036,15 @@ fn paint_hud(
         ),
         format!("paint cpu  p50 {cp50:.2}  p99 {cp99:.2} ms"),
         format!(
-            "zoom {zoom:.3}  stage {}  |  quads {}  glyphs {}  icons {}  edges {}  dropped {}L/{}I",
+            "zoom {zoom:.3}  stage {}  |  quads {}  lines {}  glyphs {}  icons {}  edges {}  dropped {}L/{}I",
             if blend.is_settled() {
                 format!("Z{}", blend.to)
             } else {
                 format!("Z{}>Z{}", blend.from, blend.to)
             },
             group(st.quads as u32),
-            st.glyphs,
+            st.lines,
+            group(st.glyphs as u32),
             st.icons,
             st.edges,
             st.labels_dropped,
@@ -1105,4 +1120,48 @@ fn group(n: u32) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LabelCounts;
+
+    const POD_LABELS: [&str; 3] = [
+        "checkout-api-7f9c8d6b5-tzq4x",
+        "postgres-primary-0",
+        "otel-collector-agent-vv2mn",
+    ];
+
+    #[test]
+    fn label_counts_keep_lines_and_glyphs_apart() {
+        let mut counts = LabelCounts::default();
+        for text in POD_LABELS {
+            counts.count(text);
+        }
+        assert_eq!(counts.lines, POD_LABELS.len());
+        assert_eq!(
+            counts.glyphs,
+            POD_LABELS.iter().map(|t| t.chars().count()).sum::<usize>()
+        );
+        assert!(
+            counts.glyphs >= counts.lines,
+            "glyphs {} lines {}",
+            counts.glyphs,
+            counts.lines
+        );
+        assert_ne!(
+            counts.glyphs, counts.lines,
+            "a line counter must not be reported as a glyph counter"
+        );
+    }
+
+    #[test]
+    fn label_counts_measure_characters_not_bytes() {
+        let text = "naive-wörker-0";
+        let mut counts = LabelCounts::default();
+        counts.count(text);
+        assert_eq!(counts.lines, 1);
+        assert_eq!(counts.glyphs, 14);
+        assert!(counts.glyphs < text.len());
+    }
 }
