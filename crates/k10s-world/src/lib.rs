@@ -775,6 +775,45 @@ mod tests {
         assert_eq!(snap.bounds, full.bounds);
     }
 
+    fn assert_rollup_arithmetic(world: &World) {
+        let topo = world.resource::<Topology>();
+        let agg = world.resource::<Aggregates>();
+        for (wl, range) in topo.wl_pod_range.iter().enumerate() {
+            let cells = (range.end - range.start) as usize;
+            let counts = agg.wl_sev_counts[wl];
+            assert_eq!(
+                counts.iter().sum::<u32>() as usize,
+                cells,
+                "workload {wl} severity counts {counts:?} do not sum to {cells} cells"
+            );
+            let mut expect = [0u32; 4];
+            for i in range.start as usize..range.end as usize {
+                expect[agg.pod_health[i].severity() as usize] += 1;
+            }
+            assert_eq!(counts, expect, "workload {wl} severity counts drifted");
+            let worst = (range.start as usize..range.end as usize)
+                .map(|i| agg.pod_health[i])
+                .max_by_key(|h| h.severity())
+                .unwrap_or(Health::Ok);
+            assert_eq!(agg.wl_health[wl], worst, "workload {wl} health drifted");
+        }
+        for (ns, range) in topo.ns_pod_range.iter().enumerate() {
+            let unhealthy = (range.start as usize..range.end as usize)
+                .filter(|&i| agg.pod_health[i].is_unhealthy())
+                .count() as u32;
+            assert_eq!(
+                agg.ns_unhealthy_count[ns], unhealthy,
+                "namespace {ns} unhealthy count drifted"
+            );
+            let total = (range.end - range.start).max(1) as f32;
+            assert_eq!(
+                agg.ns_unhealthy[ns],
+                unhealthy as f32 / total,
+                "namespace {ns} unhealthy fraction drifted"
+            );
+        }
+    }
+
     #[test]
     fn initial_snapshot_published_and_rollups_react() {
         let spec = generate(&GenConfig {
@@ -950,6 +989,179 @@ mod tests {
         assert_eq!(pinned.rev, 1);
         for (i, (cell, &h)) in pinned.cells.iter().zip(&pinned_health).enumerate() {
             assert_eq!(cell.ext.health, h, "pinned snapshot cell {i} changed");
+        }
+    }
+
+    #[test]
+    fn rollup_arithmetic_survives_adversarial_dirty_streams() {
+        let spec = platform(13, 3_000);
+        let scene = k10s_core::new_shared_scene();
+        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
+        schedule.run(&mut world);
+        assert_rollup_arithmetic(&world);
+
+        let wl = world
+            .resource::<Topology>()
+            .wl_pod_range
+            .iter()
+            .position(|r| r.end - r.start >= 4)
+            .expect("a workload with four or more pods");
+        let pods: Vec<u32> = world.resource::<Topology>().wl_pod_range[wl]
+            .clone()
+            .collect();
+        let originals: Vec<Health> = pods
+            .iter()
+            .map(|&i| world.resource::<Aggregates>().pod_health[i as usize])
+            .collect();
+
+        for h in [
+            Health::Err,
+            Health::Warn,
+            Health::Ok,
+            Health::Unknown,
+            Health::Err,
+        ] {
+            set_pod_health(&mut world, pods[0], h);
+        }
+        set_pod_health(&mut world, pods[0], originals[0]);
+        set_pod_health(&mut world, pods[1], Health::Err);
+        set_pod_health(&mut world, pods[1], Health::Warn);
+        set_pod_health(&mut world, pods[2], Health::Unknown);
+        schedule.run(&mut world);
+
+        assert_rollup_arithmetic(&world);
+        assert_eq!(
+            world.resource::<Aggregates>().pod_health[pods[0] as usize],
+            originals[0]
+        );
+        assert_eq!(
+            world.resource::<Aggregates>().pod_health[pods[1] as usize],
+            Health::Warn
+        );
+        assert_published_matches_full(&world, &scene.load_full());
+
+        for round in 0..4u32 {
+            for (slot, &pod) in pods.iter().enumerate() {
+                for h in [Health::Err, Health::Ok, Health::Warn, Health::Unknown] {
+                    set_pod_health(&mut world, pod, h);
+                }
+                set_pod_health(&mut world, pod, originals[slot]);
+                if (slot as u32).is_multiple_of(round + 1) {
+                    set_pod_health(&mut world, pod, Health::Err);
+                }
+            }
+            schedule.run(&mut world);
+            assert_rollup_arithmetic(&world);
+            assert_published_matches_full(&world, &scene.load_full());
+        }
+
+        for (slot, &pod) in pods.iter().enumerate() {
+            set_pod_health(&mut world, pod, originals[slot]);
+        }
+        schedule.run(&mut world);
+        assert_rollup_arithmetic(&world);
+        for (slot, &pod) in pods.iter().enumerate() {
+            assert_eq!(
+                world.resource::<Aggregates>().pod_health[pod as usize],
+                originals[slot]
+            );
+        }
+    }
+
+    #[test]
+    fn scene_ranges_partition_every_array() {
+        let spec = platform(17, 8_000);
+        for mode in [LayoutMode::Spread, LayoutMode::Dense] {
+            let scene = k10s_core::new_shared_scene();
+            let (mut world, mut schedule) = build_world(&spec, scene.clone(), mode);
+            schedule.run(&mut world);
+            let snap = scene.load_full();
+
+            assert_eq!(snap.totals.regions as usize, snap.regions.len(), "{mode:?}");
+            assert_eq!(snap.totals.blocks as usize, snap.blocks.len(), "{mode:?}");
+            assert_eq!(snap.totals.cells as usize, snap.cells.len(), "{mode:?}");
+            assert_eq!(snap.totals.sats as usize, snap.sats.len(), "{mode:?}");
+            assert_eq!(snap.totals.edges as usize, snap.edges.len(), "{mode:?}");
+            assert!(snap.totals.cells > 0 && snap.totals.blocks > 0);
+            assert_eq!(
+                snap.sats.is_empty(),
+                !mode.emits_attachments(),
+                "{mode:?} snapshot disagrees with emits_attachments"
+            );
+
+            let mut next_block = 0u32;
+            for (i, region) in snap.regions.iter().enumerate() {
+                assert_eq!(
+                    region.children.start, next_block,
+                    "{mode:?} region {i} children not contiguous"
+                );
+                assert!(region.children.end >= region.children.start);
+                next_block = region.children.end;
+            }
+            assert_eq!(next_block as usize, snap.blocks.len(), "{mode:?}");
+
+            let mut next_cell = 0u32;
+            let mut next_sat = 0u32;
+            for (i, block) in snap.blocks.iter().enumerate() {
+                assert_eq!(
+                    block.children.start, next_cell,
+                    "{mode:?} block {i} children not contiguous"
+                );
+                assert!(block.children.end >= block.children.start);
+                next_cell = block.children.end;
+                assert_eq!(
+                    block.sats.start, next_sat,
+                    "{mode:?} block {i} sats not contiguous"
+                );
+                assert!(block.sats.end >= block.sats.start);
+                next_sat = block.sats.end;
+                assert!(
+                    snap.regions[block.ext.ns as usize]
+                        .children
+                        .contains(&(i as u32)),
+                    "{mode:?} block {i} claims region {} which does not own it",
+                    block.ext.ns
+                );
+            }
+            assert_eq!(next_cell as usize, snap.cells.len(), "{mode:?}");
+            assert_eq!(next_sat as usize, snap.sats.len(), "{mode:?}");
+
+            assert_eq!(snap.region_edges.len(), snap.regions.len(), "{mode:?}");
+            let mut next_edge = 0u32;
+            for (i, range) in snap.region_edges.iter().enumerate() {
+                assert_eq!(
+                    range.start, next_edge,
+                    "{mode:?} region {i} edges not contiguous"
+                );
+                assert!(range.end >= range.start);
+                next_edge = range.end;
+            }
+            assert_eq!(next_edge as usize, snap.edges.len(), "{mode:?}");
+            assert!(snap.cross_edges.start <= snap.cross_edges.end, "{mode:?}");
+            assert!(
+                snap.cross_edges.end as usize <= snap.edges.len(),
+                "{mode:?} cross_edges {:?} outside edges of {}",
+                snap.cross_edges,
+                snap.edges.len()
+            );
+
+            for (i, region) in snap.regions.iter().enumerate() {
+                let cells: u32 = region
+                    .children
+                    .clone()
+                    .map(|b| {
+                        let block = &snap.blocks[b as usize];
+                        block.children.end - block.children.start
+                    })
+                    .sum();
+                assert_eq!(region.weight, cells, "{mode:?} region {i} weight");
+            }
+            for edge in &snap.edges {
+                assert!(
+                    edge.a < snap.totals.blocks && edge.b < snap.totals.blocks,
+                    "{mode:?}"
+                );
+            }
         }
     }
 
