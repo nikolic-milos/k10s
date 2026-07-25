@@ -18,4 +18,4 @@ pub use flight::{
 pub use lod::{LodPolicy, StageBlend, StageMachine};
 pub use pacing::FramePacer;
 pub use scene::{BlockNode, CellNode, Edge, Rect, RegionNode, Scene, Totals};
-pub use stats::FrameStats;
+pub use stats::{FrameSpans, FrameStats};

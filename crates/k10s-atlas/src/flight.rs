@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::camera::Camera;
 use crate::scene::{Scene, Totals};
-use crate::stats::FrameStats;
+use crate::stats::{FrameSpans, FrameStats};
 
 const VIEWPORT_STABLE_SECS: f32 = 0.75;
 const MAX_RESTARTS: u32 = 5;
@@ -47,6 +47,7 @@ pub struct SegmentResult {
     pub gate_frame: bool,
     pub frame_ms: Percentiles,
     pub cpu_ms: CpuPercentiles,
+    pub spans: FrameSpans,
     pub quads: usize,
     pub lines: usize,
     pub glyphs: usize,
@@ -264,6 +265,7 @@ impl Flight {
                     gate_frame: seg.gate_frame,
                     frame_ms: Percentiles { p50, p95, p99 },
                     cpu_ms: CpuPercentiles { p50: c50, p99: c99 },
+                    spans: stats.span_p50(),
                     quads: stats.quads,
                     lines: stats.lines,
                     glyphs: stats.glyphs,
@@ -369,6 +371,17 @@ mod tests {
         }
     }
 
+    fn painted_spans() -> FrameSpans {
+        FrameSpans {
+            walk_us: 820.0,
+            quads_us: 140.0,
+            paths_us: 310.0,
+            icons_us: 260.0,
+            text_us: 1180.0,
+            hud_us: 190.0,
+        }
+    }
+
     fn test_plan(a: &FlightAnchors, _vw: f32, _vh: f32) -> Vec<Segment> {
         let seg = |name, measure, idle, dur| Segment {
             name,
@@ -415,6 +428,7 @@ mod tests {
 
         let mut now_s = 1.0f32;
         for _ in 0..n_segs - 1 {
+            stats.push_spans(painted_spans());
             now_s += flight.segments[flight.current].dur + 0.01;
             assert!(matches!(
                 flight.frame(at(now_s), vw, vh, true, &scene, &mut stats),
@@ -456,7 +470,18 @@ mod tests {
             panic!("flight must complete");
         };
 
+        assert_eq!(
+            result.segments[0].spans,
+            painted_spans(),
+            "attributed spans must reach the segment report"
+        );
+
         let last = result.segments.last().expect("segments recorded");
+        assert_eq!(
+            last.spans.paint_total_us(),
+            0.0,
+            "an idle segment paints nothing, so it attributes nothing"
+        );
         let idle = last
             .idle
             .as_ref()

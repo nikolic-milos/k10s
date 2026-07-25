@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use serde::Serialize;
+
 const WINDOW: usize = 240;
 
 const IDLE_GAP_MS: f32 = 500.0;
@@ -45,11 +47,71 @@ impl Ring {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
+pub struct FrameSpans {
+    pub walk_us: f32,
+    pub quads_us: f32,
+    pub paths_us: f32,
+    pub icons_us: f32,
+    pub text_us: f32,
+    pub hud_us: f32,
+}
+
+impl FrameSpans {
+    pub fn paint_total_us(&self) -> f32 {
+        self.walk_us + self.quads_us + self.paths_us + self.icons_us + self.text_us
+    }
+}
+
+#[derive(Default)]
+struct SpanRings {
+    walk: Ring,
+    quads: Ring,
+    paths: Ring,
+    icons: Ring,
+    text: Ring,
+    hud: Ring,
+}
+
+impl SpanRings {
+    fn clear(&mut self) {
+        self.walk.clear();
+        self.quads.clear();
+        self.paths.clear();
+        self.icons.clear();
+        self.text.clear();
+        self.hud.clear();
+    }
+
+    fn push(&mut self, spans: FrameSpans) {
+        self.walk.push(spans.walk_us);
+        self.quads.push(spans.quads_us);
+        self.paths.push(spans.paths_us);
+        self.icons.push(spans.icons_us);
+        self.text.push(spans.text_us);
+        self.hud.push(spans.hud_us);
+    }
+
+    fn p50(&self) -> FrameSpans {
+        let mut scratch = [0.0f32; WINDOW];
+        let mut median = |ring: &Ring| pct(ring.sorted_into(&mut scratch), 0.50);
+        FrameSpans {
+            walk_us: median(&self.walk),
+            quads_us: median(&self.quads),
+            paths_us: median(&self.paths),
+            icons_us: median(&self.icons),
+            text_us: median(&self.text),
+            hud_us: median(&self.hud),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct FrameStats {
     last_frame: Option<Instant>,
     intervals: Ring,
     cpu: Ring,
+    spans: SpanRings,
     frames: u64,
     pub quads: usize,
     pub lines: usize,
@@ -69,6 +131,7 @@ impl FrameStats {
     pub fn reset(&mut self) {
         self.intervals.clear();
         self.cpu.clear();
+        self.spans.clear();
     }
 
     pub fn begin_frame(&mut self, now: Instant, continuous: bool) {
@@ -88,6 +151,14 @@ impl FrameStats {
 
     pub fn end_cpu(&mut self, frame_start: Instant) {
         self.cpu.push(frame_start.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    pub fn push_spans(&mut self, spans: FrameSpans) {
+        self.spans.push(spans);
+    }
+
+    pub fn span_p50(&self) -> FrameSpans {
+        self.spans.p50()
     }
 
     pub fn frame_percentiles(&self) -> (f32, f32, f32) {
@@ -176,9 +247,61 @@ mod tests {
         st.end_cpu(Instant::now() - Duration::from_millis(5));
         st.begin_frame(Instant::now(), true);
         st.begin_frame(Instant::now() + ms(10), true);
+        st.push_spans(spans_us(100.0));
         st.reset();
         assert_eq!(st.frame_percentiles(), (0.0, 0.0, 0.0));
         assert_eq!(st.cpu_percentiles(), (0.0, 0.0));
+        assert_eq!(st.span_p50(), FrameSpans::default());
+    }
+
+    fn spans_us(scale: f32) -> FrameSpans {
+        FrameSpans {
+            walk_us: 8.0 * scale,
+            quads_us: 1.4 * scale,
+            paths_us: 3.1 * scale,
+            icons_us: 2.6 * scale,
+            text_us: 9.0 * scale,
+            hud_us: 1.9 * scale,
+        }
+    }
+
+    #[test]
+    fn spans_report_a_median_per_segment() {
+        let mut st = FrameStats::default();
+        for scale in [0.5, 1.0, 1.0, 1.0, 40.0] {
+            st.push_spans(spans_us(scale));
+        }
+        let p50 = st.span_p50();
+        assert_eq!(p50, spans_us(1.0), "outliers must not move the median");
+        assert!(p50.walk_us > 0.0 && p50.text_us > 0.0 && p50.hud_us > 0.0);
+    }
+
+    #[test]
+    fn paint_spans_stay_inside_the_measured_frame() {
+        let mut st = FrameStats::default();
+        for _ in 0..8 {
+            st.push_spans(spans_us(100.0));
+            st.end_cpu(Instant::now() - Duration::from_micros(3_000));
+        }
+        let p50 = st.span_p50();
+        let (cpu_p50, _) = st.cpu_percentiles();
+        assert!(p50.paint_total_us() > 0.0, "spans must be populated");
+        assert!(
+            p50.paint_total_us() <= cpu_p50 * 1000.0,
+            "spans {} us exceed frame cpu {} us",
+            p50.paint_total_us(),
+            cpu_p50 * 1000.0
+        );
+    }
+
+    #[test]
+    fn hud_time_is_not_folded_into_the_paint_spans() {
+        let spans = spans_us(10.0);
+        assert!(spans.hud_us > 0.0);
+        assert_eq!(
+            spans.paint_total_us(),
+            spans.walk_us + spans.quads_us + spans.paths_us + spans.icons_us + spans.text_us
+        );
     }
 
     #[test]

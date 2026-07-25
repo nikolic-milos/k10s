@@ -16,7 +16,7 @@ use gpui::{
     quad, rgb, size,
 };
 use k10s_atlas::curves::{bow_jitter, curve_ctrl, dash_quadratic};
-use k10s_atlas::{FramePacer, FrameStats, StageMachine};
+use k10s_atlas::{FramePacer, FrameSpans, FrameStats, StageMachine};
 use k10s_core::layout::CARD_HEADER;
 use k10s_core::{Health, Rect, SatKind, SceneSnapshot, SharedScene, Tool, WorkloadKind, WorldCtrl};
 
@@ -521,6 +521,7 @@ fn paint_map(
     let mut curve_glow = PathBuilder::stroke(px(CURVE_GLOW_W));
     let mut dash_scratch: Vec<(f32, f32)> = Vec::new();
 
+    let walk_start = std::time::Instant::now();
     bg.push(fill(bounds, rgb(BG)));
     quads += 1;
 
@@ -800,8 +801,10 @@ fn paint_map(
         }
     }
 
+    let bg_quads_start = std::time::Instant::now();
     window.paint_quads(&bg);
 
+    let paths_start = std::time::Instant::now();
     let mut bg_hexes = 0usize;
     if !stress_any && hex::hex_on() {
         let (hex_r, hex_alpha) = hex::level(zoom);
@@ -858,8 +861,10 @@ fn paint_map(
         }
     }
 
+    let fg_quads_start = std::time::Instant::now();
     window.paint_quads(&fg);
 
+    let icons_start = std::time::Instant::now();
     if !icons.is_empty() {
         let wl_icon_color: gpui::Hsla = gpui::Rgba {
             r: 0.62,
@@ -906,6 +911,7 @@ fn paint_map(
         });
     }
 
+    let text_start = std::time::Instant::now();
     let font = gpui::font("Noto Sans");
     let mut label_counts = LabelCounts::default();
     for job in labels.iter() {
@@ -934,6 +940,7 @@ fn paint_map(
             label_counts.count(&job.text);
         }
     }
+    let text_end = std::time::Instant::now();
 
     #[cfg(debug_assertions)]
     {
@@ -986,6 +993,8 @@ fn paint_map(
         st.icons_dropped = icons_dropped;
         st.end_cpu(frame_start);
     }
+
+    let hud_start = std::time::Instant::now();
     paint_hud(
         scene,
         stats,
@@ -999,6 +1008,20 @@ fn paint_map(
         window,
         cx,
     );
+    let hud_end = std::time::Instant::now();
+
+    stats.borrow_mut().push_spans(FrameSpans {
+        walk_us: span_us(walk_start, bg_quads_start),
+        quads_us: span_us(bg_quads_start, paths_start) + span_us(fg_quads_start, icons_start),
+        paths_us: span_us(paths_start, fg_quads_start),
+        icons_us: span_us(icons_start, text_start),
+        text_us: span_us(text_start, text_end),
+        hud_us: span_us(hud_start, hud_end),
+    });
+}
+
+fn span_us(from: std::time::Instant, to: std::time::Instant) -> f32 {
+    (to - from).as_secs_f32() * 1_000_000.0
 }
 
 #[expect(clippy::too_many_arguments)]

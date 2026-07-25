@@ -235,6 +235,7 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k10s_atlas::FrameSpans;
     use k10s_atlas::flight::{CpuPercentiles, IdleResult, Percentiles};
 
     fn anchors() -> FlightAnchors {
@@ -318,6 +319,14 @@ mod tests {
                 p50: 0.25,
                 p99: 0.5,
             },
+            spans: FrameSpans {
+                walk_us: 80.0,
+                quads_us: 14.0,
+                paths_us: 31.0,
+                icons_us: 26.0,
+                text_us: 90.0,
+                hud_us: 19.0,
+            },
             quads: 10,
             lines: 2,
             glyphs: 41,
@@ -363,6 +372,7 @@ mod tests {
             "gate_frame",
             "frame_ms",
             "cpu_ms",
+            "spans",
             "quads",
             "lines",
             "glyphs",
@@ -375,6 +385,16 @@ mod tests {
         assert!(!s0.contains_key("idle"), "idle must be skipped when None");
         assert_eq!(v["segments"][0]["frame_ms"]["p99"], 3.0);
         assert_eq!(v["segments"][0]["cpu_ms"]["p50"], 0.25);
+        let spans = v["segments"][0]["spans"].as_object().unwrap();
+        let mut keys: Vec<_> = spans.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "hud_us", "icons_us", "paths_us", "quads_us", "text_us", "walk_us"
+            ]
+        );
+        assert_eq!(v["segments"][0]["spans"]["walk_us"], 80.0);
         assert_eq!(v["segments"][0]["sats"], 5);
         assert_eq!(v["segments"][0]["curves"], 4);
         let idle = v["segments"][1]["idle"].as_object().unwrap();
