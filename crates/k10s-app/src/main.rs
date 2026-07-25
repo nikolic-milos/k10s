@@ -8,7 +8,22 @@ use k10s_clustergen::GenConfig;
 use k10s_core::{WorldCtrl, new_shared_scene};
 use k10s_map::{BenchMeta, MapView};
 
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("unnamed").to_string();
+        eprintln!(
+            "k10s: thread {name} panicked\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        default_hook(info);
+    }));
+}
+
 fn main() {
+    install_panic_hook();
+
     let args = match cli::parse(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(err) => {
@@ -104,8 +119,11 @@ fn main() {
     });
 
     let _ = shutdown_tx.send(WorldCtrl::Shutdown);
-    let _ = world.join();
-    if window_failed.load(Ordering::Relaxed) {
+    let world_ended_cleanly = world.join().is_ok();
+    if !world_ended_cleanly {
+        eprintln!("k10s: the world thread panicked, cluster updates had stopped");
+    }
+    if !world_ended_cleanly || window_failed.load(Ordering::Relaxed) {
         std::process::exit(1);
     }
 }
