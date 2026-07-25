@@ -129,24 +129,30 @@ impl Pending {
     }
 }
 
+pub const SNAPSHOT_POOL_DEPTH: usize = 3;
+
 #[derive(Resource)]
 struct SnapshotPool {
-    bufs: [Arc<SceneSnapshot>; 2],
-    pending: [Pending; 2],
+    bufs: [Arc<SceneSnapshot>; SNAPSHOT_POOL_DEPTH],
+    pending: [Pending; SNAPSHOT_POOL_DEPTH],
     next: usize,
 }
 
 impl SnapshotPool {
     fn new() -> Self {
         SnapshotPool {
-            bufs: [
-                Arc::new(SceneSnapshot::default()),
-                Arc::new(SceneSnapshot::default()),
-            ],
-            pending: [Pending::full(), Pending::full()],
+            bufs: std::array::from_fn(|_| Arc::new(SceneSnapshot::default())),
+            pending: std::array::from_fn(|_| Pending::full()),
             next: 0,
         }
     }
+}
+
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PublishStats {
+    pub publishes: u64,
+    pub full_materializes: u64,
+    pub deep_clones: u64,
 }
 
 #[derive(Resource, Default)]
@@ -361,6 +367,7 @@ fn extract(
     mut dirty: ResMut<Dirty>,
     mut rev: ResMut<Rev>,
     mut pool: ResMut<SnapshotPool>,
+    mut stats: ResMut<PublishStats>,
     out: Res<SceneOut>,
 ) {
     if !dirty.0 && rev.0 > 0 {
@@ -368,6 +375,7 @@ fn extract(
     }
     dirty.0 = false;
     rev.0 += 1;
+    stats.publishes += 1;
 
     let SnapshotPool {
         bufs,
@@ -376,11 +384,15 @@ fn extract(
     } = &mut *pool;
     let (buf, pending) = (&mut bufs[*next], &mut pending[*next]);
     if pending.all {
+        stats.full_materializes += 1;
         match Arc::get_mut(buf) {
             Some(snap) => materialize_into(snap, &topo, &agg, rev.0),
             None => *buf = Arc::new(materialize_snapshot(&topo, &agg, rev.0)),
         }
     } else {
+        if Arc::get_mut(buf).is_none() {
+            stats.deep_clones += 1;
+        }
         let snap = Arc::make_mut(buf);
         for &i in &pending.pods {
             snap.cells[i as usize].ext.health = agg.pod_health[i as usize];
@@ -395,7 +407,7 @@ fn extract(
     }
     pending.clear();
     out.0.store(buf.clone());
-    *next = 1 - *next;
+    *next = (*next + 1) % SNAPSHOT_POOL_DEPTH;
 }
 
 pub struct ExtractBench {
@@ -424,6 +436,10 @@ impl ExtractBench {
 
     pub fn snapshot(&self) -> Arc<SceneSnapshot> {
         self.world.resource::<SceneOut>().0.load_full()
+    }
+
+    pub fn stats(&self) -> PublishStats {
+        *self.world.resource::<PublishStats>()
     }
 }
 
@@ -464,6 +480,14 @@ impl PublishBench {
 
     pub fn snapshot(&self) -> Arc<SceneSnapshot> {
         self.world.resource::<SceneOut>().0.load_full()
+    }
+
+    pub fn pod_count(&self) -> usize {
+        self.world.resource::<Topology>().pod_entities.len()
+    }
+
+    pub fn stats(&self) -> PublishStats {
+        *self.world.resource::<PublishStats>()
     }
 }
 
@@ -603,6 +627,7 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
     world.insert_resource(Dirty(false));
     world.insert_resource(Rev(0));
     world.insert_resource(SnapshotPool::new());
+    world.insert_resource(PublishStats::default());
     world.insert_resource(RollupScratch::default());
     world.insert_resource(DirtyPods::default());
 
@@ -701,8 +726,54 @@ fn spawn_world_boxed(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use k10s_clustergen::{GenConfig, Scenario, generate};
+
+    fn platform(seed: u64, target_objects: u32) -> ClusterSpec {
+        generate(&GenConfig {
+            seed,
+            target_objects,
+            scenario: Scenario::Platform,
+        })
+    }
+
+    fn flip_to_other(world: &mut World, pod: usize) {
+        let cur = world.resource::<Aggregates>().pod_health[pod];
+        let new = if cur == Health::Err {
+            Health::Warn
+        } else {
+            Health::Err
+        };
+        set_pod_health(world, pod as u32, new);
+    }
+
+    fn assert_published_matches_full(world: &World, snap: &SceneSnapshot) {
+        let topo = world.resource::<Topology>();
+        let agg = world.resource::<Aggregates>();
+        let full = materialize_snapshot(topo, agg, snap.rev);
+        assert_eq!(snap.cells.len(), full.cells.len());
+        assert_eq!(snap.blocks.len(), full.blocks.len());
+        assert_eq!(snap.regions.len(), full.regions.len());
+        for (i, (a, b)) in snap.cells.iter().zip(&full.cells).enumerate() {
+            assert_eq!(a.ext.health, b.ext.health, "cell {i} at rev {}", snap.rev);
+            assert_eq!(a.rect, b.rect, "cell {i} rect at rev {}", snap.rev);
+        }
+        for (i, (a, b)) in snap.blocks.iter().zip(&full.blocks).enumerate() {
+            assert_eq!(a.ext.health, b.ext.health, "block {i} at rev {}", snap.rev);
+            assert_eq!(a.children, b.children, "block {i} children");
+        }
+        for (i, (a, b)) in snap.regions.iter().zip(&full.regions).enumerate() {
+            assert_eq!(
+                a.ext.unhealthy_frac, b.ext.unhealthy_frac,
+                "region {i} at rev {}",
+                snap.rev
+            );
+        }
+        assert_eq!(snap.totals.cells, full.totals.cells);
+        assert_eq!(snap.bounds, full.bounds);
+    }
 
     #[test]
     fn initial_snapshot_published_and_rollups_react() {
@@ -812,6 +883,74 @@ mod tests {
         let fresh = scene.load_full();
         assert_eq!(fresh.rev, 3);
         assert_eq!(fresh.cells[target].ext.health, Health::Warn);
+    }
+
+    #[test]
+    fn a_reader_lapped_twice_costs_no_deep_clone() {
+        const LAPPED_PUBLISHES_ABSORBED: usize = 2;
+        const { assert!(SNAPSHOT_POOL_DEPTH > LAPPED_PUBLISHES_ABSORBED) };
+
+        let spec = platform(9, 3_000);
+        let scene = k10s_core::new_shared_scene();
+        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
+        schedule.run(&mut world);
+
+        let held = scene.load_full();
+        for pod in 0..LAPPED_PUBLISHES_ABSORBED {
+            flip_to_other(&mut world, pod);
+            schedule.run(&mut world);
+        }
+
+        let stats = *world.resource::<PublishStats>();
+        assert_eq!(stats.publishes as usize, LAPPED_PUBLISHES_ABSORBED + 1);
+        assert_eq!(
+            stats.deep_clones, 0,
+            "one reader lapped {LAPPED_PUBLISHES_ABSORBED} times forced {} deep clones at pool \
+             depth {SNAPSHOT_POOL_DEPTH}",
+            stats.deep_clones
+        );
+        assert_eq!(held.rev, 1);
+        assert_eq!(scene.load().rev as usize, LAPPED_PUBLISHES_ABSORBED + 1);
+        assert_published_matches_full(&world, &scene.load_full());
+    }
+
+    #[test]
+    fn publish_under_a_lapped_reader_stays_correct() {
+        let spec = platform(11, 4_000);
+        let scene = k10s_core::new_shared_scene();
+        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
+        schedule.run(&mut world);
+
+        let pinned = scene.load_full();
+        let pinned_health: Vec<Health> = pinned.cells.iter().map(|c| c.ext.health).collect();
+        let mut recent: VecDeque<Arc<SceneSnapshot>> = VecDeque::new();
+        recent.push_back(scene.load_full());
+
+        let pods = world.resource::<Topology>().pod_labels.len();
+        for round in 0..SNAPSHOT_POOL_DEPTH * 4 {
+            flip_to_other(&mut world, (round * 37) % pods);
+            flip_to_other(&mut world, (round * 101 + 5) % pods);
+            schedule.run(&mut world);
+
+            let published = scene.load_full();
+            assert_eq!(published.rev as usize, round + 2);
+            assert_published_matches_full(&world, &published);
+            recent.push_back(published);
+            if recent.len() > SNAPSHOT_POOL_DEPTH {
+                recent.pop_front();
+            }
+        }
+
+        let stats = *world.resource::<PublishStats>();
+        assert!(
+            stats.deep_clones > 0,
+            "lapped reader never forced the clone path: {stats:?}"
+        );
+        assert_eq!(stats.full_materializes as usize, SNAPSHOT_POOL_DEPTH);
+        assert_eq!(pinned.rev, 1);
+        for (i, (cell, &h)) in pinned.cells.iter().zip(&pinned_health).enumerate() {
+            assert_eq!(cell.ext.health, h, "pinned snapshot cell {i} changed");
+        }
     }
 
     #[test]
