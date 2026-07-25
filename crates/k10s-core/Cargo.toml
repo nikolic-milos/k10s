@@ -10,4 +10,3 @@ workspace = true
 [dependencies]
 k10s-atlas.workspace = true
 arc-swap.workspace = true
-crossbeam-channel.workspace = true

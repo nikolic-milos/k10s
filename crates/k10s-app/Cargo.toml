@@ -17,7 +17,6 @@ k10s-clustergen.workspace = true
 k10s-world.workspace = true
 k10s-map.workspace = true
 gpui.workspace = true
-arc-swap.workspace = true
 crossbeam-channel.workspace = true
 futures.workspace = true
 
