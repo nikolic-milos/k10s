@@ -12,3 +12,7 @@ crossbeam-channel.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 
+[[bench]]
+name = "publish"
+harness = false
+
