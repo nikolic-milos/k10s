@@ -210,6 +210,63 @@ pub fn malformed_then_recovered() -> RecordedStream {
     s
 }
 
+/// A watch that drops and resumes from a bookmark rather than relisting.
+///
+/// The distinction from [`resync_after_expired`] is the whole point of bookmarks
+/// and is invisible unless a fixture pins it: a resumed watch produces no
+/// [`DesyncReason::Expired`] and repeats no object, it simply continues at a higher
+/// `resource_version`. A producer that relists on every reconnect looks identical
+/// to a correct one from the outside, until you count events on a large cluster.
+pub fn bookmarked_reconnect() -> RecordedStream {
+    let mut s = initial_sync();
+    // The reconnect. Everything after this is a continuation, not a relist: the
+    // same uids, but as Modified at higher versions.
+    let mut later = instance("pod-1", "prod", "wl-api", State::OK, Op::Modified);
+    if let IngestEvent::Resource(r) = &mut later {
+        r.resource_version = 4_096;
+    }
+    s.push(later);
+    let mut gone = instance("pod-2", "prod", "wl-api", State::OK, Op::Deleted);
+    if let IngestEvent::Resource(r) = &mut gone {
+        r.resource_version = 4_097;
+    }
+    s.push(gone);
+    s
+}
+
+/// A kind and a reason the cluster reported that nobody compiled in.
+///
+/// The "malformed or unknown fields" case at the level the contract can express: a
+/// real API server sends reasons and kinds no release of ours knows about, and the
+/// severity has to survive even though the static reason table cannot supply it.
+/// This is exactly the shape the kube data plane produces for, say, `ErrImagePull`.
+pub fn unknown_kind_and_reason() -> RecordedStream {
+    let widget = KindId(9_200);
+    // Past the compiled-in table, so `reason_severity` knows nothing about it and
+    // the severity has to have been carried rather than derived.
+    let unnameable = crate::model::ReasonId(9_300);
+    RecordedStream::record([
+        scope("ns-edge", "edge", Op::Added),
+        IngestEvent::Capability {
+            kind: widget,
+            verdict: Capability::Watchable,
+        },
+        owner("wl-widget", "edge", "widget", widget, Op::Added),
+        instance(
+            "pod-widget",
+            "edge",
+            "wl-widget",
+            State {
+                severity: crate::model::Severity::Err,
+                reason: unnameable,
+            },
+            Op::Added,
+        ),
+        IngestEvent::Synced { kind: widget },
+        IngestEvent::Synced { kind: KindId::POD },
+    ])
+}
+
 /// One pod churning through many states inside a single tick.
 pub fn churn(updates: usize) -> RecordedStream {
     use crate::model::ReasonId;
@@ -381,6 +438,93 @@ mod tests {
             panic!("expected an instance payload")
         };
         assert_eq!(state, State::of(crate::model::ReasonId::UNKNOWN));
+    }
+
+    #[test]
+    fn a_bookmarked_reconnect_relists_nothing() {
+        // What a bookmark buys: a reconnect that costs two events instead of the
+        // whole cluster. A producer that relists looks the same from the outside
+        // until you count, so this counts.
+        let stream = bookmarked_reconnect();
+        assert!(
+            find_desync(&stream.events).is_empty(),
+            "a resumed watch has nothing to declare desynced"
+        );
+
+        let mut adds: Vec<&str> = stream
+            .resources()
+            .filter(|r| r.op == Op::Added)
+            .map(|r| &*r.uid)
+            .collect();
+        let before = adds.len();
+        adds.sort_unstable();
+        adds.dedup();
+        assert_eq!(before, adds.len(), "no object may be added twice");
+
+        // The continuation carries a higher resource version, which is what makes
+        // it a continuation.
+        let versions: Vec<u64> = stream
+            .resources()
+            .filter(|r| r.op != Op::Added)
+            .map(|r| r.resource_version)
+            .collect();
+        assert_eq!(versions, vec![4_096, 4_097]);
+
+        // And a single tick collapses it to one event per object, with the delete
+        // winning over the earlier add for pod-2.
+        let mut i = Intake::new();
+        let out = stream.drain_through(&mut i);
+        assert_eq!(res_count(&out), 3, "one namespace, one owner, one pod");
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                IngestEvent::Resource(r) if r.uid.as_ref() == "pod-1" && r.resource_version == 4_096
+            )),
+            "the surviving event must be the later one"
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_and_reason_keep_the_severity_they_arrived_with() {
+        // The static tables cannot rate a reason nobody compiled in, so the
+        // producer's severity has to be carried rather than re-derived. Getting
+        // this wrong renders every novel error as healthy-ish.
+        let mut i = Intake::new();
+        let out = unknown_kind_and_reason().drain_through(&mut i);
+        assert_eq!(res_count(&out), 3);
+
+        let instance = out
+            .iter()
+            .find_map(|e| match e {
+                IngestEvent::Resource(r) if matches!(r.payload, Payload::Instance { .. }) => {
+                    Some(r)
+                }
+                _ => None,
+            })
+            .expect("the instance arrived");
+        let Payload::Instance { state } = instance.payload else {
+            panic!("expected an instance payload")
+        };
+        assert_eq!(state.severity, crate::model::Severity::Err);
+        assert!(
+            state.reason.0 >= crate::model::BUILTIN_REASON_COUNT,
+            "the fixture has to use a reason past the compiled-in table"
+        );
+        assert_eq!(
+            crate::model::reason_severity(state.reason),
+            crate::model::Severity::Unknown,
+            "the static table knows nothing about it, which is why State::of would be wrong"
+        );
+
+        let owner = out
+            .iter()
+            .find_map(|e| match e {
+                IngestEvent::Resource(r) if matches!(r.payload, Payload::Owner { .. }) => Some(r),
+                _ => None,
+            })
+            .expect("the owner arrived");
+        assert!(!owner.kind.is_builtin());
+        assert_eq!(crate::model::kind_short(owner.kind), "?");
     }
 
     #[test]
