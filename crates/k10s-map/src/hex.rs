@@ -47,8 +47,10 @@ pub fn for_each_center(visible: &Rect, r: f32, mut emit: impl FnMut(f32, f32)) -
     n
 }
 
+/// Oracle-side hex count. `suppressed` folds in both `K10S_NO_HEX` and the stress modes, so this
+/// stays a pure function of its arguments (see `crate::frame::FrameOpts::hex_shown`).
 pub fn visible_count(visible: &Rect, zoom: f32, suppressed: bool) -> usize {
-    if suppressed || !hex_on() {
+    if suppressed {
         return 0;
     }
     let (r, _) = level(zoom);
