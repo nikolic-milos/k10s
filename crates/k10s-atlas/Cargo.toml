@@ -18,3 +18,8 @@ serde = { workspace = true, features = ["derive"] }
 name = "cull"
 harness = false
 required-features = ["testing"]
+
+[[bench]]
+name = "fanout"
+harness = false
+required-features = ["testing"]

@@ -15,7 +15,14 @@ crossbeam-channel.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 
+[dev-dependencies]
+k10s-atlas = { workspace = true, features = ["testing"] }
+
 [[bench]]
 name = "publish"
+harness = false
+
+[[bench]]
+name = "fanout_cull"
 harness = false
 

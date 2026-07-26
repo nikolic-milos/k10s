@@ -8,7 +8,8 @@ options:
   --objects N                             objects to generate (default 25000)
   --seed S                                generator seed (default 55)
   --churn EVENTS_PER_SEC                  churn events per second (default 120)
-  --scenario platform|observability|data  cluster shape (default platform)
+  --scenario NAME                         platform|observability|data|ns-fanout|wl-fanout
+                                          (default platform)
   --layout spread|dense                   layout mode (default spread)
   --machine LABEL                         machine label recorded in bench reports
   --bench                                 run the scripted flight bench
