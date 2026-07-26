@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use k10s_clustergen::ClusterSpec;
+use crate::input::ClusterInput;
 use k10s_core::Rect;
 use k10s_core::layout::*;
 
@@ -215,14 +215,14 @@ fn scatter_pack(
     bounds.unwrap_or(Rect::ZERO)
 }
 
-pub fn layout(spec: &ClusterSpec, mode: LayoutMode) -> LayoutOut {
+pub fn layout(spec: &ClusterInput, mode: LayoutMode) -> LayoutOut {
     match mode {
         LayoutMode::Dense => layout_dense(spec),
         LayoutMode::Spread => layout_spread(spec),
     }
 }
 
-fn layout_spread(spec: &ClusterSpec) -> LayoutOut {
+fn layout_spread(spec: &ClusterInput) -> LayoutOut {
     let total_wl = spec.total_workloads as usize;
     let mut out = LayoutOut {
         ns_rects: Vec::with_capacity(spec.namespaces.len()),
@@ -350,7 +350,7 @@ fn layout_spread(spec: &ClusterSpec) -> LayoutOut {
     out
 }
 
-fn layout_dense(spec: &ClusterSpec) -> LayoutOut {
+fn layout_dense(spec: &ClusterInput) -> LayoutOut {
     let total_wl = spec.total_workloads as usize;
     let mut wl_sizes: Vec<(f32, f32)> = Vec::with_capacity(total_wl);
     let mut wl_cols: Vec<u32> = Vec::with_capacity(total_wl);
@@ -438,7 +438,8 @@ fn layout_dense(spec: &ClusterSpec) -> LayoutOut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k10s_clustergen::{GenConfig, Scenario, generate};
+    use crate::input::fold;
+    use k10s_clustergen::{GenConfig, Scenario, generate, stream};
 
     fn gap(a: &Rect, b: &Rect) -> f32 {
         let dx = (a.x - b.max_x()).max(b.x - a.max_x()).max(0.0);
@@ -446,12 +447,20 @@ mod tests {
         dx.max(dy)
     }
 
-    fn platform(seed: u64, target_objects: u32) -> ClusterSpec {
-        generate(&GenConfig {
+    fn platform(seed: u64, target_objects: u32) -> ClusterInput {
+        gen_input(seed, target_objects, Scenario::Platform)
+    }
+
+    /// Generator to stream to fold, which is now the only way in. If the layout
+    /// fingerprints still match after this, the fold is provably equivalent to the
+    /// old direct spec walk.
+    fn gen_input(seed: u64, target_objects: u32, scenario: Scenario) -> ClusterInput {
+        let spec = generate(&GenConfig {
             seed,
             target_objects,
-            scenario: Scenario::Platform,
-        })
+            scenario,
+        });
+        fold(&stream::snapshot(&spec, true)).0
     }
 
     fn all_rects(out: &LayoutOut) -> [&Vec<Rect>; 5] {
@@ -515,11 +524,7 @@ mod tests {
 
     #[test]
     fn namespaces_do_not_overlap_either_mode() {
-        let spec = generate(&GenConfig {
-            seed: 42,
-            target_objects: 20_000,
-            scenario: Scenario::Platform,
-        });
+        let spec = gen_input(42, 20_000, Scenario::Platform);
         for mode in [LayoutMode::Dense, LayoutMode::Spread] {
             let out = layout(&spec, mode);
             for i in 0..out.ns_rects.len() {
@@ -537,11 +542,7 @@ mod tests {
 
     #[test]
     fn spread_islands_keep_map_distance() {
-        let spec = generate(&GenConfig {
-            seed: 42,
-            target_objects: 20_000,
-            scenario: Scenario::Platform,
-        });
+        let spec = gen_input(42, 20_000, Scenario::Platform);
         let out = layout(&spec, LayoutMode::Spread);
         for i in 0..out.ns_rects.len() {
             for j in (i + 1)..out.ns_rects.len() {
@@ -571,11 +572,7 @@ mod tests {
 
     #[test]
     fn workload_halos_do_not_overlap_within_namespace() {
-        let spec = generate(&GenConfig {
-            seed: 7,
-            target_objects: 8_000,
-            scenario: Scenario::Platform,
-        });
+        let spec = gen_input(7, 8_000, Scenario::Platform);
         let out = layout(&spec, LayoutMode::Spread);
         let mut wl = 0usize;
         for ns in &spec.namespaces {
@@ -596,11 +593,7 @@ mod tests {
 
     #[test]
     fn hierarchy_containment_spread() {
-        let spec = generate(&GenConfig {
-            seed: 42,
-            target_objects: 6_000,
-            scenario: Scenario::Platform,
-        });
+        let spec = gen_input(42, 6_000, Scenario::Platform);
         let out = layout(&spec, LayoutMode::Spread);
         let (mut wl, mut pod, mut sat) = (0usize, 0usize, 0usize);
         let eps = 0.01f32;
@@ -638,11 +631,7 @@ mod tests {
 
     #[test]
     fn pods_stay_inside_their_workload_dense() {
-        let spec = generate(&GenConfig {
-            seed: 42,
-            target_objects: 5_000,
-            scenario: Scenario::Platform,
-        });
+        let spec = gen_input(42, 5_000, Scenario::Platform);
         let out = layout(&spec, LayoutMode::Dense);
         let mut pod = 0usize;
         let mut wl = 0usize;
@@ -717,11 +706,7 @@ mod tests {
         };
         for scenario in [Scenario::NsFanOut, Scenario::WlFanOut] {
             for objects in [12_000u32, 50_000] {
-                let spec = generate(&GenConfig {
-                    seed: 55,
-                    target_objects: objects,
-                    scenario,
-                });
+                let spec = gen_input(55, objects, scenario);
                 for mode in [LayoutMode::Dense, LayoutMode::Spread] {
                     let out = layout(&spec, mode);
                     let label = format!("{} {objects} {mode:?}", scenario.as_str());
@@ -895,11 +880,7 @@ mod tests {
 
     #[test]
     fn deterministic_both_modes() {
-        let spec = generate(&GenConfig {
-            seed: 1234,
-            target_objects: 10_000,
-            scenario: Scenario::Platform,
-        });
+        let spec = gen_input(1234, 10_000, Scenario::Platform);
         for mode in [LayoutMode::Dense, LayoutMode::Spread] {
             let a = layout(&spec, mode);
             let b = layout(&spec, mode);

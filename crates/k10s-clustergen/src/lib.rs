@@ -1,3 +1,5 @@
+pub mod stream;
+
 use k10s_core::{KindId, ReasonId, State, ToolId};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;

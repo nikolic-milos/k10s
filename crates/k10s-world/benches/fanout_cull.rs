@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use k10s_atlas::testing::lod_policy;
 use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend, cull};
+use k10s_clustergen::stream;
 use k10s_clustergen::{GenConfig, Scenario, generate};
 use k10s_core::{NsNode, PodNode, SatNode, SceneSnapshot, WorkloadNode};
 use k10s_world::{ExtractBench, LayoutMode};
@@ -172,7 +173,7 @@ fn snapshot_for(scenario: Scenario, objects: u32) -> Arc<SceneSnapshot> {
         target_objects: objects,
         scenario,
     });
-    let mut bench = ExtractBench::new(spec, MODE);
+    let mut bench = ExtractBench::new(&stream::snapshot(&spec, MODE.emits_attachments()), MODE);
     bench.run_extract();
     bench.snapshot()
 }

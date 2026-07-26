@@ -3,6 +3,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use k10s_clustergen::stream;
 use k10s_clustergen::{ClusterSpec, GenConfig, Scenario, generate};
 use k10s_core::SceneSnapshot;
 use k10s_world::{ExtractBench, LayoutMode, PublishBench, PublishStats, SNAPSHOT_POOL_DEPTH};
@@ -55,7 +56,7 @@ fn budgeted(samples: &[u64], start: &Instant) -> bool {
 }
 
 fn full_materialize(spec: &ClusterSpec, objects: u32) -> Case {
-    let mut bench = ExtractBench::new(spec.clone(), MODE);
+    let mut bench = ExtractBench::new(&stream::snapshot(&spec, MODE.emits_attachments()), MODE);
     for _ in 0..WARMUP {
         bench.run_extract();
     }
@@ -85,7 +86,7 @@ fn full_materialize(spec: &ClusterSpec, objects: u32) -> Case {
 }
 
 fn incremental(spec: &ClusterSpec, objects: u32, changed: usize) -> Case {
-    let mut bench = PublishBench::new(spec.clone(), MODE);
+    let mut bench = PublishBench::new(&stream::snapshot(&spec, MODE.emits_attachments()), MODE);
     for _ in 0..WARMUP {
         bench.flip_pods(changed);
         bench.run_publish();
@@ -115,7 +116,7 @@ fn incremental(spec: &ClusterSpec, objects: u32, changed: usize) -> Case {
 }
 
 fn lapped_reader(spec: &ClusterSpec, objects: u32, changed: usize) -> Case {
-    let mut bench = PublishBench::new(spec.clone(), MODE);
+    let mut bench = PublishBench::new(&stream::snapshot(&spec, MODE.emits_attachments()), MODE);
     let mut recent: VecDeque<Arc<SceneSnapshot>> = VecDeque::with_capacity(SNAPSHOT_POOL_DEPTH);
     let lap = |bench: &mut PublishBench, recent: &mut VecDeque<Arc<SceneSnapshot>>| {
         recent.push_back(bench.snapshot());
