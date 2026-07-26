@@ -74,6 +74,14 @@ pub struct NsSpec {
 #[derive(Debug, Default, Clone)]
 pub struct ClusterSpec {
     pub namespaces: Vec<NsSpec>,
+    /// Links between workloads in *different* namespaces, as pairs of global
+    /// workload indices (namespace order, then workload order within it).
+    ///
+    /// Separate from `WorkloadSpec::deps`, which is namespace-local by
+    /// construction and so could never express a cross-namespace edge. Without
+    /// these the scene's `cross_edges` range is permanently empty and the
+    /// culler's cross-region path is dead code.
+    pub cross_deps: Vec<(u32, u32)>,
     pub total_workloads: u32,
     pub total_pods: u32,
     pub total_sats: u32,
@@ -886,7 +894,56 @@ pub fn generate(cfg: &GenConfig) -> ClusterSpec {
         ns_i += 1;
     }
 
+    gen_cross_deps(&mut rng, &mut spec);
+
     spec
+}
+
+/// Links a few workloads across namespace boundaries.
+///
+/// Drawn after every namespace exists, which is also why it cannot perturb the
+/// layout: it consumes rng only once all geometry-determining draws are done, so
+/// the committed layout fingerprints are unaffected.
+fn gen_cross_deps(rng: &mut ChaCha8Rng, spec: &mut ClusterSpec) {
+    let ns_count = spec.namespaces.len();
+    if ns_count < 2 {
+        return;
+    }
+    // Global index of each namespace's first workload.
+    let mut ns_first = Vec::with_capacity(ns_count);
+    let mut running = 0u32;
+    for ns in &spec.namespaces {
+        ns_first.push(running);
+        running += ns.workloads.len() as u32;
+    }
+    if running == 0 {
+        return;
+    }
+
+    // Roughly one link per namespace: enough that the cross range is genuinely
+    // exercised at every scale, few enough that it cannot dominate edge counts.
+    let wanted = ns_count.min(64);
+    for _ in 0..wanted {
+        let a_ns = rng.random_range(0..ns_count);
+        let b_ns = rng.random_range(0..ns_count);
+        if a_ns == b_ns {
+            continue;
+        }
+        let (an, bn) = (
+            spec.namespaces[a_ns].workloads.len() as u32,
+            spec.namespaces[b_ns].workloads.len() as u32,
+        );
+        if an == 0 || bn == 0 {
+            continue;
+        }
+        let a = ns_first[a_ns] + rng.random_range(0..an);
+        let b = ns_first[b_ns] + rng.random_range(0..bn);
+        if spec.cross_deps.contains(&(a, b)) {
+            continue;
+        }
+        spec.cross_deps.push((a, b));
+        spec.total_edges += 1;
+    }
 }
 
 #[cfg(test)]

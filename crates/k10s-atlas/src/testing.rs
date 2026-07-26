@@ -164,7 +164,7 @@ pub fn scene(spec: SceneSpec) -> Scene {
             for e in 0..spec.edges_per_region {
                 let a = block_base + (e % span) as u32;
                 let b = block_base + ((e + 1) % span) as u32;
-                edges.push(Edge { a, b });
+                edges.push(Edge::blocks(a, b));
             }
         }
         region_edges.push(edge_start..edges.len() as u32);
@@ -251,8 +251,8 @@ mod tests {
             assert!(range.end as usize <= s.edges.len());
         }
         for e in &s.edges {
-            assert!((e.a as usize) < s.blocks.len());
-            assert!((e.b as usize) < s.blocks.len());
+            assert!((e.a.index() as usize) < s.blocks.len());
+            assert!((e.b.index() as usize) < s.blocks.len());
         }
     }
 
