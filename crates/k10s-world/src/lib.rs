@@ -84,6 +84,9 @@ struct Topology {
     sat_rects: Vec<Rect>,
     edges: Vec<EdgeInst>,
     ns_edge_range: Vec<Range<u32>>,
+    /// Tail of `edges` holding links whose ends live in different regions, so the
+    /// culler cannot reach them through any single region's range.
+    cross_edge_range: Range<u32>,
     bounds: Rect,
 }
 
@@ -375,7 +378,7 @@ fn materialize_into(snap: &mut SceneSnapshot, topo: &Topology, agg: &Aggregates,
     snap.region_edges.clear();
     snap.region_edges.extend(topo.ns_edge_range.iter().cloned());
 
-    snap.cross_edges = topo.edges.len() as u32..topo.edges.len() as u32;
+    snap.cross_edges = topo.cross_edge_range.clone();
 }
 
 fn materialize_snapshot(topo: &Topology, agg: &Aggregates, rev: u64) -> SceneSnapshot {
@@ -563,10 +566,7 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
                 }
             }
             for &dep in &wl.deps {
-                edges.push(EdgeInst {
-                    a: wl_idx,
-                    b: wl_start + dep,
-                });
+                edges.push(EdgeInst::blocks(wl_idx, wl_start + dep));
             }
             wl_labels.push(Arc::<str>::from(wl.name.as_str()));
             wl_kinds.push(wl.kind);
@@ -581,6 +581,18 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
         ns_edge_range.push(edge_start..edges.len() as u32);
     }
     debug_assert_eq!(sat_labels.len(), lay.sat_rects.len());
+
+    // Appended after every namespace range is closed, so the per-region ranges
+    // stay contiguous and these form a tail the culler visits once per frame
+    // rather than per region.
+    let cross_start = edges.len() as u32;
+    let wl_total = wl_labels.len() as u32;
+    for &(a, b) in &spec.cross_deps {
+        if a < wl_total && b < wl_total {
+            edges.push(EdgeInst::blocks(a, b));
+        }
+    }
+    let cross_edge_range = cross_start..edges.len() as u32;
 
     let sev_counts = |r: &Range<u32>| {
         let mut counts = [0u32; 4];
@@ -637,6 +649,7 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
         sat_rects: lay.sat_rects,
         edges,
         ns_edge_range,
+        cross_edge_range,
         bounds: lay.bounds,
     });
     world.insert_resource(Aggregates {
@@ -757,6 +770,7 @@ mod tests {
 
     use super::*;
     use k10s_clustergen::{GenConfig, Scenario, generate};
+    use k10s_core::Level;
 
     fn platform(seed: u64, target_objects: u32) -> ClusterSpec {
         generate(&GenConfig {
@@ -1192,7 +1206,18 @@ mod tests {
                 assert!(range.end >= range.start);
                 next_edge = range.end;
             }
-            assert_eq!(next_edge as usize, snap.edges.len(), "{mode:?}");
+            // The region ranges no longer cover the whole array: they run to where
+            // the cross-region tail begins, and the two together partition it
+            // exactly, with nothing shared and nothing unreachable.
+            assert_eq!(
+                next_edge, snap.cross_edges.start,
+                "{mode:?} region ranges must end where the cross tail begins"
+            );
+            assert_eq!(
+                snap.cross_edges.end as usize,
+                snap.edges.len(),
+                "{mode:?} cross tail must run to the end of edges"
+            );
             assert!(snap.cross_edges.start <= snap.cross_edges.end, "{mode:?}");
             assert!(
                 snap.cross_edges.end as usize <= snap.edges.len(),
@@ -1213,11 +1238,79 @@ mod tests {
                 assert_eq!(region.weight, cells, "{mode:?} region {i} weight");
             }
             for edge in &snap.edges {
+                // Endpoints are tagged now, so an in-range check has to know which
+                // array each end indexes rather than assuming both are blocks.
+                for end in [edge.a, edge.b] {
+                    let limit = match end.level() {
+                        Level::Region => snap.regions.len(),
+                        Level::Block => snap.blocks.len(),
+                        Level::Cell => snap.cells.len(),
+                        Level::Sat => snap.sats.len(),
+                    };
+                    assert!(
+                        (end.index() as usize) < limit,
+                        "{mode:?} edge endpoint {end:?} outside its {:?} array of {limit}",
+                        end.level()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cross_namespace_edges_land_in_the_cross_range() {
+        // cross_edges used to be written as len..len, so the culler's cross-region
+        // scan was dead code and no cross-namespace topology could exist.
+        let spec = platform(55, 20_000);
+        assert!(
+            !spec.cross_deps.is_empty(),
+            "the generator produced no cross-namespace links"
+        );
+        for mode in [LayoutMode::Dense, LayoutMode::Spread] {
+            let scene = k10s_core::new_shared_scene();
+            let (mut world, mut schedule) = build_world(&spec, scene.clone(), mode);
+            schedule.run(&mut world);
+            let snap = scene.load_full();
+
+            let cross = &snap.cross_edges;
+            assert!(!cross.is_empty(), "{mode:?}: cross range still empty");
+            assert_eq!(
+                cross.end as usize,
+                snap.edges.len(),
+                "{mode:?}: cross links must be the tail of edges"
+            );
+
+            // Every per-region range must end where the cross tail begins, so no
+            // edge is both region-owned and cross, and none is unreachable.
+            for (i, r) in snap.region_edges.iter().enumerate() {
                 assert!(
-                    edge.a < snap.totals.blocks && edge.b < snap.totals.blocks,
-                    "{mode:?}"
+                    r.end <= cross.start,
+                    "{mode:?}: region {i} range {r:?} overlaps the cross tail at {}",
+                    cross.start
                 );
             }
+
+            // The defining property: both ends of a cross edge sit in different
+            // regions, which is exactly what no single region's range can cover.
+            let ns_of = |block: u32| snap.blocks[block as usize].ext.ns;
+            for e in &snap.edges[cross.start as usize..cross.end as usize] {
+                assert_eq!(e.a.level(), Level::Block, "{mode:?}");
+                assert_eq!(e.b.level(), Level::Block, "{mode:?}");
+                assert_ne!(
+                    ns_of(e.a.index()),
+                    ns_of(e.b.index()),
+                    "{mode:?}: cross edge {e:?} has both ends in one namespace"
+                );
+            }
+
+            // And the culler reaches them: with the whole world visible and no
+            // budget to bind, it must draw at least the cross links.
+            let drawn = k10s_atlas::walk_edges(&snap, &snap.bounds, usize::MAX, |_, _| {});
+            assert!(
+                drawn >= cross.len(),
+                "{mode:?}: culler drew {drawn} edges, fewer than the {} cross links",
+                cross.len()
+            );
         }
     }
 

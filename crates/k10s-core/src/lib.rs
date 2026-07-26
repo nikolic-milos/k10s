@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-pub use k10s_atlas::{BlockNode, CellNode, Edge, Rect, RegionNode, Scene, Totals};
+pub use k10s_atlas::{BlockNode, CellNode, Edge, Endpoint, Level, Rect, RegionNode, Scene, Totals};
 pub use model::{
     BUILTIN_KIND_COUNT, BUILTIN_KINDS, BUILTIN_REASON_COUNT, BUILTIN_REASONS, BUILTIN_TOOL_COUNT,
     BUILTIN_TOOLS, Catalog, KindEntry, KindId, KindInfo, ReasonId, ReasonInfo, Role, Severity,

@@ -1,6 +1,6 @@
 use crate::camera::Camera;
 use crate::lod::{LodPolicy, StageBlend};
-use crate::scene::{Rect, Scene};
+use crate::scene::{Endpoint, Level, Rect, Scene};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CullStats {
@@ -149,6 +149,18 @@ fn edge_visible(a: &Rect, b: &Rect, visible: &Rect) -> bool {
     seg.intersects(visible)
 }
 
+/// The rect an endpoint denotes. Blocks resolve to `inner` (the card) rather than
+/// the halo, which is what edges attached to before endpoints were tagged.
+fn endpoint_rect<R, B, C, S>(scene: &Scene<R, B, C, S>, e: Endpoint) -> Option<&Rect> {
+    let i = e.index() as usize;
+    match e.level() {
+        Level::Region => scene.regions.get(i).map(|n| &n.rect),
+        Level::Block => scene.blocks.get(i).map(|n| &n.inner),
+        Level::Cell => scene.cells.get(i).map(|n| &n.rect),
+        Level::Sat => scene.sats.get(i).map(|n| &n.rect),
+    }
+}
+
 pub fn walk_edges<R, B, C, S>(
     scene: &Scene<R, B, C, S>,
     visible: &Rect,
@@ -161,8 +173,31 @@ pub fn walk_edges<R, B, C, S>(
             if *drawn >= max_edges {
                 return false;
             }
-            let a = &scene.blocks[e.a as usize].inner;
-            let b = &scene.blocks[e.b as usize].inner;
+            // Resolved through `get`, not indexing: endpoints will come from live
+            // cluster data, where a dangling reference is a stale watch event
+            // rather than a bug worth a panic in the frame path. An edge we
+            // cannot resolve is skipped.
+            //
+            // Block-to-block is every edge the generator emits and the shape all
+            // edges had before endpoints were tagged, so it gets a straight-line
+            // path: one compare on the packed tags instead of two level matches.
+            // Measured worth it, since this is the largest traversal term at high
+            // fan-out.
+            let (a, b) = if e.is_block_pair() {
+                let (Some(a), Some(b)) = (
+                    scene.blocks.get(e.a.index() as usize),
+                    scene.blocks.get(e.b.index() as usize),
+                ) else {
+                    continue;
+                };
+                (&a.inner, &b.inner)
+            } else {
+                let (Some(a), Some(b)) = (endpoint_rect(scene, e.a), endpoint_rect(scene, e.b))
+                else {
+                    continue;
+                };
+                (a, b)
+            };
             if edge_visible(a, b, visible) {
                 emit(a, b);
                 *drawn += 1;
@@ -357,10 +392,10 @@ mod tests {
             cells: vec![],
             sats: vec![],
             edges: vec![
-                Edge { a: 0, b: 1 },
-                Edge { a: 2, b: 3 },
-                Edge { a: 4, b: 5 },
-                Edge { a: 0, b: 5 },
+                Edge::blocks(0, 1),
+                Edge::blocks(2, 3),
+                Edge::blocks(4, 5),
+                Edge::blocks(0, 5),
             ],
             region_edges: vec![0..1, 1..2, 2..3],
             cross_edges: 3..4,
