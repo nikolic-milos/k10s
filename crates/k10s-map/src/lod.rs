@@ -3,6 +3,8 @@ use std::sync::OnceLock;
 use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 use k10s_core::SceneSnapshot;
 
+use crate::frame::FrameOpts;
+
 pub const STAGE_WL: f32 = 0.09;
 pub const STAGE_POD: f32 = 0.55;
 pub const STAGE_POD_LABEL: f32 = 3.0;
@@ -25,57 +27,92 @@ pub const MAX_ICONS: usize = 1024;
 pub const MAX_EDGES: usize = 3000;
 pub const MAX_CURVES: usize = 1500;
 
+/// The four LOD knobs the environment can turn, kept apart from the policy they build so the
+/// policy stays a pure function of them. The process reads them once ([`lod`]); a test can build
+/// as many policies as it likes, in parallel, without touching a global.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Knobs {
+    pub stress_quads: bool,
+    pub stress_curves: bool,
+    pub no_curves: bool,
+    pub no_icons: bool,
+}
+
+impl Knobs {
+    fn from_env() -> Self {
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v != "0");
+        Knobs {
+            stress_quads: on("K10S_STRESS_QUADS"),
+            stress_curves: on("K10S_STRESS_CURVES"),
+            no_curves: on("K10S_NO_CURVES"),
+            no_icons: on("K10S_NO_ICONS"),
+        }
+    }
+}
+
+/// Build the shipping policy from a set of knobs. `stress_quads` wins over `stress_curves`: the
+/// two stress modes measure different things and must not be mixed.
+pub(crate) fn policy(knobs: Knobs) -> LodPolicy {
+    LodPolicy {
+        stage_block: STAGE_WL,
+        stage_cell: STAGE_POD,
+        stage_cell_label: STAGE_POD_LABEL,
+        block_min_px: WL_MIN_PX,
+        block_icon_min_px: if knobs.no_icons {
+            f32::INFINITY
+        } else {
+            WL_ICON_MIN_PX
+        },
+        region_label_min_px: NS_LABEL_MIN_PX,
+        block_label_min_px: WL_LABEL_MIN_PX,
+        block_label_min_zoom: WL_LABEL_MIN_ZOOM,
+        cell_label_min_px: POD_LABEL_MIN_PX,
+        block_chrome_min_px: WL_CHROME_MIN_PX,
+        stage_exit: STAGE_EXIT,
+        sat_min_px: SAT_MIN_PX,
+        sat_label_min_px: SAT_LABEL_MIN_PX,
+        max_labels: MAX_LABELS,
+        max_icons: MAX_ICONS,
+        max_edges: MAX_EDGES,
+        max_curves: MAX_CURVES,
+        sat_curves: !knobs.no_curves,
+        stress: knobs.stress_quads,
+        stress_curves: knobs.stress_curves && !knobs.stress_quads,
+    }
+}
+
 pub fn lod() -> &'static LodPolicy {
     static LOD: OnceLock<LodPolicy> = OnceLock::new();
-    LOD.get_or_init(|| {
-        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v != "0");
-        let stress = on("K10S_STRESS_QUADS");
-        LodPolicy {
-            stage_block: STAGE_WL,
-            stage_cell: STAGE_POD,
-            stage_cell_label: STAGE_POD_LABEL,
-            block_min_px: WL_MIN_PX,
-            block_icon_min_px: if on("K10S_NO_ICONS") {
-                f32::INFINITY
-            } else {
-                WL_ICON_MIN_PX
-            },
-            region_label_min_px: NS_LABEL_MIN_PX,
-            block_label_min_px: WL_LABEL_MIN_PX,
-            block_label_min_zoom: WL_LABEL_MIN_ZOOM,
-            cell_label_min_px: POD_LABEL_MIN_PX,
-            block_chrome_min_px: WL_CHROME_MIN_PX,
-            stage_exit: STAGE_EXIT,
-            sat_min_px: SAT_MIN_PX,
-            sat_label_min_px: SAT_LABEL_MIN_PX,
-            max_labels: MAX_LABELS,
-            max_icons: MAX_ICONS,
-            max_edges: MAX_EDGES,
-            max_curves: MAX_CURVES,
-            sat_curves: !on("K10S_NO_CURVES"),
-            stress,
-            stress_curves: on("K10S_STRESS_CURVES") && !stress,
-        }
-    })
+    LOD.get_or_init(|| policy(Knobs::from_env()))
 }
 
 pub fn stage_for_zoom(zoom: f32) -> u8 {
     lod().stage_for_zoom(zoom)
 }
 
+/// The cull oracle: re-derive every counter of a frame from `k10s-atlas` alone, with no painter
+/// and no window. `crate::frame::walk` must produce exactly this for the same inputs; the painter
+/// checks it per frame in debug and `crate::oracle_test` sweeps it in release.
 pub fn cull(
     scene: &SceneSnapshot,
     camera: &Camera,
     blend: StageBlend,
     vw: f32,
     vh: f32,
-    edges_on: bool,
-    skip_workloads: bool,
+    opts: FrameOpts<'_>,
 ) -> CullStats {
-    let pol = lod();
-    let mut st = k10s_atlas::cull(scene, camera, pol, blend, vw, vh, edges_on, skip_workloads);
+    let mut st = k10s_atlas::cull(
+        scene,
+        camera,
+        opts.policy,
+        blend,
+        vw,
+        vh,
+        opts.edges_on,
+        opts.skip_blocks,
+    );
     let visible = camera.visible_world(vw, vh);
-    st.bg_cells = crate::hex::visible_count(&visible, camera.zoom, pol.stress || pol.stress_curves);
+    st.bg_cells = crate::hex::visible_count(&visible, camera.zoom, !opts.hex_shown());
     st
 }
 
@@ -87,6 +124,16 @@ mod tests {
         WlExt, WorkloadKind, WorkloadNode,
     };
     use std::sync::Arc;
+
+    /// What the shipping binary runs with no `K10S_*` set.
+    fn default_opts(policy: &LodPolicy) -> FrameOpts<'_> {
+        FrameOpts {
+            policy,
+            edges_on: true,
+            skip_blocks: false,
+            hex: true,
+        }
+    }
 
     fn tiny_scene() -> SceneSnapshot {
         let halo = Rect::new(10.0, 20.0, 110.0, 60.0);
@@ -150,8 +197,9 @@ mod tests {
         let mut cam = Camera::default();
         cam.fit(snap.bounds, 1600.0, 1000.0);
         assert!(cam.zoom < STAGE_WL, "fit zoom {} should be Z0", cam.zoom);
-        let blend = StageBlend::settled(stage_for_zoom(cam.zoom));
-        let st = cull(&snap, &cam, blend, 1600.0, 1000.0, true, false);
+        let pol = policy(Knobs::default());
+        let blend = StageBlend::settled(pol.stage_for_zoom(cam.zoom));
+        let st = cull(&snap, &cam, blend, 1600.0, 1000.0, default_opts(&pol));
         assert_eq!(st.drawn_regions, 1);
         assert_eq!(st.stage, 0);
         assert_eq!(st.drawn_blocks, 0);
@@ -166,8 +214,9 @@ mod tests {
             cy: 50.0,
             zoom: 1.0,
         };
-        let blend = StageBlend::settled(stage_for_zoom(cam.zoom));
-        let st = cull(&snap, &cam, blend, 1600.0, 1000.0, true, false);
+        let pol = policy(Knobs::default());
+        let blend = StageBlend::settled(pol.stage_for_zoom(cam.zoom));
+        let st = cull(&snap, &cam, blend, 1600.0, 1000.0, default_opts(&pol));
         assert!(st.stage >= 2);
         assert_eq!(st.drawn_cells, 1);
         assert_eq!(st.drawn_sats, 1);

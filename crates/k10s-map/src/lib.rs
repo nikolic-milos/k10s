@@ -1,7 +1,10 @@
 mod bench;
 mod colors;
+mod frame;
 mod hex;
 mod lod;
+#[cfg(test)]
+mod oracle_test;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,37 +14,21 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{
     App, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, PathBuilder, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    TextAlign, TextRun, TransformationMatrix, Window, canvas, div, fill, point, prelude::*, px,
-    quad, rgb, size,
+    MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString, TextAlign,
+    TextRun, TransformationMatrix, Window, canvas, div, point, prelude::*, px, quad, rgb, size,
 };
-use k10s_atlas::curves::{bow_jitter, curve_ctrl, dash_quadratic};
 use k10s_atlas::{DrawnCounts, FramePacer, FrameSpans, FrameStats, StageMachine};
-use k10s_core::layout::CARD_HEADER;
-use k10s_core::{Health, Rect, SatKind, SceneSnapshot, SharedScene, Tool, WorkloadKind, WorldCtrl};
+use k10s_core::{SatKind, SceneSnapshot, SharedScene, Tool, WorkloadKind, WorldCtrl};
 
 pub use bench::{BenchMeta, BenchReport};
-pub use k10s_atlas::{Camera, CullStats, StageBlend};
+pub use frame::FrameOpts;
+pub use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 pub use lod::{cull, stage_for_zoom};
 
 use bench::{Bench, BenchFrame};
 use colors::*;
+use frame::{IconJob, LabelJob, PaintSink};
 use lod::lod;
-
-const NS_LABEL_PX: f32 = 13.0;
-const WL_LABEL_PX: f32 = 11.0;
-const POD_LABEL_PX: f32 = 10.0;
-const SAT_NAME_PX: f32 = 9.5;
-const SAT_DETAIL_PX: f32 = 8.5;
-
-const WL_ICON_PX: f32 = 12.0;
-const SAT_ICON_PX: f32 = 15.0;
-
-const CURVE_DASH_ON: f32 = 6.0;
-const CURVE_DASH_OFF: f32 = 5.0;
-const CURVE_TOL: f32 = 0.35;
-const CURVE_CORE_W: f32 = 1.5;
-const CURVE_GLOW_W: f32 = 5.0;
 
 fn kind_icon(kind: WorkloadKind) -> (SharedString, &'static [u8]) {
     match kind {
@@ -372,20 +359,6 @@ fn glow_on() -> bool {
     *GLOW.get_or_init(|| std::env::var_os("K10S_NO_GLOW").is_none_or(|v| v == "0"))
 }
 
-struct LabelJob {
-    text: SharedString,
-    x: f32,
-    y: f32,
-    size_px: f32,
-    color: gpui::Rgba,
-}
-
-enum IconJob {
-    Wl(WorkloadKind, Bounds<Pixels>),
-    Tool(Tool, Bounds<Pixels>),
-    Sat(SatKind, Bounds<Pixels>),
-}
-
 #[derive(Default, Clone, Copy)]
 struct LabelCounts {
     lines: usize,
@@ -420,443 +393,72 @@ fn paint_map(
     let frame_start = std::time::Instant::now();
     stats.borrow_mut().begin_frame(frame_start, was_continuous);
     let mut bg = bg_buf.borrow_mut();
-    bg.clear();
     let mut fg = fg_buf.borrow_mut();
-    fg.clear();
+    let mut labels = label_buf.borrow_mut();
+    let mut icons = icon_buf.borrow_mut();
 
-    let vw = f32::from(bounds.size.width);
-    let vh = f32::from(bounds.size.height);
     let ox = f32::from(bounds.origin.x);
     let oy = f32::from(bounds.origin.y);
     let zoom = camera.zoom;
-    let visible = camera.visible_world(vw, vh);
-
-    let w2b = |r: &Rect| -> Bounds<Pixels> {
-        let (sx, sy) = camera.w2s(r.x, r.y, vw, vh);
-        Bounds {
-            origin: point(px(ox + sx), px(oy + sy)),
-            size: size(px(r.w * zoom), px(r.h * zoom)),
-        }
-    };
-
-    let lod = lod();
-    let stage = blend.walk_stage();
-    let skip_wl = skip_workloads();
-    let stress_any = lod.stress || lod.stress_curves;
-
     let block_alpha = blend.stage_alpha(1);
     let cell_alpha = blend.stage_alpha(2);
-    let cell_label_alpha = blend.stage_alpha(3);
 
-    let z01_t = if stage == 0 {
-        0.0
-    } else if blend.from.min(blend.to) >= 1 {
-        1.0
-    } else {
-        blend.fade_alpha()
+    let opts = FrameOpts {
+        policy: lod(),
+        edges_on,
+        skip_blocks: skip_workloads(),
+        hex: hex::hex_on(),
     };
-
-    let ns_border_hsla: gpui::Hsla = rgb(NS_BORDER).into();
-    let ns_fill_bg: gpui::Background = rgb(NS_FILL).into();
-    let ns_fill_rgba = rgb(NS_FILL);
-    let ns_border_rgba = rgb(NS_BORDER);
-    let header_fill_bg: gpui::Background = scale_alpha(rgb(CARD_HEADER_FILL), block_alpha).into();
-    const HEALTHS: [Health; 4] = [Health::Ok, Health::Warn, Health::Err, Health::Unknown];
-    let health_ix = |h: Health| -> usize {
-        match h {
-            Health::Ok => 0,
-            Health::Warn => 1,
-            Health::Err => 2,
-            Health::Unknown => 3,
-        }
-    };
-    let wl_paint: [(gpui::Background, gpui::Hsla); 4] = HEALTHS.map(|h| {
-        let (fill_c, border_c) = workload_colors(h);
-        (
-            scale_alpha(fill_c, block_alpha).into(),
-            scale_alpha(border_c, block_alpha).into(),
-        )
-    });
-    let pod_paint: [gpui::Background; 4] =
-        HEALTHS.map(|h| scale_alpha(pod_color(h), cell_alpha).into());
-    let strip_paint: [gpui::Background; 4] =
-        HEALTHS.map(|h| scale_alpha(pod_color(h), block_alpha).into());
-
-    let mut quads = 0usize;
-    let mut drawn_ns = 0usize;
-    let mut drawn_wl = 0usize;
-    let mut drawn_pods = 0usize;
-    let mut drawn_sats = 0usize;
-    let mut curves = 0usize;
-    let mut curves_dropped = 0usize;
-    let mut labels = label_buf.borrow_mut();
-    labels.clear();
-    let mut labels_dropped = 0usize;
-    let mut icons = icon_buf.borrow_mut();
-    icons.clear();
-    let mut icons_dropped = 0usize;
-
-    let push_label = |labels: &mut Vec<LabelJob>,
-                      dropped: &mut usize,
-                      text: &std::sync::Arc<str>,
-                      x: f32,
-                      y: f32,
-                      size_px: f32,
-                      color: gpui::Rgba| {
-        if labels.len() >= lod.max_labels {
-            *dropped += 1;
-        } else {
-            labels.push(LabelJob {
-                text: SharedString::new(&**text),
-                x,
-                y,
-                size_px,
-                color,
-            });
-        }
-    };
-
-    let glow = glow_on();
-    let mut curve_core = PathBuilder::stroke(px(CURVE_CORE_W));
-    let mut curve_glow = PathBuilder::stroke(px(CURVE_GLOW_W));
-    let mut dash_scratch: Vec<(f32, f32)> = Vec::new();
 
     let walk_start = std::time::Instant::now();
-    bg.push(fill(bounds, rgb(BG)));
-    quads += 1;
+    let mut sink = PaintSink::new(&mut bg, &mut fg, &mut labels, &mut icons, glow_on());
+    let counts = frame::walk(bounds, scene, camera, blend, opts, &mut sink);
+    let paths = sink.into_paths();
 
-    for ns in &scene.regions {
-        if !ns.rect.intersects(&visible) {
-            continue;
-        }
-        drawn_ns += 1;
-        let b = w2b(&ns.rect);
-
-        if z01_t <= 0.0 {
-            bg.push(quad(
-                b,
-                px(6.0),
-                heat_color(ns.ext.unhealthy_frac),
-                px(1.0),
-                ns_border_hsla,
-                Default::default(),
-            ));
-        } else if z01_t >= 1.0 {
-            bg.push(quad(
-                b,
-                px(8.0),
-                ns_fill_bg,
-                px(1.0),
-                heat_border(ns.ext.unhealthy_frac),
-                Default::default(),
-            ));
-        } else {
-            bg.push(quad(
-                b,
-                px(6.0 + 2.0 * z01_t),
-                mix(heat_color(ns.ext.unhealthy_frac), ns_fill_rgba, z01_t),
-                px(1.0),
-                mix(ns_border_rgba, heat_border(ns.ext.unhealthy_frac), z01_t),
-                Default::default(),
-            ));
-        }
-        quads += 1;
-
-        if lod.region_label_shown(ns.rect.w, zoom) {
-            let (sx, sy) = camera.w2s(ns.rect.x, ns.rect.y, vw, vh);
-            push_label(
-                &mut labels,
-                &mut labels_dropped,
-                &ns.label,
-                ox + sx + 10.0,
-                oy + sy + 6.0,
-                NS_LABEL_PX,
-                gpui::Rgba {
-                    r: 0.62,
-                    g: 0.58,
-                    b: 0.75,
-                    a: 1.0,
-                },
-            );
-        }
-
-        if stage == 0 {
-            continue;
-        }
-
-        let region_inside = visible.contains(&ns.rect);
-        let ns_blocks = &scene.blocks[ns.children.start as usize..ns.children.end as usize];
-        for wl in ns_blocks {
-            if !(region_inside || wl.rect.intersects(&visible)) {
-                continue;
-            }
-            let painted = lod.block_painted(wl.inner.w, zoom) && !skip_wl;
-            if painted {
-                drawn_wl += 1;
-                let (fill_bg, border_hsla) = wl_paint[health_ix(wl.ext.health)];
-                fg.push(quad(
-                    w2b(&wl.inner),
-                    px(4.0),
-                    fill_bg,
-                    px(1.0),
-                    border_hsla,
-                    Default::default(),
-                ));
-                quads += 1;
-
-                if lod.block_chrome_shown(wl.inner.w, zoom) {
-                    let header_h = CARD_HEADER.min(wl.inner.h * 0.32);
-                    let header = Rect::new(wl.inner.x, wl.inner.y, wl.inner.w, header_h);
-                    fg.push(quad(
-                        w2b(&header),
-                        px(4.0),
-                        header_fill_bg,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        Default::default(),
-                    ));
-                    let strip = Rect::new(
-                        wl.inner.x + wl.inner.w * 0.06,
-                        wl.inner.y + header_h * 0.72,
-                        wl.inner.w * 0.88,
-                        header_h * 0.14,
-                    );
-                    fg.push(fill(w2b(&strip), strip_paint[health_ix(wl.ext.health)]));
-                    quads += 2;
-                }
-
-                if lod.block_icon_shown(wl.inner.w, zoom) {
-                    if icons.len() >= lod.max_icons {
-                        icons_dropped += 1;
-                    } else {
-                        let (sx, sy) = camera.w2s(wl.inner.max_x(), wl.inner.y, vw, vh);
-                        let b = Bounds {
-                            origin: point(px(ox + sx - WL_ICON_PX - 3.0), px(oy + sy + 3.0)),
-                            size: size(px(WL_ICON_PX), px(WL_ICON_PX)),
-                        };
-                        icons.push(if wl.ext.tool != Tool::None {
-                            IconJob::Tool(wl.ext.tool, b)
-                        } else {
-                            IconJob::Wl(wl.ext.kind, b)
-                        });
-                    }
-                }
-
-                if lod.block_label_shown(wl.inner.w, zoom) {
-                    let (sx, sy) = camera.w2s(wl.inner.x, wl.inner.y, vw, vh);
-                    push_label(
-                        &mut labels,
-                        &mut labels_dropped,
-                        &wl.label,
-                        ox + sx + 4.0,
-                        oy + sy + 1.0,
-                        WL_LABEL_PX,
-                        gpui::Rgba {
-                            r: 0.72,
-                            g: 0.68,
-                            b: 0.85,
-                            a: block_alpha,
-                        },
-                    );
-                }
-            }
-
-            if stage < 2 {
-                continue;
-            }
-            let block_inside = region_inside || visible.contains(&wl.rect);
-
-            if painted || lod.stress_curves {
-                let sat_base = wl.sats.start as usize;
-                let sats = &scene.sats[sat_base..wl.sats.end as usize];
-                let (hub_wx, hub_wy) = wl.inner.center();
-                let (hx, hy) = camera.w2s(hub_wx, hub_wy, vw, vh);
-                let hub_pt = (ox + hx, oy + hy);
-                for (j, sat) in sats.iter().enumerate() {
-                    if !(block_inside || sat.rect.intersects(&visible)) {
-                        continue;
-                    }
-                    if !lod.sat_painted(sat.rect.w, zoom) {
-                        continue;
-                    }
-                    drawn_sats += 1;
-                    let (sat_wx, sat_wy) = sat.rect.center();
-                    let (sx, sy) = camera.w2s(sat_wx, sat_wy, vw, vh);
-                    let sat_pt = (ox + sx, oy + sy);
-
-                    if lod.sat_icon_shown() {
-                        if icons.len() >= lod.max_icons {
-                            icons_dropped += 1;
-                        } else {
-                            icons.push(IconJob::Sat(
-                                sat.ext.kind,
-                                Bounds {
-                                    origin: point(
-                                        px(sat_pt.0 - SAT_ICON_PX * 0.5),
-                                        px(sat_pt.1 - SAT_ICON_PX * 0.5),
-                                    ),
-                                    size: size(px(SAT_ICON_PX), px(SAT_ICON_PX)),
-                                },
-                            ));
-                        }
-                    }
-
-                    if lod.sat_label_shown(sat.rect.w, zoom) {
-                        let (lx, ly) = camera.w2s(sat.rect.x, sat.rect.max_y(), vw, vh);
-                        push_label(
-                            &mut labels,
-                            &mut labels_dropped,
-                            &sat.label,
-                            ox + lx - 8.0,
-                            oy + ly + 2.0,
-                            SAT_NAME_PX,
-                            gpui::Rgba {
-                                r: 0.80,
-                                g: 0.75,
-                                b: 0.90,
-                                a: cell_alpha,
-                            },
-                        );
-                        push_label(
-                            &mut labels,
-                            &mut labels_dropped,
-                            &sat.ext.detail,
-                            ox + lx - 8.0,
-                            oy + ly + 2.0 + SAT_NAME_PX * 1.25,
-                            SAT_DETAIL_PX,
-                            gpui::Rgba {
-                                r: 0.62,
-                                g: 0.57,
-                                b: 0.74,
-                                a: cell_alpha,
-                            },
-                        );
-                    }
-
-                    if lod.sat_curves {
-                        if curves >= lod.curve_budget() {
-                            curves_dropped += 1;
-                        } else {
-                            curves += 1;
-                            let bow = bow_jitter((sat_base + j) as u64);
-                            let ctrl = curve_ctrl(hub_pt, sat_pt, bow);
-                            if glow {
-                                curve_glow.move_to(point(px(hub_pt.0), px(hub_pt.1)));
-                                curve_glow.curve_to(
-                                    point(px(sat_pt.0), px(sat_pt.1)),
-                                    point(px(ctrl.0), px(ctrl.1)),
-                                );
-                            }
-                            dash_quadratic(
-                                hub_pt,
-                                ctrl,
-                                sat_pt,
-                                CURVE_TOL,
-                                CURVE_DASH_ON,
-                                CURVE_DASH_OFF,
-                                &mut dash_scratch,
-                                |is_move, p| {
-                                    if is_move {
-                                        curve_core.move_to(point(px(p.0), px(p.1)));
-                                    } else {
-                                        curve_core.line_to(point(px(p.0), px(p.1)));
-                                    }
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-
-            if !painted {
-                continue;
-            }
-            let wl_cells = &scene.cells[wl.children.start as usize..wl.children.end as usize];
-            for pod in wl_cells {
-                if !(block_inside || pod.rect.intersects(&visible)) {
-                    continue;
-                }
-                drawn_pods += 1;
-                fg.push(fill(w2b(&pod.rect), pod_paint[health_ix(pod.ext.health)]));
-                quads += 1;
-
-                if stage >= 3 && lod.cell_label_shown(pod.rect.w, zoom) {
-                    let (sx, sy) = camera.w2s(pod.rect.x, pod.rect.y + pod.rect.h, vw, vh);
-                    push_label(
-                        &mut labels,
-                        &mut labels_dropped,
-                        &pod.label,
-                        ox + sx,
-                        oy + sy + 2.0,
-                        POD_LABEL_PX,
-                        gpui::Rgba {
-                            r: 0.55,
-                            g: 0.51,
-                            b: 0.66,
-                            a: cell_label_alpha,
-                        },
-                    );
-                }
-            }
-        }
+    #[cfg(debug_assertions)]
+    {
+        // `oracle_test.rs` sweeps this same comparison headless, in release, across zoom stages,
+        // blend states and stress flags. Keeping it here too costs nothing in release and is the
+        // only version that sees real scenes, real churn and real camera paths.
+        let vw = f32::from(bounds.size.width);
+        let vh = f32::from(bounds.size.height);
+        debug_assert_eq!(
+            lod::cull(scene, &camera, blend, vw, vh, opts),
+            counts,
+            "cull oracle diverged from painter"
+        );
+        debug_assert_eq!(
+            counts.quads,
+            bg.len() + fg.len(),
+            "quad counter drifted from the quads actually emitted"
+        );
+        debug_assert_eq!(counts.labels, labels.len(), "label counter drifted");
+        debug_assert_eq!(counts.icons, icons.len(), "icon counter drifted");
     }
 
     let bg_quads_start = std::time::Instant::now();
     window.paint_quads(&bg);
 
     let paths_start = std::time::Instant::now();
-    let mut bg_hexes = 0usize;
-    if !stress_any && hex::hex_on() {
-        let (hex_r, hex_alpha) = hex::level(zoom);
-        let mut builder = PathBuilder::stroke(px(1.0));
-        bg_hexes = hex::for_each_center(&visible, hex_r, |cx_, cy_| {
-            for i in 0..6 {
-                let ang = i as f32 * std::f32::consts::FRAC_PI_3;
-                let (wx, wy) = (cx_ + hex_r * ang.cos(), cy_ + hex_r * ang.sin());
-                let (sx, sy) = camera.w2s(wx, wy, vw, vh);
-                let p = point(px(ox + sx), px(oy + sy));
-                if i == 0 {
-                    builder.move_to(p);
-                } else {
-                    builder.line_to(p);
-                }
-            }
-            builder.close();
-        });
-        if bg_hexes > 0
-            && let Ok(path) = builder.build()
-        {
-            window.paint_path(path, rgb(HEX_LINE).alpha(hex_alpha));
-        }
+    if counts.bg_cells > 0
+        && let Ok(path) = paths.hex.build()
+    {
+        window.paint_path(path, rgb(HEX_LINE).alpha(hex::level(zoom).1));
     }
 
-    let mut drawn_edges = 0usize;
-    if edges_on && stage >= 2 && !stress_any {
-        let mut builder = PathBuilder::stroke(px(1.0));
-        drawn_edges = k10s_atlas::walk_edges(scene, &visible, lod.max_edges, |a, b| {
-            let (ax, ay) = camera.w2s(a.center().0, a.center().1, vw, vh);
-            let (bx, by) = camera.w2s(b.center().0, b.center().1, vw, vh);
-            let pa = (ox + ax, oy + ay);
-            let pb = (ox + bx, oy + by);
-
-            let h = ((a.x.to_bits() as u64) << 32 ^ a.y.to_bits() as u64)
-                ^ ((b.x.to_bits() as u64) << 16 ^ b.y.to_bits() as u64);
-            let ctrl = curve_ctrl(pa, pb, bow_jitter(h) * 0.6);
-            builder.move_to(point(px(pa.0), px(pa.1)));
-            builder.curve_to(point(px(pb.0), px(pb.1)), point(px(ctrl.0), px(ctrl.1)));
-        });
-        if drawn_edges > 0
-            && let Ok(path) = builder.build()
-        {
-            window.paint_path(path, rgb(EDGE).alpha(0.30 * cell_alpha));
-        }
+    if counts.edges > 0
+        && let Ok(path) = paths.edges.build()
+    {
+        window.paint_path(path, rgb(EDGE).alpha(0.30 * cell_alpha));
     }
 
-    if curves > 0 {
-        if glow && let Ok(path) = curve_glow.build() {
+    if counts.curves > 0 {
+        if paths.glow
+            && let Ok(path) = paths.curve_glow.build()
+        {
             window.paint_path(path, rgb(CURVE_GLOW).alpha(CURVE_GLOW_ALPHA * cell_alpha));
         }
-        if let Ok(path) = curve_core.build() {
+        if let Ok(path) = paths.curve_core.build() {
             window.paint_path(path, rgb(CURVE_CORE).alpha(CURVE_CORE_ALPHA * cell_alpha));
         }
     }
@@ -942,59 +544,24 @@ fn paint_map(
     }
     let text_end = std::time::Instant::now();
 
-    #[cfg(debug_assertions)]
-    {
-        let oracle = lod::cull(scene, &camera, blend, vw, vh, edges_on, skip_workloads());
-        debug_assert_eq!(
-            oracle.quads, quads,
-            "cull oracle: quads diverged from painter"
-        );
-        debug_assert_eq!(oracle.edges, drawn_edges, "cull oracle: edges diverged");
-        debug_assert_eq!(
-            (oracle.drawn_sats, oracle.curves, oracle.curves_dropped),
-            (drawn_sats, curves, curves_dropped),
-            "cull oracle: satellites/curves diverged"
-        );
-        debug_assert_eq!(oracle.bg_cells, bg_hexes, "cull oracle: hex count diverged");
-        debug_assert_eq!(
-            (oracle.labels, oracle.labels_dropped),
-            (labels.len(), labels_dropped),
-            "cull oracle: labels diverged"
-        );
-        debug_assert_eq!(
-            (oracle.icons, oracle.icons_dropped),
-            (icons.len(), icons_dropped),
-            "cull oracle: icons diverged"
-        );
-        debug_assert_eq!(
-            (
-                oracle.drawn_regions,
-                oracle.drawn_blocks,
-                oracle.drawn_cells
-            ),
-            (drawn_ns, drawn_wl, drawn_pods),
-            "cull oracle: drawn counts diverged"
-        );
-    }
-
     {
         let mut st = stats.borrow_mut();
-        st.quads = quads;
+        st.quads = counts.quads;
         st.lines = label_counts.lines;
         st.glyphs = label_counts.glyphs;
-        st.edges = drawn_edges;
-        st.icons = icons.len();
-        st.sats = drawn_sats;
-        st.curves = curves;
-        st.curves_dropped = curves_dropped;
-        st.bg_cells = bg_hexes;
+        st.edges = counts.edges;
+        st.icons = counts.icons;
+        st.sats = counts.drawn_sats;
+        st.curves = counts.curves;
+        st.curves_dropped = counts.curves_dropped;
+        st.bg_cells = counts.bg_cells;
         st.drawn = DrawnCounts {
-            regions: drawn_ns,
-            blocks: drawn_wl,
-            cells: drawn_pods,
+            regions: counts.drawn_regions,
+            blocks: counts.drawn_blocks,
+            cells: counts.drawn_cells,
         };
-        st.labels_dropped = labels_dropped;
-        st.icons_dropped = icons_dropped;
+        st.labels_dropped = counts.labels_dropped;
+        st.icons_dropped = counts.icons_dropped;
         st.end_cpu(frame_start);
     }
 
@@ -1014,6 +581,8 @@ fn paint_map(
     );
     let hud_end = std::time::Instant::now();
 
+    // `walk_us` covers the whole traversal, hex grid and edges included; `paths_us` is now
+    // tessellation and submission only.
     stats.borrow_mut().push_spans(FrameSpans {
         walk_us: span_us(walk_start, bg_quads_start),
         quads_us: span_us(bg_quads_start, paths_start) + span_us(fg_quads_start, icons_start),
