@@ -1,4 +1,4 @@
-use k10s_core::{Health, SatKind, Tool, WorkloadKind};
+use k10s_core::{KindId, ReasonId, State, ToolId};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 
@@ -45,21 +45,21 @@ pub struct GenConfig {
 #[derive(Debug, Clone)]
 pub struct PodSpec {
     pub name: String,
-    pub health: Health,
+    pub state: State,
 }
 
 #[derive(Debug, Clone)]
 pub struct SatSpec {
     pub name: String,
-    pub kind: SatKind,
+    pub kind: KindId,
     pub detail: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct WorkloadSpec {
     pub name: String,
-    pub kind: WorkloadKind,
-    pub tool: Tool,
+    pub kind: KindId,
+    pub tool: ToolId,
     pub pods: Vec<PodSpec>,
     pub sats: Vec<SatSpec>,
     pub deps: Vec<u32>,
@@ -82,8 +82,8 @@ pub struct ClusterSpec {
 
 struct Archetype {
     stem: &'static str,
-    tool: Tool,
-    kind: WorkloadKind,
+    tool: ToolId,
+    kind: KindId,
     replicas: &'static [u32],
     pvc_sizes: &'static [&'static str],
     svc_p: f64,
@@ -93,8 +93,8 @@ struct Archetype {
 
 const fn arch(
     stem: &'static str,
-    tool: Tool,
-    kind: WorkloadKind,
+    tool: ToolId,
+    kind: KindId,
     replicas: &'static [u32],
     pvc_sizes: &'static [&'static str],
     svc_p: f64,
@@ -113,14 +113,18 @@ const fn arch(
     }
 }
 
-use Tool as T;
-use WorkloadKind::{DaemonSet as Ds, Deployment as Dep, StatefulSet as Sts};
+use ToolId as T;
+// Terse column values for the archetype tables below. Associated constants cannot
+// be brought into scope with `use`, so these are local aliases.
+const DEP: KindId = KindId::DEPLOYMENT;
+const STS: KindId = KindId::STATEFUL_SET;
+const DS: KindId = KindId::DAEMON_SET;
 
 const MONITORING: &[Archetype] = &[
     arch(
         "prometheus",
-        T::Prometheus,
-        Sts,
+        T::PROMETHEUS,
+        STS,
         &[1, 2],
         &["64Gi", "128Gi"],
         0.95,
@@ -129,19 +133,19 @@ const MONITORING: &[Archetype] = &[
     ),
     arch(
         "alertmanager",
-        T::Prometheus,
-        Sts,
+        T::PROMETHEUS,
+        STS,
         &[1, 3],
         &["1Gi"],
         0.9,
         0.9,
         0.1,
     ),
-    arch("grafana", T::Grafana, Dep, &[1, 2], &[], 0.95, 0.9, 0.8),
+    arch("grafana", T::GRAFANA, DEP, &[1, 2], &[], 0.95, 0.9, 0.8),
     arch(
         "node-exporter",
-        T::Prometheus,
-        Ds,
+        T::PROMETHEUS,
+        DS,
         &[6, 9, 12],
         &[],
         0.3,
@@ -150,8 +154,8 @@ const MONITORING: &[Archetype] = &[
     ),
     arch(
         "kube-state-metrics",
-        T::Kubernetes,
-        Dep,
+        T::KUBERNETES,
+        DEP,
         &[1],
         &[],
         0.9,
@@ -160,47 +164,47 @@ const MONITORING: &[Archetype] = &[
     ),
     arch(
         "otel-collector",
-        T::OpenTelemetry,
-        Ds,
+        T::OPEN_TELEMETRY,
+        DS,
         &[6, 9],
         &[],
         0.5,
         0.9,
         0.1,
     ),
-    arch("jaeger", T::Jaeger, Dep, &[1, 2], &[], 0.9, 0.6, 0.1),
+    arch("jaeger", T::JAEGER, DEP, &[1, 2], &[], 0.9, 0.6, 0.1),
 ];
 
 const LOGGING: &[Archetype] = &[
     arch(
         "elasticsearch",
-        T::Elasticsearch,
-        Sts,
+        T::ELASTICSEARCH,
+        STS,
         &[3, 5],
         &["64Gi", "128Gi"],
         0.9,
         0.6,
         0.5,
     ),
-    arch("kibana", T::Kibana, Dep, &[1, 2], &[], 0.9, 0.6, 0.3),
+    arch("kibana", T::KIBANA, DEP, &[1, 2], &[], 0.9, 0.6, 0.3),
     arch(
         "fluent-bit",
-        T::FluentBit,
-        Ds,
+        T::FLUENT_BIT,
+        DS,
         &[6, 9, 12],
         &[],
         0.2,
         0.9,
         0.1,
     ),
-    arch("fluentd", T::Fluentd, Ds, &[6, 9], &[], 0.2, 0.9, 0.1),
+    arch("fluentd", T::FLUENTD, DS, &[6, 9], &[], 0.2, 0.9, 0.1),
 ];
 
 const DATA: &[Archetype] = &[
     arch(
         "postgres",
-        T::Postgres,
-        Sts,
+        T::POSTGRES,
+        STS,
         &[1, 3],
         &["32Gi", "64Gi", "128Gi"],
         0.9,
@@ -209,19 +213,19 @@ const DATA: &[Archetype] = &[
     ),
     arch(
         "mariadb",
-        T::MariaDb,
-        Sts,
+        T::MARIA_DB,
+        STS,
         &[1, 3],
         &["32Gi", "64Gi"],
         0.9,
         0.5,
         0.9,
     ),
-    arch("mongodb", T::MongoDb, Sts, &[3], &["64Gi"], 0.9, 0.5, 0.9),
+    arch("mongodb", T::MONGO_DB, STS, &[3], &["64Gi"], 0.9, 0.5, 0.9),
     arch(
         "redis",
-        T::Redis,
-        Sts,
+        T::REDIS,
+        STS,
         &[1, 3],
         &["8Gi", "16Gi"],
         0.9,
@@ -230,8 +234,8 @@ const DATA: &[Archetype] = &[
     ),
     arch(
         "clickhouse",
-        T::ClickHouse,
-        Sts,
+        T::CLICK_HOUSE,
+        STS,
         &[2, 4],
         &["128Gi"],
         0.9,
@@ -240,8 +244,8 @@ const DATA: &[Archetype] = &[
     ),
     arch(
         "cassandra",
-        T::Cassandra,
-        Sts,
+        T::CASSANDRA,
+        STS,
         &[3, 5],
         &["64Gi"],
         0.9,
@@ -253,52 +257,61 @@ const DATA: &[Archetype] = &[
 const MESSAGING: &[Archetype] = &[
     arch(
         "kafka",
-        T::Kafka,
-        Sts,
+        T::KAFKA,
+        STS,
         &[3, 5],
         &["64Gi", "128Gi"],
         0.9,
         0.7,
         0.3,
     ),
-    arch("rabbitmq", T::RabbitMq, Sts, &[3], &["16Gi"], 0.9, 0.6, 0.5),
-    arch("nats", T::Nats, Sts, &[3], &["8Gi"], 0.9, 0.5, 0.2),
+    arch(
+        "rabbitmq",
+        T::RABBIT_MQ,
+        STS,
+        &[3],
+        &["16Gi"],
+        0.9,
+        0.6,
+        0.5,
+    ),
+    arch("nats", T::NATS, STS, &[3], &["8Gi"], 0.9, 0.5, 0.2),
 ];
 
 const INGRESS: &[Archetype] = &[
-    arch("ingress-nginx", T::Nginx, Dep, &[2, 3], &[], 0.95, 0.8, 0.4),
-    arch("traefik", T::Traefik, Dep, &[2], &[], 0.95, 0.8, 0.3),
-    arch("istiod", T::Istio, Dep, &[1, 2], &[], 0.9, 0.7, 0.3),
-    arch("envoy-gateway", T::Envoy, Dep, &[2], &[], 0.9, 0.7, 0.2),
+    arch("ingress-nginx", T::NGINX, DEP, &[2, 3], &[], 0.95, 0.8, 0.4),
+    arch("traefik", T::TRAEFIK, DEP, &[2], &[], 0.95, 0.8, 0.3),
+    arch("istiod", T::ISTIO, DEP, &[1, 2], &[], 0.9, 0.7, 0.3),
+    arch("envoy-gateway", T::ENVOY, DEP, &[2], &[], 0.9, 0.7, 0.2),
 ];
 
 const SECURITY: &[Archetype] = &[
-    arch("vault", T::Vault, Sts, &[3], &["8Gi"], 0.9, 0.5, 0.95),
-    arch("keycloak", T::Keycloak, Sts, &[2], &["8Gi"], 0.9, 0.6, 0.9),
-    arch("consul", T::Consul, Sts, &[3], &["8Gi"], 0.9, 0.6, 0.4),
-    arch("etcd", T::Etcd, Sts, &[3, 5], &["8Gi"], 0.9, 0.2, 0.5),
+    arch("vault", T::VAULT, STS, &[3], &["8Gi"], 0.9, 0.5, 0.95),
+    arch("keycloak", T::KEYCLOAK, STS, &[2], &["8Gi"], 0.9, 0.6, 0.9),
+    arch("consul", T::CONSUL, STS, &[3], &["8Gi"], 0.9, 0.6, 0.4),
+    arch("etcd", T::ETCD, STS, &[3, 5], &["8Gi"], 0.9, 0.2, 0.5),
 ];
 
 const CI: &[Archetype] = &[
     arch(
         "jenkins",
-        T::Jenkins,
-        Sts,
+        T::JENKINS,
+        STS,
         &[1],
         &["32Gi", "64Gi"],
         0.9,
         0.6,
         0.7,
     ),
-    arch("argocd", T::ArgoCd, Dep, &[2], &[], 0.9, 0.8, 0.6),
-    arch("flux", T::Flux, Dep, &[1, 2], &[], 0.5, 0.7, 0.4),
-    arch("temporal", T::Temporal, Dep, &[2, 3], &[], 0.9, 0.6, 0.4),
-    arch("airflow", T::Airflow, Dep, &[2, 3], &[], 0.9, 0.9, 0.6),
+    arch("argocd", T::ARGO_CD, DEP, &[2], &[], 0.9, 0.8, 0.6),
+    arch("flux", T::FLUX, DEP, &[1, 2], &[], 0.5, 0.7, 0.4),
+    arch("temporal", T::TEMPORAL, DEP, &[2, 3], &[], 0.9, 0.6, 0.4),
+    arch("airflow", T::AIRFLOW, DEP, &[2, 3], &[], 0.9, 0.9, 0.6),
 ];
 
 const STORAGE: &[Archetype] = &[
-    arch("minio", T::Minio, Sts, &[4], &["128Gi"], 0.9, 0.4, 0.8),
-    arch("harbor", T::Harbor, Sts, &[1, 2], &["128Gi"], 0.9, 0.6, 0.7),
+    arch("minio", T::MINIO, STS, &[4], &["128Gi"], 0.9, 0.4, 0.8),
+    arch("harbor", T::HARBOR, STS, &[1, 2], &["128Gi"], 0.9, 0.6, 0.7),
 ];
 
 const THEMES: &[(&str, &str, &[Archetype])] = &[
@@ -342,15 +355,15 @@ fn scenario_themes(s: Scenario) -> &'static [&'static str] {
     }
 }
 
-fn embed_multiplier(s: Scenario, tool: Tool) -> f64 {
+fn embed_multiplier(s: Scenario, tool: ToolId) -> f64 {
     match s {
         Scenario::Platform => 1.0,
         Scenario::Observability => match tool {
-            T::Jaeger | T::Prometheus | T::OpenTelemetry => 3.0,
+            T::JAEGER | T::PROMETHEUS | T::OPEN_TELEMETRY => 3.0,
             _ => 0.7,
         },
         Scenario::Data => match tool {
-            T::Postgres | T::Redis | T::MariaDb | T::MongoDb | T::RabbitMq | T::Nats => 2.0,
+            T::POSTGRES | T::REDIS | T::MARIA_DB | T::MONGO_DB | T::RABBIT_MQ | T::NATS => 2.0,
             _ => 0.5,
         },
         Scenario::NsFanOut | Scenario::WlFanOut => 0.5,
@@ -475,21 +488,25 @@ fn sample_replicas(rng: &mut ChaCha8Rng) -> u32 {
     1
 }
 
-fn sample_kind(rng: &mut ChaCha8Rng) -> WorkloadKind {
+fn sample_kind(rng: &mut ChaCha8Rng) -> KindId {
     match rng.random_range(0..100u32) {
-        0..70 => WorkloadKind::Deployment,
-        70..80 => WorkloadKind::StatefulSet,
-        80..90 => WorkloadKind::DaemonSet,
-        _ => WorkloadKind::Job,
+        0..70 => KindId::DEPLOYMENT,
+        70..80 => KindId::STATEFUL_SET,
+        80..90 => KindId::DAEMON_SET,
+        _ => KindId::JOB,
     }
 }
 
-fn sample_health(rng: &mut ChaCha8Rng) -> Health {
+/// One draw against the same thresholds as before, so generated output is
+/// unchanged. What is new is that the severity now travels with the reason that
+/// produced it, which is what the closed `Health` enum could not express:
+/// `CrashLoopBackOff` is distinct from a generic warning.
+fn sample_state(rng: &mut ChaCha8Rng) -> State {
     match rng.random_range(0..1000u32) {
-        0..920 => Health::Ok,
-        920..960 => Health::Warn,
-        960..990 => Health::Err,
-        _ => Health::Unknown,
+        0..920 => State::of(ReasonId::RUNNING),
+        920..960 => State::of(ReasonId::NOT_READY),
+        960..990 => State::of(ReasonId::CRASH_LOOP_BACK_OFF),
+        _ => State::of(ReasonId::UNKNOWN),
     }
 }
 
@@ -534,10 +551,14 @@ struct SatProfile<'a> {
     secret_p: f64,
 }
 
-fn kind_profile(kind: WorkloadKind) -> SatProfile<'static> {
+fn kind_profile(kind: KindId) -> SatProfile<'static> {
+    // A match on KindId cannot be exhaustive by construction, which is the point:
+    // an unrecognised kind takes a middle default instead of failing to compile.
+    // No generated output changes, because only the four sampled kinds reach here.
     let svc_p = match kind {
-        WorkloadKind::Deployment | WorkloadKind::StatefulSet => 0.55,
-        WorkloadKind::DaemonSet | WorkloadKind::Job => 0.08,
+        KindId::DEPLOYMENT | KindId::STATEFUL_SET => 0.55,
+        KindId::DAEMON_SET | KindId::JOB => 0.08,
+        _ => 0.3,
     };
     SatProfile {
         pvc_sizes: &[],
@@ -550,12 +571,12 @@ fn kind_profile(kind: WorkloadKind) -> SatProfile<'static> {
 fn gen_sats(
     rng: &mut ChaCha8Rng,
     name: &str,
-    kind: WorkloadKind,
+    kind: KindId,
     replicas: u32,
     profile: &SatProfile,
 ) -> Vec<SatSpec> {
     let mut sats = Vec::new();
-    if kind == WorkloadKind::StatefulSet {
+    if kind == KindId::STATEFUL_SET {
         let size = if profile.pvc_sizes.is_empty() {
             sample_pvc_size(rng)
         } else {
@@ -564,7 +585,7 @@ fn gen_sats(
         for i in 0..replicas {
             sats.push(SatSpec {
                 name: format!("pvc/data-{name}-{i}"),
-                kind: SatKind::Volume,
+                kind: KindId::VOLUME,
                 detail: size.to_string(),
             });
         }
@@ -577,7 +598,7 @@ fn gen_sats(
         };
         sats.push(SatSpec {
             name: format!("svc/{name}"),
-            kind: SatKind::Service,
+            kind: KindId::SERVICE,
             detail: detail.to_string(),
         });
     }
@@ -590,7 +611,7 @@ fn gen_sats(
             };
             sats.push(SatSpec {
                 name: cm_name,
-                kind: SatKind::ConfigMap,
+                kind: KindId::CONFIG_MAP,
                 detail: format!("{} keys", rng.random_range(2..14u32)),
             });
         }
@@ -598,22 +619,22 @@ fn gen_sats(
     if rng.random_bool(profile.secret_p) {
         sats.push(SatSpec {
             name: format!("secret/{name}-creds"),
-            kind: SatKind::Secret,
+            kind: KindId::SECRET,
             detail: "opaque".to_string(),
         });
     }
     sats
 }
 
-fn gen_pods(rng: &mut ChaCha8Rng, name: &str, kind: WorkloadKind, replicas: u32) -> Vec<PodSpec> {
+fn gen_pods(rng: &mut ChaCha8Rng, name: &str, kind: KindId, replicas: u32) -> Vec<PodSpec> {
     (0..replicas)
         .map(|i| PodSpec {
-            name: if kind == WorkloadKind::StatefulSet {
+            name: if kind == KindId::STATEFUL_SET {
                 format!("{name}-{i}")
             } else {
                 format!("{name}-{}", pod_suffix(rng))
             },
-            health: sample_health(rng),
+            state: sample_state(rng),
         })
         .collect()
 }
@@ -679,18 +700,13 @@ fn instantiate(rng: &mut ChaCha8Rng, a: &Archetype, name: String) -> WorkloadSpe
     }
 }
 
-fn plain_workload(
-    rng: &mut ChaCha8Rng,
-    name: String,
-    kind: WorkloadKind,
-    replicas: u32,
-) -> WorkloadSpec {
+fn plain_workload(rng: &mut ChaCha8Rng, name: String, kind: KindId, replicas: u32) -> WorkloadSpec {
     let pods = gen_pods(rng, &name, kind, replicas);
     let sats = gen_sats(rng, &name, kind, replicas, &kind_profile(kind));
     WorkloadSpec {
         name,
         kind,
-        tool: Tool::None,
+        tool: ToolId::NONE,
         pods,
         sats,
         deps: Vec::new(),
@@ -749,7 +765,7 @@ fn gen_fan_out(
                 let wl = plain_workload(
                     rng,
                     format!("{svc}-{role}-{i}"),
-                    WorkloadKind::Deployment,
+                    KindId::DEPLOYMENT,
                     replicas,
                 );
                 push_workload(spec, objects, wl, &mut workloads);
@@ -766,7 +782,7 @@ fn gen_fan_out(
                 let wl = plain_workload(
                     rng,
                     format!("{}-{role}-{i}", fan.ns_name),
-                    WorkloadKind::Deployment,
+                    KindId::DEPLOYMENT,
                     replicas,
                 );
                 push_workload(spec, objects, wl, &mut workloads);
@@ -780,7 +796,7 @@ fn gen_fan_out(
             let wl = plain_workload(
                 rng,
                 format!("{}-shard", fan.ns_name),
-                WorkloadKind::StatefulSet,
+                KindId::STATEFUL_SET,
                 (left / 2).max(1),
             );
             push_workload(spec, objects, wl, &mut workloads);
@@ -839,8 +855,8 @@ pub fn generate(cfg: &GenConfig) -> ClusterSpec {
             let name = format!("{svc}-{role}");
             let kind = sample_kind(&mut rng);
             let replicas = match kind {
-                WorkloadKind::Job => 1,
-                WorkloadKind::DaemonSet => rng.random_range(3..12),
+                KindId::JOB => 1,
+                KindId::DAEMON_SET => rng.random_range(3..12),
                 _ => sample_replicas(&mut rng),
             };
             let wl = plain_workload(&mut rng, name, kind, replicas);
@@ -924,14 +940,14 @@ mod tests {
         let mut pvc = 0u32;
         let mut sts_pods = 0u32;
         for wl in spec.namespaces.iter().flat_map(|n| &n.workloads) {
-            if wl.kind == WorkloadKind::StatefulSet {
+            if wl.kind == KindId::STATEFUL_SET {
                 sts_pods += wl.pods.len() as u32;
-                let vols = wl.sats.iter().filter(|s| s.kind == SatKind::Volume).count() as u32;
+                let vols = wl.sats.iter().filter(|s| s.kind == KindId::VOLUME).count() as u32;
                 assert_eq!(vols, wl.pods.len() as u32, "one PVC per sts replica");
                 pvc += vols;
             } else {
                 assert!(
-                    wl.sats.iter().all(|s| s.kind != SatKind::Volume),
+                    wl.sats.iter().all(|s| s.kind != KindId::VOLUME),
                     "only StatefulSets own PVCs"
                 );
             }
@@ -972,8 +988,8 @@ mod tests {
             .find(|n| n.name == "observability")
             .and_then(|n| n.workloads.iter().find(|w| w.name == "prometheus-server"))
             .expect("observability runs prometheus-server");
-        assert_eq!(prom.tool, Tool::Prometheus);
-        assert_eq!(prom.kind, WorkloadKind::StatefulSet);
+        assert_eq!(prom.tool, ToolId::PROMETHEUS);
+        assert_eq!(prom.kind, KindId::STATEFUL_SET);
         let obs2 = generate(&GenConfig {
             seed: 42,
             target_objects: 20_000,
@@ -1048,18 +1064,14 @@ mod tests {
         let spec = generate(&fan_cfg(Scenario::WlFanOut, 25_000));
         let hot = deepest_wl(&spec);
         assert_eq!(hot.name, "shard-prod-shard");
-        assert_eq!(hot.kind, WorkloadKind::StatefulSet);
+        assert_eq!(hot.kind, KindId::STATEFUL_SET);
         assert!(
             hot.pods.len() >= 4_000,
             "fan-out degree = {}",
             hot.pods.len()
         );
 
-        let vols = hot
-            .sats
-            .iter()
-            .filter(|s| s.kind == SatKind::Volume)
-            .count();
+        let vols = hot.sats.iter().filter(|s| s.kind == KindId::VOLUME).count();
         assert_eq!(vols, hot.pods.len(), "the sat ring fans out with the pods");
 
         let shard_ns = spec
@@ -1174,7 +1186,7 @@ mod tests {
             .namespaces
             .iter()
             .flat_map(|n| &n.workloads)
-            .find(|w| w.kind == WorkloadKind::StatefulSet)
+            .find(|w| w.kind == KindId::STATEFUL_SET)
             .expect("some sts");
         assert!(sts.pods[0].name.ends_with("-0"), "{}", sts.pods[0].name);
     }

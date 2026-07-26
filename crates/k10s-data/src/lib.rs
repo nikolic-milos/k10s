@@ -1,5 +1,5 @@
 use crossbeam_channel::Sender;
-use k10s_core::Health;
+use k10s_core::Severity;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ObjKind {
@@ -24,7 +24,7 @@ pub struct ObjEvent {
     pub namespace: String,
     pub name: String,
     pub op: Op,
-    pub health: Health,
+    pub health: Severity,
 }
 
 pub struct DataPlane {

@@ -18,7 +18,7 @@ use gpui::{
     TextRun, TransformationMatrix, Window, canvas, div, point, prelude::*, px, quad, rgb, size,
 };
 use k10s_atlas::{DrawnCounts, FramePacer, FrameSpans, FrameStats, StageMachine};
-use k10s_core::{SatKind, SceneSnapshot, SharedScene, Tool, WorkloadKind, WorldCtrl};
+use k10s_core::{KindId, SceneSnapshot, SharedScene, ToolId, WorldCtrl};
 
 pub use bench::{BenchMeta, BenchReport};
 pub use frame::FrameOpts;
@@ -30,97 +30,113 @@ use colors::*;
 use frame::{IconJob, LabelJob, PaintSink};
 use lod::lod;
 
-fn kind_icon(kind: WorkloadKind) -> (SharedString, &'static [u8]) {
-    match kind {
-        WorkloadKind::Deployment => (
-            SharedString::new_static("icons/deploy.svg"),
-            include_bytes!("../assets/icons/deploy.svg"),
-        ),
-        WorkloadKind::StatefulSet => (
-            SharedString::new_static("icons/sts.svg"),
-            include_bytes!("../assets/icons/sts.svg"),
-        ),
-        WorkloadKind::DaemonSet => (
-            SharedString::new_static("icons/ds.svg"),
-            include_bytes!("../assets/icons/ds.svg"),
-        ),
-        WorkloadKind::Job => (
-            SharedString::new_static("icons/job.svg"),
-            include_bytes!("../assets/icons/job.svg"),
-        ),
-    }
-}
+/// A rasterised glyph: the cache key gpui dedupes on, and the bytes behind it.
+/// Stored as a plain `&str` rather than a `SharedString` so the tables stay
+/// `static`; `SharedString::new_static` is free at the call site.
+type Glyph = (&'static str, &'static [u8]);
 
-macro_rules! tool_icons {
-    ($($tool:ident => $file:literal),+ $(,)?) => {
-        fn tool_icon(tool: Tool) -> (SharedString, &'static [u8]) {
-            match tool {
-                $(Tool::$tool => (
-                    SharedString::new_static(concat!("icons/tools/", $file)),
-                    include_bytes!(concat!("../assets/icons/tools/", $file)),
-                ),)+
-                Tool::None => unreachable!("generic workloads use the kind badge"),
-            }
-        }
+macro_rules! glyph {
+    ($file:literal) => {
+        (
+            concat!("icons/", $file),
+            include_bytes!(concat!("../assets/icons/", $file)) as &'static [u8],
+        )
     };
 }
 
-tool_icons! {
-    Airflow => "apacheairflow.svg",
-    ArgoCd => "argo.svg",
-    Cassandra => "apachecassandra.svg",
-    ClickHouse => "clickhouse.svg",
-    Consul => "consul.svg",
-    Elasticsearch => "elasticsearch.svg",
-    Envoy => "envoyproxy.svg",
-    Etcd => "etcd.svg",
-    FluentBit => "fluentbit.svg",
-    Fluentd => "fluentd.svg",
-    Flux => "flux.svg",
-    Grafana => "grafana.svg",
-    Harbor => "harbor.svg",
-    Istio => "istio.svg",
-    Jaeger => "jaeger.svg",
-    Jenkins => "jenkins.svg",
-    Kafka => "apachekafka.svg",
-    Keycloak => "keycloak.svg",
-    Kibana => "kibana.svg",
-    Kubernetes => "kubernetes.svg",
-    MariaDb => "mariadb.svg",
-    Minio => "minio.svg",
-    MongoDb => "mongodb.svg",
-    MySql => "mysql.svg",
-    Nats => "natsdotio.svg",
-    Nginx => "nginx.svg",
-    OpenTelemetry => "opentelemetry.svg",
-    Postgres => "postgresql.svg",
-    Prometheus => "prometheus.svg",
-    RabbitMq => "rabbitmq.svg",
-    Redis => "redis.svg",
-    Temporal => "temporal.svg",
-    Traefik => "traefikproxy.svg",
-    Vault => "vault.svg",
+macro_rules! tool_glyph {
+    ($file:literal) => {
+        (
+            concat!("icons/tools/", $file),
+            include_bytes!(concat!("../assets/icons/tools/", $file)) as &'static [u8],
+        )
+    };
 }
 
-fn sat_icon(kind: SatKind) -> (SharedString, &'static [u8]) {
-    match kind {
-        SatKind::Volume => (
-            SharedString::new_static("icons/pvc.svg"),
-            include_bytes!("../assets/icons/pvc.svg"),
-        ),
-        SatKind::Service => (
-            SharedString::new_static("icons/svc.svg"),
-            include_bytes!("../assets/icons/svc.svg"),
-        ),
-        SatKind::ConfigMap => (
-            SharedString::new_static("icons/cm.svg"),
-            include_bytes!("../assets/icons/cm.svg"),
-        ),
-        SatKind::Secret => (
-            SharedString::new_static("icons/secret.svg"),
-            include_bytes!("../assets/icons/secret.svg"),
-        ),
-    }
+/// Drawn for any kind or vendor with no compiled-in glyph, which is what lets a
+/// CRD render at all. Original artwork, so it carries no attribution burden.
+const UNKNOWN_GLYPH: Glyph = glyph!("unknown.svg");
+
+/// Indexed by [`KindId`], in `k10s_core::BUILTIN_KINDS` order.
+static KIND_GLYPHS: &[Glyph] = &[
+    glyph!("deploy.svg"),  // Deployment
+    glyph!("sts.svg"),     // StatefulSet
+    glyph!("ds.svg"),      // DaemonSet
+    glyph!("job.svg"),     // Job
+    glyph!("job.svg"),     // CronJob
+    glyph!("unknown.svg"), // Pod
+    glyph!("unknown.svg"), // Namespace
+    glyph!("pvc.svg"),     // PersistentVolumeClaim
+    glyph!("svc.svg"),     // Service
+    glyph!("cm.svg"),      // ConfigMap
+    glyph!("secret.svg"),  // Secret
+    glyph!("svc.svg"),     // Ingress
+    glyph!("unknown.svg"), // Node
+];
+
+const _: () = assert!(
+    KIND_GLYPHS.len() == k10s_core::BUILTIN_KIND_COUNT as usize,
+    "every built-in kind needs a glyph"
+);
+
+/// Indexed by [`ToolId`], in `k10s_core::BUILTIN_TOOLS` order. Slot zero is
+/// `ToolId::NONE`: a generic workload falls out of the table, not off a cliff.
+static TOOL_GLYPHS: &[Glyph] = &[
+    UNKNOWN_GLYPH,                      // None
+    tool_glyph!("apacheairflow.svg"),   // Airflow
+    tool_glyph!("argo.svg"),            // Argo CD
+    tool_glyph!("apachecassandra.svg"), // Cassandra
+    tool_glyph!("clickhouse.svg"),      // ClickHouse
+    tool_glyph!("consul.svg"),          // Consul
+    tool_glyph!("elasticsearch.svg"),   // Elasticsearch
+    tool_glyph!("envoyproxy.svg"),      // Envoy
+    tool_glyph!("etcd.svg"),            // etcd
+    tool_glyph!("fluentbit.svg"),       // Fluent Bit
+    tool_glyph!("fluentd.svg"),         // Fluentd
+    tool_glyph!("flux.svg"),            // Flux
+    tool_glyph!("grafana.svg"),         // Grafana
+    tool_glyph!("harbor.svg"),          // Harbor
+    tool_glyph!("istio.svg"),           // Istio
+    tool_glyph!("jaeger.svg"),          // Jaeger
+    tool_glyph!("jenkins.svg"),         // Jenkins
+    tool_glyph!("apachekafka.svg"),     // Kafka
+    tool_glyph!("keycloak.svg"),        // Keycloak
+    tool_glyph!("kibana.svg"),          // Kibana
+    tool_glyph!("kubernetes.svg"),      // Kubernetes
+    tool_glyph!("mariadb.svg"),         // MariaDB
+    tool_glyph!("minio.svg"),           // MinIO
+    tool_glyph!("mongodb.svg"),         // MongoDB
+    tool_glyph!("mysql.svg"),           // MySQL
+    tool_glyph!("natsdotio.svg"),       // NATS
+    tool_glyph!("nginx.svg"),           // nginx
+    tool_glyph!("opentelemetry.svg"),   // OpenTelemetry
+    tool_glyph!("postgresql.svg"),      // PostgreSQL
+    tool_glyph!("prometheus.svg"),      // Prometheus
+    tool_glyph!("rabbitmq.svg"),        // RabbitMQ
+    tool_glyph!("redis.svg"),           // Redis
+    tool_glyph!("temporal.svg"),        // Temporal
+    tool_glyph!("traefikproxy.svg"),    // Traefik
+    tool_glyph!("vault.svg"),           // Vault
+];
+
+const _: () = assert!(
+    TOOL_GLYPHS.len() == k10s_core::BUILTIN_TOOL_COUNT as usize,
+    "every built-in vendor needs a glyph"
+);
+
+fn glyph_of(table: &'static [Glyph], idx: usize) -> (SharedString, &'static [u8]) {
+    let (key, data) = table.get(idx).copied().unwrap_or(UNKNOWN_GLYPH);
+    (SharedString::new_static(key), data)
+}
+
+/// Table lookups, not exhaustive matches. An id the cluster reported and nobody
+/// compiled in paints the fallback instead of failing to build.
+fn kind_icon(kind: KindId) -> (SharedString, &'static [u8]) {
+    glyph_of(KIND_GLYPHS, kind.0 as usize)
+}
+
+fn tool_icon(tool: ToolId) -> (SharedString, &'static [u8]) {
+    glyph_of(TOOL_GLYPHS, tool.0 as usize)
 }
 
 pub struct MapView {
@@ -482,7 +498,7 @@ fn paint_map(
                         let (key, data) = kind_icon(*kind);
                         (key, data, *b, wl_icon_color)
                     }
-                    IconJob::Tool(tool, b) => {
+                    IconJob::ToolId(tool, b) => {
                         let (key, data) = tool_icon(*tool);
                         (
                             key,
@@ -492,12 +508,12 @@ fn paint_map(
                         )
                     }
                     IconJob::Sat(kind, b) => {
-                        let (key, data) = sat_icon(*kind);
+                        let (key, data) = kind_icon(*kind);
                         (
                             key,
                             data,
                             *b,
-                            scale_alpha(sat_color(*kind), cell_alpha).into(),
+                            scale_alpha(kind_color(*kind), cell_alpha).into(),
                         )
                     }
                 };

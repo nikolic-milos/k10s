@@ -18,7 +18,7 @@ use gpui::{
 use k10s_atlas::curves::{bow_jitter, curve_ctrl, dash_quadratic};
 use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 use k10s_core::layout::CARD_HEADER;
-use k10s_core::{Health, Rect, SatKind, SceneSnapshot, Tool, WorkloadKind};
+use k10s_core::{KindId, Rect, SceneSnapshot, Severity, ToolId};
 
 use crate::colors::*;
 use crate::hex;
@@ -74,9 +74,9 @@ pub(crate) struct LabelJob {
 }
 
 pub(crate) enum IconJob {
-    Wl(WorkloadKind, Bounds<Pixels>),
-    Tool(Tool, Bounds<Pixels>),
-    Sat(SatKind, Bounds<Pixels>),
+    Wl(KindId, Bounds<Pixels>),
+    ToolId(ToolId, Bounds<Pixels>),
+    Sat(KindId, Bounds<Pixels>),
 }
 
 /// Where a frame's primitives go. Implemented once for real painting ([`PaintSink`]) and once in
@@ -176,16 +176,21 @@ pub(crate) fn walk<S: FrameSink>(
     let ns_fill_rgba = rgb(NS_FILL);
     let ns_border_rgba = rgb(NS_BORDER);
     let header_fill_bg: gpui::Background = scale_alpha(rgb(CARD_HEADER_FILL), block_alpha).into();
-    const HEALTHS: [Health; 4] = [Health::Ok, Health::Warn, Health::Err, Health::Unknown];
-    let health_ix = |h: Health| -> usize {
+    const SEVERITIES: [Severity; 4] = [
+        Severity::Ok,
+        Severity::Warn,
+        Severity::Err,
+        Severity::Unknown,
+    ];
+    let sev_ix = |h: Severity| -> usize {
         match h {
-            Health::Ok => 0,
-            Health::Warn => 1,
-            Health::Err => 2,
-            Health::Unknown => 3,
+            Severity::Ok => 0,
+            Severity::Warn => 1,
+            Severity::Err => 2,
+            Severity::Unknown => 3,
         }
     };
-    let wl_paint: [(gpui::Background, gpui::Hsla); 4] = HEALTHS.map(|h| {
+    let wl_paint: [(gpui::Background, gpui::Hsla); 4] = SEVERITIES.map(|h| {
         let (fill_c, border_c) = workload_colors(h);
         (
             scale_alpha(fill_c, block_alpha).into(),
@@ -193,9 +198,9 @@ pub(crate) fn walk<S: FrameSink>(
         )
     });
     let pod_paint: [gpui::Background; 4] =
-        HEALTHS.map(|h| scale_alpha(pod_color(h), cell_alpha).into());
+        SEVERITIES.map(|h| scale_alpha(pod_color(h), cell_alpha).into());
     let strip_paint: [gpui::Background; 4] =
-        HEALTHS.map(|h| scale_alpha(pod_color(h), block_alpha).into());
+        SEVERITIES.map(|h| scale_alpha(pod_color(h), block_alpha).into());
 
     let mut st = CullStats {
         stage,
@@ -273,7 +278,7 @@ pub(crate) fn walk<S: FrameSink>(
             let painted = lod.block_painted(wl.inner.w, zoom) && !skip_wl;
             if painted {
                 st.drawn_blocks += 1;
-                let (fill_bg, border_hsla) = wl_paint[health_ix(wl.ext.health)];
+                let (fill_bg, border_hsla) = wl_paint[sev_ix(wl.ext.rollup)];
                 sink.fg_quad(quad(
                     w2b(&wl.inner),
                     px(4.0),
@@ -301,7 +306,7 @@ pub(crate) fn walk<S: FrameSink>(
                         wl.inner.w * 0.88,
                         header_h * 0.14,
                     );
-                    sink.fg_quad(fill(w2b(&strip), strip_paint[health_ix(wl.ext.health)]));
+                    sink.fg_quad(fill(w2b(&strip), strip_paint[sev_ix(wl.ext.rollup)]));
                     st.quads += 2;
                 }
 
@@ -312,8 +317,8 @@ pub(crate) fn walk<S: FrameSink>(
                             origin: point(px(ox + sx - WL_ICON_PX - 3.0), px(oy + sy + 3.0)),
                             size: size(px(WL_ICON_PX), px(WL_ICON_PX)),
                         };
-                        if wl.ext.tool != Tool::None {
-                            IconJob::Tool(wl.ext.tool, b)
+                        if wl.ext.tool != ToolId::NONE {
+                            IconJob::ToolId(wl.ext.tool, b)
                         } else {
                             IconJob::Wl(wl.ext.kind, b)
                         }
@@ -427,7 +432,10 @@ pub(crate) fn walk<S: FrameSink>(
                     continue;
                 }
                 st.drawn_cells += 1;
-                sink.fg_quad(fill(w2b(&pod.rect), pod_paint[health_ix(pod.ext.health)]));
+                sink.fg_quad(fill(
+                    w2b(&pod.rect),
+                    pod_paint[sev_ix(pod.ext.state.severity)],
+                ));
                 st.quads += 1;
 
                 if stage >= 3 && lod.cell_label_shown(pod.rect.w, zoom) {

@@ -120,8 +120,8 @@ pub fn cull(
 mod tests {
     use super::*;
     use k10s_core::{
-        Health, NsExt, NsNode, PodExt, PodNode, Rect, SatExt, SatKind, SatNode, Tool, Totals,
-        WlExt, WorkloadKind, WorkloadNode,
+        KindId, NsExt, NsNode, PodExt, PodNode, Rect, SatExt, SatNode, Severity, State, ToolId,
+        Totals, WlExt, WorkloadNode,
     };
     use std::sync::Arc;
 
@@ -148,6 +148,7 @@ mod tests {
                 children: 0..1,
                 ext: NsExt {
                     unhealthy_frac: 0.0,
+                    rollup: Severity::Ok,
                 },
             }],
             blocks: vec![WorkloadNode {
@@ -157,22 +158,22 @@ mod tests {
                 children: 0..1,
                 sats: 0..1,
                 ext: WlExt {
-                    kind: WorkloadKind::Deployment,
-                    tool: Tool::None,
-                    health: Health::Ok,
+                    kind: KindId::DEPLOYMENT,
+                    tool: ToolId::NONE,
+                    rollup: Severity::Ok,
                     ns: 0,
                 },
             }],
             cells: vec![PodNode {
                 rect: Rect::new(20.0, 40.0, 12.0, 12.0),
                 label: Arc::from("pod"),
-                ext: PodExt { health: Health::Ok },
+                ext: PodExt { state: State::OK },
             }],
             sats: vec![SatNode {
                 rect: Rect::new(94.0, 30.0, 18.0, 18.0),
                 label: Arc::from("pvc/data-wl-0"),
                 ext: SatExt {
-                    kind: SatKind::Volume,
+                    kind: KindId::VOLUME,
                     detail: Arc::from("16Gi"),
                 },
             }],
