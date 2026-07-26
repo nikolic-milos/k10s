@@ -3512,6 +3512,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_ecs",
  "crossbeam-channel",
+ "k10s-atlas",
  "k10s-clustergen",
  "k10s-core",
  "rand 0.10.2",

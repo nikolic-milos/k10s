@@ -8,6 +8,8 @@ pub enum Scenario {
     Platform,
     Observability,
     Data,
+    NsFanOut,
+    WlFanOut,
 }
 
 impl Scenario {
@@ -16,6 +18,8 @@ impl Scenario {
             "platform" => Some(Scenario::Platform),
             "observability" => Some(Scenario::Observability),
             "data" => Some(Scenario::Data),
+            "ns-fanout" => Some(Scenario::NsFanOut),
+            "wl-fanout" => Some(Scenario::WlFanOut),
             _ => None,
         }
     }
@@ -25,6 +29,8 @@ impl Scenario {
             Scenario::Platform => "platform",
             Scenario::Observability => "observability",
             Scenario::Data => "data",
+            Scenario::NsFanOut => "ns-fanout",
+            Scenario::WlFanOut => "wl-fanout",
         }
     }
 }
@@ -331,6 +337,8 @@ fn scenario_themes(s: Scenario) -> &'static [&'static str] {
         ],
         Scenario::Observability => &["monitoring", "logging", "ingress"],
         Scenario::Data => &["data", "messaging", "storage", "monitoring"],
+        Scenario::NsFanOut => &["ingress", "security"],
+        Scenario::WlFanOut => &["data", "ingress"],
     }
 }
 
@@ -345,6 +353,39 @@ fn embed_multiplier(s: Scenario, tool: Tool) -> f64 {
             T::Postgres | T::Redis | T::MariaDb | T::MongoDb | T::RabbitMq | T::Nats => 2.0,
             _ => 0.5,
         },
+        Scenario::NsFanOut | Scenario::WlFanOut => 0.5,
+    }
+}
+
+enum FanAxis {
+    Namespace,
+    Workload,
+}
+
+struct FanOut {
+    ns_name: &'static str,
+    axis: FanAxis,
+    budget_frac: f64,
+}
+
+const FAN_NS_MIN_REPLICAS: u32 = 1;
+const FAN_NS_MAX_REPLICAS: u32 = 3;
+const FAN_WL_SIBLINGS: u32 = 4;
+const FAN_WL_SAT_HEADROOM: u32 = 4;
+
+fn fan_out(s: Scenario) -> Option<FanOut> {
+    match s {
+        Scenario::Platform | Scenario::Observability | Scenario::Data => None,
+        Scenario::NsFanOut => Some(FanOut {
+            ns_name: "monorepo-prod",
+            axis: FanAxis::Namespace,
+            budget_frac: 0.96,
+        }),
+        Scenario::WlFanOut => Some(FanOut {
+            ns_name: "shard-prod",
+            axis: FanAxis::Workload,
+            budget_frac: 0.40,
+        }),
     }
 }
 
@@ -638,6 +679,24 @@ fn instantiate(rng: &mut ChaCha8Rng, a: &Archetype, name: String) -> WorkloadSpe
     }
 }
 
+fn plain_workload(
+    rng: &mut ChaCha8Rng,
+    name: String,
+    kind: WorkloadKind,
+    replicas: u32,
+) -> WorkloadSpec {
+    let pods = gen_pods(rng, &name, kind, replicas);
+    let sats = gen_sats(rng, &name, kind, replicas, &kind_profile(kind));
+    WorkloadSpec {
+        name,
+        kind,
+        tool: Tool::None,
+        pods,
+        sats,
+        deps: Vec::new(),
+    }
+}
+
 fn push_workload(
     spec: &mut ClusterSpec,
     objects: &mut u32,
@@ -669,6 +728,73 @@ fn gen_deps(rng: &mut ChaCha8Rng, workloads: &mut [WorkloadSpec], total_edges: &
     }
 }
 
+fn gen_fan_out(
+    rng: &mut ChaCha8Rng,
+    cfg: &GenConfig,
+    fan: &FanOut,
+    spec: &mut ClusterSpec,
+    objects: &mut u32,
+) {
+    let budget = (cfg.target_objects as f64 * fan.budget_frac) as u32;
+    let stop = objects.saturating_add(budget).min(cfg.target_objects);
+    let mut workloads = Vec::new();
+
+    match fan.axis {
+        FanAxis::Namespace => {
+            let mut i = 0u32;
+            loop {
+                let role = ROLE_WORDS[rng.random_range(0..ROLE_WORDS.len())];
+                let svc = NS_WORDS[rng.random_range(0..NS_WORDS.len())];
+                let replicas = rng.random_range(FAN_NS_MIN_REPLICAS..=FAN_NS_MAX_REPLICAS);
+                let wl = plain_workload(
+                    rng,
+                    format!("{svc}-{role}-{i}"),
+                    WorkloadKind::Deployment,
+                    replicas,
+                );
+                push_workload(spec, objects, wl, &mut workloads);
+                i += 1;
+                if *objects >= stop {
+                    break;
+                }
+            }
+        }
+        FanAxis::Workload => {
+            for i in 0..FAN_WL_SIBLINGS {
+                let role = ROLE_WORDS[rng.random_range(0..ROLE_WORDS.len())];
+                let replicas = rng.random_range(FAN_NS_MIN_REPLICAS..=FAN_NS_MAX_REPLICAS);
+                let wl = plain_workload(
+                    rng,
+                    format!("{}-{role}-{i}", fan.ns_name),
+                    WorkloadKind::Deployment,
+                    replicas,
+                );
+                push_workload(spec, objects, wl, &mut workloads);
+                if *objects >= stop {
+                    break;
+                }
+            }
+            let left = stop
+                .saturating_sub(*objects)
+                .saturating_sub(FAN_WL_SAT_HEADROOM);
+            let wl = plain_workload(
+                rng,
+                format!("{}-shard", fan.ns_name),
+                WorkloadKind::StatefulSet,
+                (left / 2).max(1),
+            );
+            push_workload(spec, objects, wl, &mut workloads);
+        }
+    }
+
+    gen_deps(rng, &mut workloads, &mut spec.total_edges);
+    *objects += 1;
+    spec.namespaces.push(NsSpec {
+        name: fan.ns_name.to_string(),
+        workloads,
+    });
+}
+
 pub fn generate(cfg: &GenConfig) -> ClusterSpec {
     let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
     let mut spec = ClusterSpec::default();
@@ -689,6 +815,10 @@ pub fn generate(cfg: &GenConfig) -> ClusterSpec {
             name: ns_label.to_string(),
             workloads,
         });
+    }
+
+    if let Some(fan) = fan_out(cfg.scenario) {
+        gen_fan_out(&mut rng, cfg, &fan, &mut spec, &mut objects);
     }
 
     let mut ns_i = 0usize;
@@ -713,16 +843,7 @@ pub fn generate(cfg: &GenConfig) -> ClusterSpec {
                 WorkloadKind::DaemonSet => rng.random_range(3..12),
                 _ => sample_replicas(&mut rng),
             };
-            let pods = gen_pods(&mut rng, &name, kind, replicas);
-            let sats = gen_sats(&mut rng, &name, kind, replicas, &kind_profile(kind));
-            let wl = WorkloadSpec {
-                name,
-                kind,
-                tool: Tool::None,
-                pods,
-                sats,
-                deps: Vec::new(),
-            };
+            let wl = plain_workload(&mut rng, name, kind, replicas);
             push_workload(&mut spec, &mut objects, wl, &mut workloads);
 
             if objects >= cfg.target_objects {
@@ -859,6 +980,191 @@ mod tests {
             scenario: Scenario::Observability,
         });
         assert_eq!(obs.total_pods, obs2.total_pods);
+    }
+
+    fn fan_cfg(scenario: Scenario, target_objects: u32) -> GenConfig {
+        GenConfig {
+            seed: 42,
+            target_objects,
+            scenario,
+        }
+    }
+
+    fn widest_ns(spec: &ClusterSpec) -> &NsSpec {
+        spec.namespaces
+            .iter()
+            .max_by_key(|n| n.workloads.len())
+            .expect("some namespace")
+    }
+
+    fn deepest_wl(spec: &ClusterSpec) -> &WorkloadSpec {
+        spec.namespaces
+            .iter()
+            .flat_map(|n| &n.workloads)
+            .max_by_key(|w| w.pods.len())
+            .expect("some workload")
+    }
+
+    #[test]
+    fn ns_fan_out_concentrates_workloads_in_one_namespace() {
+        let spec = generate(&fan_cfg(Scenario::NsFanOut, 25_000));
+        let hot = widest_ns(&spec);
+        assert_eq!(hot.name, "monorepo-prod");
+        assert!(
+            hot.workloads.len() >= 4_000,
+            "fan-out degree = {}",
+            hot.workloads.len()
+        );
+
+        let rest: usize = spec
+            .namespaces
+            .iter()
+            .filter(|n| n.name != hot.name)
+            .map(|n| n.workloads.len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            hot.workloads.len() > rest * 20,
+            "hot {} vs widest other {rest}",
+            hot.workloads.len()
+        );
+        assert!(
+            spec.namespaces.len() <= 16,
+            "few namespaces, got {}",
+            spec.namespaces.len()
+        );
+        assert!(
+            hot.workloads.iter().all(|w| w.pods.len() <= 3),
+            "the budget must buy workload count, not pods"
+        );
+
+        let total =
+            spec.namespaces.len() as u32 + spec.total_workloads + spec.total_pods + spec.total_sats;
+        assert!((25_000..25_600).contains(&total), "total = {total}");
+    }
+
+    #[test]
+    fn wl_fan_out_concentrates_pods_on_one_workload() {
+        let spec = generate(&fan_cfg(Scenario::WlFanOut, 25_000));
+        let hot = deepest_wl(&spec);
+        assert_eq!(hot.name, "shard-prod-shard");
+        assert_eq!(hot.kind, WorkloadKind::StatefulSet);
+        assert!(
+            hot.pods.len() >= 4_000,
+            "fan-out degree = {}",
+            hot.pods.len()
+        );
+
+        let vols = hot
+            .sats
+            .iter()
+            .filter(|s| s.kind == SatKind::Volume)
+            .count();
+        assert_eq!(vols, hot.pods.len(), "the sat ring fans out with the pods");
+
+        let shard_ns = spec
+            .namespaces
+            .iter()
+            .find(|n| n.name == "shard-prod")
+            .expect("shard-prod exists");
+        assert!(
+            shard_ns.workloads.len() <= FAN_WL_SIBLINGS as usize + 1,
+            "few workloads, got {}",
+            shard_ns.workloads.len()
+        );
+
+        let second = spec
+            .namespaces
+            .iter()
+            .flat_map(|n| &n.workloads)
+            .filter(|w| w.name != hot.name)
+            .map(|w| w.pods.len())
+            .max()
+            .unwrap_or(0);
+        assert!(hot.pods.len() > second * 20, "hot vs second {second}");
+
+        let total =
+            spec.namespaces.len() as u32 + spec.total_workloads + spec.total_pods + spec.total_sats;
+        assert!((25_000..25_600).contains(&total), "total = {total}");
+    }
+
+    #[test]
+    fn fan_out_degree_scales_with_the_object_budget() {
+        let mut ns_degrees = Vec::new();
+        let mut wl_degrees = Vec::new();
+        for target in [2_000u32, 6_000, 25_000] {
+            ns_degrees.push(
+                widest_ns(&generate(&fan_cfg(Scenario::NsFanOut, target)))
+                    .workloads
+                    .len(),
+            );
+            wl_degrees.push(
+                deepest_wl(&generate(&fan_cfg(Scenario::WlFanOut, target)))
+                    .pods
+                    .len(),
+            );
+        }
+        assert!(
+            ns_degrees.windows(2).all(|w| w[1] > w[0] * 2),
+            "ns degrees {ns_degrees:?}"
+        );
+        assert!(
+            wl_degrees.windows(2).all(|w| w[1] > w[0] * 2),
+            "wl degrees {wl_degrees:?}"
+        );
+    }
+
+    #[test]
+    fn fan_out_scenarios_are_deterministic() {
+        for scenario in [Scenario::NsFanOut, Scenario::WlFanOut] {
+            let a = generate(&fan_cfg(scenario, 12_000));
+            let b = generate(&fan_cfg(scenario, 12_000));
+            assert_eq!(a.namespaces.len(), b.namespaces.len());
+            assert_eq!(a.total_workloads, b.total_workloads);
+            assert_eq!(a.total_pods, b.total_pods);
+            assert_eq!(a.total_sats, b.total_sats);
+            assert_eq!(a.total_edges, b.total_edges);
+            assert_eq!(
+                widest_ns(&a).workloads.len(),
+                widest_ns(&b).workloads.len(),
+                "{}",
+                scenario.as_str()
+            );
+            assert_eq!(deepest_wl(&a).pods.len(), deepest_wl(&b).pods.len());
+            for (x, y) in a.namespaces.iter().zip(&b.namespaces) {
+                assert_eq!(x.name, y.name);
+                assert_eq!(x.workloads.len(), y.workloads.len());
+            }
+            let names_a: Vec<&str> = widest_ns(&a).workloads.iter().map(|w| &*w.name).collect();
+            let names_b: Vec<&str> = widest_ns(&b).workloads.iter().map(|w| &*w.name).collect();
+            assert_eq!(names_a, names_b);
+        }
+    }
+
+    #[test]
+    fn fan_out_workload_names_stay_unique_inside_the_hot_namespace() {
+        for scenario in [Scenario::NsFanOut, Scenario::WlFanOut] {
+            let spec = generate(&fan_cfg(scenario, 25_000));
+            for ns in &spec.namespaces {
+                let mut names: Vec<&str> = ns.workloads.iter().map(|w| &*w.name).collect();
+                let count = names.len();
+                names.sort_unstable();
+                names.dedup();
+                if ns.name == "monorepo-prod" || ns.name == "shard-prod" {
+                    assert_eq!(names.len(), count, "{} has duplicate names", ns.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fan_out_scenarios_round_trip_through_parse() {
+        for scenario in [Scenario::NsFanOut, Scenario::WlFanOut] {
+            assert_eq!(Scenario::parse(scenario.as_str()), Some(scenario));
+        }
+        assert_eq!(Scenario::parse("ns-fanout"), Some(Scenario::NsFanOut));
+        assert_eq!(Scenario::parse("wl-fanout"), Some(Scenario::WlFanOut));
+        assert_eq!(Scenario::parse("fanout"), None);
     }
 
     #[test]
