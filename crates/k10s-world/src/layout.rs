@@ -701,6 +701,103 @@ mod tests {
         }
     }
 
+    /// Skewed fan-out is the shape real clusters have and the themed scenarios do not: one
+    /// namespace holding thousands of workloads, or one workload holding thousands of pods and
+    /// an equal number of PVCs. Every invariant the themed scenarios are held to must survive it,
+    /// per mode: containment and halo separation are spread-mode properties, because dense mode
+    /// omits attachments and packs halos flush.
+    #[test]
+    fn fan_out_layout_holds_every_invariant() {
+        const EPS: f32 = 0.01;
+        let inside = |inner: &Rect, outer: &Rect| {
+            inner.x >= outer.x - EPS
+                && inner.y >= outer.y - EPS
+                && inner.max_x() <= outer.max_x() + EPS
+                && inner.max_y() <= outer.max_y() + EPS
+        };
+        for scenario in [Scenario::NsFanOut, Scenario::WlFanOut] {
+            for objects in [12_000u32, 50_000] {
+                let spec = generate(&GenConfig {
+                    seed: 55,
+                    target_objects: objects,
+                    scenario,
+                });
+                for mode in [LayoutMode::Dense, LayoutMode::Spread] {
+                    let out = layout(&spec, mode);
+                    let label = format!("{} {objects} {mode:?}", scenario.as_str());
+
+                    for i in 0..out.ns_rects.len() {
+                        for j in (i + 1)..out.ns_rects.len() {
+                            assert!(
+                                !out.ns_rects[i].intersects(&out.ns_rects[j]),
+                                "{label}: islands {i}/{j} overlap"
+                            );
+                        }
+                    }
+
+                    for arr in all_rects(&out) {
+                        for r in arr {
+                            let e = escape(&out.bounds, r);
+                            assert!(e <= EPS, "{label}: rect {r:?} leaves bounds by {e} px");
+                        }
+                    }
+
+                    let (mut wl, mut pod, mut sat) = (0usize, 0usize, 0usize);
+                    for (ni, ns) in spec.namespaces.iter().enumerate() {
+                        let nr = out.ns_rects[ni];
+                        let first_wl = wl;
+                        for w in &ns.workloads {
+                            let halo = out.wl_rects[wl];
+                            assert!(inside(&halo, &nr), "{label}: halo {wl} escapes island {ni}");
+                            let parent = match mode {
+                                LayoutMode::Dense => halo,
+                                LayoutMode::Spread => {
+                                    let card = out.card_rects[wl];
+                                    assert!(
+                                        inside(&card, &halo),
+                                        "{label}: card {wl} escapes halo"
+                                    );
+                                    card
+                                }
+                            };
+                            for _ in 0..w.pods.len() {
+                                assert!(
+                                    inside(&out.pod_rects[pod], &parent),
+                                    "{label}: pod {pod} escapes workload {wl}"
+                                );
+                                pod += 1;
+                            }
+                            if mode == LayoutMode::Spread {
+                                for _ in 0..w.sats.len() {
+                                    let sr = out.sat_rects[sat];
+                                    assert!(
+                                        inside(&sr, &halo),
+                                        "{label}: sat {sat} escapes halo {wl}"
+                                    );
+                                    sat += 1;
+                                }
+                            }
+                            wl += 1;
+                        }
+                        if mode == LayoutMode::Spread {
+                            for i in first_wl..wl {
+                                for j in (i + 1)..wl {
+                                    assert!(
+                                        !out.wl_rects[i].intersects(&out.wl_rects[j]),
+                                        "{label}: halos {i}/{j} overlap in ns {ni}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if mode == LayoutMode::Spread {
+                        assert_eq!(sat, spec.total_sats as usize, "{label}: sat count");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn satellites_keep_clearance_within_their_hub() {
         const MAX_OVERLAP_DEPTH_PX: f32 = 0.2 * SAT_SIZE;
