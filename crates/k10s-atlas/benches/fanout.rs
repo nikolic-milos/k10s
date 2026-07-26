@@ -37,9 +37,9 @@ impl<const N: usize> Default for Pad<N> {
     }
 }
 
-type NsPad = Pad<4>;
-type WlPad = Pad<8>;
-type PodPad = Pad<1>;
+type NsPad = Pad<8>;
+type WlPad = Pad<12>;
+type PodPad = Pad<8>;
 type SatPad = Pad<24>;
 type PaddedScene = Scene<NsPad, WlPad, PodPad, SatPad>;
 

@@ -1,5 +1,5 @@
 use gpui::Rgba;
-use k10s_core::{Health, SatKind, Tool};
+use k10s_core::{BUILTIN_TOOL_COUNT, KindId, Severity, ToolId};
 
 pub const BG: u32 = 0x160f26;
 pub const HEX_LINE: u32 = 0x4d3a78;
@@ -16,31 +16,61 @@ pub const CURVE_GLOW_ALPHA: f32 = 0.16;
 
 pub const CARD_HEADER_FILL: u32 = 0x2a1c49;
 
-pub fn pod_color(h: Health) -> Rgba {
+pub fn pod_color(h: Severity) -> Rgba {
     match h {
-        Health::Ok => gpui::rgb(0x2ea043),
-        Health::Warn => gpui::rgb(0xd29922),
-        Health::Err => gpui::rgb(0xf85149),
-        Health::Unknown => gpui::rgb(0x545d68),
+        Severity::Ok => gpui::rgb(0x2ea043),
+        Severity::Warn => gpui::rgb(0xd29922),
+        Severity::Err => gpui::rgb(0xf85149),
+        Severity::Unknown => gpui::rgb(0x545d68),
     }
 }
 
-pub fn workload_colors(h: Health) -> (Rgba, Rgba) {
+pub fn workload_colors(h: Severity) -> (Rgba, Rgba) {
     match h {
-        Health::Ok => (gpui::rgb(0x1d132f), gpui::rgb(0x7a5fb5).alpha(0.55)),
-        Health::Warn => (gpui::rgb(0x2a2312), gpui::rgb(0xd29922).alpha(0.75)),
-        Health::Err => (gpui::rgb(0x2d1417), gpui::rgb(0xf85149).alpha(0.85)),
-        Health::Unknown => (gpui::rgb(0x191325), gpui::rgb(0x545d68).alpha(0.6)),
+        Severity::Ok => (gpui::rgb(0x1d132f), gpui::rgb(0x7a5fb5).alpha(0.55)),
+        Severity::Warn => (gpui::rgb(0x2a2312), gpui::rgb(0xd29922).alpha(0.75)),
+        Severity::Err => (gpui::rgb(0x2d1417), gpui::rgb(0xf85149).alpha(0.85)),
+        Severity::Unknown => (gpui::rgb(0x191325), gpui::rgb(0x545d68).alpha(0.6)),
     }
 }
 
-pub fn sat_color(kind: SatKind) -> Rgba {
-    match kind {
-        SatKind::Volume => gpui::rgb(0xe36bdc),
-        SatKind::Service => gpui::rgb(0x3fd68f),
-        SatKind::ConfigMap => gpui::rgb(0x6aa9ff),
-        SatKind::Secret => gpui::rgb(0xd8a63a),
-    }
+/// What a kind nobody compiled in is drawn with. Deliberately neutral: an
+/// unknown CRD should read as "we do not know this", not as a specific vendor.
+pub const UNKNOWN_KIND: u32 = 0x9e96b8;
+
+/// Indexed by [`KindId`], in the same order as `k10s_core::BUILTIN_KINDS`. The
+/// length assertion below is what keeps the two tables from drifting: adding a
+/// built-in kind without a colour fails the build.
+static KIND_COLORS: &[u32] = &[
+    0x7a5fb5, // Deployment
+    0x9a7fd0, // StatefulSet
+    0x6f8fd0, // DaemonSet
+    0x8fd06f, // Job
+    0xd0b06f, // CronJob
+    0x2ea043, // Pod
+    0x342552, // Namespace
+    0xe36bdc, // PersistentVolumeClaim
+    0x3fd68f, // Service
+    0x6aa9ff, // ConfigMap
+    0xd8a63a, // Secret
+    0x4fd0c0, // Ingress
+    0xa79fc2, // Node
+];
+
+const _: () = assert!(
+    KIND_COLORS.len() == k10s_core::BUILTIN_KIND_COUNT as usize,
+    "every built-in kind needs a colour"
+);
+
+/// A table lookup, not an exhaustive match: a kind discovered at runtime has no
+/// compiled-in entry and must still paint.
+pub fn kind_color(kind: KindId) -> Rgba {
+    gpui::rgb(
+        KIND_COLORS
+            .get(kind.0 as usize)
+            .copied()
+            .unwrap_or(UNKNOWN_KIND),
+    )
 }
 
 pub fn heat_color(frac: f32) -> Rgba {
@@ -66,45 +96,58 @@ pub fn heat_border(frac: f32) -> Rgba {
     )
 }
 
-pub fn tool_color(tool: Tool) -> Rgba {
-    let hex = match tool {
-        Tool::Airflow => 0x017CEE,
-        Tool::ArgoCd => 0xEF7B4D,
-        Tool::Cassandra => 0x1287B1,
-        Tool::ClickHouse => 0xFFCC01,
-        Tool::Consul => 0xF24C53,
-        Tool::Elasticsearch => 0x8CB3BF,
-        Tool::Envoy => 0xAC6199,
-        Tool::Etcd => 0x419EDA,
-        Tool::FluentBit => 0x49BDA5,
-        Tool::Fluentd => 0x0E83C8,
-        Tool::Flux => 0x5468FF,
-        Tool::Grafana => 0xF46800,
-        Tool::Harbor => 0x60B932,
-        Tool::Istio => 0x466BB0,
-        Tool::Jaeger => 0x66CFE3,
-        Tool::Jenkins => 0xD24939,
-        Tool::Kafka => 0x9C9A9B,
-        Tool::Keycloak => 0xAFAFAF,
-        Tool::Kibana => 0x8CB3BF,
-        Tool::Kubernetes => 0x326CE5,
-        Tool::MariaDb => 0x8CA4AB,
-        Tool::Minio => 0xC72E49,
-        Tool::MongoDb => 0x47A248,
-        Tool::MySql => 0x4479A1,
-        Tool::Nats => 0x27AAE1,
-        Tool::Nginx => 0x009639,
-        Tool::OpenTelemetry => 0x8C8C8C,
-        Tool::Postgres => 0x4169E1,
-        Tool::Prometheus => 0xE6522C,
-        Tool::RabbitMq => 0xFF6600,
-        Tool::Redis => 0xFF4438,
-        Tool::Temporal => 0x8C8C8C,
-        Tool::Traefik => 0x24A1C1,
-        Tool::Vault => 0xFFEC6E,
-        Tool::None => 0x9E96B8,
-    };
-    gpui::rgb(hex)
+/// Indexed by [`ToolId`], in the same order as `k10s_core::BUILTIN_TOOLS`. Slot
+/// zero is `ToolId::NONE`, which is why a generic workload needs no branch here.
+static TOOL_COLORS: &[u32] = &[
+    UNKNOWN_KIND, // None
+    0x017CEE,     // Airflow
+    0xEF7B4D,     // Argo CD
+    0x1287B1,     // Cassandra
+    0xFFCC01,     // ClickHouse
+    0xF24C53,     // Consul
+    0x8CB3BF,     // Elasticsearch
+    0xAC6199,     // Envoy
+    0x419EDA,     // etcd
+    0x49BDA5,     // Fluent Bit
+    0x0E83C8,     // Fluentd
+    0x5468FF,     // Flux
+    0xF46800,     // Grafana
+    0x60B932,     // Harbor
+    0x466BB0,     // Istio
+    0x66CFE3,     // Jaeger
+    0xD24939,     // Jenkins
+    0x9C9A9B,     // Kafka
+    0xAFAFAF,     // Keycloak
+    0x8CB3BF,     // Kibana
+    0x326CE5,     // Kubernetes
+    0x8CA4AB,     // MariaDB
+    0xC72E49,     // MinIO
+    0x47A248,     // MongoDB
+    0x4479A1,     // MySQL
+    0x27AAE1,     // NATS
+    0x009639,     // nginx
+    0x8C8C8C,     // OpenTelemetry
+    0x4169E1,     // PostgreSQL
+    0xE6522C,     // Prometheus
+    0xFF6600,     // RabbitMQ
+    0xFF4438,     // Redis
+    0x8C8C8C,     // Temporal
+    0x24A1C1,     // Traefik
+    0xFFEC6E,     // Vault
+];
+
+const _: () = assert!(
+    TOOL_COLORS.len() == BUILTIN_TOOL_COUNT as usize,
+    "every built-in vendor needs a colour"
+);
+
+pub fn tool_color(tool: ToolId) -> Rgba {
+    gpui::rgb(
+        TOOL_COLORS
+            .get(tool.0 as usize)
+            .copied()
+            .unwrap_or(UNKNOWN_KIND),
+    )
 }
 
 pub fn scale_alpha(mut c: Rgba, a: f32) -> Rgba {

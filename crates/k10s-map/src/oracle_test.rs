@@ -25,8 +25,8 @@ use gpui::{Bounds, PaintQuad, Pixels, point, px, size};
 use k10s_atlas::testing::{SceneSpec, scene as base_scene};
 use k10s_atlas::{Camera, CullStats, LodPolicy, MAX_ZOOM, MIN_ZOOM, StageBlend};
 use k10s_core::{
-    Health, NsExt, NsNode, PodExt, PodNode, SatExt, SatKind, SatNode, SceneSnapshot, Tool, WlExt,
-    WorkloadKind, WorkloadNode,
+    KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, SatExt, SatNode, SceneSnapshot, Severity,
+    State, ToolId, WlExt, WorkloadNode,
 };
 use std::sync::Arc;
 
@@ -116,29 +116,47 @@ impl FrameSink for Tally {
     }
 }
 
-/// Give the engine's generic test scene the extensions the painter matches on, cycling through
-/// every `Health`, `WorkloadKind`, `Tool` and `SatKind` so no colour or icon branch is unreached.
+/// Give the engine's generic test scene the extensions the painter looks up, cycling through
+/// every `Severity`, built-in `KindId`, `ToolId` and `ReasonId` so no colour or glyph branch is
+/// unreached, plus ids past the built-in tables so the fallback paths are swept too.
 fn snapshot(spec: SceneSpec) -> SceneSnapshot {
     let base = base_scene(spec);
-    const HEALTHS: [Health; 4] = [Health::Ok, Health::Warn, Health::Err, Health::Unknown];
-    const KINDS: [WorkloadKind; 4] = [
-        WorkloadKind::Deployment,
-        WorkloadKind::StatefulSet,
-        WorkloadKind::DaemonSet,
-        WorkloadKind::Job,
+    const SEVERITIES: [Severity; 4] = [
+        Severity::Ok,
+        Severity::Warn,
+        Severity::Err,
+        Severity::Unknown,
     ];
-    const TOOLS: [Tool; 5] = [
-        Tool::None,
-        Tool::Postgres,
-        Tool::None,
-        Tool::Istio,
-        Tool::Prometheus,
+    const REASONS: [ReasonId; 5] = [
+        ReasonId::RUNNING,
+        ReasonId::NOT_READY,
+        ReasonId::CRASH_LOOP_BACK_OFF,
+        ReasonId::UNKNOWN,
+        // Past the built-in table: the severity must degrade to Unknown, never Ok.
+        ReasonId(9_001),
     ];
-    const SATS: [SatKind; 4] = [
-        SatKind::Volume,
-        SatKind::Service,
-        SatKind::ConfigMap,
-        SatKind::Secret,
+    const KINDS: [KindId; 6] = [
+        KindId::DEPLOYMENT,
+        KindId::STATEFUL_SET,
+        KindId::DAEMON_SET,
+        KindId::JOB,
+        KindId::CRON_JOB,
+        // Stands in for a CRD: no compiled-in colour or glyph, so this sweeps the
+        // fallback the whole open model depends on.
+        KindId(9_000),
+    ];
+    const TOOLS: [ToolId; 5] = [
+        ToolId::NONE,
+        ToolId::POSTGRES,
+        ToolId::NONE,
+        ToolId::ISTIO,
+        ToolId::PROMETHEUS,
+    ];
+    const SATS: [KindId; 4] = [
+        KindId::VOLUME,
+        KindId::SERVICE,
+        KindId::CONFIG_MAP,
+        KindId::SECRET,
     ];
 
     SceneSnapshot {
@@ -156,6 +174,7 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
                 ext: NsExt {
                     // 0.0, 0.15, 0.3, 0.45, 0.6: below, inside and above every heat breakpoint.
                     unhealthy_frac: (i % 5) as f32 * 0.15,
+                    rollup: SEVERITIES[i % SEVERITIES.len()],
                 },
             })
             .collect(),
@@ -172,7 +191,7 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
                 ext: WlExt {
                     kind: KINDS[i % KINDS.len()],
                     tool: TOOLS[i % TOOLS.len()],
-                    health: HEALTHS[i % HEALTHS.len()],
+                    rollup: SEVERITIES[i % SEVERITIES.len()],
                     ns: 0,
                 },
             })
@@ -185,7 +204,7 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
                 rect: c.rect,
                 label: c.label.clone(),
                 ext: PodExt {
-                    health: HEALTHS[i % HEALTHS.len()],
+                    state: State::of(REASONS[i % REASONS.len()]),
                 },
             })
             .collect(),

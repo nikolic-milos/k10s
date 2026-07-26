@@ -9,8 +9,8 @@ use bevy_ecs::prelude::*;
 use crossbeam_channel::Receiver;
 use k10s_clustergen::ClusterSpec;
 use k10s_core::{
-    EdgeInst, Health, NsExt, NsNode, PodExt, PodNode, Rect, SatExt, SatKind, SatNode,
-    SceneSnapshot, SharedScene, Tool, Totals, WlExt, WorkloadKind, WorkloadNode, WorldCtrl,
+    EdgeInst, KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, Rect, SatExt, SatNode,
+    SceneSnapshot, Severity, SharedScene, State, ToolId, Totals, WlExt, WorkloadNode, WorldCtrl,
 };
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
@@ -20,12 +20,12 @@ pub use layout::LayoutMode;
 const TICK_HZ: f32 = 20.0;
 
 #[derive(Component)]
-struct PodH(Health);
+struct PodH(State);
 
 #[derive(Resource, Default)]
-struct DirtyPods(Vec<(u32, Health)>);
+struct DirtyPods(Vec<(u32, State)>);
 
-fn set_pod_health(world: &mut World, idx: u32, new: Health) {
+fn set_pod_state(world: &mut World, idx: u32, new: State) {
     let e = world.resource::<Topology>().pod_entities[idx as usize];
     let changed = match world.get_mut::<PodH>(e) {
         Some(mut h) if h.0 != new => {
@@ -39,7 +39,7 @@ fn set_pod_health(world: &mut World, idx: u32, new: Health) {
     }
 }
 
-fn update_pod_healths(world: &mut World, indices: &[u32], mut f: impl FnMut(Health) -> Health) {
+fn update_pod_states(world: &mut World, indices: &[u32], mut f: impl FnMut(State) -> State) {
     let entities: Vec<Entity> = {
         let topo = world.resource::<Topology>();
         indices
@@ -69,8 +69,8 @@ struct Topology {
     wl_labels: Vec<Arc<str>>,
     wl_rects: Vec<Rect>,
     wl_card_rects: Vec<Rect>,
-    wl_kinds: Vec<WorkloadKind>,
-    wl_tools: Vec<Tool>,
+    wl_kinds: Vec<KindId>,
+    wl_tools: Vec<ToolId>,
     wl_ns: Vec<u32>,
     wl_pod_range: Vec<Range<u32>>,
     wl_sat_range: Vec<Range<u32>>,
@@ -80,7 +80,7 @@ struct Topology {
     pod_entities: Vec<Entity>,
     sat_labels: Vec<Arc<str>>,
     sat_details: Vec<Arc<str>>,
-    sat_kinds: Vec<SatKind>,
+    sat_kinds: Vec<KindId>,
     sat_rects: Vec<Rect>,
     edges: Vec<EdgeInst>,
     ns_edge_range: Vec<Range<u32>>,
@@ -89,11 +89,29 @@ struct Topology {
 
 #[derive(Resource)]
 struct Aggregates {
-    pod_health: Vec<Health>,
-    wl_health: Vec<Health>,
+    pod_state: Vec<State>,
+    wl_rollup: Vec<Severity>,
+    ns_rollup: Vec<Severity>,
     ns_unhealthy: Vec<f32>,
     wl_sev_counts: Vec<[u32; 4]>,
+    /// Per-severity histograms, kept per scope for the same reason they are kept
+    /// per owner: a max cannot be lowered incrementally, but a histogram can, so
+    /// a pod leaving Err drops the rollup without rescanning the scope.
+    ns_sev_counts: Vec<[u32; 4]>,
     ns_unhealthy_count: Vec<u32>,
+}
+
+/// The highest severity present in a per-severity histogram.
+fn rollup_of(counts: &[u32; 4]) -> Severity {
+    if counts[3] > 0 {
+        Severity::Err
+    } else if counts[2] > 0 {
+        Severity::Warn
+    } else if counts[1] > 0 {
+        Severity::Unknown
+    } else {
+        Severity::Ok
+    }
 }
 
 #[derive(Resource)]
@@ -183,29 +201,39 @@ fn rollup(
 
     for &(iu, new) in &dirty_pods.0 {
         let i = iu as usize;
-        let old = agg.pod_health[i];
-        if old != new {
-            agg.pod_health[i] = new;
-            for p in &mut pool.pending {
-                if !p.all {
-                    p.pods.push(iu);
-                }
+        let old = agg.pod_state[i];
+        if old == new {
+            continue;
+        }
+        agg.pod_state[i] = new;
+        for p in &mut pool.pending {
+            if !p.all {
+                p.pods.push(iu);
             }
-            let wl = topo.pod_wl[i];
-            let sev = &mut agg.wl_sev_counts[wl as usize];
-            sev[old.severity() as usize] -= 1;
-            sev[new.severity() as usize] += 1;
-            if old.is_unhealthy() != new.is_unhealthy() {
-                let ns = topo.wl_ns[wl as usize] as usize;
-                if new.is_unhealthy() {
-                    agg.ns_unhealthy_count[ns] += 1;
-                } else {
-                    agg.ns_unhealthy_count[ns] -= 1;
-                }
+        }
+        if old.severity == new.severity {
+            // The reason moved but the severity did not, so the pod repaints and
+            // every rollup above it is provably unchanged. Skipping the histogram
+            // work here is what keeps a reason-only update O(1).
+            continue;
+        }
+        let wl = topo.pod_wl[i];
+        let ns = topo.wl_ns[wl as usize] as usize;
+        let sev = &mut agg.wl_sev_counts[wl as usize];
+        sev[old.severity.rank() as usize] -= 1;
+        sev[new.severity.rank() as usize] += 1;
+        let nsev = &mut agg.ns_sev_counts[ns];
+        nsev[old.severity.rank() as usize] -= 1;
+        nsev[new.severity.rank() as usize] += 1;
+        if old.severity.is_unhealthy() != new.severity.is_unhealthy() {
+            if new.severity.is_unhealthy() {
+                agg.ns_unhealthy_count[ns] += 1;
+            } else {
+                agg.ns_unhealthy_count[ns] -= 1;
             }
-            if !std::mem::replace(&mut scratch.wl_stamp[wl as usize], true) {
-                scratch.wl_list.push(wl);
-            }
+        }
+        if !std::mem::replace(&mut scratch.wl_stamp[wl as usize], true) {
+            scratch.wl_list.push(wl);
         }
     }
     dirty_pods.0.clear();
@@ -214,16 +242,7 @@ fn rollup(
     }
 
     for &wl in &scratch.wl_list {
-        let counts = &agg.wl_sev_counts[wl as usize];
-        agg.wl_health[wl as usize] = if counts[3] > 0 {
-            Health::Err
-        } else if counts[2] > 0 {
-            Health::Warn
-        } else if counts[1] > 0 {
-            Health::Unknown
-        } else {
-            Health::Ok
-        };
+        agg.wl_rollup[wl as usize] = rollup_of(&agg.wl_sev_counts[wl as usize]);
         let ns = topo.wl_ns[wl as usize];
         if !std::mem::replace(&mut scratch.ns_stamp[ns as usize], true) {
             scratch.ns_list.push(ns);
@@ -233,6 +252,7 @@ fn rollup(
         let range = &topo.ns_pod_range[ns as usize];
         let total = (range.end - range.start).max(1) as f32;
         agg.ns_unhealthy[ns as usize] = agg.ns_unhealthy_count[ns as usize] as f32 / total;
+        agg.ns_rollup[ns as usize] = rollup_of(&agg.ns_sev_counts[ns as usize]);
     }
 
     for p in &mut pool.pending {
@@ -271,13 +291,17 @@ fn materialize_into(snap: &mut SceneSnapshot, topo: &Topology, agg: &Aggregates,
             .zip(&topo.ns_wl_range)
             .zip(&topo.ns_pod_range)
             .zip(&agg.ns_unhealthy)
+            .zip(&agg.ns_rollup)
             .map(
-                |((((&rect, label), wl_range), pod_range), &unhealthy_frac)| NsNode {
+                |(((((&rect, label), wl_range), pod_range), &unhealthy_frac), &rollup)| NsNode {
                     rect,
                     label: label.clone(),
                     weight: pod_range.end - pod_range.start,
                     children: wl_range.clone(),
-                    ext: NsExt { unhealthy_frac },
+                    ext: NsExt {
+                        unhealthy_frac,
+                        rollup,
+                    },
                 },
             ),
     );
@@ -293,11 +317,11 @@ fn materialize_into(snap: &mut SceneSnapshot, topo: &Topology, agg: &Aggregates,
             .zip(&topo.wl_kinds)
             .zip(&topo.wl_tools)
             .zip(&topo.wl_ns)
-            .zip(&agg.wl_health)
+            .zip(&agg.wl_rollup)
             .map(
                 |(
                     (((((((&rect, &inner), label), pod_range), sat_range), &kind), &tool), &ns),
-                    &health,
+                    &rollup,
                 )| {
                     WorkloadNode {
                         rect,
@@ -308,7 +332,7 @@ fn materialize_into(snap: &mut SceneSnapshot, topo: &Topology, agg: &Aggregates,
                         ext: WlExt {
                             kind,
                             tool,
-                            health,
+                            rollup,
                             ns,
                         },
                     }
@@ -321,11 +345,11 @@ fn materialize_into(snap: &mut SceneSnapshot, topo: &Topology, agg: &Aggregates,
         topo.pod_rects
             .iter()
             .zip(&topo.pod_labels)
-            .zip(&agg.pod_health)
-            .map(|((&rect, label), &health)| PodNode {
+            .zip(&agg.pod_state)
+            .map(|((&rect, label), &state)| PodNode {
                 rect,
                 label: label.clone(),
-                ext: PodExt { health },
+                ext: PodExt { state },
             }),
     );
 
@@ -395,13 +419,15 @@ fn extract(
         }
         let snap = Arc::make_mut(buf);
         for &i in &pending.pods {
-            snap.cells[i as usize].ext.health = agg.pod_health[i as usize];
+            snap.cells[i as usize].ext.state = agg.pod_state[i as usize];
         }
         for &i in &pending.wls {
-            snap.blocks[i as usize].ext.health = agg.wl_health[i as usize];
+            snap.blocks[i as usize].ext.rollup = agg.wl_rollup[i as usize];
         }
         for &i in &pending.nss {
-            snap.regions[i as usize].ext.unhealthy_frac = agg.ns_unhealthy[i as usize];
+            let ext = &mut snap.regions[i as usize].ext;
+            ext.unhealthy_frac = agg.ns_unhealthy[i as usize];
+            ext.rollup = agg.ns_rollup[i as usize];
         }
         snap.rev = rev.0;
     }
@@ -466,11 +492,14 @@ impl PublishBench {
             let stride = (n / k.max(1)).max(1);
             (0..k.min(n)).map(|j| ((j * stride) % n) as u32).collect()
         };
-        update_pod_healths(&mut self.world, &indices, |cur| match cur {
-            Health::Ok => Health::Warn,
-            Health::Warn => Health::Err,
-            Health::Err => Health::Unknown,
-            Health::Unknown => Health::Ok,
+        // Rotates through one reason per severity, so churn still moves severity
+        // on every step (the idle invariant depends on churn actually changing
+        // something) while exercising the reason channel the model just gained.
+        update_pod_states(&mut self.world, &indices, |cur| match cur.severity {
+            Severity::Ok => State::of(ReasonId::NOT_READY),
+            Severity::Warn => State::of(ReasonId::CRASH_LOOP_BACK_OFF),
+            Severity::Err => State::of(ReasonId::UNKNOWN),
+            Severity::Unknown => State::of(ReasonId::RUNNING),
         });
     }
 
@@ -506,7 +535,7 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
     let mut wl_sat_range = Vec::new();
     let mut pod_labels = Vec::new();
     let mut pod_wl = Vec::new();
-    let mut pod_health = Vec::new();
+    let mut pod_state = Vec::new();
     let mut sat_labels = Vec::new();
     let mut sat_details = Vec::new();
     let mut sat_kinds = Vec::new();
@@ -523,7 +552,7 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
             for pod in &wl.pods {
                 pod_labels.push(Arc::<str>::from(pod.name.as_str()));
                 pod_wl.push(wl_idx);
-                pod_health.push(pod.health);
+                pod_state.push(pod.state);
             }
             let sat_start = sat_labels.len() as u32;
             if with_sats {
@@ -553,30 +582,24 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
     }
     debug_assert_eq!(sat_labels.len(), lay.sat_rects.len());
 
-    let wl_health: Vec<Health> = wl_pod_range
-        .iter()
-        .map(|r| {
-            (r.start as usize..r.end as usize)
-                .map(|i| pod_health[i])
-                .max_by_key(|h| h.severity())
-                .unwrap_or(Health::Ok)
-        })
-        .collect();
-    let wl_sev_counts: Vec<[u32; 4]> = wl_pod_range
-        .iter()
-        .map(|r| {
-            let mut counts = [0u32; 4];
-            for i in r.start as usize..r.end as usize {
-                counts[pod_health[i].severity() as usize] += 1;
-            }
-            counts
-        })
-        .collect();
+    let sev_counts = |r: &Range<u32>| {
+        let mut counts = [0u32; 4];
+        for i in r.start as usize..r.end as usize {
+            counts[pod_state[i].severity.rank() as usize] += 1;
+        }
+        counts
+    };
+    let wl_sev_counts: Vec<[u32; 4]> = wl_pod_range.iter().map(sev_counts).collect();
+    let wl_rollup: Vec<Severity> = wl_sev_counts.iter().map(rollup_of).collect();
+    // Scopes histogram their own pods rather than folding the owner rollups,
+    // because a rollup has already lost the counts needed to decrement it later.
+    let ns_sev_counts: Vec<[u32; 4]> = ns_pod_range.iter().map(sev_counts).collect();
+    let ns_rollup: Vec<Severity> = ns_sev_counts.iter().map(rollup_of).collect();
     let ns_unhealthy_count: Vec<u32> = ns_pod_range
         .iter()
         .map(|r| {
             (r.start as usize..r.end as usize)
-                .filter(|&i| pod_health[i].is_unhealthy())
+                .filter(|&i| pod_state[i].severity.is_unhealthy())
                 .count() as u32
         })
         .collect();
@@ -588,7 +611,7 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
 
     let mut world = World::new();
     let pod_entities: Vec<Entity> = world
-        .spawn_batch(pod_health.iter().map(|&h| (PodH(h),)).collect::<Vec<_>>())
+        .spawn_batch(pod_state.iter().map(|&h| (PodH(h),)).collect::<Vec<_>>())
         .collect();
 
     world.insert_resource(Topology {
@@ -617,10 +640,12 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
         bounds: lay.bounds,
     });
     world.insert_resource(Aggregates {
-        pod_health,
-        wl_health,
+        pod_state,
+        wl_rollup,
+        ns_rollup,
         ns_unhealthy,
         wl_sev_counts,
+        ns_sev_counts,
         ns_unhealthy_count,
     });
     world.insert_resource(SceneOut(scene));
@@ -636,12 +661,14 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
     (world, schedule)
 }
 
-fn weighted_health(rng: &mut ChaCha8Rng) -> Health {
+/// One draw against the same thresholds as before, so churn behaviour is
+/// unchanged; the reason now travels with the severity.
+fn weighted_state(rng: &mut ChaCha8Rng) -> State {
     match rng.random_range(0..100u32) {
-        0..90 => Health::Ok,
-        90..94 => Health::Warn,
-        94..98 => Health::Err,
-        _ => Health::Unknown,
+        0..90 => State::of(ReasonId::RUNNING),
+        90..94 => State::of(ReasonId::NOT_READY),
+        94..98 => State::of(ReasonId::CRASH_LOOP_BACK_OFF),
+        _ => State::of(ReasonId::UNKNOWN),
     }
 }
 
@@ -702,8 +729,8 @@ fn spawn_world_boxed(
                     if n > 0 {
                         for _ in 0..flips {
                             let i = rng.random_range(0..n);
-                            let new = weighted_health(&mut rng);
-                            set_pod_health(&mut world, i as u32, new);
+                            let new = weighted_state(&mut rng);
+                            set_pod_state(&mut world, i as u32, new);
                         }
                     }
                 }
@@ -739,14 +766,26 @@ mod tests {
         })
     }
 
+    /// Tests reason about severities; the model stores a reason alongside one.
+    /// A single representative reason per severity keeps these cases readable and
+    /// still exercises the reason channel end to end.
+    fn st(sev: Severity) -> State {
+        match sev {
+            Severity::Ok => State::of(ReasonId::RUNNING),
+            Severity::Unknown => State::of(ReasonId::UNKNOWN),
+            Severity::Warn => State::of(ReasonId::NOT_READY),
+            Severity::Err => State::of(ReasonId::CRASH_LOOP_BACK_OFF),
+        }
+    }
+
     fn flip_to_other(world: &mut World, pod: usize) {
-        let cur = world.resource::<Aggregates>().pod_health[pod];
-        let new = if cur == Health::Err {
-            Health::Warn
+        let cur = world.resource::<Aggregates>().pod_state[pod];
+        let new = if cur.severity == Severity::Err {
+            State::of(ReasonId::NOT_READY)
         } else {
-            Health::Err
+            State::of(ReasonId::CRASH_LOOP_BACK_OFF)
         };
-        set_pod_health(world, pod as u32, new);
+        set_pod_state(world, pod as u32, new);
     }
 
     fn assert_published_matches_full(world: &World, snap: &SceneSnapshot) {
@@ -757,17 +796,22 @@ mod tests {
         assert_eq!(snap.blocks.len(), full.blocks.len());
         assert_eq!(snap.regions.len(), full.regions.len());
         for (i, (a, b)) in snap.cells.iter().zip(&full.cells).enumerate() {
-            assert_eq!(a.ext.health, b.ext.health, "cell {i} at rev {}", snap.rev);
+            assert_eq!(a.ext.state, b.ext.state, "cell {i} at rev {}", snap.rev);
             assert_eq!(a.rect, b.rect, "cell {i} rect at rev {}", snap.rev);
         }
         for (i, (a, b)) in snap.blocks.iter().zip(&full.blocks).enumerate() {
-            assert_eq!(a.ext.health, b.ext.health, "block {i} at rev {}", snap.rev);
+            assert_eq!(a.ext.rollup, b.ext.rollup, "block {i} at rev {}", snap.rev);
             assert_eq!(a.children, b.children, "block {i} children");
         }
         for (i, (a, b)) in snap.regions.iter().zip(&full.regions).enumerate() {
             assert_eq!(
                 a.ext.unhealthy_frac, b.ext.unhealthy_frac,
                 "region {i} at rev {}",
+                snap.rev
+            );
+            assert_eq!(
+                a.ext.rollup, b.ext.rollup,
+                "region {i} rollup at rev {}",
                 snap.rev
             );
         }
@@ -788,18 +832,18 @@ mod tests {
             );
             let mut expect = [0u32; 4];
             for i in range.start as usize..range.end as usize {
-                expect[agg.pod_health[i].severity() as usize] += 1;
+                expect[agg.pod_state[i].severity.rank() as usize] += 1;
             }
             assert_eq!(counts, expect, "workload {wl} severity counts drifted");
             let worst = (range.start as usize..range.end as usize)
-                .map(|i| agg.pod_health[i])
-                .max_by_key(|h| h.severity())
-                .unwrap_or(Health::Ok);
-            assert_eq!(agg.wl_health[wl], worst, "workload {wl} health drifted");
+                .map(|i| agg.pod_state[i].severity)
+                .max()
+                .unwrap_or(Severity::Ok);
+            assert_eq!(agg.wl_rollup[wl], worst, "workload {wl} rollup drifted");
         }
         for (ns, range) in topo.ns_pod_range.iter().enumerate() {
             let unhealthy = (range.start as usize..range.end as usize)
-                .filter(|&i| agg.pod_health[i].is_unhealthy())
+                .filter(|&i| agg.pod_state[i].severity.is_unhealthy())
                 .count() as u32;
             assert_eq!(
                 agg.ns_unhealthy_count[ns], unhealthy,
@@ -833,14 +877,14 @@ mod tests {
         schedule.run(&mut world);
         assert_eq!(scene.load().rev, 1);
 
-        set_pod_health(&mut world, 0, Health::Err);
+        set_pod_state(&mut world, 0, st(Severity::Err));
         schedule.run(&mut world);
         let snap = scene.load();
         assert_eq!(snap.rev, 2);
-        assert_eq!(snap.cells[0].ext.health, Health::Err);
+        assert_eq!(snap.cells[0].ext.state.severity, Severity::Err);
         let pod_rect = snap.cells[0].rect;
         let owner = &snap.blocks[world.resource::<Topology>().pod_wl[0] as usize];
-        assert_eq!(owner.ext.health, Health::Err);
+        assert_eq!(owner.ext.rollup, Severity::Err);
         assert!(owner.rect.intersects(&pod_rect));
     }
 
@@ -855,15 +899,15 @@ mod tests {
         let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
         schedule.run(&mut world);
 
-        let flip = |world: &mut World, pod: usize, h: Health| {
-            set_pod_health(world, pod as u32, h);
+        let flip = |world: &mut World, pod: usize, h: Severity| {
+            set_pod_state(world, pod as u32, st(h));
         };
 
-        flip(&mut world, 0, Health::Err);
+        flip(&mut world, 0, Severity::Err);
         schedule.run(&mut world);
-        flip(&mut world, 1, Health::Warn);
+        flip(&mut world, 1, Severity::Warn);
         schedule.run(&mut world);
-        flip(&mut world, 2, Health::Unknown);
+        flip(&mut world, 2, Severity::Unknown);
         schedule.run(&mut world);
 
         let snap = scene.load_full();
@@ -875,18 +919,18 @@ mod tests {
         };
         assert_eq!(snap.cells.len(), full.cells.len());
         for (a, b) in snap.cells.iter().zip(full.cells.iter()) {
-            assert_eq!(a.ext.health, b.ext.health);
+            assert_eq!(a.ext.state, b.ext.state);
         }
         for (a, b) in snap.blocks.iter().zip(full.blocks.iter()) {
-            assert_eq!(a.ext.health, b.ext.health);
+            assert_eq!(a.ext.rollup, b.ext.rollup);
         }
         for (a, b) in snap.regions.iter().zip(full.regions.iter()) {
             assert_eq!(a.ext.unhealthy_frac, b.ext.unhealthy_frac);
         }
         assert_eq!(snap.region_edges.len(), snap.regions.len());
-        assert_eq!(snap.cells[0].ext.health, Health::Err);
-        assert_eq!(snap.cells[1].ext.health, Health::Warn);
-        assert_eq!(snap.cells[2].ext.health, Health::Unknown);
+        assert_eq!(snap.cells[0].ext.state.severity, Severity::Err);
+        assert_eq!(snap.cells[1].ext.state.severity, Severity::Warn);
+        assert_eq!(snap.cells[2].ext.state.severity, Severity::Unknown);
     }
 
     #[test]
@@ -901,27 +945,30 @@ mod tests {
         schedule.run(&mut world);
 
         let held = scene.load_full();
-        let held_health: Vec<Health> = held.cells.iter().map(|c| c.ext.health).collect();
+        let held_health: Vec<Severity> = held.cells.iter().map(|c| c.ext.state.severity).collect();
 
-        let flip = |world: &mut World, pod: usize, h: Health| {
-            set_pod_health(world, pod as u32, h);
+        let flip = |world: &mut World, pod: usize, h: Severity| {
+            set_pod_state(world, pod as u32, st(h));
         };
         let target = held_health
             .iter()
-            .position(|&h| h != Health::Err)
+            .position(|&h| h != Severity::Err)
             .expect("some pod not already Err");
-        flip(&mut world, target, Health::Err);
+        flip(&mut world, target, Severity::Err);
         schedule.run(&mut world);
-        flip(&mut world, target, Health::Warn);
+        flip(&mut world, target, Severity::Warn);
         schedule.run(&mut world);
 
         assert_eq!(held.rev, 1, "reader's snapshot changed under it");
         for (cell, &h) in held.cells.iter().zip(&held_health) {
-            assert_eq!(cell.ext.health, h, "reader's snapshot changed under it");
+            assert_eq!(
+                cell.ext.state.severity, h,
+                "reader's snapshot changed under it"
+            );
         }
         let fresh = scene.load_full();
         assert_eq!(fresh.rev, 3);
-        assert_eq!(fresh.cells[target].ext.health, Health::Warn);
+        assert_eq!(fresh.cells[target].ext.state.severity, Severity::Warn);
     }
 
     #[test]
@@ -961,7 +1008,8 @@ mod tests {
         schedule.run(&mut world);
 
         let pinned = scene.load_full();
-        let pinned_health: Vec<Health> = pinned.cells.iter().map(|c| c.ext.health).collect();
+        let pinned_health: Vec<Severity> =
+            pinned.cells.iter().map(|c| c.ext.state.severity).collect();
         let mut recent: VecDeque<Arc<SceneSnapshot>> = VecDeque::new();
         recent.push_back(scene.load_full());
 
@@ -988,7 +1036,10 @@ mod tests {
         assert_eq!(stats.full_materializes as usize, SNAPSHOT_POOL_DEPTH);
         assert_eq!(pinned.rev, 1);
         for (i, (cell, &h)) in pinned.cells.iter().zip(&pinned_health).enumerate() {
-            assert_eq!(cell.ext.health, h, "pinned snapshot cell {i} changed");
+            assert_eq!(
+                cell.ext.state.severity, h,
+                "pinned snapshot cell {i} changed"
+            );
         }
     }
 
@@ -1009,45 +1060,50 @@ mod tests {
         let pods: Vec<u32> = world.resource::<Topology>().wl_pod_range[wl]
             .clone()
             .collect();
-        let originals: Vec<Health> = pods
+        let originals: Vec<State> = pods
             .iter()
-            .map(|&i| world.resource::<Aggregates>().pod_health[i as usize])
+            .map(|&i| world.resource::<Aggregates>().pod_state[i as usize])
             .collect();
 
         for h in [
-            Health::Err,
-            Health::Warn,
-            Health::Ok,
-            Health::Unknown,
-            Health::Err,
+            Severity::Err,
+            Severity::Warn,
+            Severity::Ok,
+            Severity::Unknown,
+            Severity::Err,
         ] {
-            set_pod_health(&mut world, pods[0], h);
+            set_pod_state(&mut world, pods[0], st(h));
         }
-        set_pod_health(&mut world, pods[0], originals[0]);
-        set_pod_health(&mut world, pods[1], Health::Err);
-        set_pod_health(&mut world, pods[1], Health::Warn);
-        set_pod_health(&mut world, pods[2], Health::Unknown);
+        set_pod_state(&mut world, pods[0], originals[0]);
+        set_pod_state(&mut world, pods[1], st(Severity::Err));
+        set_pod_state(&mut world, pods[1], st(Severity::Warn));
+        set_pod_state(&mut world, pods[2], st(Severity::Unknown));
         schedule.run(&mut world);
 
         assert_rollup_arithmetic(&world);
         assert_eq!(
-            world.resource::<Aggregates>().pod_health[pods[0] as usize],
+            world.resource::<Aggregates>().pod_state[pods[0] as usize],
             originals[0]
         );
         assert_eq!(
-            world.resource::<Aggregates>().pod_health[pods[1] as usize],
-            Health::Warn
+            world.resource::<Aggregates>().pod_state[pods[1] as usize],
+            st(Severity::Warn)
         );
         assert_published_matches_full(&world, &scene.load_full());
 
         for round in 0..4u32 {
             for (slot, &pod) in pods.iter().enumerate() {
-                for h in [Health::Err, Health::Ok, Health::Warn, Health::Unknown] {
-                    set_pod_health(&mut world, pod, h);
+                for h in [
+                    Severity::Err,
+                    Severity::Ok,
+                    Severity::Warn,
+                    Severity::Unknown,
+                ] {
+                    set_pod_state(&mut world, pod, st(h));
                 }
-                set_pod_health(&mut world, pod, originals[slot]);
+                set_pod_state(&mut world, pod, originals[slot]);
                 if (slot as u32).is_multiple_of(round + 1) {
-                    set_pod_health(&mut world, pod, Health::Err);
+                    set_pod_state(&mut world, pod, st(Severity::Err));
                 }
             }
             schedule.run(&mut world);
@@ -1056,13 +1112,13 @@ mod tests {
         }
 
         for (slot, &pod) in pods.iter().enumerate() {
-            set_pod_health(&mut world, pod, originals[slot]);
+            set_pod_state(&mut world, pod, originals[slot]);
         }
         schedule.run(&mut world);
         assert_rollup_arithmetic(&world);
         for (slot, &pod) in pods.iter().enumerate() {
             assert_eq!(
-                world.resource::<Aggregates>().pod_health[pod as usize],
+                world.resource::<Aggregates>().pod_state[pod as usize],
                 originals[slot]
             );
         }
