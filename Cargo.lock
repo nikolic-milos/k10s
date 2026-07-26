@@ -348,6 +348,7 @@ dependencies = [
  "compression-core",
  "futures-io",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -3009,13 +3010,16 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
+ "base64",
  "bytes",
  "futures-channel",
  "futures-util",
  "http",
  "http-body",
  "hyper",
+ "ipnet",
  "libc",
+ "percent-encoding",
  "pin-project-lite",
  "socket2",
  "tokio",
@@ -3250,6 +3254,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipnet"
+version = "2.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+
+[[package]]
 name = "is-docker"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3452,6 +3462,7 @@ dependencies = [
  "gpui_platform",
  "k10s-clustergen",
  "k10s-core",
+ "k10s-data",
  "k10s-map",
  "k10s-world",
 ]
@@ -3485,10 +3496,16 @@ name = "k10s-data"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "futures",
+ "http",
  "k10s-core",
+ "k10s-world",
  "k8s-openapi",
  "kube",
+ "serde",
+ "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -3569,6 +3586,7 @@ dependencies = [
  "base64",
  "bytes",
  "either",
+ "form_urlencoded",
  "futures",
  "http",
  "http-body",
@@ -6631,13 +6649,18 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
+ "async-compression",
  "base64",
  "bitflags 2.13.1",
  "bytes",
+ "futures-core",
  "http",
  "http-body",
+ "http-body-util",
  "mime",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
