@@ -9,7 +9,6 @@ workspace = true
 
 [dependencies]
 k10s-core.workspace = true
-k10s-clustergen.workspace = true
 bevy_ecs.workspace = true
 crossbeam-channel.workspace = true
 rand.workspace = true
@@ -17,6 +16,9 @@ rand_chacha.workspace = true
 
 [dev-dependencies]
 k10s-atlas = { workspace = true, features = ["testing"] }
+# The generator is a producer to test and bench against, not something the world
+# builds on: its only input contract is the ingest stream.
+k10s-clustergen.workspace = true
 
 [[bench]]
 name = "publish"

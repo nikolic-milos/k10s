@@ -1,16 +1,23 @@
+pub mod ingest;
 pub mod layout;
 pub mod model;
+pub mod replay;
 
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
+pub use ingest::{
+    Capability, DEFAULT_INTAKE_CAPACITY, DesyncReason, IngestEvent, Intake, IntakeStats, Op,
+    Payload, ResourceEvent,
+};
 pub use k10s_atlas::{BlockNode, CellNode, Edge, Endpoint, Level, Rect, RegionNode, Scene, Totals};
 pub use model::{
     BUILTIN_KIND_COUNT, BUILTIN_KINDS, BUILTIN_REASON_COUNT, BUILTIN_REASONS, BUILTIN_TOOL_COUNT,
     BUILTIN_TOOLS, Catalog, KindEntry, KindId, KindInfo, ReasonId, ReasonInfo, Role, Severity,
     State, ToolId, ToolInfo, kind_role, kind_short, reason_severity,
 };
+pub use replay::RecordedStream;
 
 #[derive(Debug, Clone, Copy)]
 pub struct NsExt {

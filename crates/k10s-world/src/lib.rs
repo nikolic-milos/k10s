@@ -1,3 +1,4 @@
+pub mod input;
 pub mod layout;
 
 use std::ops::Range;
@@ -5,11 +6,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::input::ClusterInput;
 use bevy_ecs::prelude::*;
 use crossbeam_channel::Receiver;
-use k10s_clustergen::ClusterSpec;
 use k10s_core::{
-    EdgeInst, KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, Rect, SatExt, SatNode,
+    EdgeInst, IngestEvent, KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, Rect, SatExt, SatNode,
     SceneSnapshot, Severity, SharedScene, State, ToolId, Totals, WlExt, WorkloadNode, WorldCtrl,
 };
 use rand::prelude::*;
@@ -445,9 +446,9 @@ pub struct ExtractBench {
 }
 
 impl ExtractBench {
-    pub fn new(spec: ClusterSpec, mode: LayoutMode) -> Self {
+    pub fn new(events: &[IngestEvent], mode: LayoutMode) -> Self {
         let scene = k10s_core::new_shared_scene();
-        let (mut world, mut schedule) = build_world(&spec, scene, mode);
+        let (mut world, mut schedule) = build_world_from_stream(events, scene, mode);
         schedule.run(&mut world);
         Self { world, schedule }
     }
@@ -478,9 +479,9 @@ pub struct PublishBench {
 }
 
 impl PublishBench {
-    pub fn new(spec: ClusterSpec, mode: LayoutMode) -> Self {
+    pub fn new(events: &[IngestEvent], mode: LayoutMode) -> Self {
         let scene = k10s_core::new_shared_scene();
-        let (mut world, mut schedule) = build_world(&spec, scene, mode);
+        let (mut world, mut schedule) = build_world_from_stream(events, scene, mode);
 
         schedule.run(&mut world);
         world.resource_mut::<Dirty>().0 = true;
@@ -523,8 +524,27 @@ impl PublishBench {
     }
 }
 
-fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (World, Schedule) {
+/// Builds a world from an ingest stream, which is the only input contract now.
+///
+/// Folding first and laying out second is why this takes a whole stream rather
+/// than events one at a time: layout places every island in one pass.
+pub fn build_world_from_stream(
+    events: &[IngestEvent],
+    scene: SharedScene,
+    mode: LayoutMode,
+) -> (World, Schedule) {
+    let (input, fold_stats) = input::fold(events);
+    debug_assert_eq!(
+        fold_stats,
+        input::FoldStats::default(),
+        "a conforming initial sync leaves nothing unplaced"
+    );
+    build_world(&input, scene, mode)
+}
+
+fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (World, Schedule) {
     let lay = layout::layout(spec, mode);
+    let owner_index = spec.owner_indices();
     let with_sats = mode.emits_attachments();
 
     let mut ns_labels = Vec::new();
@@ -544,6 +564,7 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
     let mut sat_kinds = Vec::new();
     let mut edges = Vec::new();
     let mut ns_edge_range = Vec::with_capacity(spec.namespaces.len());
+    let mut cross_pending: Vec<(u32, u32)> = Vec::new();
 
     for (ni, ns) in spec.namespaces.iter().enumerate() {
         let wl_start = wl_labels.len() as u32;
@@ -553,29 +574,40 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
             let wl_idx = wl_labels.len() as u32;
             let pod_start = pod_labels.len() as u32;
             for pod in &wl.pods {
-                pod_labels.push(Arc::<str>::from(pod.name.as_str()));
+                pod_labels.push(pod.name.clone());
                 pod_wl.push(wl_idx);
                 pod_state.push(pod.state);
             }
             let sat_start = sat_labels.len() as u32;
             if with_sats {
                 for sat in &wl.sats {
-                    sat_labels.push(Arc::<str>::from(sat.name.as_str()));
-                    sat_details.push(Arc::<str>::from(sat.detail.as_str()));
+                    sat_labels.push(sat.name.clone());
+                    sat_details.push(sat.detail.clone());
                     sat_kinds.push(sat.kind);
                 }
             }
-            for &dep in &wl.deps {
-                edges.push(EdgeInst::blocks(wl_idx, wl_start + dep));
+            // Dependencies arrive as uids, so they can point anywhere. Ones that
+            // stay inside this namespace keep their place in the region's range;
+            // ones that leave it go to the cross tail, which is what makes the
+            // culler's cross-region scan reachable.
+            for target in &wl.depends_on {
+                let Some(&to) = owner_index.get(target) else {
+                    continue;
+                };
+                if to >= wl_start && to < wl_start + ns.workloads.len() as u32 {
+                    edges.push(EdgeInst::blocks(wl_idx, to));
+                } else {
+                    cross_pending.push((wl_idx, to));
+                }
             }
-            wl_labels.push(Arc::<str>::from(wl.name.as_str()));
+            wl_labels.push(wl.name.clone());
             wl_kinds.push(wl.kind);
             wl_tools.push(wl.tool);
             wl_ns.push(ni as u32);
             wl_pod_range.push(pod_start..pod_labels.len() as u32);
             wl_sat_range.push(sat_start..sat_labels.len() as u32);
         }
-        ns_labels.push(Arc::<str>::from(ns.name.as_str()));
+        ns_labels.push(ns.name.clone());
         ns_wl_range.push(wl_start..wl_labels.len() as u32);
         ns_pod_range.push(ns_pod_start..pod_labels.len() as u32);
         ns_edge_range.push(edge_start..edges.len() as u32);
@@ -586,11 +618,8 @@ fn build_world(spec: &ClusterSpec, scene: SharedScene, mode: LayoutMode) -> (Wor
     // stay contiguous and these form a tail the culler visits once per frame
     // rather than per region.
     let cross_start = edges.len() as u32;
-    let wl_total = wl_labels.len() as u32;
-    for &(a, b) in &spec.cross_deps {
-        if a < wl_total && b < wl_total {
-            edges.push(EdgeInst::blocks(a, b));
-        }
+    for (a, b) in cross_pending {
+        edges.push(EdgeInst::blocks(a, b));
     }
     let cross_edge_range = cross_start..edges.len() as u32;
 
@@ -686,7 +715,7 @@ fn weighted_state(rng: &mut ChaCha8Rng) -> State {
 }
 
 pub fn spawn_world(
-    spec: ClusterSpec,
+    events: Vec<IngestEvent>,
     scene: SharedScene,
     ctrl: Receiver<WorldCtrl>,
     seed: u64,
@@ -695,7 +724,7 @@ pub fn spawn_world(
     on_publish: impl Fn() + Send + 'static,
 ) -> JoinHandle<()> {
     spawn_world_boxed(
-        spec,
+        events,
         scene,
         ctrl,
         seed,
@@ -706,7 +735,7 @@ pub fn spawn_world(
 }
 
 fn spawn_world_boxed(
-    spec: ClusterSpec,
+    events: Vec<IngestEvent>,
     scene: SharedScene,
     ctrl: Receiver<WorldCtrl>,
     seed: u64,
@@ -717,8 +746,10 @@ fn spawn_world_boxed(
     std::thread::Builder::new()
         .name("k10s-world".into())
         .spawn(move || {
-            let (mut world, mut schedule) = build_world(&spec, scene, mode);
-            drop(spec);
+            let (mut world, mut schedule) = build_world_from_stream(&events, scene, mode);
+            // The stream is only needed to build; releasing it here keeps the
+            // initial sync from being held for the life of the process.
+            drop(events);
             let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xC0FFEE);
             let tick = Duration::from_secs_f32(1.0 / TICK_HZ);
             let mut churn_on = true;
@@ -772,12 +803,23 @@ mod tests {
     use k10s_clustergen::{GenConfig, Scenario, generate};
     use k10s_core::Level;
 
-    fn platform(seed: u64, target_objects: u32) -> ClusterSpec {
-        generate(&GenConfig {
+    /// Generator to stream to fold. Tests now reach the world only through the
+    /// ingestion contract, which is the point of the seam.
+    fn platform(seed: u64, target_objects: u32) -> ClusterInput {
+        input_of(seed, target_objects, Scenario::Platform)
+    }
+
+    fn input_of(seed: u64, target_objects: u32, scenario: Scenario) -> ClusterInput {
+        input::fold(&stream_of(seed, target_objects, scenario)).0
+    }
+
+    fn stream_of(seed: u64, target_objects: u32, scenario: Scenario) -> Vec<IngestEvent> {
+        let spec = generate(&GenConfig {
             seed,
             target_objects,
-            scenario: Scenario::Platform,
-        })
+            scenario,
+        });
+        k10s_clustergen::stream::snapshot(&spec, true)
     }
 
     /// Tests reason about severities; the model stores a reason alongside one.
@@ -874,11 +916,7 @@ mod tests {
 
     #[test]
     fn initial_snapshot_published_and_rollups_react() {
-        let spec = generate(&GenConfig {
-            seed: 1,
-            target_objects: 3000,
-            scenario: Scenario::Platform,
-        });
+        let spec = input_of(1, 3000, Scenario::Platform);
         let scene = k10s_core::new_shared_scene();
         let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
 
@@ -904,11 +942,7 @@ mod tests {
 
     #[test]
     fn incremental_publish_matches_full_materialize() {
-        let spec = generate(&GenConfig {
-            seed: 3,
-            target_objects: 5_000,
-            scenario: Scenario::Platform,
-        });
+        let spec = input_of(3, 5_000, Scenario::Platform);
         let scene = k10s_core::new_shared_scene();
         let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
         schedule.run(&mut world);
@@ -949,11 +983,7 @@ mod tests {
 
     #[test]
     fn held_buffer_is_never_mutated_under_reader() {
-        let spec = generate(&GenConfig {
-            seed: 4,
-            target_objects: 2_000,
-            scenario: Scenario::Platform,
-        });
+        let spec = input_of(4, 2_000, Scenario::Platform);
         let scene = k10s_core::new_shared_scene();
         let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
         schedule.run(&mut world);
@@ -1262,8 +1292,30 @@ mod tests {
         // cross_edges used to be written as len..len, so the culler's cross-region
         // scan was dead code and no cross-namespace topology could exist.
         let spec = platform(55, 20_000);
+        // The folded input keeps dependencies as uids, so a cross-namespace link is
+        // one whose target resolves outside the source's namespace.
+        let owner_index = spec.owner_indices();
+        let ns_of_block: Vec<u32> = spec
+            .namespaces
+            .iter()
+            .enumerate()
+            .flat_map(|(ni, ns)| ns.workloads.iter().map(move |_| ni as u32))
+            .collect();
+        let crossing = spec
+            .namespaces
+            .iter()
+            .enumerate()
+            .flat_map(|(ni, ns)| ns.workloads.iter().map(move |wl| (ni as u32, wl)))
+            .filter(|(ni, wl)| {
+                wl.depends_on.iter().any(|t| {
+                    owner_index
+                        .get(t)
+                        .is_some_and(|&to| ns_of_block[to as usize] != *ni)
+                })
+            })
+            .count();
         assert!(
-            !spec.cross_deps.is_empty(),
+            crossing > 0,
             "the generator produced no cross-namespace links"
         );
         for mode in [LayoutMode::Dense, LayoutMode::Spread] {
@@ -1316,16 +1368,11 @@ mod tests {
 
     #[test]
     fn publish_hook_fires_per_snapshot_not_per_tick() {
-        let spec = generate(&GenConfig {
-            seed: 2,
-            target_objects: 500,
-            scenario: Scenario::Platform,
-        });
         let scene = k10s_core::new_shared_scene();
         let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
         let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
         let world = spawn_world(
-            spec,
+            stream_of(2, 500, Scenario::Platform),
             scene.clone(),
             ctrl_rx,
             2,

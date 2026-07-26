@@ -62,8 +62,11 @@ fn main() {
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
 
     let (damage_tx, damage_rx) = futures::channel::mpsc::unbounded();
+    // The app wires a producer to the world through the ingestion contract; the
+    // world no longer knows the generator exists. Dense layout omits attachments,
+    // so they are not streamed either.
     let world = k10s_world::spawn_world(
-        spec,
+        k10s_clustergen::stream::snapshot(&spec, args.layout.emits_attachments()),
         scene.clone(),
         ctrl_rx,
         args.seed,
