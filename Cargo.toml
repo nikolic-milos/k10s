@@ -38,11 +38,6 @@ rand_chacha = "0.10"
 serde = "1"
 serde_json = "1"
 
-# `runtime` for the watcher (bookmarks and 410 recovery live there), `oidc` for
-# refresh-token renewal, `http-proxy`/`socks5` because a kubeconfig may name a
-# proxy, `gzip` because the initial LIST is the bytes that matter. `oauth` is
-# deliberately off: it only covers the legacy GCP auth-provider, and current GKE
-# kubeconfigs use an exec plugin, which needs no feature.
 kube = { version = "4.0", features = [
     "runtime",
     "oidc",
