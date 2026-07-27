@@ -110,13 +110,22 @@ pub struct ClusterReport {
     pub kinds_discovered: usize,
     pub kinds_watched: usize,
     pub streams: usize,
-    /// Kinds watched per namespace rather than cluster-wide, which is the shape a
-    /// restricted service account produces.
+    /// Streams scoped to one namespace rather than to the cluster, which is the
+    /// shape a restricted service account produces. Counted per stream, so a kind
+    /// read across three namespaces contributes three.
     pub namespaced_streams: usize,
     pub probe_requests: u32,
     /// The probe could not run, so capabilities gate nothing and a stream's own
     /// 403 is the verdict.
     pub probe_degraded: bool,
+    /// Kinds whose cluster-wide access review never answered. They are attempted
+    /// rather than gated, so a denial on one arrives as a stream error instead of
+    /// a label.
+    pub kinds_unanswered: usize,
+    /// The namespaces a rules review answered for. A kind reported `Forbidden` was
+    /// checked against these and nowhere else, so this is the set `--namespace`
+    /// extends.
+    pub probed_namespaces: Vec<String>,
     pub objects_held: usize,
     pub assemble: AssembleStats,
     pub desyncs: Vec<(KindId, DesyncReason)>,
@@ -353,6 +362,8 @@ pub async fn sync_from(
     report.probe_ms = ms(at_probe);
     report.probe_requests = access.requests;
     report.probe_degraded = access.degraded;
+    report.kinds_unanswered = access.unanswered();
+    report.probed_namespaces = access.namespaces().map(str::to_string).collect();
 
     let attach = attach_kinds(&discovered);
     let pass_through: Vec<KindId> = watch_set
@@ -609,6 +620,8 @@ async fn forward_live(
 /// An object whose parent the index has never seen is held in the store and skipped
 /// rather than emitted as an orphan: the world's fold asserts on orphans, and
 /// inventing a parent would be worse than waiting for the phase that can place it.
+/// A pass-through owner is held to the same rule about itself: it is emitted only
+/// where the sync drew a card for it.
 fn live_event(
     store: &Store,
     index: &Index,
@@ -625,14 +638,25 @@ fn live_event(
     let op = change.op;
     let (parent, payload) = match &staged.detail {
         Detail::Scope => (None, Payload::Scope),
-        Detail::Owner { tool } => (
-            Some(index.scope_uid(&staged.namespace)?.clone()),
-            Payload::Owner {
-                kind: staged.kind,
-                tool: *tool,
-                depends_on: Vec::new(),
-            },
-        ),
+        Detail::Owner { tool } => {
+            // A pass-through kind is watched to resolve ownership, so it has a card
+            // only where assembly promoted one for having nothing above it. Emitting
+            // the rest would stand a ReplicaSet next to its own Deployment the first
+            // time a rolling update touched it, which is the doubling pass-through
+            // exists to prevent. One promoted after the sync waits in the store,
+            // like every other object the index cannot place.
+            if store.is_pass_through(staged.kind) && !index.emitted_owner(uid) {
+                return None;
+            }
+            (
+                Some(index.scope_uid(&staged.namespace)?.clone()),
+                Payload::Owner {
+                    kind: staged.kind,
+                    tool: *tool,
+                    depends_on: live_depends_on(index, staged),
+                },
+            )
+        }
         Detail::Instance { reason, .. } => (
             Some(index.parent_of(uid)?.clone()),
             Payload::Instance {
@@ -664,6 +688,24 @@ fn live_event(
         op,
         payload,
     }))
+}
+
+/// What one live owner depends on, by the rule the initial sync used: its
+/// controlling reference, and only where that names an owner with a card.
+///
+/// Not the whole truth, and the gap is one-sided. An owner the live phase itself
+/// emitted is not in the index, so an edge onto it is missing here rather than
+/// pointing at a workload the world does not have — the same reason that owner's
+/// instances are not placed either, and the same phase closes both. What follows for
+/// a phase-D apply: it may add every edge this names, and must not read a short list
+/// as the owner having lost the rest.
+fn live_depends_on(index: &Index, staged: &Staged) -> Vec<Arc<str>> {
+    staged
+        .controller
+        .as_ref()
+        .filter(|c| index.emitted_owner(&c.uid))
+        .map(|c| vec![c.uid.clone()])
+        .unwrap_or_default()
 }
 
 /// The capability verdict for every kind worth reporting.
@@ -725,7 +767,8 @@ pub fn verdicts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k10s_core::{Intake, replay};
+    use crate::mapping::{Controller, Reason};
+    use k10s_core::{Intake, Role, Severity, ToolId, replay};
 
     #[test]
     fn the_sink_carries_contract_events_to_an_intake() {
@@ -751,6 +794,184 @@ mod tests {
             4
         );
         assert_eq!(plane.metrics(), MetricsSnapshot::default());
+    }
+
+    /// A pass-through kind that is not a built-in, so nothing below can pass on a
+    /// compiled-in id.
+    const RS: KindId = KindId(9_500);
+
+    fn object(kind: KindId, role: Role, uid: &str, name: &str) -> Staged {
+        let namespace = if role == Role::Scope { "" } else { "prod" };
+        Staged {
+            kind,
+            role,
+            uid: uid.into(),
+            namespace: namespace.into(),
+            name: name.into(),
+            resource_version: 7,
+            controller: None,
+            detail: match role {
+                Role::Scope => Detail::Scope,
+                Role::Owner => Detail::Owner { tool: ToolId::NONE },
+                _ => Detail::Instance {
+                    reason: Reason {
+                        severity: Severity::Ok,
+                        display: "Running".into(),
+                    },
+                    labels: Vec::new(),
+                    refs: Vec::new(),
+                },
+            },
+        }
+    }
+
+    fn under(mut staged: Staged, controller: Controller) -> Staged {
+        staged.controller = Some(controller);
+        staged
+    }
+
+    fn ctrl(uid: &str, kind: &str, name: &str, api_version: &str) -> Controller {
+        Controller {
+            uid: uid.into(),
+            kind: kind.into(),
+            name: name.into(),
+            api_version: api_version.into(),
+        }
+    }
+
+    /// What a cold start over these objects would leave to the live phase.
+    fn after_sync(objects: Vec<Staged>) -> (Store, Catalog, assemble::Assembled) {
+        let mut store = Store::new(vec![RS]);
+        for object in objects {
+            store.apply(object);
+        }
+        let mut catalog = Catalog::new();
+        let assembled = assemble::assemble(&store, &mut catalog);
+        (store, catalog, assembled)
+    }
+
+    fn modified(uid: &str) -> Change {
+        Change {
+            op: Op::Modified,
+            uid: uid.into(),
+            removed: None,
+        }
+    }
+
+    fn resource_event(event: Option<IngestEvent>) -> ResourceEvent {
+        match event.expect("an event was built") {
+            IngestEvent::Resource(r) => r,
+            other => panic!("expected a resource event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_live_replicaset_is_emitted_only_where_the_sync_gave_it_a_card() {
+        // Both ReplicaSets change on a rolling update. Emitting the one under the
+        // Deployment would stand a second card beside it and double the Deployment
+        // on the map, which is what pass-through exists to prevent; suppressing the
+        // hand-rolled one would freeze the only card its pods have.
+        let (mut store, mut catalog, assembled) = after_sync(vec![
+            object(KindId::NAMESPACE, Role::Scope, "ns-1", "prod"),
+            object(KindId::DEPLOYMENT, Role::Owner, "dep-1", "api"),
+            under(
+                object(RS, Role::Owner, "rs-1", "api-abc"),
+                ctrl("dep-1", "Deployment", "api", "apps/v1"),
+            ),
+            object(RS, Role::Owner, "rs-2", "hand-rolled"),
+            under(
+                object(KindId::POD, Role::Instance, "pod-1", "api-abc-1"),
+                ctrl("rs-1", "ReplicaSet", "api-abc", "apps/v1"),
+            ),
+            under(
+                object(KindId::POD, Role::Instance, "pod-2", "hand-rolled-1"),
+                ctrl("rs-2", "ReplicaSet", "hand-rolled", "apps/v1"),
+            ),
+        ]);
+        let index = &assembled.index;
+
+        assert!(
+            live_event(&store, index, &mut catalog, &modified("rs-1")).is_none(),
+            "a ReplicaSet under a Deployment has no card to update"
+        );
+        // The promoted one keeps updating, under its namespace and as its own kind.
+        let promoted = resource_event(live_event(&store, index, &mut catalog, &modified("rs-2")));
+        assert_eq!(promoted.parent.as_deref(), Some("ns-1"));
+        assert!(matches!(promoted.payload, Payload::Owner { kind, .. } if kind == RS));
+        // The guard is about pass-through, not about owners.
+        let dep = resource_event(live_event(&store, index, &mut catalog, &modified("dep-1")));
+        assert_eq!(&*dep.uid, "dep-1");
+        // And the pods on both sides are still placed, which is the whole point of
+        // watching a ReplicaSet nobody draws.
+        for (pod, parent) in [("pod-1", "dep-1"), ("pod-2", "rs-2")] {
+            let event = resource_event(live_event(&store, index, &mut catalog, &modified(pod)));
+            assert_eq!(event.parent.as_deref(), Some(parent), "{pod}");
+        }
+
+        // A delete is answered from the copy that went away rather than the store,
+        // and a Deleted for a card the world never had is as wrong as an Added.
+        let removed = store.remove("rs-1").map(Box::new);
+        assert!(removed.is_some(), "the store held it");
+        let vanished = Change {
+            op: Op::Deleted,
+            uid: "rs-1".into(),
+            removed,
+        };
+        assert!(live_event(&store, index, &mut catalog, &vanished).is_none());
+    }
+
+    #[test]
+    fn a_live_owner_repeats_the_dependency_the_sync_gave_it() {
+        // One producer describing the same Job two ways is the defect: the sync
+        // names its CronJob and the live payload used to say the Job depends on
+        // nothing, so a phase-D apply that trusted it would erase the edge on the
+        // Job's first status change.
+        let (store, mut catalog, assembled) = after_sync(vec![
+            object(KindId::NAMESPACE, Role::Scope, "ns-1", "prod"),
+            object(KindId::CRON_JOB, Role::Owner, "cj-1", "nightly"),
+            under(
+                object(KindId::JOB, Role::Owner, "job-1", "nightly-123"),
+                ctrl("cj-1", "CronJob", "nightly", "batch/v1"),
+            ),
+            // A Job under a controller nobody drew: an operator's CRD outside the
+            // watch set, with no pod to discover it from.
+            under(
+                object(KindId::JOB, Role::Owner, "job-2", "adhoc"),
+                ctrl("ro-1", "Rollout", "web", "argoproj.io/v1alpha1"),
+            ),
+        ]);
+        let index = &assembled.index;
+        let from_sync = |uid: &str| {
+            assembled
+                .events
+                .iter()
+                .find_map(|e| match e {
+                    IngestEvent::Resource(r) if &*r.uid == uid => match &r.payload {
+                        Payload::Owner { depends_on, .. } => Some(depends_on.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("the sync emitted this owner")
+        };
+        let live = |uid: &str, catalog: &mut Catalog| {
+            let event = live_event(&store, index, catalog, &modified(uid));
+            match resource_event(event).payload {
+                Payload::Owner { depends_on, .. } => depends_on,
+                other => panic!("expected an owner payload, got {other:?}"),
+            }
+        };
+
+        assert_eq!(live("job-1", &mut catalog), vec![Arc::<str>::from("cj-1")]);
+        assert_eq!(
+            live("job-1", &mut catalog),
+            from_sync("job-1"),
+            "one producer, one answer"
+        );
+        // An endpoint nothing drew is not named at all: a uid the world has no
+        // workload for is a dangling edge, which is worse than a missing one.
+        assert!(live("job-2", &mut catalog).is_empty());
+        assert!(from_sync("job-2").is_empty());
     }
 
     fn resource(

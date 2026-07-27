@@ -127,11 +127,43 @@ pub enum WatchScope {
     Denied,
 }
 
+/// What a cluster-wide access review said about one kind.
+///
+/// Three states rather than a boolean because a review that errored — a 503, a
+/// timeout, an authorization webhook that hiccuped — said nothing about
+/// permission, and recording it as `false` makes it indistinguishable from an
+/// authoritative deny. There is no later chance to tell them apart: a genuinely
+/// restricted account has every cluster-wide answer denied, so "all false" is its
+/// normal state rather than a symptom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Allowed,
+    Denied,
+    /// The review did not complete. Not a denial, and not a grant.
+    Unanswered,
+}
+
+impl Answer {
+    /// The two verbs of a reflection, combined.
+    ///
+    /// A denial from either verb denies the pair, because a reflector needs both.
+    /// A verb that never answered leaves the pair unanswered unless the other
+    /// already settled it: an error on `list` beside a grant on `watch` is still
+    /// no answer about listing.
+    fn and(self, other: Answer) -> Answer {
+        match (self, other) {
+            (Answer::Denied, _) | (_, Answer::Denied) => Answer::Denied,
+            (Answer::Unanswered, _) | (_, Answer::Unanswered) => Answer::Unanswered,
+            (Answer::Allowed, Answer::Allowed) => Answer::Allowed,
+        }
+    }
+}
+
 /// Everything the probe learned.
 #[derive(Debug, Clone, Default)]
 pub struct Access {
     /// Access-review answers for a whole-cluster list-and-watch, per kind.
-    cluster_wide: HashMap<KindId, bool>,
+    cluster_wide: HashMap<KindId, Answer>,
     /// Rules review per namespace, in the order the namespaces were given.
     per_namespace: Vec<(String, RuleSet)>,
     /// The probe itself could not run. Then the capability set cannot gate
@@ -155,6 +187,18 @@ impl Access {
         self.per_namespace.iter().map(|(ns, _)| ns.as_str())
     }
 
+    /// How many kinds the cluster-wide review left unanswered.
+    ///
+    /// Worth reporting rather than only acting on: those kinds are attempted
+    /// rather than gated, so a denial on one arrives as a stream error instead of
+    /// a label.
+    pub fn unanswered(&self) -> usize {
+        self.cluster_wide
+            .values()
+            .filter(|answer| **answer == Answer::Unanswered)
+            .count()
+    }
+
     /// The rules that apply in one namespace, if it was probed.
     pub fn rules(&self, namespace: &str) -> Option<&RuleSet> {
         self.per_namespace
@@ -169,30 +213,44 @@ impl Access {
     /// denied cluster-wide falls back to the namespaces whose rules allow it,
     /// which is what makes a developer with access to two namespaces see two
     /// namespaces rather than nothing.
+    ///
+    /// Only a definite denial narrows anything. An unanswered review is attempted
+    /// cluster-wide, for the same reason `degraded` attempts everything: a 403
+    /// from the stream is a labelled capability, and narrowing to the probed
+    /// namespaces would show a fraction of a cluster we may be allowed to read
+    /// whole, with nothing to say it was a fraction.
     pub fn scope_for(&self, target: &KindTarget) -> WatchScope {
         if self.degraded {
             // Nothing was learned, so attempt it: a 403 from the stream is a
             // labelled capability, while refusing to try is a silent empty list.
             return WatchScope::All;
         }
-        if self.cluster_wide.get(&target.id).copied().unwrap_or(false) {
-            return WatchScope::All;
-        }
-        if !target.namespaced {
-            return WatchScope::Denied;
-        }
-        let allowed: Vec<String> = self
-            .per_namespace
-            .iter()
-            .filter(|(_, rules)| {
-                rules.allows_reflection(target.group(), target.plural()) || rules.is_incomplete()
-            })
-            .map(|(ns, _)| ns.clone())
-            .collect();
-        if allowed.is_empty() {
-            WatchScope::Denied
-        } else {
-            WatchScope::Namespaces(allowed)
+        // A kind nobody asked about is in the same position as one whose review
+        // errored, and `probe` asks about every kind it is given.
+        let answer = self
+            .cluster_wide
+            .get(&target.id)
+            .copied()
+            .unwrap_or(Answer::Unanswered);
+        match answer {
+            Answer::Allowed | Answer::Unanswered => WatchScope::All,
+            Answer::Denied if !target.namespaced => WatchScope::Denied,
+            Answer::Denied => {
+                let allowed: Vec<String> = self
+                    .per_namespace
+                    .iter()
+                    .filter(|(_, rules)| {
+                        rules.allows_reflection(target.group(), target.plural())
+                            || rules.is_incomplete()
+                    })
+                    .map(|(ns, _)| ns.clone())
+                    .collect();
+                if allowed.is_empty() {
+                    WatchScope::Denied
+                } else {
+                    WatchScope::Namespaces(allowed)
+                }
+            }
         }
     }
 
@@ -243,28 +301,39 @@ pub async fn probe(client: &Client, targets: &[WatchTarget], namespaces: &[Strin
     let access_api: Api<SelfSubjectAccessReview> = Api::all(client.clone());
     let mut reviews_failed = 0u32;
     for want in targets {
-        let mut allowed = true;
+        let mut answer = Answer::Allowed;
         for verb in ["list", "watch"] {
             access.requests += 1;
-            match access_api
+            let verdict = match access_api
                 .create(&PostParams::default(), &access_review(&want.target, verb))
                 .await
             {
-                Ok(review) => {
-                    allowed &= review.status.map(|s| s.allowed).unwrap_or(false);
-                }
+                Ok(review) if review.status.as_ref().is_some_and(|s| s.allowed) => Answer::Allowed,
+                Ok(_) => Answer::Denied,
                 Err(_) => {
                     reviews_failed += 1;
-                    allowed = false;
+                    Answer::Unanswered
                 }
-            }
+            };
+            answer = answer.and(verdict);
         }
-        access.cluster_wide.insert(want.target.id, allowed);
+        access.cluster_wide.insert(want.target.id, answer);
     }
 
     // Distinguish "the probe ran and said no" from "the probe could not run".
     // Only the first may gate anything.
-    if reviews_failed > 0 && access.cluster_wide.values().all(|ok| !ok) {
+    //
+    // The cluster-wide half used to ask whether every answer was false, which is
+    // the state a restricted account is legitimately in: one errored review then
+    // declared the whole probe useless, sent every kind cluster-wide and threw
+    // away the per-namespace fallback. An error is now `Unanswered` on its own
+    // kind, so what is left to ask here is whether any kind was answered at all.
+    let answered = access
+        .cluster_wide
+        .values()
+        .filter(|answer| **answer != Answer::Unanswered)
+        .count();
+    if reviews_failed > 0 && answered == 0 {
         access.degraded = true;
     }
     if rules_failed > 0 && access.per_namespace.is_empty() && !namespaces.is_empty() {
@@ -451,6 +520,7 @@ mod tests {
         // authorizer. Disabling an affordance on that basis labels a working
         // feature as forbidden.
         let mut access = Access::default();
+        access.cluster_wide.insert(KindId::POD, Answer::Denied);
         access
             .per_namespace
             .push(("prod".into(), ruleset(Vec::new(), true)));
@@ -464,7 +534,7 @@ mod tests {
     #[test]
     fn cluster_wide_permission_yields_one_stream() {
         let mut access = Access::default();
-        access.cluster_wide.insert(KindId::POD, true);
+        access.cluster_wide.insert(KindId::POD, Answer::Allowed);
         assert_eq!(access.scope_for(&pods()), WatchScope::All);
         assert_eq!(access.verdict(&pods()), Capability::Watchable);
     }
@@ -474,7 +544,7 @@ mod tests {
         // The restricted-developer case, and the one the roadmap calls the normal
         // enterprise case.
         let mut access = Access::default();
-        access.cluster_wide.insert(KindId::POD, false);
+        access.cluster_wide.insert(KindId::POD, Answer::Denied);
         access.per_namespace.push((
             "team-a".into(),
             ruleset(vec![rule(&[""], &["pods"], &["list", "watch"], &[])], false),
@@ -493,7 +563,7 @@ mod tests {
     #[test]
     fn a_cluster_scoped_kind_has_no_namespace_fallback() {
         let mut access = Access::default();
-        access.cluster_wide.insert(KindId::NODE, false);
+        access.cluster_wide.insert(KindId::NODE, Answer::Denied);
         access.per_namespace.push((
             "team-a".into(),
             ruleset(vec![rule(&["*"], &["*"], &["*"], &[])], false),
@@ -503,11 +573,72 @@ mod tests {
     }
 
     #[test]
+    fn an_unanswered_review_is_attempted_at_either_scope() {
+        // The state a boolean could not hold. A review that errored said nothing
+        // about permission, and recording it as a denial made one transient
+        // failure permanent: a cluster-scoped kind became unwatchable outright,
+        // and a namespaced one shrank to whatever the probed namespaces allow.
+        let mut access = Access::default();
+        access.cluster_wide.insert(KindId::NODE, Answer::Unanswered);
+        access.cluster_wide.insert(KindId::POD, Answer::Unanswered);
+        access.per_namespace.push((
+            "team-a".into(),
+            ruleset(vec![rule(&[""], &["pods"], &["list", "watch"], &[])], false),
+        ));
+        assert_eq!(access.scope_for(&nodes()), WatchScope::All);
+        assert_eq!(access.verdict(&nodes()), Capability::Watchable);
+        assert_eq!(
+            access.scope_for(&pods()),
+            WatchScope::All,
+            "a grant in one namespace is no reason to stop asking about the cluster"
+        );
+    }
+
+    #[test]
+    fn one_unanswered_kind_leaves_its_neighbours_alone() {
+        // Unanswered is per kind: the neighbours keep the answers they got, so the
+        // per-namespace fallback still stands beside one attempt. That an errored
+        // review no longer flips `degraded` as well — which would send every one
+        // of them cluster-wide — takes a request to fail, so it is checked against
+        // the scripted API server instead.
+        let mut access = Access::default();
+        access.cluster_wide.insert(KindId::NODE, Answer::Unanswered);
+        access.cluster_wide.insert(KindId::POD, Answer::Denied);
+        access.cluster_wide.insert(KindId::SECRET, Answer::Denied);
+        access.per_namespace.push((
+            "team-a".into(),
+            ruleset(vec![rule(&[""], &["pods"], &["list", "watch"], &[])], false),
+        ));
+        assert_eq!(access.scope_for(&nodes()), WatchScope::All);
+        assert_eq!(
+            access.scope_for(&pods()),
+            WatchScope::Namespaces(vec!["team-a".into()])
+        );
+        let secrets = target("", "Secret", "secrets", true, KindId::SECRET);
+        assert_eq!(access.scope_for(&secrets), WatchScope::Denied);
+        assert_eq!(access.unanswered(), 1);
+    }
+
+    #[test]
+    fn a_denial_on_either_verb_denies_the_pair_and_an_error_does_not() {
+        // A reflector lists and watches, so the two answers combine. The ordering
+        // that matters is the middle pair: a definite denial outranks an error,
+        // because `list` denied is denied whatever `watch` failed to say.
+        use Answer::{Allowed, Denied, Unanswered};
+        assert_eq!(Allowed.and(Allowed), Allowed);
+        assert_eq!(Allowed.and(Denied), Denied);
+        assert_eq!(Denied.and(Unanswered), Denied);
+        assert_eq!(Unanswered.and(Denied), Denied);
+        assert_eq!(Allowed.and(Unanswered), Unanswered);
+        assert_eq!(Unanswered.and(Unanswered), Unanswered);
+    }
+
+    #[test]
     fn forbidden_and_absent_are_different_answers() {
         // Absent means the cluster does not serve it, so it is invisible.
         // Forbidden means it does and we may not look, so it is labelled.
         let mut access = Access::default();
-        access.cluster_wide.insert(KindId::SECRET, false);
+        access.cluster_wide.insert(KindId::SECRET, Answer::Denied);
         let mut unwatchable = target("", "Secret", "secrets", true, KindId::SECRET);
         unwatchable.watchable = false;
         assert_eq!(access.verdict(&unwatchable), Capability::Absent);
@@ -528,11 +659,12 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_probe_denies_rather_than_guessing() {
+    fn a_kind_the_probe_answered_no_for_is_denied() {
         // The difference from `unprobed`: here the probe ran and the answer was
-        // no, which is a real verdict.
+        // no, which is a real verdict. A kind it never answered for is not this
+        // case -- that reads `Unanswered` and attempts the stream.
         let mut access = Access::default();
-        access.cluster_wide.insert(KindId::POD, false);
+        access.cluster_wide.insert(KindId::POD, Answer::Denied);
         assert_eq!(access.scope_for(&pods()), WatchScope::Denied);
         assert_eq!(access.verdict(&pods()), Capability::Forbidden);
     }
@@ -574,7 +706,7 @@ mod tests {
     #[test]
     fn watch_targets_carry_through_to_verdicts() {
         let mut access = Access::default();
-        access.cluster_wide.insert(KindId::POD, true);
+        access.cluster_wide.insert(KindId::POD, Answer::Allowed);
         let w = watch(pods());
         assert_eq!(access.verdict(&w.target), Capability::Watchable);
     }

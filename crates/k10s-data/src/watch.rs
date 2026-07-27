@@ -12,11 +12,21 @@
 //! client that will never be allowed in, so a stream that is denied stops, and the
 //! denial becomes a labelled capability instead of a retry loop.
 //!
+//! **A relist is also a set of deletes.** `watcher` states the consumer's side of
+//! its contract: "any objects that were previously `Applied` but are not listed in
+//! any of the `InitApply` events should be assumed to have been `Deleted`". A 410
+//! resets it to a fresh list and delivers no deletes in between, so the objects
+//! that went away during the gap are knowable only as "held before, not listed
+//! now". [`drive`] keeps the uids one stream holds and turns that difference into
+//! deletes. Per stream rather than per kind, because one kind can be watched across
+//! N namespaces and a shared set would have each relist reap the others' objects.
+//!
 //! Everything decision-shaped is pulled out of the I/O: [`desync_reason`] and
 //! [`signal_of`] are functions over values a real API server could produce, so a
 //! 410 mid-watch and a 403 on start are unit tests rather than things that need a
 //! cluster.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::{StreamExt, stream::BoxStream};
@@ -33,8 +43,12 @@ use crate::rbac::WatchScope;
 /// What one stream says, before it is attributed to a kind.
 #[derive(Debug, PartialEq)]
 pub enum Signal {
-    /// A relist began. Objects arrive again as applies, and since the store is
-    /// keyed by uid that is idempotent, so there is nothing to do here.
+    /// A list began: the objects that exist arrive again as applies, up to the next
+    /// [`Signal::Settled`].
+    ///
+    /// The applies need nothing special, since the store is keyed by uid and a
+    /// re-apply is idempotent. The *absences* are the whole problem: see the module
+    /// doc, and [`drive`], which is where they are turned back into deletes.
     Restarted,
     Apply(Box<Staged>),
     Delete(Arc<str>),
@@ -251,11 +265,26 @@ where
     }
 }
 
+/// What a finished list says has gone: everything the stream still held that the
+/// list did not produce.
+///
+/// Sorted rather than left in hash order, so two runs over the same stream emit the
+/// same deletes in the same order and a recorded stream can be a fixture.
+fn vanished(held: &HashSet<Arc<str>>, listed: &HashSet<Arc<str>>) -> Vec<Arc<str>> {
+    let mut gone: Vec<Arc<str>> = held.difference(listed).cloned().collect();
+    gone.sort_unstable();
+    gone
+}
+
 /// Drives one stream until it ends, translating signals into messages.
 ///
 /// Ends on an unrecoverable reason, which is the only place `is_recoverable` is
 /// load-bearing: `StreamBackoff` would otherwise retry a 403 for as long as the
 /// app runs.
+///
+/// The uid set this holds is the price of the relist sweep: one `Arc<str>` clone per
+/// object this stream carries, against a `Staged` in the store that is an order of
+/// magnitude larger and against the alternative of a store that never shrinks.
 pub async fn drive(
     kind: KindId,
     mut stream: BoxStream<'static, Signal>,
@@ -264,11 +293,33 @@ pub async fn drive(
     let mut listed = false;
     let mut settled_sent = false;
     let mut undecodable = 0u32;
+    // What this stream has applied and not seen deleted, plus — while a list is in
+    // flight — what that list has produced so far. `None` between lists, so the
+    // steady-state watch pays only the one insert per apply.
+    let mut held: HashSet<Arc<str>> = HashSet::new();
+    let mut listing: Option<HashSet<Arc<str>>> = None;
     while let Some(signal) = stream.next().await {
         let send = match signal {
-            Signal::Restarted => continue,
-            Signal::Apply(staged) => Message::Apply { kind, staged },
-            Signal::Delete(uid) => Message::Delete { kind, uid },
+            Signal::Restarted => {
+                listing = Some(HashSet::new());
+                continue;
+            }
+            Signal::Apply(staged) => {
+                if let Some(seen) = &mut listing {
+                    seen.insert(staged.uid.clone());
+                }
+                held.insert(staged.uid.clone());
+                Message::Apply { kind, staged }
+            }
+            Signal::Delete(uid) => {
+                // Dropped from both, so a relist does not report as vanished
+                // something the watch already said had gone.
+                held.remove(&uid);
+                if let Some(seen) = &mut listing {
+                    seen.remove(&uid);
+                }
+                Message::Delete { kind, uid }
+            }
             Signal::Undecodable => {
                 undecodable += 1;
                 // One report per stream: a malformed object is worth counting, not
@@ -283,6 +334,18 @@ pub async fn drive(
             }
             Signal::Settled => {
                 listed = true;
+                // The reaping the module doc describes. On the initial list `held`
+                // is empty, so nothing is swept; a list that arrives in pages is one
+                // `Restarted` and one `Settled` around all of them, so a page
+                // boundary cannot be mistaken for an absence either.
+                if let Some(relisted) = listing.take() {
+                    for uid in vanished(&held, &relisted) {
+                        if tx.send(Message::Delete { kind, uid }).await.is_err() {
+                            return;
+                        }
+                    }
+                    held = relisted;
+                }
                 if settled_sent {
                     // A relist after the initial sync. The collector already knows
                     // this kind is listed.
@@ -512,6 +575,72 @@ mod tests {
                 .count(),
             2,
             "a relist re-applies, which the store coalesces by uid"
+        );
+    }
+
+    #[test]
+    fn a_relist_deletes_what_it_did_not_list() {
+        // The obligation kube-runtime states and leaves to its consumer. A 410
+        // resets the watcher to a fresh list and sends no deletes in between, so
+        // without this an object that went away during the gap is held forever: the
+        // store grows for the life of the process, and from phase D the map shows a
+        // pod the cluster no longer has.
+        let messages = runtime().block_on(collect(vec![
+            Signal::Restarted,
+            Signal::Apply(Box::new(stage_pod(&pod(Some("u1"))).expect("staged"))),
+            Signal::Apply(Box::new(stage_pod(&pod(Some("u2"))).expect("staged"))),
+            Signal::Settled,
+            Signal::Error(DesyncReason::Expired),
+            Signal::Restarted,
+            Signal::Apply(Box::new(stage_pod(&pod(Some("u1"))).expect("staged"))),
+            Signal::Settled,
+        ]));
+        let deleted: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Delete { uid, .. } => Some(&**uid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted, ["u2"], "{messages:?}");
+    }
+
+    #[test]
+    fn an_initial_list_deletes_nothing_and_a_relist_repeats_no_delete() {
+        // Two ways the sweep could reap something that is still there. The first
+        // list has nothing to compare against, and a page boundary is not an
+        // absence: a paged list is one restart and one settle around every page. And
+        // an object the watch already deleted must not be deleted again by the next
+        // relist, which would be a delete for a uid nothing holds.
+        let first = runtime().block_on(collect(vec![
+            Signal::Restarted,
+            Signal::Apply(Box::new(stage_pod(&pod(Some("u1"))).expect("staged"))),
+            Signal::Apply(Box::new(stage_pod(&pod(Some("u2"))).expect("staged"))),
+            Signal::Settled,
+        ]));
+        assert!(
+            first.iter().all(|m| !matches!(m, Message::Delete { .. })),
+            "{first:?}"
+        );
+
+        let after_delete = runtime().block_on(collect(vec![
+            Signal::Restarted,
+            Signal::Apply(Box::new(stage_pod(&pod(Some("u1"))).expect("staged"))),
+            Signal::Apply(Box::new(stage_pod(&pod(Some("u2"))).expect("staged"))),
+            Signal::Settled,
+            Signal::Delete(Arc::from("u2")),
+            Signal::Error(DesyncReason::Expired),
+            Signal::Restarted,
+            Signal::Apply(Box::new(stage_pod(&pod(Some("u1"))).expect("staged"))),
+            Signal::Settled,
+        ]));
+        assert_eq!(
+            after_delete
+                .iter()
+                .filter(|m| matches!(m, Message::Delete { .. }))
+                .count(),
+            1,
+            "{after_delete:?}"
         );
     }
 
