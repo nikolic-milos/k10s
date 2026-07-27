@@ -144,6 +144,17 @@ impl Flight {
         scene: &Scene<R, B, C, S>,
         stats: &mut FrameStats,
     ) -> FlightFrame {
+        // The consumer prints every `Done` and the flight has one report to give. The
+        // view calls `cx.quit()` on it, but a damage notify queued behind that still
+        // paints, and the closing window can go inactive or resize; none of those may
+        // report again or restart the flight.
+        if let Some(camera) = self.at_rest() {
+            return FlightFrame::Idle {
+                camera,
+                arm_timer: None,
+            };
+        }
+
         if scene.rev == 0 || vw <= 0.0 || vh <= 0.0 {
             return FlightFrame::Waiting;
         }
@@ -164,7 +175,9 @@ impl Flight {
                 cam.fit(scene.bounds, vw, vh);
                 return FlightFrame::Camera(cam);
             }
-            self.build(scene, vw, vh, now);
+            if !self.build(scene, vw, vh, now) {
+                return FlightFrame::Aborted;
+            }
             stats.reset();
         } else if (vw, vh) != self.viewport || !active {
             self.restarts += 1;
@@ -195,17 +208,35 @@ impl Flight {
         self.step(now, stats)
     }
 
-    fn build<R, B, C, S>(&mut self, scene: &Scene<R, B, C, S>, vw: f32, vh: f32, now: Instant) {
+    /// False when no region in the scene owns a block, which is a scene the user can
+    /// ask for — the bench flies the generator, and `--objects 0` generates nothing —
+    /// rather than a broken invariant worth panicking a paint pass over.
+    fn build<R, B, C, S>(
+        &mut self,
+        scene: &Scene<R, B, C, S>,
+        vw: f32,
+        vh: f32,
+        now: Instant,
+    ) -> bool {
         self.viewport = (vw, vh);
         self.totals = scene.totals;
 
         let mut fit = Camera::default();
         fit.fit(scene.bounds, vw, vh);
-        let big = scene
+        // `max_by_key` returns the *last* maximum on ties, so a scene where no region
+        // carries any weight anchors on the trailing one, and a region with no blocks
+        // has a `children.start` of exactly `blocks.len()`.
+        let Some(big) = scene
             .regions
             .iter()
+            .filter(|r| !r.children.is_empty())
             .max_by_key(|r| r.weight)
-            .expect("flight needs a non-empty scene");
+        else {
+            eprintln!(
+                "bench: no region in the scene has a block to fly to; aborting. Raise --objects until one does, then re-run."
+            );
+            return false;
+        };
         let block = &scene.blocks[big.children.start as usize];
 
         let mut hub: Option<&crate::scene::BlockNode<B>> = None;
@@ -228,6 +259,7 @@ impl Flight {
             "planner returned an empty flight"
         );
         self.seg_start = now;
+        true
     }
 
     fn step(&mut self, now: Instant, stats: &mut FrameStats) -> FlightFrame {
@@ -289,15 +321,26 @@ impl Flight {
             self.current += 1;
             self.seg_start = now;
             if self.current == self.segments.len() {
-                return FlightFrame::Done(FlightResult {
-                    viewport: [self.viewport.0, self.viewport.1],
-                    totals: self.totals,
-                    segments: std::mem::take(&mut self.results),
-                    restarts: self.restarts,
-                });
+                return self.done();
             }
         }
         FlightFrame::Camera(cam)
+    }
+
+    /// The camera the flight came to rest at, once the last segment has ended and
+    /// `done()` has handed the report over.
+    fn at_rest(&self) -> Option<Camera> {
+        let last = self.segments.last()?;
+        (self.current == self.segments.len()).then_some(last.to)
+    }
+
+    fn done(&mut self) -> FlightFrame {
+        FlightFrame::Done(FlightResult {
+            viewport: [self.viewport.0, self.viewport.1],
+            totals: self.totals,
+            segments: std::mem::take(&mut self.results),
+            restarts: self.restarts,
+        })
     }
 }
 
@@ -512,6 +555,145 @@ mod tests {
         assert_eq!(result.totals.cells, 1);
         assert_eq!(result.viewport, [vw, vh]);
         assert_eq!(result.restarts, 0);
+    }
+
+    #[test]
+    fn a_frame_after_done_neither_reports_nor_restarts() {
+        let rest = Camera {
+            cx: 7.0,
+            cy: 9.0,
+            zoom: 3.0,
+        };
+        let mut flight = Flight::new(move |a: &FlightAnchors, _vw: f32, _vh: f32| {
+            vec![Segment {
+                name: "static",
+                from: a.fit,
+                to: rest,
+                dur: 1.0,
+                measure: true,
+                idle: false,
+            }]
+        });
+        let scene = tiny_scene();
+        let mut stats = FrameStats::default();
+        let (vw, vh) = (1600.0, 1000.0);
+        let t0 = Instant::now();
+        let at = |s: f32| t0 + Duration::from_secs_f32(s);
+
+        assert!(matches!(
+            flight.frame(at(0.0), vw, vh, true, &scene, &mut stats),
+            FlightFrame::Camera(_)
+        ));
+        assert!(matches!(
+            flight.frame(at(1.0), vw, vh, true, &scene, &mut stats),
+            FlightFrame::Camera(_)
+        ));
+        let FlightFrame::Done(result) = flight.frame(at(2.5), vw, vh, true, &scene, &mut stats)
+        else {
+            panic!("flight must complete");
+        };
+        assert_eq!(result.segments.len(), 1);
+
+        // Every `Done` is a printed report at the consumer, so none of the frames that
+        // land behind the view's cx.quit() may be one, however the window behaves on
+        // the way out.
+        let mut now_s = 2.6;
+        for (what, vw, vh, active) in [
+            ("a queued damage notify", vw, vh, true),
+            ("the window going inactive", vw, vh, false),
+            ("a resize as the window closes", vw * 0.5, vh * 0.5, true),
+        ] {
+            let frame = flight.frame(at(now_s), vw, vh, active, &scene, &mut stats);
+            assert!(!frame.needs_frame(), "{what} must not ask for a repaint");
+            let FlightFrame::Idle { camera, arm_timer } = frame else {
+                panic!("{what} must not re-enter the flight");
+            };
+            assert!(arm_timer.is_none(), "{what} must not arm a wake timer");
+            assert_eq!(
+                (camera.cx, camera.cy, camera.zoom),
+                (rest.cx, rest.cy, rest.zoom),
+                "{what} must hold the camera the flight ended on"
+            );
+            now_s += 0.1;
+        }
+        assert_eq!(
+            flight.restarts, 0,
+            "a finished flight has nothing left to restart"
+        );
+    }
+
+    #[test]
+    fn a_zero_weight_scene_anchors_on_a_region_that_has_blocks() {
+        fn anchor_plan(a: &FlightAnchors, _vw: f32, _vh: f32) -> Vec<Segment> {
+            let (bx, by) = a.block_center;
+            vec![Segment {
+                name: "anchor",
+                from: a.fit,
+                to: Camera {
+                    cx: bx,
+                    cy: by,
+                    zoom: 1.0,
+                },
+                dur: 1.0,
+                measure: false,
+                idle: false,
+            }]
+        }
+
+        // Nothing in the scene carries any weight, so the tie goes to the trailing
+        // region, and that one is empty: children.start is blocks.len().
+        let mut scene = tiny_scene();
+        scene.regions[0].weight = 0;
+        scene.regions.push(RegionNode {
+            rect: Rect::new(200.0, 0.0, 200.0, 100.0),
+            label: "empty".into(),
+            weight: 0,
+            children: 1..1,
+            ext: (),
+        });
+
+        let mut flight = Flight::new(anchor_plan);
+        assert!(flight.build(&scene, 1600.0, 1000.0, Instant::now()));
+        let to = flight.segments[0].to;
+        assert_eq!(
+            (to.cx, to.cy),
+            scene.blocks[0].inner.center(),
+            "the anchor must be a block of the region that owns it"
+        );
+    }
+
+    #[test]
+    fn a_scene_with_no_blocks_aborts_instead_of_panicking() {
+        let mut no_regions = tiny_scene();
+        no_regions.regions.clear();
+        no_regions.blocks.clear();
+        no_regions.cells.clear();
+
+        let mut no_blocks = tiny_scene();
+        no_blocks.regions[0].weight = 0;
+        no_blocks.regions[0].children = 0..0;
+        no_blocks.blocks.clear();
+        no_blocks.cells.clear();
+
+        for (what, scene) in [("no regions", no_regions), ("no blocks", no_blocks)] {
+            let mut flight = Flight::new(test_plan);
+            let mut stats = FrameStats::default();
+            let (vw, vh) = (1600.0, 1000.0);
+            let t0 = Instant::now();
+            let at = |s: f32| t0 + Duration::from_secs_f32(s);
+
+            assert!(matches!(
+                flight.frame(at(0.0), vw, vh, true, &scene, &mut stats),
+                FlightFrame::Camera(_)
+            ));
+            assert!(
+                matches!(
+                    flight.frame(at(1.0), vw, vh, true, &scene, &mut stats),
+                    FlightFrame::Aborted
+                ),
+                "{what} must abort with a reason, not panic in a paint pass"
+            );
+        }
     }
 
     #[test]
