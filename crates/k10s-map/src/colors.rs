@@ -34,27 +34,11 @@ pub fn workload_colors(h: Severity) -> (Rgba, Rgba) {
     }
 }
 
-/// What a kind nobody compiled in is drawn with. Deliberately neutral: an
-/// unknown CRD should read as "we do not know this", not as a specific vendor.
 pub const UNKNOWN_KIND: u32 = 0x9e96b8;
 
-/// Indexed by [`KindId`], in the same order as `k10s_core::BUILTIN_KINDS`. The
-/// length assertion below is what keeps the two tables from drifting: adding a
-/// built-in kind without a colour fails the build.
 static KIND_COLORS: &[u32] = &[
-    0x7a5fb5, // Deployment
-    0x9a7fd0, // StatefulSet
-    0x6f8fd0, // DaemonSet
-    0x8fd06f, // Job
-    0xd0b06f, // CronJob
-    0x2ea043, // Pod
-    0x342552, // Namespace
-    0xe36bdc, // PersistentVolumeClaim
-    0x3fd68f, // Service
-    0x6aa9ff, // ConfigMap
-    0xd8a63a, // Secret
-    0x4fd0c0, // Ingress
-    0xa79fc2, // Node
+    0x7a5fb5, 0x9a7fd0, 0x6f8fd0, 0x8fd06f, 0xd0b06f, 0x2ea043, 0x342552, 0xe36bdc, 0x3fd68f,
+    0x6aa9ff, 0xd8a63a, 0x4fd0c0, 0xa79fc2,
 ];
 
 const _: () = assert!(
@@ -62,8 +46,6 @@ const _: () = assert!(
     "every built-in kind needs a colour"
 );
 
-/// A table lookup, not an exhaustive match: a kind discovered at runtime has no
-/// compiled-in entry and must still paint.
 pub fn kind_color(kind: KindId) -> Rgba {
     gpui::rgb(
         KIND_COLORS
@@ -96,44 +78,42 @@ pub fn heat_border(frac: f32) -> Rgba {
     )
 }
 
-/// Indexed by [`ToolId`], in the same order as `k10s_core::BUILTIN_TOOLS`. Slot
-/// zero is `ToolId::NONE`, which is why a generic workload needs no branch here.
 static TOOL_COLORS: &[u32] = &[
-    UNKNOWN_KIND, // None
-    0x017CEE,     // Airflow
-    0xEF7B4D,     // Argo CD
-    0x1287B1,     // Cassandra
-    0xFFCC01,     // ClickHouse
-    0xF24C53,     // Consul
-    0x8CB3BF,     // Elasticsearch
-    0xAC6199,     // Envoy
-    0x419EDA,     // etcd
-    0x49BDA5,     // Fluent Bit
-    0x0E83C8,     // Fluentd
-    0x5468FF,     // Flux
-    0xF46800,     // Grafana
-    0x60B932,     // Harbor
-    0x466BB0,     // Istio
-    0x66CFE3,     // Jaeger
-    0xD24939,     // Jenkins
-    0x9C9A9B,     // Kafka
-    0xAFAFAF,     // Keycloak
-    0x8CB3BF,     // Kibana
-    0x326CE5,     // Kubernetes
-    0x8CA4AB,     // MariaDB
-    0xC72E49,     // MinIO
-    0x47A248,     // MongoDB
-    0x4479A1,     // MySQL
-    0x27AAE1,     // NATS
-    0x009639,     // nginx
-    0x8C8C8C,     // OpenTelemetry
-    0x4169E1,     // PostgreSQL
-    0xE6522C,     // Prometheus
-    0xFF6600,     // RabbitMQ
-    0xFF4438,     // Redis
-    0x8C8C8C,     // Temporal
-    0x24A1C1,     // Traefik
-    0xFFEC6E,     // Vault
+    UNKNOWN_KIND,
+    0x017CEE,
+    0xEF7B4D,
+    0x1287B1,
+    0xFFCC01,
+    0xF24C53,
+    0x8CB3BF,
+    0xAC6199,
+    0x419EDA,
+    0x49BDA5,
+    0x0E83C8,
+    0x5468FF,
+    0xF46800,
+    0x60B932,
+    0x466BB0,
+    0x66CFE3,
+    0xD24939,
+    0x9C9A9B,
+    0xAFAFAF,
+    0x8CB3BF,
+    0x326CE5,
+    0x8CA4AB,
+    0xC72E49,
+    0x47A248,
+    0x4479A1,
+    0x27AAE1,
+    0x009639,
+    0x8C8C8C,
+    0x4169E1,
+    0xE6522C,
+    0xFF6600,
+    0xFF4438,
+    0x8C8C8C,
+    0x24A1C1,
+    0xFFEC6E,
 ];
 
 const _: () = assert!(

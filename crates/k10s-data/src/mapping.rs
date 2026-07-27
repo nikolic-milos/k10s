@@ -1,38 +1,9 @@
-//! Kubernetes objects to the ingestion contract.
-//!
-//! Every function here is pure over an object the API server could have sent, so
-//! the whole mapping is testable from JSON fixtures with no cluster. That matters
-//! more than usual: this is the layer where a wrong answer is invisible, because a
-//! pod shown as healthy looks exactly like a pod that is healthy.
-//!
-//! Three decisions worth naming:
-//!
-//! - **A reason is a string here, not a `ReasonId`.** Interning needs a
-//!   `Catalog`, and a catalog behind a mutex shared by a dozen watch tasks would
-//!   put a lock on the hot path of an initial sync. The severity is decided here,
-//!   where the vocabulary lives, and the single-threaded collector interns.
-//!   `ReasonId` is deliberately not mentioned below this line.
-//! - **Severity comes from a table, not from `State::of`.** `reason_severity`
-//!   only knows compiled-in reasons, so `State::of` would rate `ErrImagePull` as
-//!   `Unknown`. A real cluster reports dozens of reasons nobody compiled in, and
-//!   rating them all unknown is how an error stops looking like one.
-//! - **A pod is as unhealthy as its unhealthiest container.** A `Running` pod
-//!   with a `CrashLoopBackOff` sidecar is not running. The scan is worst-first
-//!   across init, regular and ephemeral containers.
-//!
-//! No function here can read a Secret's value, because no function here is given
-//! one: secrets are staged from [`ObjectMeta`] alone.
-
 use std::sync::Arc;
 
 use k8s_openapi::api::core::v1::{ContainerStatus, PersistentVolumeClaim, Pod, PodSpec, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k10s_core::{BUILTIN_TOOLS, KindId, Role, Severity, ToolId};
 
-/// A severity paired with the reason string the cluster used for it.
-///
-/// The display string is what the API server said, because that is what a user
-/// recognises: "CrashLoopBackOff", not our paraphrase of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reason {
     pub severity: Severity,
@@ -47,24 +18,19 @@ impl Reason {
         }
     }
 
-    /// A reason whose severity comes from the table below.
     fn reported(display: &str) -> Reason {
         Reason::new(severity_of_reason(display), display)
     }
 }
 
-/// Something a pod references that we may see as an attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachRef {
     pub kind: KindId,
     pub name: Arc<str>,
 }
 
-/// Label pairs, sorted by key so selector matching is a merge and equality is
-/// structural.
 pub type Labels = Vec<(Arc<str>, Arc<str>)>;
 
-/// The role-specific part of a staged object.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Detail {
     Scope,
@@ -73,25 +39,15 @@ pub enum Detail {
     },
     Instance {
         reason: Reason,
-        /// Needed to match a Service selector back to this pod's workload.
         labels: Labels,
-        /// Attachments this pod names, which is how a ConfigMap finds the
-        /// workload that uses it.
         refs: Vec<AttachRef>,
     },
     Attached {
         detail: Arc<str>,
-        /// A Service's pod selector. Empty for everything else, and for a
-        /// headless or ExternalName Service that selects nothing.
         selector: Labels,
     },
 }
 
-/// The controller that owns an object.
-///
-/// Carries the whole reference, not just the uid, because a reference to a kind we
-/// do not watch is still enough to draw a card: `apiVersion` plus `kind` is a GVK,
-/// and `name` is what the card says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Controller {
     pub uid: Arc<str>,
@@ -100,18 +56,11 @@ pub struct Controller {
     pub api_version: Arc<str>,
 }
 
-/// One observed object, reduced to the contract's shape with its parent still
-/// unresolved.
-///
-/// The parent cannot be filled in here: a pod's parent is the workload above its
-/// ReplicaSet, and a ConfigMap's parent is whichever workload mounts it. Both are
-/// joins over the whole set, which is [`crate::assemble`]'s job.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Staged {
     pub kind: KindId,
     pub role: Role,
     pub uid: Arc<str>,
-    /// Empty for a cluster-scoped object.
     pub namespace: Arc<str>,
     pub name: Arc<str>,
     pub resource_version: u64,
@@ -119,12 +68,6 @@ pub struct Staged {
     pub detail: Detail,
 }
 
-/// The parsed `resourceVersion`, or zero.
-///
-/// Kubernetes documents `resourceVersion` as an opaque string and warns against
-/// interpreting it. The contract stores a `u64` because it is a cheap change
-/// counter for coalescing; zero for anything unparseable keeps that honest rather
-/// than inventing an ordering.
 pub fn resource_version(meta: &ObjectMeta) -> u64 {
     meta.resource_version
         .as_deref()
@@ -132,11 +75,6 @@ pub fn resource_version(meta: &ObjectMeta) -> u64 {
         .unwrap_or(0)
 }
 
-/// The controlling owner reference, which is the one that means "created by".
-///
-/// `ownerReferences` can hold several entries and only one may be the controller.
-/// Taking the first reference instead would parent a pod to whatever happened to
-/// be listed first, which for a pod with an extra non-controller owner is wrong.
 pub fn controller_of(meta: &ObjectMeta) -> Option<Controller> {
     meta.owner_references
         .as_deref()
@@ -162,23 +100,12 @@ fn labels_of(meta: &ObjectMeta) -> Labels {
     out
 }
 
-/// The vocabulary: every reason string the mapping can produce, with the severity
-/// it implies.
-///
-/// A table rather than a `match` for one reason: the collector pre-interns all of
-/// it, so the ids it hands out later cannot disagree with the catalog snapshot the
-/// app already holds. A `match` cannot be enumerated.
-///
-/// The names are the API server's own, because they are what a user recognises and
-/// what they will search the internet for.
 const REASON_SEVERITY: &[(&str, Severity)] = &[
-    // Running normally, or finished the way it was supposed to.
     ("Running", Severity::Ok),
     ("Completed", Severity::Ok),
     ("Succeeded", Severity::Ok),
     ("PodCompleted", Severity::Ok),
     ("ContainerReady", Severity::Ok),
-    // On the way somewhere, or on the way out.
     ("Pending", Severity::Warn),
     ("ContainerCreating", Severity::Warn),
     ("PodInitializing", Severity::Warn),
@@ -188,8 +115,6 @@ const REASON_SEVERITY: &[(&str, Severity)] = &[
     ("Unschedulable", Severity::Warn),
     ("SchedulingGated", Severity::Warn),
     ("Terminated", Severity::Warn),
-    // Broken. Image pulls, config, OOM, eviction and node loss all land here
-    // because in every one of them the workload is not doing its job.
     ("CrashLoopBackOff", Severity::Err),
     ("ImagePullBackOff", Severity::Err),
     ("ErrImagePull", Severity::Err),
@@ -215,20 +140,13 @@ const REASON_SEVERITY: &[(&str, Severity)] = &[
     ("Shutdown", Severity::Err),
     ("UnexpectedAdmissionError", Severity::Err),
     ("Failed", Severity::Err),
-    // The literal fallback, named so it interns with the rest.
     ("Unknown", Severity::Unknown),
 ];
 
-/// Every reason the mapping can name, for pre-interning.
 pub fn known_reasons() -> impl Iterator<Item = &'static str> {
     REASON_SEVERITY.iter().map(|(name, _)| *name)
 }
 
-/// The severity a reason implies, including the many a cluster reports that
-/// nobody compiled in.
-///
-/// The default is [`Severity::Unknown`], never `Ok`: an unrecognised reason is a
-/// question, and answering it with "healthy" is the one wrong answer.
 pub fn severity_of_reason(reason: &str) -> Severity {
     REASON_SEVERITY
         .iter()
@@ -237,25 +155,15 @@ pub fn severity_of_reason(reason: &str) -> Severity {
         .unwrap_or(Severity::Unknown)
 }
 
-/// The state of a pod, as a severity and the reason for it.
-///
-/// Ordered most specific first, because the specific answer is the useful one:
-/// "CrashLoopBackOff" tells a user what to do and "NotReady" does not.
 pub fn pod_reason(pod: &Pod) -> Reason {
-    // A pod with a deletion timestamp is going away whatever its containers
-    // still claim, and a terminating pod stuck on a finalizer is a real thing
-    // people need to see.
     if pod.metadata.deletion_timestamp.is_some() {
         return Reason::reported("Terminating");
     }
 
     let Some(status) = &pod.status else {
-        // No status yet: the object exists and the kubelet has not spoken.
         return Reason::reported("Pending");
     };
 
-    // A pod-level reason means the kubelet or the node controller made a
-    // decision about the whole pod, which outranks stale container statuses.
     if let Some(reason) = status.reason.as_deref()
         && !reason.is_empty()
     {
@@ -264,8 +172,6 @@ pub fn pod_reason(pod: &Pod) -> Reason {
 
     let phase = status.phase.as_deref().unwrap_or("");
 
-    // Worst-first across every container status. A pod is as unhealthy as its
-    // unhealthiest container, and the sidecar case is the common one.
     let mut worst: Option<Reason> = None;
     for cs in container_statuses(status) {
         if let Some(candidate) = container_reason(cs, phase)
@@ -287,16 +193,12 @@ pub fn pod_reason(pod: &Pod) -> Reason {
         "Failed" => Reason::reported("Failed"),
         "Pending" => Reason::reported("Pending"),
         "Running" => {
-            // `phase: Running` only means the containers were created. Readiness
-            // is what a service uses to route, so it is what the map should show.
             if pod_is_ready(status) {
                 Reason::reported("Running")
             } else {
                 Reason::reported("NotReady")
             }
         }
-        // Includes the literal "Unknown" phase, which the API server sends when
-        // the node stopped reporting.
         _ => Reason::new(Severity::Unknown, "Unknown"),
     }
 }
@@ -312,10 +214,6 @@ fn container_statuses(
         .chain(status.ephemeral_container_statuses.iter().flatten())
 }
 
-/// The reason one container contributes, if it contributes one.
-///
-/// A running container contributes nothing: its state carries no reason, and
-/// inventing "Running" per container would make the worst-first fold meaningless.
 fn container_reason(cs: &ContainerStatus, phase: &str) -> Option<Reason> {
     let state = cs.state.as_ref()?;
     if let Some(waiting) = &state.waiting {
@@ -323,10 +221,6 @@ fn container_reason(cs: &ContainerStatus, phase: &str) -> Option<Reason> {
         return Some(Reason::reported(reason));
     }
     if let Some(terminated) = &state.terminated {
-        // A clean exit inside a Succeeded pod is the expected end of a Job, so it
-        // must not read as a problem. A clean exit inside a Running pod is a
-        // container that stopped and has not restarted yet, which is worth
-        // showing, and the restart count is the tell.
         let reason = terminated
             .reason
             .as_deref()
@@ -345,8 +239,6 @@ fn container_reason(cs: &ContainerStatus, phase: &str) -> Option<Reason> {
 }
 
 fn pod_is_ready(status: &k8s_openapi::api::core::v1::PodStatus) -> bool {
-    // The Ready condition is authoritative when present; falling back to every
-    // container being ready covers a status the kubelet has only half filled in.
     if let Some(conditions) = &status.conditions
         && let Some(ready) = conditions.iter().find(|c| c.type_ == "Ready")
     {
@@ -359,14 +251,7 @@ fn pod_is_ready(status: &k8s_openapi::api::core::v1::PodStatus) -> bool {
         .all(|cs| cs.ready)
 }
 
-/// Vendor detection from the labels a chart or operator sets.
-///
-/// Deliberately bounded to vendors we have a glyph for. Interning every label
-/// value we see would grow the tool registry without bound from user data, for ids
-/// that all render the same fallback anyway.
 pub fn tool_of(meta: &ObjectMeta) -> ToolId {
-    // In preference order: the recommended label, then what Helm charts actually
-    // set, then the pre-recommended-labels convention.
     const KEYS: &[&str] = &[
         "app.kubernetes.io/name",
         "app.kubernetes.io/part-of",
@@ -398,8 +283,6 @@ fn tool_from_value(value: &str) -> Option<ToolId> {
     {
         return builtin_tool(alias);
     }
-    // A chart called `my-redis-primary` is still Redis. Token-wise rather than
-    // substring, so `redistribute` is not.
     value
         .split(['-', '_', '.', '/'])
         .map(normalize)
@@ -424,7 +307,6 @@ fn builtin_tool(normal: &str) -> Option<ToolId> {
         .map(|i| ToolId(i as u16))
 }
 
-/// Names that mean a vendor we know under a name we do not.
 const TOOL_ALIASES: &[(&str, &str)] = &[
     ("postgresql", "postgres"),
     ("pgbouncer", "postgres"),
@@ -449,10 +331,6 @@ const TOOL_ALIASES: &[(&str, &str)] = &[
     ("rabbit", "rabbitmq"),
 ];
 
-/// Stages any object from its metadata alone.
-///
-/// The default path, and the reason a Secret is safe: this function is given no
-/// field that could hold a value.
 pub fn stage_meta(kind: KindId, role: Role, meta: &ObjectMeta) -> Option<Staged> {
     let uid: Arc<str> = meta.uid.as_deref()?.into();
     let name: Arc<str> = meta.name.as_deref()?.into();
@@ -461,8 +339,6 @@ pub fn stage_meta(kind: KindId, role: Role, meta: &ObjectMeta) -> Option<Staged>
         Role::Owner => Detail::Owner {
             tool: tool_of(meta),
         },
-        // A pod reached through the metadata path has no status to read, so it
-        // gets the honest answer rather than a guess.
         Role::Instance => Detail::Instance {
             reason: Reason::new(Severity::Unknown, "Unknown"),
             labels: labels_of(meta),
@@ -485,8 +361,6 @@ pub fn stage_meta(kind: KindId, role: Role, meta: &ObjectMeta) -> Option<Staged>
     })
 }
 
-/// Stages a pod: the one kind whose whole object we need, for its container
-/// statuses and for the attachments its spec names.
 pub fn stage_pod(kind: KindId, attach_kinds: &AttachKinds, pod: &Pod) -> Option<Staged> {
     let mut staged = stage_meta(kind, Role::Instance, &pod.metadata)?;
     staged.detail = Detail::Instance {
@@ -501,8 +375,6 @@ pub fn stage_pod(kind: KindId, attach_kinds: &AttachKinds, pod: &Pod) -> Option<
     Some(staged)
 }
 
-/// The kind ids an attachment reference resolves to, passed in because the ids
-/// come from discovery rather than from a constant.
 #[derive(Debug, Clone, Copy)]
 pub struct AttachKinds {
     pub config_map: KindId,
@@ -520,11 +392,6 @@ impl Default for AttachKinds {
     }
 }
 
-/// Every ConfigMap, Secret and PersistentVolumeClaim a pod spec names.
-///
-/// This is how an attachment finds its owner. Reading a pod spec to learn *that a
-/// Secret is used* is the opposite of reading the Secret: the name is in the pod,
-/// the value is not, and this is the only join we need.
 pub fn attachment_refs(spec: &PodSpec, kinds: &AttachKinds) -> Vec<AttachRef> {
     let mut out: Vec<AttachRef> = Vec::new();
     let mut push = |kind: KindId, name: &str| {
@@ -599,8 +466,6 @@ pub fn attachment_refs(spec: &PodSpec, kinds: &AttachKinds) -> Vec<AttachRef> {
     out
 }
 
-/// Stages a Service: whole object for `spec.selector`, which is the only way to
-/// know which workload it fronts.
 pub fn stage_service(kind: KindId, svc: &Service) -> Option<Staged> {
     let mut staged = stage_meta(kind, Role::Attached, &svc.metadata)?;
     let spec = svc.spec.as_ref();
@@ -618,7 +483,6 @@ pub fn stage_service(kind: KindId, svc: &Service) -> Option<Staged> {
     Some(staged)
 }
 
-/// What a Service card says: its type, and the ports if it has any.
 pub fn service_detail(svc: &Service) -> Arc<str> {
     let Some(spec) = &svc.spec else {
         return Arc::from("");
@@ -638,8 +502,6 @@ pub fn service_detail(svc: &Service) -> Arc<str> {
     }
 }
 
-/// Stages a PersistentVolumeClaim: whole object for its size, which is the only
-/// interesting thing about a claim on a map.
 pub fn stage_pvc(kind: KindId, pvc: &PersistentVolumeClaim) -> Option<Staged> {
     let mut staged = stage_meta(kind, Role::Attached, &pvc.metadata)?;
     staged.detail = Detail::Attached {
@@ -649,7 +511,6 @@ pub fn stage_pvc(kind: KindId, pvc: &PersistentVolumeClaim) -> Option<Staged> {
     Some(staged)
 }
 
-/// The bound size, falling back to the requested size for a pending claim.
 pub fn pvc_detail(pvc: &PersistentVolumeClaim) -> Arc<str> {
     let bound = pvc
         .status
@@ -765,12 +626,9 @@ mod tests {
 
     #[test]
     fn crashloopbackoff_is_its_own_reason_at_error_severity() {
-        // The distinction the closed model could not express, and the single most
-        // important state in the product.
         let r = pod_reason(&pod("Running", vec![waiting("CrashLoopBackOff")]));
         assert_eq!(&*r.display, "CrashLoopBackOff");
         assert_eq!(r.severity, Severity::Err);
-        // And it is not the same reason as a generic failure.
         let failed = pod_reason(&pod("Failed", vec![]));
         assert_ne!(r.display, failed.display);
         assert_eq!(failed.severity, Severity::Err);
@@ -778,8 +636,6 @@ mod tests {
 
     #[test]
     fn a_running_pod_with_a_broken_sidecar_is_not_running() {
-        // Worst-first: the common shape of a real outage is one bad container in
-        // an otherwise Running pod.
         let r = pod_reason(&pod(
             "Running",
             vec![running(true), waiting("ImagePullBackOff")],
@@ -804,8 +660,6 @@ mod tests {
 
     #[test]
     fn a_completed_init_container_is_not_a_problem() {
-        // Every pod with an init container has one of these, so reading it as a
-        // fault would mark most of a cluster unhealthy.
         let mut p = pod("Running", vec![running(true)]);
         p.status.as_mut().unwrap().init_container_statuses =
             Some(vec![terminated("Completed", 0, 0)]);
@@ -827,15 +681,12 @@ mod tests {
 
     #[test]
     fn readiness_not_phase_decides_a_running_pod() {
-        // `phase: Running` only says the containers were created; a service
-        // routes on readiness, so the map should show readiness.
         let ready = pod_reason(&pod("Running", vec![running(true)]));
         assert_eq!(&*ready.display, "Running");
         let not_ready = pod_reason(&pod("Running", vec![running(false)]));
         assert_eq!(&*not_ready.display, "NotReady");
         assert_eq!(not_ready.severity, Severity::Warn);
 
-        // An explicit Ready condition wins over the container scan.
         let mut p = pod("Running", vec![running(false)]);
         p.status.as_mut().unwrap().conditions = Some(vec![PodCondition {
             type_: "Ready".into(),
@@ -859,8 +710,6 @@ mod tests {
 
     #[test]
     fn an_evicted_pod_reports_the_pod_level_reason() {
-        // Once the kubelet has evicted a pod its container statuses are stale, so
-        // the pod-level reason is the true one.
         let mut p = pod("Failed", vec![running(true)]);
         p.status.as_mut().unwrap().reason = Some("Evicted".into());
         let r = pod_reason(&p);
@@ -886,8 +735,6 @@ mod tests {
 
     #[test]
     fn an_unrecognised_reason_is_unknown_and_never_ok() {
-        // The default that matters: a reason we have never heard of must not
-        // render as healthy.
         assert_eq!(severity_of_reason("SomeFutureReason"), Severity::Unknown);
         assert_eq!(severity_of_reason(""), Severity::Unknown);
         let r = pod_reason(&pod("Running", vec![waiting("SomeFutureReason")]));
@@ -896,7 +743,6 @@ mod tests {
             "unknown is not unhealthy, so the phase answer stands"
         );
 
-        // But every reason a real kubelet emits for a broken container is Err.
         for reason in [
             "CrashLoopBackOff",
             "ImagePullBackOff",
@@ -944,7 +790,6 @@ mod tests {
             "the reference has to carry a GVK, so an unwatched controller is still nameable"
         );
 
-        // No controller flag anywhere means no parent, not the first entry.
         m.owner_references.as_mut().unwrap()[1].controller = None;
         m.owner_references.as_mut().unwrap()[0].controller = None;
         assert_eq!(controller_of(&m), None);
@@ -987,9 +832,6 @@ mod tests {
 
     #[test]
     fn a_vendor_never_lands_outside_the_compiled_in_table() {
-        // An id past the table renders a fallback glyph, which is fine, but
-        // interning arbitrary label values would grow the registry from user
-        // data. Nothing here may do that.
         for value in ["totally-made-up", "", "none", "x", "13"] {
             let m = labeled("x", "u", &[("app", value)]);
             assert!(tool_of(&m).is_builtin(), "{value}");
@@ -998,8 +840,6 @@ mod tests {
 
     #[test]
     fn a_pod_spec_yields_every_attachment_it_names_once() {
-        // This walk is what lets a ConfigMap find the workload that mounts it,
-        // and it reads names only: nothing here touches a value.
         let spec: PodSpec = serde_json::from_value(serde_json::json!({
             "containers": [{
                 "name": "app",
@@ -1046,7 +886,6 @@ mod tests {
         ] {
             assert!(names.contains(&want), "missing {want:?} in {names:?}");
         }
-        // `app-config` is named four times and must appear once.
         assert_eq!(
             names
                 .iter()
@@ -1086,8 +925,6 @@ mod tests {
 
     #[test]
     fn a_selectorless_service_is_staged_without_one() {
-        // Headless and ExternalName services select nothing, and inventing a
-        // selector for them would attach them to an arbitrary workload.
         let svc: Service = serde_json::from_value(serde_json::json!({
             "metadata": {"name": "db", "uid": "uid-db", "namespace": "prod"},
             "spec": {"type": "ExternalName", "externalName": "db.example.com"}
@@ -1125,8 +962,6 @@ mod tests {
 
     #[test]
     fn a_secret_is_staged_from_metadata_and_carries_no_detail() {
-        // The hygiene invariant at its narrowest point: the only staging path a
-        // Secret has is given an ObjectMeta, which cannot hold a value.
         let staged = stage_meta(
             KindId::SECRET,
             Role::Attached,
@@ -1139,15 +974,12 @@ mod tests {
         };
         assert!(detail.is_empty(), "a secret detail must be empty");
         assert!(selector.is_empty());
-        // Name and namespace are metadata and are fine to carry.
         assert_eq!(&*staged.name, "db-password");
         assert_eq!(&*staged.namespace, "prod");
     }
 
     #[test]
     fn an_object_without_a_uid_is_not_staged() {
-        // The uid is the coalescing key and the one field that may not change,
-        // so an object without one has no identity we can use.
         let mut m = meta("a", "u");
         m.uid = None;
         assert!(stage_meta(KindId::POD, Role::Instance, &m).is_none());

@@ -144,10 +144,6 @@ impl Flight {
         scene: &Scene<R, B, C, S>,
         stats: &mut FrameStats,
     ) -> FlightFrame {
-        // The consumer prints every `Done` and the flight has one report to give. The
-        // view calls `cx.quit()` on it, but a damage notify queued behind that still
-        // paints, and the closing window can go inactive or resize; none of those may
-        // report again or restart the flight.
         if let Some(camera) = self.at_rest() {
             return FlightFrame::Idle {
                 camera,
@@ -208,9 +204,6 @@ impl Flight {
         self.step(now, stats)
     }
 
-    /// False when no region in the scene owns a block, which is a scene the user can
-    /// ask for — the bench flies the generator, and `--objects 0` generates nothing —
-    /// rather than a broken invariant worth panicking a paint pass over.
     fn build<R, B, C, S>(
         &mut self,
         scene: &Scene<R, B, C, S>,
@@ -223,9 +216,6 @@ impl Flight {
 
         let mut fit = Camera::default();
         fit.fit(scene.bounds, vw, vh);
-        // `max_by_key` returns the *last* maximum on ties, so a scene where no region
-        // carries any weight anchors on the trailing one, and a region with no blocks
-        // has a `children.start` of exactly `blocks.len()`.
         let Some(big) = scene
             .regions
             .iter()
@@ -327,8 +317,6 @@ impl Flight {
         FlightFrame::Camera(cam)
     }
 
-    /// The camera the flight came to rest at, once the last segment has ended and
-    /// `done()` has handed the report over.
     fn at_rest(&self) -> Option<Camera> {
         let last = self.segments.last()?;
         (self.current == self.segments.len()).then_some(last.to)
@@ -594,9 +582,6 @@ mod tests {
         };
         assert_eq!(result.segments.len(), 1);
 
-        // Every `Done` is a printed report at the consumer, so none of the frames that
-        // land behind the view's cx.quit() may be one, however the window behaves on
-        // the way out.
         let mut now_s = 2.6;
         for (what, vw, vh, active) in [
             ("a queued damage notify", vw, vh, true),
@@ -640,8 +625,6 @@ mod tests {
             }]
         }
 
-        // Nothing in the scene carries any weight, so the tie goes to the trailing
-        // region, and that one is empty: children.start is blocks.len().
         let mut scene = tiny_scene();
         scene.regions[0].weight = 0;
         scene.regions.push(RegionNode {

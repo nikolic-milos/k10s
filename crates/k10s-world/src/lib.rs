@@ -85,8 +85,6 @@ struct Topology {
     sat_rects: Vec<Rect>,
     edges: Vec<EdgeInst>,
     ns_edge_range: Vec<Range<u32>>,
-    /// Tail of `edges` holding links whose ends live in different regions, so the
-    /// culler cannot reach them through any single region's range.
     cross_edge_range: Range<u32>,
     bounds: Rect,
 }
@@ -98,14 +96,10 @@ struct Aggregates {
     ns_rollup: Vec<Severity>,
     ns_unhealthy: Vec<f32>,
     wl_sev_counts: Vec<[u32; 4]>,
-    /// Per-severity histograms, kept per scope for the same reason they are kept
-    /// per owner: a max cannot be lowered incrementally, but a histogram can, so
-    /// a pod leaving Err drops the rollup without rescanning the scope.
     ns_sev_counts: Vec<[u32; 4]>,
     ns_unhealthy_count: Vec<u32>,
 }
 
-/// The highest severity present in a per-severity histogram.
 fn rollup_of(counts: &[u32; 4]) -> Severity {
     if counts[3] > 0 {
         Severity::Err
@@ -218,9 +212,6 @@ fn rollup(
             }
         }
         if old.severity == new.severity {
-            // The reason moved but the severity did not, so the pod repaints and
-            // every rollup above it is provably unchanged. Skipping the histogram
-            // work here is what keeps a reason-only update O(1).
             continue;
         }
         let wl = topo.pod_wl[i];
@@ -243,10 +234,6 @@ fn rollup(
         }
     }
     dirty_pods.0.clear();
-    // Armed on any committed pod state, not only on one that moved a rollup: the
-    // reason-only path above has already written the new state into the aggregates
-    // and into every pool slot's pending list, and returning with the flag down
-    // strands it there until some unrelated severity change arms it.
     if changed {
         dirty.0 = true;
     }
@@ -504,9 +491,6 @@ impl PublishBench {
             let stride = (n / k.max(1)).max(1);
             (0..k.min(n)).map(|j| ((j * stride) % n) as u32).collect()
         };
-        // Rotates through one reason per severity, so churn still moves severity
-        // on every step (the idle invariant depends on churn actually changing
-        // something) while exercising the reason channel the model just gained.
         update_pod_states(&mut self.world, &indices, |cur| match cur.severity {
             Severity::Ok => State::of(ReasonId::NOT_READY),
             Severity::Warn => State::of(ReasonId::CRASH_LOOP_BACK_OFF),
@@ -532,10 +516,6 @@ impl PublishBench {
     }
 }
 
-/// Builds a world from an ingest stream, which is the only input contract now.
-///
-/// Folding first and laying out second is why this takes a whole stream rather
-/// than events one at a time: layout places every island in one pass.
 pub fn build_world_from_stream(
     events: &[IngestEvent],
     scene: SharedScene,
@@ -594,10 +574,6 @@ fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (Wo
                     sat_kinds.push(sat.kind);
                 }
             }
-            // Dependencies arrive as uids, so they can point anywhere. Ones that
-            // stay inside this namespace keep their place in the region's range;
-            // ones that leave it go to the cross tail, which is what makes the
-            // culler's cross-region scan reachable.
             for target in &wl.depends_on {
                 let Some(&to) = owner_index.get(target) else {
                     continue;
@@ -622,9 +598,6 @@ fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (Wo
     }
     debug_assert_eq!(sat_labels.len(), lay.sat_rects.len());
 
-    // Appended after every namespace range is closed, so the per-region ranges
-    // stay contiguous and these form a tail the culler visits once per frame
-    // rather than per region.
     let cross_start = edges.len() as u32;
     for (a, b) in cross_pending {
         edges.push(EdgeInst::blocks(a, b));
@@ -640,8 +613,6 @@ fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (Wo
     };
     let wl_sev_counts: Vec<[u32; 4]> = wl_pod_range.iter().map(sev_counts).collect();
     let wl_rollup: Vec<Severity> = wl_sev_counts.iter().map(rollup_of).collect();
-    // Scopes histogram their own pods rather than folding the owner rollups,
-    // because a rollup has already lost the counts needed to decrement it later.
     let ns_sev_counts: Vec<[u32; 4]> = ns_pod_range.iter().map(sev_counts).collect();
     let ns_rollup: Vec<Severity> = ns_sev_counts.iter().map(rollup_of).collect();
     let ns_unhealthy_count: Vec<u32> = ns_pod_range
@@ -711,8 +682,6 @@ fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (Wo
     (world, schedule)
 }
 
-/// One draw against the same thresholds as before, so churn behaviour is
-/// unchanged; the reason now travels with the severity.
 fn weighted_state(rng: &mut ChaCha8Rng) -> State {
     match rng.random_range(0..100u32) {
         0..90 => State::of(ReasonId::RUNNING),
@@ -755,8 +724,6 @@ fn spawn_world_boxed(
         .name("k10s-world".into())
         .spawn(move || {
             let (mut world, mut schedule) = build_world_from_stream(&events, scene, mode);
-            // The stream is only needed to build; releasing it here keeps the
-            // initial sync from being held for the life of the process.
             drop(events);
             let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xC0FFEE);
             let tick = Duration::from_secs_f32(1.0 / TICK_HZ);
@@ -811,8 +778,6 @@ mod tests {
     use k10s_clustergen::{GenConfig, Scenario, generate};
     use k10s_core::Level;
 
-    /// Generator to stream to fold. Tests now reach the world only through the
-    /// ingestion contract, which is the point of the seam.
     fn platform(seed: u64, target_objects: u32) -> ClusterInput {
         input_of(seed, target_objects, Scenario::Platform)
     }
@@ -830,9 +795,6 @@ mod tests {
         k10s_clustergen::stream::snapshot(&spec, true)
     }
 
-    /// Tests reason about severities; the model stores a reason alongside one.
-    /// A single representative reason per severity keeps these cases readable and
-    /// still exercises the reason channel end to end.
     fn st(sev: Severity) -> State {
         match sev {
             Severity::Ok => State::of(ReasonId::RUNNING),
@@ -991,18 +953,12 @@ mod tests {
 
     #[test]
     fn a_reason_only_change_publishes_instead_of_piling_up() {
-        // rollup used to commit the new state to the aggregates and to every pool
-        // slot's pending list and then return before arming Dirty, so a change that
-        // moved the reason without moving the severity was half-applied: no publish,
-        // no rev bump, and one u32 per event stranded in three lists until some
-        // unrelated severity change armed the flag.
         let spec = platform(21, 2_000);
         let scene = k10s_core::new_shared_scene();
         let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
         schedule.run(&mut world);
         assert_eq!(scene.load().rev, 1);
 
-        // Two Warn reasons, so no rollup anywhere above the pod can move.
         let warn = [ReasonId::PENDING, ReasonId::NOT_READY];
         set_pod_state(&mut world, 0, State::of(warn[0]));
         schedule.run(&mut world);
@@ -1287,9 +1243,6 @@ mod tests {
                 assert!(range.end >= range.start);
                 next_edge = range.end;
             }
-            // The region ranges no longer cover the whole array: they run to where
-            // the cross-region tail begins, and the two together partition it
-            // exactly, with nothing shared and nothing unreachable.
             assert_eq!(
                 next_edge, snap.cross_edges.start,
                 "{mode:?} region ranges must end where the cross tail begins"
@@ -1319,8 +1272,6 @@ mod tests {
                 assert_eq!(region.weight, cells, "{mode:?} region {i} weight");
             }
             for edge in &snap.edges {
-                // Endpoints are tagged now, so an in-range check has to know which
-                // array each end indexes rather than assuming both are blocks.
                 for end in [edge.a, edge.b] {
                     let limit = match end.level() {
                         Level::Region => snap.regions.len(),
@@ -1340,11 +1291,7 @@ mod tests {
 
     #[test]
     fn cross_namespace_edges_land_in_the_cross_range() {
-        // cross_edges used to be written as len..len, so the culler's cross-region
-        // scan was dead code and no cross-namespace topology could exist.
         let spec = platform(55, 20_000);
-        // The folded input keeps dependencies as uids, so a cross-namespace link is
-        // one whose target resolves outside the source's namespace.
         let owner_index = spec.owner_indices();
         let ns_of_block: Vec<u32> = spec
             .namespaces
@@ -1383,8 +1330,6 @@ mod tests {
                 "{mode:?}: cross links must be the tail of edges"
             );
 
-            // Every per-region range must end where the cross tail begins, so no
-            // edge is both region-owned and cross, and none is unreachable.
             for (i, r) in snap.region_edges.iter().enumerate() {
                 assert!(
                     r.end <= cross.start,
@@ -1393,8 +1338,6 @@ mod tests {
                 );
             }
 
-            // The defining property: both ends of a cross edge sit in different
-            // regions, which is exactly what no single region's range can cover.
             let ns_of = |block: u32| snap.blocks[block as usize].ext.ns;
             for e in &snap.edges[cross.start as usize..cross.end as usize] {
                 assert_eq!(e.a.level(), Level::Block, "{mode:?}");
@@ -1406,8 +1349,6 @@ mod tests {
                 );
             }
 
-            // And the culler reaches them: with the whole world visible and no
-            // budget to bind, it must draw at least the cross links.
             let drawn = k10s_atlas::walk_edges(&snap, &snap.bounds, usize::MAX, |_, _| {});
             assert!(
                 drawn >= cross.len(),

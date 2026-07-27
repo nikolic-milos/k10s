@@ -16,27 +16,12 @@ const MIN_ITERS: usize = 40;
 const MAX_ITERS: usize = 20_000;
 const BUDGET: Duration = Duration::from_millis(250);
 
-/// Below this many samples the tail is not a p99 and must not be reported as one: under a hundred
-/// one sample carries more than a whole percentile, so the honest answer is the worst sample seen
-/// rather than a percentile estimated from too few of them.
-///
-/// `MIN_ITERS` is 40 against a 250 ms budget, so a case falls under this floor once one iteration
-/// costs more than about 2.5 ms. Nothing here does on the machine this was written on -- the
-/// slowest, a 50k full materialize, takes 735 us and gets 339 samples -- but the guard is what
-/// stops a slower runner or a larger scene from quietly reporting a forty-sample maximum as a p99.
 const P99_MIN_ITERS: usize = 100;
 
-/// `p99` or `max`, whichever the sample count earns.
 fn tail(iters: usize) -> &'static str {
     if iters >= P99_MIN_ITERS { "p99" } else { "max" }
 }
 
-/// The value [`tail`] names, so the column and its heading cannot disagree.
-///
-/// Taken as the largest sample rather than the 0.99 percentile below the floor, because the two
-/// coincide only up to 51 samples: `round(0.99 * (n - 1))` first lands short of `n - 1` at n = 52,
-/// where it picks the second largest. Reporting that under a `max` heading would understate the
-/// tail in exactly the sample range the floor exists to be careful about.
 fn tail_value(sorted: &[u64]) -> f64 {
     if sorted.len() >= P99_MIN_ITERS {
         percentile(sorted, 0.99)
@@ -52,8 +37,6 @@ struct Case {
     changed: usize,
     iters: usize,
     p50_us: f64,
-    /// The 0.99 percentile, or the largest sample when the run fell under [`P99_MIN_ITERS`].
-    /// [`tail`] names which one it is, in the table and in the JSON key.
     tail_us: f64,
     stats: PublishStats,
 }

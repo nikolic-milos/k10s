@@ -451,9 +451,6 @@ mod tests {
         gen_input(seed, target_objects, Scenario::Platform)
     }
 
-    /// Generator to stream to fold, which is now the only way in. If the layout
-    /// fingerprints still match after this, the fold is provably equivalent to the
-    /// old direct spec walk.
     fn gen_input(seed: u64, target_objects: u32, scenario: Scenario) -> ClusterInput {
         let spec = generate(&GenConfig {
             seed,
@@ -690,11 +687,6 @@ mod tests {
         }
     }
 
-    /// Skewed fan-out is the shape real clusters have and the themed scenarios do not: one
-    /// namespace holding thousands of workloads, or one workload holding thousands of pods and
-    /// an equal number of PVCs. Every invariant the themed scenarios are held to must survive it,
-    /// per mode: containment and halo separation are spread-mode properties, because dense mode
-    /// omits attachments and packs halos flush.
     #[test]
     fn fan_out_layout_holds_every_invariant() {
         const EPS: f32 = 0.01;

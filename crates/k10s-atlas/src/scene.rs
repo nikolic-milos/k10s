@@ -73,8 +73,6 @@ pub struct CellNode<X = ()> {
     pub ext: X,
 }
 
-/// Which array an [`Endpoint`] indexes. Named after the scene's four levels
-/// rather than after any domain kind, so the engine stays domain-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Level {
@@ -84,17 +82,10 @@ pub enum Level {
     Sat = 3,
 }
 
-/// One end of an [`Edge`]: a level tag packed into the top two bits of an index.
-///
-/// Packed rather than a `{ level, idx }` struct because `walk_edges` is the
-/// largest single term in cull cost at high fan-out, and a plain struct would
-/// double [`Edge`] from 8 bytes to 16 on the array that term walks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Endpoint(u32);
 
 impl Endpoint {
-    /// Two bits go to the level, so an index is capped at ~1.07 billion nodes per
-    /// level. A scene that large has other problems.
     pub const MAX_INDEX: u32 = (1 << 30) - 1;
 
     pub const fn new(level: Level, idx: u32) -> Endpoint {
@@ -102,7 +93,6 @@ impl Endpoint {
         Endpoint(((level as u32) << 30) | (idx & Endpoint::MAX_INDEX))
     }
 
-    /// The overwhelmingly common case today, and the only one the generator emits.
     pub const fn block(idx: u32) -> Endpoint {
         Endpoint::new(Level::Block, idx)
     }
@@ -133,10 +123,6 @@ impl Endpoint {
     }
 }
 
-/// A link between any two nodes at any two levels.
-///
-/// Endpoints used to be bare block indices, which made pod-to-service,
-/// service-to-ingress and workload-to-node inexpressible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Edge {
     pub a: Endpoint,
@@ -144,7 +130,6 @@ pub struct Edge {
 }
 
 impl Edge {
-    /// Block to block, the shape every edge had before endpoints were tagged.
     pub const fn blocks(a: u32, b: u32) -> Edge {
         Edge {
             a: Endpoint::block(a),
@@ -152,12 +137,6 @@ impl Edge {
         }
     }
 
-    /// Whether both ends index the block array.
-    ///
-    /// One comparison on the packed tags rather than two `level()` matches, which
-    /// is what keeps the common case in `walk_edges` on a straight line. That walk
-    /// is the largest traversal term at high fan-out, so the difference is
-    /// measurable rather than theoretical.
     #[inline(always)]
     pub const fn is_block_pair(&self) -> bool {
         const BLOCK: u32 = (Level::Block as u32) << 30;
@@ -212,9 +191,6 @@ mod endpoint_tests {
 
     #[test]
     fn edge_stays_eight_bytes() {
-        // walk_edges is the largest single term in cull cost at high fan-out, so
-        // the level tag rides in spare index bits rather than widening the array
-        // that term walks. A regression here is a real cost, not a style nit.
         assert_eq!(size_of::<Endpoint>(), 4);
         assert_eq!(size_of::<Edge>(), 8);
     }
@@ -236,7 +212,6 @@ mod endpoint_tests {
         assert_eq!(Endpoint::block(7), Endpoint::new(Level::Block, 7));
         assert_eq!(Endpoint::cell(7), Endpoint::new(Level::Cell, 7));
         assert_eq!(Endpoint::sat(7), Endpoint::new(Level::Sat, 7));
-        // Slot zero must not collide across levels: same index, different arrays.
         let zeros = [
             Endpoint::region(0),
             Endpoint::block(0),
@@ -263,7 +238,6 @@ mod endpoint_tests {
                 assert_eq!(e.is_block_pair(), expected, "{la:?}/{lb:?}");
             }
         }
-        // Index bits must not leak into the tag comparison.
         assert!(Edge::blocks(Endpoint::MAX_INDEX, 0).is_block_pair());
         assert!(Edge::blocks(0, Endpoint::MAX_INDEX).is_block_pair());
     }
@@ -278,8 +252,6 @@ mod endpoint_tests {
 
     #[test]
     fn a_pod_can_link_to_a_service() {
-        // The whole point of tagging: this edge was inexpressible before, because
-        // both ends resolved through scene.blocks.
         let e = Edge {
             a: Endpoint::cell(12),
             b: Endpoint::sat(4),

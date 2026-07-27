@@ -27,9 +27,6 @@ pub const MAX_ICONS: usize = 1024;
 pub const MAX_EDGES: usize = 3000;
 pub const MAX_CURVES: usize = 1500;
 
-/// The four LOD knobs the environment can turn, kept apart from the policy they build so the
-/// policy stays a pure function of them. The process reads them once ([`lod`]); a test can build
-/// as many policies as it likes, in parallel, without touching a global.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Knobs {
     pub stress_quads: bool,
@@ -50,8 +47,6 @@ impl Knobs {
     }
 }
 
-/// Build the shipping policy from a set of knobs. `stress_quads` wins over `stress_curves`: the
-/// two stress modes measure different things and must not be mixed.
 pub(crate) fn policy(knobs: Knobs) -> LodPolicy {
     LodPolicy {
         stage_block: STAGE_WL,
@@ -90,9 +85,6 @@ pub fn stage_for_zoom(zoom: f32) -> u8 {
     lod().stage_for_zoom(zoom)
 }
 
-/// The cull oracle: re-derive every counter of a frame from `k10s-atlas` alone, with no painter
-/// and no window. `crate::frame::walk` must produce exactly this for the same inputs; the painter
-/// checks it per frame in debug and `crate::oracle_test` sweeps it in release.
 pub fn cull(
     scene: &SceneSnapshot,
     camera: &Camera,
@@ -113,10 +105,6 @@ pub fn cull(
     );
     let visible = camera.visible_world(vw, vh);
     st.bg_cells = crate::hex::visible_count(&visible, camera.zoom, !opts.hex_shown());
-    // Thrown away and re-derived: `k10s_atlas::cull` gets `edges` from the same `walk_edges` call
-    // with the same arguments the painter makes, so comparing the two proves only that the
-    // function agrees with itself -- on the largest traversal term in the frame path. The gate is
-    // rewritten here for the same reason.
     st.edges = if opts.edges_on && blend.walk_stage() >= 2 && !opts.stress_any() {
         reference_edges(scene, &visible, opts.policy.max_edges)
     } else {
@@ -125,17 +113,6 @@ pub fn cull(
     st
 }
 
-/// Count the visible edges the slow, obvious way: every edge in the scene, both endpoints resolved
-/// through the level tag, no block-pair shortcut and no per-region skip.
-///
-/// Flat and grouped agree only while `region_edges` is a spatial index -- every grouped edge inside
-/// the rect of the region grouping it, everything that escapes in the cross tail. That precondition
-/// is the thing this comparison actually checks, and the only reason the painter may skip a whole
-/// range on one intersection test. Both sides walk `scene.edges` in index order and stop at
-/// `max_edges`, so a full budget truncates them at the same edge rather than at the same count.
-///
-/// One pass over `scene.edges` per call, which makes `paint_map`'s per-frame `debug_assert` O(total
-/// edges) in a debug build. Nothing in release and nothing in the benches pays for it.
 fn reference_edges(scene: &SceneSnapshot, visible: &Rect, max_edges: usize) -> usize {
     let rect = |e: Endpoint| {
         let i = e.index() as usize;
@@ -155,8 +132,6 @@ fn reference_edges(scene: &SceneSnapshot, visible: &Rect, max_edges: usize) -> u
         let (Some(a), Some(b)) = (rect(e.a), rect(e.b)) else {
             continue;
         };
-        // The visibility rule itself is not re-derived: it is the definition of a visible edge,
-        // and a second opinion on it would just be a second bug.
         let (ax, ay) = a.center();
         let (bx, by) = b.center();
         let span = Rect::new(
@@ -181,7 +156,6 @@ mod tests {
     };
     use std::sync::Arc;
 
-    /// What the shipping binary runs with no `K10S_*` set.
     fn default_opts(policy: &LodPolicy) -> FrameOpts<'_> {
         FrameOpts {
             policy,

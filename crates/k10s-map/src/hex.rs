@@ -3,10 +3,6 @@ use k10s_atlas::Rect;
 const BASE_R: f32 = 48.0;
 const MIN_PX: f32 = 72.0;
 
-/// One stroked ring tessellates to 14 vertices and the whole backdrop is a single path, so the
-/// `u16` index buffer gpui builds a path into is a hard ceiling on rings per frame: at 4,682
-/// `PathBuilder::build` returns `Err` and the backdrop is gone. Measured against the fork rather
-/// than derived, and pinned by `ring_cap_is_what_one_path_holds`.
 const MAX_RINGS: usize = u16::MAX as usize / 14;
 
 pub fn hex_on() -> bool {
@@ -23,8 +19,6 @@ pub fn level(zoom: f32) -> (f32, f32) {
     (r, alpha)
 }
 
-/// The columns and rows whose hexes can reach `visible`, one hex wide on every side so a centre
-/// just outside still paints the edge that crosses in.
 fn ring_band(visible: &Rect, r: f32) -> (i64, i64, i64, i64) {
     let col_pitch = 1.5 * r;
     let row_pitch = 3.0f32.sqrt() * r;
@@ -40,30 +34,10 @@ fn ring_count((c0, c1, r0, r1): (i64, i64, i64, i64)) -> usize {
     (c1 - c0 + 1).max(0) as usize * (r1 - r0 + 1).max(0) as usize
 }
 
-/// Emit the centre of every hex covering `visible`, growing the hex radius by as little as it takes
-/// to bring the ring count inside [`MAX_RINGS`].
-///
-/// [`level`] holds hex size fixed in pixels, so the ring count is a function of window size alone:
-/// 627 rings at 1600x1000, 2,847 at 4K, 4,753 at 5K, 10,585 at 8K. A fixed cap is therefore a
-/// display-size cliff, and a backdrop that vanishes when the window grows reads as a broken feature
-/// rather than as a budget.
-///
-/// The count falls as 1/r^2, so the radius that just fits is one square root away and the grid gives
-/// up only what it has to: across the whole zoom range on all six of those displays it never returns
-/// less than 0.994 of the budget. Coarsening by whole levels instead -- the doublings [`level`]
-/// walks -- answers a 1.5% overshoot by quartering the count, which at 5K is 26 of 851 zoom steps
-/// where the backdrop thins out and comes back.
-///
-/// The caller strokes at [`level`]'s radius, which cannot see the viewport, so wherever this grows
-/// the radius the rings sit on a lattice coarser than they are: 2% at 5K, 53% at the 8K peak, and
-/// nothing at all at 4K and below. Closing that needs the level decision to take the viewport,
-/// which is a change to the caller.
 pub fn for_each_center(visible: &Rect, r: f32, mut emit: impl FnMut(f32, f32)) -> usize {
     let mut r = r;
     let mut band = ring_band(visible, r);
     while ring_count(band) > MAX_RINGS {
-        // The square root alone can ask for a radius the band rounds straight back to the one that
-        // did not fit, so every pass moves it at least 1%. Three passes is the most the sweep sees.
         let overshoot = ring_count(band) as f32 / MAX_RINGS as f32;
         r *= overshoot.sqrt().max(1.01);
         band = ring_band(visible, r);
@@ -87,8 +61,6 @@ pub fn for_each_center(visible: &Rect, r: f32, mut emit: impl FnMut(f32, f32)) -
     n
 }
 
-/// Oracle-side hex count. `suppressed` folds in both `K10S_NO_HEX` and the stress modes, so this
-/// stays a pure function of its arguments (see `crate::frame::FrameOpts::hex_shown`).
 pub fn visible_count(visible: &Rect, zoom: f32, suppressed: bool) -> usize {
     if suppressed {
         return 0;
@@ -124,8 +96,6 @@ mod tests {
             assert_eq!(n, seen);
             assert!(n > 0, "zoom {zoom}: grid empty");
             assert!(n <= MAX_RINGS, "zoom {zoom}: {n} hexes");
-            // The oracle baselines are pinned at this viewport, so the clamp has no business here:
-            // the grid is the whole band, ring for ring.
             assert_eq!(
                 n,
                 ring_count(ring_band(&visible, r)),
@@ -135,16 +105,6 @@ mod tests {
         }
     }
 
-    /// Every display the app can be opened on, swept across the whole zoom range, because the ring
-    /// count is a function of window size alone. A fixed cap of 1,500 rings blanked the backdrop
-    /// outright -- 448 of these steps at 4K, all 851 at 8K -- and coarsening by a whole level
-    /// replaced the blank with a pop: 0.28 of the budget on the 26 steps where it engaged at 5K,
-    /// full density again a step later. So the sweep asks for all three at once -- a grid, inside
-    /// the budget, spending what it is given. The measured worst case for the last is 0.994 of the
-    /// budget, and the quarter of slack is for the band's own rounding, not for a level.
-    ///
-    /// What no clamp can flatten is [`level`]'s own sawtooth: at 4K, where nothing here engages, the
-    /// count still steps 3.5x across a level boundary, and that jump is the alpha ramp's to hide.
     #[test]
     fn grid_holds_on_every_viewport() {
         for (name, vw, vh) in [
@@ -172,9 +132,6 @@ mod tests {
         }
     }
 
-    /// [`MAX_RINGS`] is a measurement of the gpui fork, so it has to be checked from both sides: too
-    /// high and `build` drops the layer the cap was meant to protect, too low and the grid coarsens
-    /// where it would have fit. Same geometry the painter emits (`frame::PaintSink::hex_ring`).
     #[test]
     fn ring_cap_is_what_one_path_holds() {
         let builds = |n: usize| {

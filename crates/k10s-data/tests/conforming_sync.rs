@@ -1,18 +1,3 @@
-//! The contract test: what the kube data plane assembles must be something the
-//! world accepts, checked against the world's own fold rather than against a
-//! restatement of what the fold wants.
-//!
-//! This is the test that would otherwise need a cluster. The cluster shapes below
-//! are the ones that break a naive mapping: a Deployment's pods reached through a
-//! ReplicaSet, a CronJob's Jobs, a pod owned by a CRD nobody compiled in, a bare
-//! pod, attachments reached by mount and by selector, an attachment nothing
-//! references, and a namespace we cannot see.
-//!
-//! `k10s_world::input::fold` is asserted on directly because
-//! `build_world_from_stream` `debug_assert_eq!`s the same thing, meaning a
-//! non-conforming stream panics the world thread in a debug build. Better to fail
-//! here.
-
 use std::sync::Arc;
 
 use k10s_core::{Catalog, IngestEvent, Intake, KindId, Op, Payload, Role, Severity, State, ToolId};
@@ -20,7 +5,6 @@ use k10s_data::assemble::{self, Store};
 use k10s_data::mapping::{AttachKinds, AttachRef, Controller, Detail, Labels, Reason, Staged};
 use k10s_world::input::{FoldStats, fold};
 
-/// The pass-through kind id, taken from the catalog the way discovery would.
 fn replica_set(catalog: &mut Catalog) -> KindId {
     catalog.intern_gvk_as("apps", "v1", "ReplicaSet", Role::Owner)
 }
@@ -82,7 +66,6 @@ fn mounts(kind: KindId, name: &str) -> AttachRef {
     }
 }
 
-/// A cluster with every shape that breaks a naive mapping.
 fn realistic_cluster(catalog: &mut Catalog) -> Store {
     let rs = replica_set(catalog);
     let mut store = Store::new(vec![rs]);
@@ -98,8 +81,6 @@ fn realistic_cluster(catalog: &mut Catalog) -> Store {
         ));
     }
 
-    // A Deployment reached through a ReplicaSet, with a Service selecting its
-    // pods, a mounted ConfigMap, a referenced Secret and a claimed volume.
     store.apply(staged(
         KindId::DEPLOYMENT,
         Role::Owner,
@@ -169,7 +150,6 @@ fn realistic_cluster(catalog: &mut Catalog) -> Store {
         "api-config",
         attachment("", Vec::new()),
     ));
-    // A Secret carries no detail, by construction.
     store.apply(staged(
         KindId::SECRET,
         Role::Attached,
@@ -186,7 +166,6 @@ fn realistic_cluster(catalog: &mut Catalog) -> Store {
         "api-data",
         attachment("10Gi", Vec::new()),
     ));
-    // Nothing mounts this one.
     store.apply(staged(
         KindId::CONFIG_MAP,
         Role::Attached,
@@ -196,7 +175,6 @@ fn realistic_cluster(catalog: &mut Catalog) -> Store {
         attachment("", Vec::new()),
     ));
 
-    // A CronJob, its Job, and the Job's pod: the built-in owner-to-owner edge.
     store.apply(staged(
         KindId::CRON_JOB,
         Role::Owner,
@@ -234,7 +212,6 @@ fn realistic_cluster(catalog: &mut Catalog) -> Store {
         "batch/v1",
     ));
 
-    // Pods owned by a CRD nobody compiled in and that we do not watch.
     for i in 0..2 {
         store.apply(owned_by(
             staged(
@@ -252,7 +229,6 @@ fn realistic_cluster(catalog: &mut Catalog) -> Store {
         ));
     }
 
-    // A bare pod, with no controller at all.
     store.apply(staged(
         KindId::POD,
         Role::Instance,
@@ -262,7 +238,6 @@ fn realistic_cluster(catalog: &mut Catalog) -> Store {
         instance("Running", Severity::Ok, Vec::new(), Vec::new()),
     ));
 
-    // A namespace we never saw: pods readable, namespaces not.
     store.apply(staged(
         KindId::DEPLOYMENT,
         Role::Owner,
@@ -287,9 +262,6 @@ fn resources(events: &[IngestEvent]) -> Vec<&k10s_core::ResourceEvent> {
 
 #[test]
 fn an_assembled_sync_is_something_the_world_accepts() {
-    // The point of the whole module: the fold has to place every event. Its
-    // `orphaned` and `ignored_updates` counters are what `build_world_from_stream`
-    // asserts are zero, so a nonzero one here is a debug panic in the app.
     let mut catalog = Catalog::new();
     let store = realistic_cluster(&mut catalog);
     let assembled = assemble::assemble(&store, &mut catalog);
@@ -313,7 +285,6 @@ fn an_assembled_sync_is_something_the_world_accepts() {
         .find(|ns| &*ns.name == "staging")
         .expect("staging");
 
-    // api, the CronJob and its Job. No ReplicaSet.
     assert_eq!(prod.workloads.len(), 3);
     assert!(
         prod.workloads
@@ -333,7 +304,6 @@ fn an_assembled_sync_is_something_the_world_accepts() {
         "service, config map, secret and claim all sit under the workload that uses them"
     );
 
-    // The CRD-owned pods share one card and the bare pod gets its own.
     assert_eq!(staging.workloads.len(), 2);
     let vmi = staging
         .workloads
@@ -363,9 +333,6 @@ fn an_assembled_sync_is_something_the_world_accepts() {
 
 #[test]
 fn an_assembled_sync_builds_a_world_without_tripping_its_assertions() {
-    // `build_world_from_stream` holds the debug assertion this module exists to
-    // protect, plus layout's own containment and non-overlap checks. Running it is
-    // the strongest single statement that the mapping produces a usable scene.
     let mut catalog = Catalog::new();
     let store = realistic_cluster(&mut catalog);
     let assembled = assemble::assemble(&store, &mut catalog);
@@ -397,8 +364,6 @@ fn an_assembled_sync_builds_a_world_without_tripping_its_assertions() {
 
 #[test]
 fn the_severity_of_a_crashlooping_pod_reaches_the_scene() {
-    // End to end for the state lattice: a container reason becomes a ReasonId,
-    // rolls up to the workload, and rolls up again to the namespace.
     let mut catalog = Catalog::new();
     let store = realistic_cluster(&mut catalog);
     let assembled = assemble::assemble(&store, &mut catalog);
@@ -438,7 +403,6 @@ fn the_severity_of_a_crashlooping_pod_reaches_the_scene() {
         .find(|b| &*b.label == "api")
         .expect("api");
     assert_eq!(api.ext.rollup, Severity::Err);
-    // And a healthy namespace stays healthy, so the rollup is not a constant.
     let staging = snapshot
         .regions
         .iter()
@@ -449,8 +413,6 @@ fn the_severity_of_a_crashlooping_pod_reaches_the_scene() {
 
 #[test]
 fn an_assembled_sync_survives_an_intake_the_way_a_recorded_one_does() {
-    // The generator and a recorded stream both pass through `Intake`; so must this
-    // one, with the same idempotence under a repeated relist.
     let mut catalog = Catalog::new();
     let store = realistic_cluster(&mut catalog);
     let assembled = assemble::assemble(&store, &mut catalog);
@@ -462,7 +424,6 @@ fn an_assembled_sync_survives_an_intake_the_way_a_recorded_one_does() {
     let once = intake.drain();
     assert_eq!(resources(&once).len(), assembled.events.len());
 
-    // A relist replays the same Added events; coalescing by uid must not inflate.
     let mut intake = Intake::new();
     for _ in 0..2 {
         for event in &assembled.events {
@@ -480,9 +441,6 @@ fn an_assembled_sync_survives_an_intake_the_way_a_recorded_one_does() {
 
 #[test]
 fn a_secret_reaches_the_scene_as_a_name_and_nothing_else() {
-    // The invariant, checked at the far end rather than at the mapping: whatever a
-    // Secret's detail is, it cannot be a value, because the only thing that ever
-    // reached the staging function was an ObjectMeta.
     let mut catalog = Catalog::new();
     let store = realistic_cluster(&mut catalog);
     let assembled = assemble::assemble(&store, &mut catalog);
@@ -497,9 +455,6 @@ fn a_secret_reaches_the_scene_as_a_name_and_nothing_else() {
     assert!(detail.is_empty(), "a secret detail must carry nothing");
     assert_eq!(&*secret.name, "api-tls");
 
-    // And nothing anywhere in the stream contains a value-shaped string. The
-    // fixture would have to have smuggled one in for this to catch anything, which
-    // is the point: there is no field it could have come through.
     for r in resources(&assembled.events) {
         if let Payload::Attached { detail, .. } = &r.payload {
             assert!(
@@ -513,8 +468,6 @@ fn a_secret_reaches_the_scene_as_a_name_and_nothing_else() {
 
 #[test]
 fn an_empty_cluster_is_an_empty_sync_rather_than_a_failure() {
-    // A brand-new cluster with nothing in it, and the case where "empty" must be
-    // distinguishable from "not loaded" only by Synced.
     let mut catalog = Catalog::new();
     let store = Store::new(Vec::new());
     let assembled = assemble::assemble(&store, &mut catalog);
@@ -526,9 +479,6 @@ fn an_empty_cluster_is_an_empty_sync_rather_than_a_failure() {
 
 #[test]
 fn attachment_kinds_default_to_the_builtins_so_a_reference_resolves() {
-    // The reference walk keys on kind ids, and if the id a pod's reference carries
-    // differed from the id the ConfigMap watch reports, no attachment would ever
-    // find its owner.
     let kinds = AttachKinds::default();
     assert_eq!(kinds.config_map, KindId::CONFIG_MAP);
     assert_eq!(kinds.secret, KindId::SECRET);
@@ -545,9 +495,6 @@ fn attachment_kinds_default_to_the_builtins_so_a_reference_resolves() {
 
 #[test]
 fn every_replay_scenario_still_folds_the_way_the_data_plane_output_does() {
-    // Ties the two producers together: whatever the recorded fixtures assert about
-    // a conforming stream has to hold for ours too, and the initial-sync fixture is
-    // the shared reference.
     let (_, stats) = fold(&k10s_core::replay::initial_sync().events);
     assert_eq!(stats, FoldStats::default());
 
@@ -557,8 +504,6 @@ fn every_replay_scenario_still_folds_the_way_the_data_plane_output_does() {
     let (_, stats) = fold(&ours.events);
     assert_eq!(stats, FoldStats::default());
 
-    // Both declare a state on their instances, which is the field the map colours
-    // by, so neither can be silently stateless.
     for events in [&k10s_core::replay::initial_sync().events, &ours.events] {
         let states: Vec<State> = resources(events)
             .into_iter()

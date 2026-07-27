@@ -76,13 +76,6 @@ pub struct NsSpec {
 #[derive(Debug, Default, Clone)]
 pub struct ClusterSpec {
     pub namespaces: Vec<NsSpec>,
-    /// Links between workloads in *different* namespaces, as pairs of global
-    /// workload indices (namespace order, then workload order within it).
-    ///
-    /// Separate from `WorkloadSpec::deps`, which is namespace-local by
-    /// construction and so could never express a cross-namespace edge. Without
-    /// these the scene's `cross_edges` range is permanently empty and the
-    /// culler's cross-region path is dead code.
     pub cross_deps: Vec<(u32, u32)>,
     pub total_workloads: u32,
     pub total_pods: u32,
@@ -124,8 +117,6 @@ const fn arch(
 }
 
 use ToolId as T;
-// Terse column values for the archetype tables below. Associated constants cannot
-// be brought into scope with `use`, so these are local aliases.
 const DEP: KindId = KindId::DEPLOYMENT;
 const STS: KindId = KindId::STATEFUL_SET;
 const DS: KindId = KindId::DAEMON_SET;
@@ -507,10 +498,6 @@ fn sample_kind(rng: &mut ChaCha8Rng) -> KindId {
     }
 }
 
-/// One draw against the same thresholds as before, so generated output is
-/// unchanged. What is new is that the severity now travels with the reason that
-/// produced it, which is what the closed `Health` enum could not express:
-/// `CrashLoopBackOff` is distinct from a generic warning.
 fn sample_state(rng: &mut ChaCha8Rng) -> State {
     match rng.random_range(0..1000u32) {
         0..920 => State::of(ReasonId::RUNNING),
@@ -562,9 +549,6 @@ struct SatProfile<'a> {
 }
 
 fn kind_profile(kind: KindId) -> SatProfile<'static> {
-    // A match on KindId cannot be exhaustive by construction, which is the point:
-    // an unrecognised kind takes a middle default instead of failing to compile.
-    // No generated output changes, because only the four sampled kinds reach here.
     let svc_p = match kind {
         KindId::DEPLOYMENT | KindId::STATEFUL_SET => 0.55,
         KindId::DAEMON_SET | KindId::JOB => 0.08,
@@ -901,17 +885,11 @@ pub fn generate(cfg: &GenConfig) -> ClusterSpec {
     spec
 }
 
-/// Links a few workloads across namespace boundaries.
-///
-/// Drawn after every namespace exists, which is also why it cannot perturb the
-/// layout: it consumes rng only once all geometry-determining draws are done, so
-/// the committed layout fingerprints are unaffected.
 fn gen_cross_deps(rng: &mut ChaCha8Rng, spec: &mut ClusterSpec) {
     let ns_count = spec.namespaces.len();
     if ns_count < 2 {
         return;
     }
-    // Global index of each namespace's first workload.
     let mut ns_first = Vec::with_capacity(ns_count);
     let mut running = 0u32;
     for ns in &spec.namespaces {
@@ -922,8 +900,6 @@ fn gen_cross_deps(rng: &mut ChaCha8Rng, spec: &mut ClusterSpec) {
         return;
     }
 
-    // Roughly one link per namespace: enough that the cross range is genuinely
-    // exercised at every scale, few enough that it cannot dominate edge counts.
     let wanted = ns_count.min(64);
     for _ in 0..wanted {
         let a_ns = rng.random_range(0..ns_count);

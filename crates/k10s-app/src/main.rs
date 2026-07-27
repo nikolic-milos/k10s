@@ -22,10 +22,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Whatever is keeping the data plane alive, held for the life of the process.
-///
-/// Dropping the [`DataPlane`] drops the tokio runtime, which ends every watch, so
-/// this is not an unused binding: it is the thing that keeps the cluster connected.
 struct Live {
     _plane: DataPlane,
     drain: std::thread::JoinHandle<()>,
@@ -79,8 +75,6 @@ fn main() {
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
 
     let (damage_tx, damage_rx) = futures::channel::mpsc::unbounded();
-    // The app wires a producer to the world through the ingestion contract; the
-    // world no longer knows either producer exists.
     let world = k10s_world::spawn_world(
         events,
         scene.clone(),
@@ -174,8 +168,6 @@ fn generate(args: &cli::Args) -> Vec<IngestEvent> {
 }
 
 fn list_contexts() -> i32 {
-    // A channel nobody reads: listing contexts touches no cluster, so nothing is
-    // ever sent.
     let (tx, _rx) = crossbeam_channel::unbounded();
     let plane = match k10s_data::spawn(tx) {
         Ok(plane) => plane,
@@ -202,7 +194,6 @@ fn list_contexts() -> i32 {
     }
 }
 
-/// Connects, syncs, and leaves the watches running.
 fn connect_cluster(args: &cli::Args) -> Result<(Vec<IngestEvent>, Option<Live>), String> {
     let (tx, rx) = crossbeam_channel::unbounded();
     let plane = k10s_data::spawn(tx).map_err(|e| format!("cannot start the data plane: {e}"))?;
@@ -216,19 +207,12 @@ fn connect_cluster(args: &cli::Args) -> Result<(Vec<IngestEvent>, Option<Live>),
     eprintln!("k10s: {}", sync.report.summary());
     report_degradation(&sync);
 
-    // The world folds a whole initial sync and has no incremental path yet, so live
-    // events are drained and counted rather than applied. Phase D replaces the
-    // discard with the world's own intake; until then this keeps the queue bounded
-    // and makes the live path exercised rather than theoretical.
     let stop = Arc::new(AtomicBool::new(false));
     let drain = {
         let stop = stop.clone();
         std::thread::Builder::new()
             .name("k10s-live-drain".into())
             .spawn(move || {
-                // One tick's worth, drained into a reused buffer, exactly the way
-                // the world thread will: the coalescing counters then mean the same
-                // thing here as they will there.
                 const TICK: std::time::Duration = std::time::Duration::from_millis(200);
                 let mut intake = Intake::new();
                 let mut batch = Vec::new();
@@ -257,20 +241,12 @@ fn connect_cluster(args: &cli::Args) -> Result<(Vec<IngestEvent>, Option<Live>),
     ))
 }
 
-/// Says out loud whatever the cluster would otherwise let us show as an empty map.
 fn report_degradation(sync: &k10s_data::Sync) {
     for note in degradation_notes(sync) {
         eprintln!("k10s: {note}");
     }
 }
 
-/// The lines [`report_degradation`] prints, as values.
-///
-/// The failure mode the roadmap calls the worst kind is an RBAC-restricted cluster
-/// where the app looks like it works. Every line here exists so that cannot happen
-/// silently — and every line has to say only what the report observed, because a
-/// line that names a cause it did not observe sends the reader after the wrong
-/// problem. Separated from the printing so that is checkable.
 fn degradation_notes(sync: &k10s_data::Sync) -> Vec<String> {
     let report = &sync.report;
     let name = |kind: k10s_core::KindId| {
@@ -319,14 +295,6 @@ fn degradation_notes(sync: &k10s_data::Sync) -> Vec<String> {
             forbidden.len(),
             preview(&forbidden)
         ));
-        // For a namespaced kind, forbidden means denied cluster-wide *and* in every
-        // namespace that was asked about, and that set defaults to one. Naming it is
-        // the difference between "this account cannot see it" and "nobody asked about
-        // the namespace you care about". A cluster-scoped kind is decided on the
-        // cluster-wide answer alone and no --namespace can move it, so the hint
-        // over-offers whenever the forbidden list holds one; it is printed anyway
-        // rather than filtered, because a list this account cannot read is worth more
-        // than a hint that is actionable for every line of it.
         notes.push(match report.probed_namespaces.as_slice() {
             [] => "no namespace was checked for a narrower grant; --namespace NS adds one to \
                    the probe"
@@ -386,8 +354,6 @@ fn degradation_notes(sync: &k10s_data::Sync) -> Vec<String> {
     notes
 }
 
-/// The first few names plus a count, so a cluster with two hundred denied kinds
-/// does not print two hundred lines.
 fn preview(names: &[String]) -> String {
     const SHOWN: usize = 6;
     if names.len() <= SHOWN {
@@ -406,8 +372,6 @@ mod tests {
     use k10s_core::{Catalog, KindId};
     use k10s_data::{ClusterReport, assemble::AssembleStats};
 
-    /// A report with nothing to complain about: aggregated discovery, one readable
-    /// namespace. Every note below is then the one its test put there.
     fn readable() -> ClusterReport {
         ClusterReport {
             aggregated_discovery: true,
@@ -436,11 +400,6 @@ mod tests {
 
     #[test]
     fn a_namespace_scoped_stream_is_stated_rather_than_explained() {
-        // Two claims this line used to make and could not support. That the cause
-        // was a cluster-wide denial: the counter also rose for a review that had
-        // merely errored, which is what the tri-state now separates. And that the
-        // namespaces came from --namespace, which is false on every run that fell
-        // back to the context's own namespace.
         let notes = notes_for(
             ClusterReport {
                 streams: 4,
@@ -458,11 +417,6 @@ mod tests {
 
     #[test]
     fn a_forbidden_kind_names_the_namespaces_that_were_checked() {
-        // Both kinds here are namespaced, which is the case the hint is for: denied
-        // cluster-wide and in every namespace asked about, and the probe asks about
-        // one by default. Without the second line a developer with access to team-a
-        // reads "not readable by this account" and has no way to know that
-        // --namespace team-a is the answer.
         let notes = notes_for(
             ClusterReport {
                 probed_namespaces: vec!["default".into()],
@@ -477,8 +431,6 @@ mod tests {
             .unwrap_or_else(|| panic!("{notes:?}"));
         assert!(hint.contains("default"), "{hint}");
 
-        // And a cluster whose rules review answered for nothing says so, rather
-        // than naming an empty list.
         let unprobed = notes_for(readable(), vec![forbidden(KindId::SECRET)]);
         assert!(
             unprobed
@@ -490,9 +442,6 @@ mod tests {
 
     #[test]
     fn an_unanswered_review_is_reported_apart_from_a_probe_that_could_not_run() {
-        // Both mean "attempted rather than gated", and the difference is how much
-        // of the cluster it applies to. Folding the first into the second is what
-        // the tri-state exists to stop.
         let notes = notes_for(
             ClusterReport {
                 kinds_unanswered: 2,

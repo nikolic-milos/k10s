@@ -1,19 +1,8 @@
-//! Recorded ingest streams, and the scenarios a data plane has to survive.
-//!
-//! The point is to make the hard cases testable without a cluster. Contract tests
-//! over recorded streams are what let the kube layer be checked against initial
-//! sync, a 410 resync, partial permissions, a CRD appearing mid-stream and
-//! malformed events, on a machine with no kubeconfig.
-//!
-//! Storage is in memory for now. Persisting these as fixtures is a protobuf job
-//! and deliberately not done here.
-
 use std::sync::Arc;
 
 use crate::ingest::{Capability, DesyncReason, IngestEvent, Intake, Op, Payload, ResourceEvent};
 use crate::model::{KindId, State, ToolId};
 
-/// A captured stream, replayable as many times as a test likes.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RecordedStream {
     pub events: Vec<IngestEvent>,
@@ -43,14 +32,12 @@ impl RecordedStream {
         self.events.is_empty()
     }
 
-    /// Feeds the whole stream through an intake, as a producer would.
     pub fn replay_into(&self, intake: &mut Intake) {
         for e in &self.events {
             intake.push(e.clone());
         }
     }
 
-    /// Replays and drains in one step, which is what a single-tick test wants.
     pub fn drain_through(&self, intake: &mut Intake) -> Vec<IngestEvent> {
         self.replay_into(intake);
         intake.drain()
@@ -64,7 +51,6 @@ impl RecordedStream {
     }
 }
 
-/// Builders for a scope, an owner and an instance, so scenarios stay readable.
 pub fn scope(uid: &str, name: &str, op: Op) -> IngestEvent {
     IngestEvent::Resource(ResourceEvent {
         kind: KindId::NAMESPACE,
@@ -108,8 +94,6 @@ pub fn instance(uid: &str, ns: &str, parent: &str, state: State, op: Op) -> Inge
     })
 }
 
-/// A small complete initial sync: one scope, one owner, two instances, then the
-/// `Synced` that makes absence meaningful.
 pub fn initial_sync() -> RecordedStream {
     RecordedStream::record([
         scope("ns-prod", "prod", Op::Added),
@@ -127,25 +111,18 @@ pub fn initial_sync() -> RecordedStream {
     ])
 }
 
-/// A watch that expires and relists. The relist repeats objects as `Added`, which
-/// is exactly why coalescing has to be idempotent.
 pub fn resync_after_expired() -> RecordedStream {
     let mut s = initial_sync();
     s.push(IngestEvent::Desync {
         kind: KindId::POD,
         reason: DesyncReason::Expired,
     });
-    // The relist: same uids, arriving again as Added.
     s.push(instance("pod-1", "prod", "wl-api", State::OK, Op::Added));
     s.push(instance("pod-2", "prod", "wl-api", State::OK, Op::Added));
-    // And one that vanished while we were disconnected: absent from the relist,
-    // which is the case only Synced makes detectable.
     s.push(IngestEvent::Synced { kind: KindId::POD });
     s
 }
 
-/// A cluster where we may read pods but not secrets. The forbidden kind must be
-/// reported, not silently empty.
 pub fn partial_permissions() -> RecordedStream {
     RecordedStream::record([
         scope("ns-prod", "prod", Op::Added),
@@ -167,7 +144,6 @@ pub fn partial_permissions() -> RecordedStream {
     ])
 }
 
-/// A CRD kind nobody compiled in, appearing and then being removed while we watch.
 pub fn crd_added_and_removed_midstream() -> RecordedStream {
     let vmi = KindId(9_100);
     RecordedStream::record([
@@ -179,7 +155,6 @@ pub fn crd_added_and_removed_midstream() -> RecordedStream {
         owner("wl-vmi", "vms", "web-vm", vmi, Op::Added),
         instance("pod-vmi", "vms", "wl-vmi", State::OK, Op::Added),
         IngestEvent::Synced { kind: vmi },
-        // The CRD is uninstalled: the kind stops being served entirely.
         owner("wl-vmi", "vms", "web-vm", vmi, Op::Deleted),
         IngestEvent::Capability {
             kind: vmi,
@@ -188,8 +163,6 @@ pub fn crd_added_and_removed_midstream() -> RecordedStream {
     ])
 }
 
-/// An undecodable event, then recovery. A steady trickle of these is a bug, but
-/// one must not take the stream down.
 pub fn malformed_then_recovered() -> RecordedStream {
     let mut s = RecordedStream::record([
         scope("ns-prod", "prod", Op::Added),
@@ -210,17 +183,8 @@ pub fn malformed_then_recovered() -> RecordedStream {
     s
 }
 
-/// A watch that drops and resumes from a bookmark rather than relisting.
-///
-/// The distinction from [`resync_after_expired`] is the whole point of bookmarks
-/// and is invisible unless a fixture pins it: a resumed watch produces no
-/// [`DesyncReason::Expired`] and repeats no object, it simply continues at a higher
-/// `resource_version`. A producer that relists on every reconnect looks identical
-/// to a correct one from the outside, until you count events on a large cluster.
 pub fn bookmarked_reconnect() -> RecordedStream {
     let mut s = initial_sync();
-    // The reconnect. Everything after this is a continuation, not a relist: the
-    // same uids, but as Modified at higher versions.
     let mut later = instance("pod-1", "prod", "wl-api", State::OK, Op::Modified);
     if let IngestEvent::Resource(r) = &mut later {
         r.resource_version = 4_096;
@@ -234,16 +198,8 @@ pub fn bookmarked_reconnect() -> RecordedStream {
     s
 }
 
-/// A kind and a reason the cluster reported that nobody compiled in.
-///
-/// The "malformed or unknown fields" case at the level the contract can express: a
-/// real API server sends reasons and kinds no release of ours knows about, and the
-/// severity has to survive even though the static reason table cannot supply it.
-/// This is exactly the shape the kube data plane produces for, say, `ErrImagePull`.
 pub fn unknown_kind_and_reason() -> RecordedStream {
     let widget = KindId(9_200);
-    // Past the compiled-in table, so `reason_severity` knows nothing about it and
-    // the severity has to have been carried rather than derived.
     let unnameable = crate::model::ReasonId(9_300);
     RecordedStream::record([
         scope("ns-edge", "edge", Op::Added),
@@ -267,7 +223,6 @@ pub fn unknown_kind_and_reason() -> RecordedStream {
     ])
 }
 
-/// One pod churning through many states inside a single tick.
 pub fn churn(updates: usize) -> RecordedStream {
     use crate::model::ReasonId;
     let cycle = [
@@ -327,8 +282,6 @@ mod tests {
 
     #[test]
     fn a_relist_after_410_does_not_duplicate_objects() {
-        // The property that matters: coalescing by uid makes a resync idempotent,
-        // so a flapping watch cannot inflate the scene.
         let mut i = Intake::new();
         let out = resync_after_expired().drain_through(&mut i);
         assert_eq!(res_count(&out), 4, "relisted pods must not double up");
@@ -352,10 +305,8 @@ mod tests {
             .collect();
         assert!(caps.contains(&(KindId::SECRET, Capability::Forbidden)));
         assert!(caps.contains(&(KindId::POD, Capability::Watchable)));
-        // And it must not be retried into the ground.
         let (_, reason) = find_desync(&out)[0];
         assert!(!reason.is_recoverable(), "403 must not look retryable");
-        // Pods still arrived: one denied kind cannot take the rest down.
         assert!(res_count(&out) >= 3);
     }
 
@@ -367,8 +318,6 @@ mod tests {
         let vmi = KindId(9_100);
         assert!(!vmi.is_builtin(), "the fixture must use an unknown kind");
 
-        // Added then Deleted inside one tick elides, which is correct: nothing
-        // downstream ever saw the VMI.
         assert!(
             !out.iter().any(|e| matches!(
                 e,
@@ -378,8 +327,6 @@ mod tests {
         );
         assert_eq!(i.stats().elided, 1);
 
-        // The capability transition still reaches the consumer, so the UI can go
-        // from showing the kind to hiding it rather than showing it as broken.
         let caps: Vec<Capability> = out
             .iter()
             .filter_map(|e| match e {
@@ -392,7 +339,6 @@ mod tests {
 
     #[test]
     fn a_crd_deleted_in_a_later_tick_does_surface() {
-        // The counterpart to the elision above: across ticks, the delete is real.
         let vmi = KindId(9_100);
         let mut i = Intake::new();
         RecordedStream::record([owner("wl-vmi", "vms", "web-vm", vmi, Op::Added)])
@@ -430,7 +376,6 @@ mod tests {
         let out = churn(200).drain_through(&mut i);
         assert_eq!(res_count(&out), 1, "200 updates, one publish");
         assert_eq!(i.stats().coalesced, 200);
-        // And the surviving event carries the last state, not the first.
         let IngestEvent::Resource(r) = &out[0] else {
             panic!("expected a resource event")
         };
@@ -442,9 +387,6 @@ mod tests {
 
     #[test]
     fn a_bookmarked_reconnect_relists_nothing() {
-        // What a bookmark buys: a reconnect that costs two events instead of the
-        // whole cluster. A producer that relists looks the same from the outside
-        // until you count, so this counts.
         let stream = bookmarked_reconnect();
         assert!(
             find_desync(&stream.events).is_empty(),
@@ -461,8 +403,6 @@ mod tests {
         adds.dedup();
         assert_eq!(before, adds.len(), "no object may be added twice");
 
-        // The continuation carries a higher resource version, which is what makes
-        // it a continuation.
         let versions: Vec<u64> = stream
             .resources()
             .filter(|r| r.op != Op::Added)
@@ -470,8 +410,6 @@ mod tests {
             .collect();
         assert_eq!(versions, vec![4_096, 4_097]);
 
-        // And a single tick collapses it to one event per object, with the delete
-        // winning over the earlier add for pod-2.
         let mut i = Intake::new();
         let out = stream.drain_through(&mut i);
         assert_eq!(res_count(&out), 3, "one namespace, one owner, one pod");
@@ -486,9 +424,6 @@ mod tests {
 
     #[test]
     fn an_unknown_kind_and_reason_keep_the_severity_they_arrived_with() {
-        // The static tables cannot rate a reason nobody compiled in, so the
-        // producer's severity has to be carried rather than re-derived. Getting
-        // this wrong renders every novel error as healthy-ish.
         let mut i = Intake::new();
         let out = unknown_kind_and_reason().drain_through(&mut i);
         assert_eq!(res_count(&out), 3);

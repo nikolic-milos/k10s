@@ -22,9 +22,6 @@ pub use replay::RecordedStream;
 #[derive(Debug, Clone, Copy)]
 pub struct NsExt {
     pub unhealthy_frac: f32,
-    /// The worst severity anywhere in this scope. Folded with
-    /// [`Severity::rollup`], so it is order-free and cheap to maintain
-    /// incrementally.
     pub rollup: Severity,
 }
 
@@ -32,9 +29,6 @@ pub struct NsExt {
 pub struct WlExt {
     pub kind: KindId,
     pub tool: ToolId,
-    /// The worst severity among this owner's instances. A rollup, not a
-    /// [`State`]: many pods have many reasons, and picking one to stand for the
-    /// workload would invent information. The reason lives on the instance.
     pub rollup: Severity,
     pub ns: u32,
 }
@@ -75,10 +69,6 @@ pub enum WorldCtrl {
 mod tests {
     use super::*;
 
-    /// The frame path walks these arrays per visible node, and the fan-out benches
-    /// pad synthetic scenes to these strides to stand in for production. Pinning
-    /// them means accidental growth shows up here rather than as an unexplained
-    /// benchmark drift. Raise a number deliberately, with a measurement.
     #[test]
     fn node_extension_strides_are_pinned() {
         assert_eq!(size_of::<NsExt>(), 8, "NsExt");
@@ -90,8 +80,6 @@ mod tests {
 
         assert_eq!(size_of::<NsNode>(), 56, "NsNode");
         assert_eq!(size_of::<WorkloadNode>(), 80, "WorkloadNode");
-        // Unchanged from the closed-enum model: the old one-byte health sat in
-        // seven bytes of tail padding, so the reason channel came for free.
         assert_eq!(size_of::<PodNode>(), 40, "PodNode");
         assert_eq!(size_of::<SatNode>(), 56, "SatNode");
     }

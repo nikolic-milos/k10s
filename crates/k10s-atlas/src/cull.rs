@@ -139,8 +139,6 @@ pub fn cull<R, B, C, S>(
     st
 }
 
-/// The rect an edge occupies, centre to centre. Widened to a unit because `intersects` is strict on
-/// both sides, so a perfectly horizontal or vertical run would otherwise be invisible everywhere.
 fn edge_span(a: &Rect, b: &Rect) -> Rect {
     let (ax, ay) = a.center();
     let (bx, by) = b.center();
@@ -156,8 +154,6 @@ fn edge_visible(a: &Rect, b: &Rect, visible: &Rect) -> bool {
     edge_span(a, b).intersects(visible)
 }
 
-/// The rect an endpoint denotes. Blocks resolve to `inner` (the card) rather than
-/// the halo, which is what edges attached to before endpoints were tagged.
 fn endpoint_rect<R, B, C, S>(scene: &Scene<R, B, C, S>, e: Endpoint) -> Option<&Rect> {
     let i = e.index() as usize;
     match e.level() {
@@ -168,15 +164,6 @@ fn endpoint_rect<R, B, C, S>(scene: &Scene<R, B, C, S>, e: Endpoint) -> Option<&
     }
 }
 
-/// Emit every visible edge, region by region where the scene carries the grouping.
-///
-/// `region_edges[i]` is a spatial index and not merely a partition by owner: the span of every edge
-/// in it must lie inside `regions[i].rect`, which is what lets one intersection test skip the whole
-/// range. An edge that reaches outside its region belongs in the `cross_edges` tail, scanned
-/// unconditionally -- that is where `k10s_world` puts a dependency that leaves its namespace, and
-/// `k10s_atlas::testing` keeps the generated scene's edges inside their regions. Group an escaping
-/// edge under a region anyway and this drops it whenever the region misses the viewport; the flat
-/// rescan behind `k10s_map`'s cull oracle is what notices.
 pub fn walk_edges<R, B, C, S>(
     scene: &Scene<R, B, C, S>,
     visible: &Rect,
@@ -189,16 +176,6 @@ pub fn walk_edges<R, B, C, S>(
             if *drawn >= max_edges {
                 return false;
             }
-            // Resolved through `get`, not indexing: endpoints will come from live
-            // cluster data, where a dangling reference is a stale watch event
-            // rather than a bug worth a panic in the frame path. An edge we
-            // cannot resolve is skipped.
-            //
-            // Block-to-block is every edge the generator emits and the shape all
-            // edges had before endpoints were tagged, so it gets a straight-line
-            // path: one compare on the packed tags instead of two level matches.
-            // Measured worth it, since this is the largest traversal term at high
-            // fan-out.
             let (a, b) = if e.is_block_pair() {
                 let (Some(a), Some(b)) = (
                     scene.blocks.get(e.a.index() as usize),
@@ -425,9 +402,6 @@ mod tests {
             },
         };
 
-        // The three regions hold their own blocks and the one edge that spans two of them is in the
-        // cross tail, so the grouped walk is entitled to skip a range on one intersection test and
-        // the two orders must agree. Break that and this comparison is what fails.
         let visible = Rect::new(0.0, 0.0, 350.0, 100.0);
         let mut grouped = Vec::new();
         let n = walk_edges(&scene, &visible, 100, |a, b| grouped.push((*a, *b)));
@@ -443,27 +417,13 @@ mod tests {
         assert_eq!(walk_edges(&scene, &visible, 2, |_, _| {}), 2);
     }
 
-    /// The precondition the per-region skip rides on, checked against every scene shape
-    /// `benches/cull.rs` and `k10s-map`'s oracle sweep actually feed the generator. Block
-    /// containment alone is not quite enough: `edge_span` widens a straight run of blocks to a
-    /// unit, so a region needs that unit of slack as well.
-    ///
-    /// `testing::scene` leaves `cross_edges` empty, so every shape is built a second time by
-    /// `cross_scene`, which fills the tail wherever the shape has two regions for an edge to run
-    /// between. Without that second build the tail scan is never entered and the walk assertion
-    /// below holds for a reason that says nothing about it.
     #[test]
     fn region_edges_are_a_spatial_index() {
-        // One region count stands for the bench's uniform axis: a region's rect and the placement
-        // of its blocks within it do not depend on how many regions there are. The three fan-out
-        // sizes do not collapse the same way -- `blocks_per_region` is what sets the block grid and
-        // so the region's size.
         let specs = [
             SceneSpec::uniform(200, 15),
             SceneSpec::fan_out(500),
             SceneSpec::fan_out(2000),
             SceneSpec::fan_out(8000),
-            // The oracle sweep's three: uniform, fan-out, dense.
             SceneSpec {
                 cells_per_block: 8,
                 sats_per_block: 3,
@@ -519,10 +479,6 @@ mod tests {
                      the walk never reaches"
                 );
 
-                // The partition above is a property of the fixture; this is the property of the
-                // walk that the fixture exists to enable. With everything visible and no budget,
-                // reachable and reached must be the same number, which is what fails if the tail
-                // scan is dropped.
                 let all = Rect::new(-1e6, -1e6, 2e6, 2e6);
                 assert_eq!(
                     walk_edges(&scene, &all, usize::MAX, |_, _| {}),
@@ -538,11 +494,6 @@ mod tests {
         );
     }
 
-    /// Every edge the generator and `k10s-world` build today is a block pair, so the tagged branch
-    /// and `endpoint_rect` run for the first time when a Phase D or F overlay links a pod to a
-    /// service. Pin what they resolve to while the answer is still obvious: a block endpoint means
-    /// the card and not the halo, the same rect the block-pair fast path picks, and an endpoint that
-    /// resolves to nothing is skipped rather than counted or panicked on.
     #[test]
     fn walk_edges_resolves_tagged_endpoints() {
         let mut scene = hub_scene();
@@ -555,7 +506,6 @@ mod tests {
                 a: Endpoint::block(0),
                 b: Endpoint::region(0),
             },
-            // A stale watch event: the satellite this refers to is gone.
             Edge {
                 a: Endpoint::cell(0),
                 b: Endpoint::sat(9),
@@ -580,19 +530,6 @@ mod tests {
         );
     }
 
-    /// ROADMAP §6.1's crown jewel as an assertion rather than a bench table: at a fixed camera the
-    /// counters must be *identical* between object counts (§6.7), not merely similar. The oracle
-    /// sweep in `k10s-map` checks the four budgeted counters as ceilings, but `quads`,
-    /// `drawn_blocks`, `drawn_cells` and `drawn_sats` have no budget and nothing else pins them, so
-    /// work proportional to total object count -- a child loop that forgets to slice by its parent,
-    /// an overlay walked per scene node -- lands here or nowhere.
-    ///
-    /// The axis is `benches/cull.rs`'s: 200 to 1600 regions at 15 blocks each. Region 0 sits at the
-    /// origin and its size depends only on `blocks_per_region` and `cells_per_block`, so one camera
-    /// frames the same objects at every scene size -- as long as the frame stays inside region 0,
-    /// which each camera is checked for. A frame reaching a neighbouring region would turn this
-    /// into a test of the layout grid. The Z0 fit camera is left out because it is O(regions) *by
-    /// design*, which is why §4-I makes Z0 aggregation a prerequisite for multi-cluster.
     #[test]
     fn visible_work_is_independent_of_scene_size() {
         const VW: f32 = 1600.0;
@@ -605,12 +542,6 @@ mod tests {
             .map(|&regions| crate::testing::scene(SceneSpec::uniform(regions, BLOCKS)))
             .collect();
         let (rx, ry) = scenes[0].regions[0].rect.center();
-        // The bench centres its Z2, Z3 and Z4 on `blocks[0]`, region 0's corner block, and the Z2
-        // frame from there runs off the region's left edge and its top. It still counts one region,
-        // because nothing sits above or left of the origin -- but only because region 0 is the
-        // grid's first cell, which is the layout accident this test must not rest on. So the
-        // cameras below sit on the block nearest the region's middle, where every frame stays
-        // inside the rect.
         let region0 = scenes[0].regions[0].rect;
         let (cx, cy) = scenes[0].blocks[0].inner.center();
         let corner = Camera { cx, cy, zoom: 2.2 }.visible_world(VW, VH);
@@ -638,9 +569,6 @@ mod tests {
 
         let (bx, by) = scenes[0].blocks[hub].inner.center();
         let pol = policy();
-        // The bench's Z2, Z3 and Z4 zooms, plus a region-centred zoom 2.0. Only that fourth one
-        // reaches every block of region 0; the bench's three each see part of it, so on their own
-        // this would be invariance over a corner.
         let cams = [
             (
                 "region",
