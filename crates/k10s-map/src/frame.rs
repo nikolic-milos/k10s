@@ -11,6 +11,10 @@
 //! [`FrameOpts`] plus the `LodPolicy` it borrows, which is what lets a test sweep policies in
 //! parallel threads. `K10S_NO_GLOW` stops at [`PaintSink`] and `K10S_REPAINT_ALWAYS` never gets
 //! this far.
+//!
+//! `mod frame` is private, so `pub` in here reaches no further than the crate. `crate::testing`
+//! re-exports the seam under the `testing` feature, which is the only way `benches/walk.rs` -- a
+//! separate crate -- can time the traversal the painter actually runs.
 
 use gpui::{
     Bounds, PaintQuad, PathBuilder, Pixels, SharedString, fill, point, px, quad, rgb, size,
@@ -65,15 +69,19 @@ impl FrameOpts<'_> {
     }
 }
 
-pub(crate) struct LabelJob {
-    pub(crate) text: SharedString,
-    pub(crate) x: f32,
-    pub(crate) y: f32,
-    pub(crate) size_px: f32,
-    pub(crate) color: gpui::Rgba,
+pub struct LabelJob {
+    /// Always built with `SharedString::from(&Arc<str>)`, never `SharedString::new`. The `SmolStr`
+    /// behind a `SharedString` keeps up to 23 bytes inline and an `Arc<str>` above that, so handing
+    /// it the scene's own `Arc` is a refcount bump where a copy was a malloc per label per frame,
+    /// and pod names run past 23 bytes routinely.
+    pub text: SharedString,
+    pub x: f32,
+    pub y: f32,
+    pub size_px: f32,
+    pub color: gpui::Rgba,
 }
 
-pub(crate) enum IconJob {
+pub enum IconJob {
     Wl(KindId, Bounds<Pixels>),
     ToolId(ToolId, Bounds<Pixels>),
     Sat(KindId, Bounds<Pixels>),
@@ -84,7 +92,7 @@ pub(crate) enum IconJob {
 ///
 /// The walk never reads anything back from a sink, so a sink cannot influence the counters: that
 /// is what makes the headless comparison a test of the painter rather than of the test's own copy.
-pub(crate) trait FrameSink {
+pub trait FrameSink {
     fn bg_quad(&mut self, quad: PaintQuad);
     fn fg_quad(&mut self, quad: PaintQuad);
     fn label(&mut self, label: LabelJob);
@@ -132,7 +140,7 @@ fn push_icon<S: FrameSink>(
 ///
 /// This is the painter's traversal. `crate::paint_map` calls it with a [`PaintSink`] and then
 /// submits the buffers to gpui; nothing else about a frame decides visibility.
-pub(crate) fn walk<S: FrameSink>(
+pub fn walk<S: FrameSink>(
     bounds: Bounds<Pixels>,
     scene: &SceneSnapshot,
     camera: Camera,
@@ -251,7 +259,7 @@ pub(crate) fn walk<S: FrameSink>(
             push_label(&mut st, lod, sink, || {
                 let (sx, sy) = camera.w2s(ns.rect.x, ns.rect.y, vw, vh);
                 LabelJob {
-                    text: SharedString::new(&*ns.label),
+                    text: SharedString::from(&ns.label),
                     x: ox + sx + 10.0,
                     y: oy + sy + 6.0,
                     size_px: NS_LABEL_PX,
@@ -329,7 +337,7 @@ pub(crate) fn walk<S: FrameSink>(
                     push_label(&mut st, lod, sink, || {
                         let (sx, sy) = camera.w2s(wl.inner.x, wl.inner.y, vw, vh);
                         LabelJob {
-                            text: SharedString::new(&*wl.label),
+                            text: SharedString::from(&wl.label),
                             x: ox + sx + 4.0,
                             y: oy + sy + 1.0,
                             size_px: WL_LABEL_PX,
@@ -385,7 +393,7 @@ pub(crate) fn walk<S: FrameSink>(
                     if lod.sat_label_shown(sat.rect.w, zoom) {
                         let (lx, ly) = camera.w2s(sat.rect.x, sat.rect.max_y(), vw, vh);
                         push_label(&mut st, lod, sink, || LabelJob {
-                            text: SharedString::new(&*sat.label),
+                            text: SharedString::from(&sat.label),
                             x: ox + lx - 8.0,
                             y: oy + ly + 2.0,
                             size_px: SAT_NAME_PX,
@@ -397,7 +405,7 @@ pub(crate) fn walk<S: FrameSink>(
                             },
                         });
                         push_label(&mut st, lod, sink, || LabelJob {
-                            text: SharedString::new(&*sat.ext.detail),
+                            text: SharedString::from(&sat.ext.detail),
                             x: ox + lx - 8.0,
                             y: oy + ly + 2.0 + SAT_NAME_PX * 1.25,
                             size_px: SAT_DETAIL_PX,
@@ -442,7 +450,7 @@ pub(crate) fn walk<S: FrameSink>(
                     push_label(&mut st, lod, sink, || {
                         let (sx, sy) = camera.w2s(pod.rect.x, pod.rect.y + pod.rect.h, vw, vh);
                         LabelJob {
-                            text: SharedString::new(&*pod.label),
+                            text: SharedString::from(&pod.label),
                             x: ox + sx,
                             y: oy + sy + 2.0,
                             size_px: POD_LABEL_PX,
@@ -494,7 +502,15 @@ pub(crate) fn walk<S: FrameSink>(
 ///
 /// It owns the geometry decisions that cannot change a counter (dash flattening, whether the glow
 /// pass is built), which is why `K10S_NO_GLOW` lives here and not in [`FrameOpts`].
-pub(crate) struct PaintSink<'a> {
+///
+/// The quad and job buffers are borrowed so the painter keeps their capacity across frames. The
+/// four builders cannot be: each grows two lyon vectors as it is written, and
+/// `PathBuilder::build(self)` moves them into the tessellated path and drops them there, so there
+/// is no storage left to hand back, and gpui exposes neither a capacity constructor nor a reset.
+/// Together with `dash`, which is fresh per frame because `new` takes no scratch from the caller,
+/// that is the whole of `benches/walk.rs`'s `structural` column: two allocations per stroked layer
+/// the camera touches, plus one more when it draws any curve at all.
+pub struct PaintSink<'a> {
     bg: &'a mut Vec<PaintQuad>,
     fg: &'a mut Vec<PaintQuad>,
     labels: &'a mut Vec<LabelJob>,
@@ -510,7 +526,7 @@ pub(crate) struct PaintSink<'a> {
 /// The four stroked paths a frame builds, handed back once the walk is done so the painter can
 /// tessellate and submit them. `glow` is false when `K10S_NO_GLOW` suppressed the glow pass, in
 /// which case `curve_glow` is empty.
-pub(crate) struct FramePaths {
+pub struct FramePaths {
     pub(crate) hex: PathBuilder,
     pub(crate) edges: PathBuilder,
     pub(crate) curve_core: PathBuilder,
@@ -519,7 +535,7 @@ pub(crate) struct FramePaths {
 }
 
 impl<'a> PaintSink<'a> {
-    pub(crate) fn new(
+    pub fn new(
         bg: &'a mut Vec<PaintQuad>,
         fg: &'a mut Vec<PaintQuad>,
         labels: &'a mut Vec<LabelJob>,
@@ -545,7 +561,7 @@ impl<'a> PaintSink<'a> {
     }
 
     /// Release the borrowed buffers and hand the built paths to the painter.
-    pub(crate) fn into_paths(self) -> FramePaths {
+    pub fn into_paths(self) -> FramePaths {
         FramePaths {
             hex: self.hex_path,
             edges: self.edge_path,
@@ -615,5 +631,181 @@ impl FrameSink for PaintSink<'_> {
         self.edge_path.move_to(point(px(a.0), px(a.1)));
         self.edge_path
             .curve_to(point(px(b.0), px(b.1)), point(px(ctrl.0), px(ctrl.1)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use k10s_core::{
+        NsExt, NsNode, PodExt, PodNode, ReasonId, SatExt, SatNode, State, WlExt, WorkloadNode,
+    };
+
+    use super::*;
+    use crate::lod::{Knobs, policy};
+
+    /// `SmolStr`'s inline capacity, which smol_str does not export.
+    ///
+    /// `a_label_shares_the_arc_only_past_the_inline_cap` is the whole guard on this copy of it, and
+    /// it watches both directions. The `bench-alloc` ratchet watches something else: `From<Arc<str>>`
+    /// stack-copies below the cap and keeps the caller's `Arc` above it, so it allocates at no
+    /// length and the ratchet cannot see the cap move at all. What the ratchet catches is a call
+    /// site going back to `SharedString::new`, which allocates whatever the cap is.
+    const INLINE_CAP: usize = 23;
+
+    const VW: f32 = 1600.0;
+    const VH: f32 = 1000.0;
+
+    /// Close enough that the single region, block, cell and satellite are all inside the visible
+    /// world, and zoomed far enough that every label predicate in `LodPolicy` fires.
+    const CAMERA: Camera = Camera {
+        cx: 50.0,
+        cy: 50.0,
+        zoom: 4.0,
+    };
+
+    fn viewport() -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(VW), px(VH)),
+        }
+    }
+
+    /// One node at each level, each labelled past the inline cap except the cell, whose label the
+    /// caller chooses so the cap itself can be walked over.
+    fn scene(cell_label: &str) -> SceneSnapshot {
+        SceneSnapshot {
+            rev: 1,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            regions: vec![NsNode {
+                rect: Rect::new(0.0, 0.0, 100.0, 100.0),
+                label: Arc::from("payments-production-eu-west"),
+                weight: 1,
+                children: 0..1,
+                ext: NsExt {
+                    unhealthy_frac: 0.25,
+                    rollup: Severity::Warn,
+                },
+            }],
+            blocks: vec![WorkloadNode {
+                rect: Rect::new(10.0, 10.0, 60.0, 60.0),
+                inner: Rect::new(10.0, 10.0, 60.0, 60.0),
+                label: Arc::from("checkout-api-canary-rollout"),
+                children: 0..1,
+                sats: 0..1,
+                ext: WlExt {
+                    kind: KindId::DEPLOYMENT,
+                    tool: ToolId::NONE,
+                    rollup: Severity::Ok,
+                    ns: 0,
+                },
+            }],
+            cells: vec![PodNode {
+                rect: Rect::new(12.0, 12.0, 20.0, 20.0),
+                label: Arc::from(cell_label),
+                ext: PodExt {
+                    state: State::of(ReasonId::RUNNING),
+                },
+            }],
+            sats: vec![SatNode {
+                rect: Rect::new(75.0, 20.0, 10.0, 10.0),
+                label: Arc::from("checkout-api-primary-service"),
+                ext: SatExt {
+                    kind: KindId::SERVICE,
+                    detail: Arc::from("ClusterIP 10.96.0.1:8443/tcp"),
+                },
+            }],
+            ..SceneSnapshot::default()
+        }
+    }
+
+    /// Keeps the jobs alive so the scene's refcounts can be read while a frame still holds them,
+    /// which is the whole point: a copy and a share are indistinguishable once the job is dropped.
+    #[derive(Default)]
+    struct Collect {
+        labels: Vec<LabelJob>,
+    }
+
+    impl FrameSink for Collect {
+        fn bg_quad(&mut self, _: PaintQuad) {}
+        fn fg_quad(&mut self, _: PaintQuad) {}
+        fn label(&mut self, label: LabelJob) {
+            self.labels.push(label);
+        }
+        fn icon(&mut self, _: IconJob) {}
+        fn hex_ring(&mut self, _: &[(f32, f32); 6]) {}
+        fn curve(&mut self, _: (f32, f32), _: (f32, f32), _: (f32, f32)) {}
+        fn edge(&mut self, _: (f32, f32), _: (f32, f32), _: (f32, f32)) {}
+    }
+
+    /// The hex grid and the edge pass emit no labels, so both are off: this fixture is about the
+    /// five label sites and nothing else.
+    fn walk_labels(scene: &SceneSnapshot) -> Collect {
+        let pol = policy(Knobs::default());
+        let opts = FrameOpts {
+            policy: &pol,
+            edges_on: false,
+            skip_blocks: false,
+            hex: false,
+        };
+        let blend = StageBlend::settled(pol.stage_for_zoom(CAMERA.zoom));
+        let mut sink = Collect::default();
+        let st = walk(viewport(), scene, CAMERA, blend, opts, &mut sink);
+        assert_eq!(
+            st.labels,
+            sink.labels.len(),
+            "the sink and the counter disagree"
+        );
+        sink
+    }
+
+    /// Every one of `walk`'s five label sites has to hand the job the scene's own `Arc<str>`, which
+    /// shows as a second strong reference for as long as the job lives. A site that built its text
+    /// from a `&str` would leave the count at one and cost a malloc on every frame.
+    #[test]
+    fn every_label_site_shares_the_scenes_arc() {
+        let scene = scene("checkout-api-7f9c8d6b5-tzq4x");
+        let sink = walk_labels(&scene);
+        assert_eq!(sink.labels.len(), 5, "the fixture must fire all five sites");
+
+        for (site, label) in [
+            ("region", &scene.regions[0].label),
+            ("block", &scene.blocks[0].label),
+            ("cell", &scene.cells[0].label),
+            ("satellite", &scene.sats[0].label),
+            ("satellite detail", &scene.sats[0].ext.detail),
+        ] {
+            assert!(
+                label.len() > INLINE_CAP,
+                "{site}: a {}-byte fixture label inlines, so it proves nothing",
+                label.len()
+            );
+            assert_eq!(
+                Arc::strong_count(label),
+                2,
+                "{site}: the label was copied instead of shared"
+            );
+        }
+        drop(sink);
+    }
+
+    /// Both sides of [`INLINE_CAP`], through the shipping path: at the cap the text is inlined and
+    /// the scene's refcount is untouched, one byte past it the `Arc` is shared. Each row fails if
+    /// the cap moves the way it is the wrong side of -- a cap of 24 inlines the second row and
+    /// reads 1, a cap of 22 shares the first and reads 2 -- so the pair pins the constant from
+    /// above and below.
+    #[test]
+    fn a_label_shares_the_arc_only_past_the_inline_cap() {
+        for (len, strong) in [(INLINE_CAP, 1), (INLINE_CAP + 1, 2)] {
+            let scene = scene(&"p".repeat(len));
+            let sink = walk_labels(&scene);
+            assert_eq!(
+                Arc::strong_count(&scene.cells[0].label),
+                strong,
+                "{len}-byte cell label"
+            );
+            drop(sink);
+        }
     }
 }
