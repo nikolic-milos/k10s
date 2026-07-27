@@ -24,7 +24,7 @@
 //! Everything unplaceable is counted, never dropped quietly: a producer bug has
 //! to show up as a number rather than as a quietly smaller cluster.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use k10s_core::{Catalog, IngestEvent, KindId, Op, Payload, ResourceEvent, Role, State, ToolId};
@@ -131,19 +131,35 @@ pub struct AssembleStats {
     pub owner_cycles: u32,
 }
 
-/// The resolved parents, kept so live events after the initial sync can be
-/// parented without redoing the joins.
+/// The resolved parents and the owners that got a card, kept so live events after
+/// the initial sync can be placed without redoing the joins.
+///
+/// Only owners the sync emitted appear here. An object whose owner was dropped —
+/// its namespace unreadable, so its card never arrived — has nothing to be named
+/// under, and naming it anyway would put an orphan in the stream the first time it
+/// changed.
 #[derive(Debug, Default)]
 pub struct Index {
     scope_of: HashMap<Arc<str>, Arc<str>>,
     attach_owner: HashMap<AttachKey, Arc<str>>,
     parent_of: HashMap<Arc<str>, Arc<str>>,
+    owners: HashSet<Arc<str>>,
 }
 
 impl Index {
     /// The uid of a namespace by name.
     pub fn scope_uid(&self, namespace: &str) -> Option<&Arc<str>> {
         self.scope_of.get(namespace)
+    }
+
+    /// Whether the sync drew an owner card for this uid.
+    ///
+    /// The question the live phase cannot answer from a kind: a pass-through
+    /// ReplicaSet is [`Role::Owner`] in the store whether or not it was promoted,
+    /// so only the set of cards actually emitted says which one has something to
+    /// update.
+    pub fn emitted_owner(&self, uid: &str) -> bool {
+        self.owners.contains(uid)
     }
 
     /// The owner an already-placed object sits under.
@@ -421,7 +437,7 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
     }
 
     // Owners, each under its scope.
-    let mut emitted: HashMap<Arc<str>, ()> = HashMap::new();
+    let mut emitted: HashSet<Arc<str>> = HashSet::new();
     for owner in &owners {
         let Some(scope) = out.index.scope_of.get(&owner.namespace) else {
             out.stats.unknown_namespace += 1;
@@ -453,15 +469,12 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
                 depends_on,
             },
         }));
-        emitted.insert(owner.uid.clone(), ());
+        emitted.insert(owner.uid.clone());
         out.stats.owners += 1;
     }
 
     for inst in &instances {
-        let Some(parent) = parent_of
-            .get(&inst.uid)
-            .filter(|p| emitted.contains_key(*p))
-        else {
+        let Some(parent) = parent_of.get(&inst.uid).filter(|p| emitted.contains(*p)) else {
             // Either no owner resolved, or the owner sat in a namespace we never
             // saw. Both counted, neither emitted: an orphan makes the world's
             // fold assert.
@@ -496,7 +509,7 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
             continue;
         };
         let key = (att.kind, att.namespace.clone(), att.name.clone());
-        let Some(parent) = attach_owner.get(&key).filter(|p| emitted.contains_key(*p)) else {
+        let Some(parent) = attach_owner.get(&key).filter(|p| emitted.contains(*p)) else {
             out.stats.unattached += 1;
             continue;
         };
@@ -516,8 +529,14 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
         out.stats.attachments += 1;
     }
 
+    // The index's invariant, applied here rather than where the parents are
+    // resolved, because the resolution that lands on an owner nobody can see is
+    // exactly what `unknown_namespace` and `unattached` count.
+    parent_of.retain(|_, owner| emitted.contains(owner));
+    attach_owner.retain(|_, owner| emitted.contains(owner));
     out.index.attach_owner = attach_owner;
     out.index.parent_of = parent_of;
+    out.index.owners = emitted;
     out
 }
 
@@ -966,6 +985,103 @@ mod tests {
         assert!(a.events.is_empty());
         assert_eq!(a.stats.unknown_namespace, 2);
         assert_eq!(a.stats.owners, 0);
+    }
+
+    #[test]
+    fn the_index_names_only_owners_the_sync_emitted() {
+        // The index is what parents live events, so an entry naming an owner that
+        // was never emitted is a promise to emit an orphan the first time the
+        // object changes. Same RBAC shape as above: pods readable, namespaces not.
+        let objects = |scoped: bool| {
+            let mut out = vec![
+                owner("dep-1", "prod", "api", KindId::DEPLOYMENT),
+                with_detail(
+                    instance(
+                        "pod-1",
+                        "prod",
+                        "api-1",
+                        Some(ctrl("dep-1", "Deployment", "api", "apps/v1")),
+                    ),
+                    Vec::new(),
+                    vec![AttachRef {
+                        kind: KindId::CONFIG_MAP,
+                        name: "api-config".into(),
+                    }],
+                ),
+                attached("cm-1", "prod", "api-config", KindId::CONFIG_MAP, Vec::new()),
+            ];
+            if scoped {
+                out.push(scope("ns-1", "prod"));
+            }
+            out
+        };
+
+        // Both joins hold when the namespace is readable, which is what makes the
+        // absences below mean something rather than passing on an empty index.
+        let placed = assemble(&store(objects(true)), &mut Catalog::new());
+        assert_eq!(placed.index.parent_of("pod-1").map(|u| &**u), Some("dep-1"));
+        assert_eq!(
+            placed
+                .index
+                .attachment_owner(KindId::CONFIG_MAP, "prod", "api-config")
+                .map(|u| &**u),
+            Some("dep-1")
+        );
+
+        let dropped = assemble(&store(objects(false)), &mut Catalog::new());
+        assert!(dropped.events.is_empty(), "{:?}", dropped.events);
+        assert!(dropped.index.parent_of("pod-1").is_none());
+        assert!(
+            dropped
+                .index
+                .attachment_owner(KindId::CONFIG_MAP, "prod", "api-config")
+                .is_none()
+        );
+        // And the counts are the half that must not change: the joins did resolve,
+        // onto an owner nobody can see.
+        assert_eq!(dropped.stats.unknown_namespace, 2);
+        assert_eq!(dropped.stats.unattached, 1);
+    }
+
+    #[test]
+    fn the_index_names_the_promoted_replicaset_and_not_the_passed_through_one() {
+        // The two ReplicaSets are indistinguishable by kind and by role, and only
+        // one of them was drawn. The live phase has no other way to tell them apart,
+        // and suppressing both would freeze the hand-rolled one's card.
+        let s = store(vec![
+            scope("ns-1", "prod"),
+            owner("dep-1", "prod", "api", KindId::DEPLOYMENT),
+            replicaset(
+                "rs-1",
+                "prod",
+                "api-abc",
+                Some(ctrl("dep-1", "Deployment", "api", "apps/v1")),
+            ),
+            replicaset("rs-2", "prod", "hand-rolled", None),
+            instance(
+                "pod-1",
+                "prod",
+                "api-abc-1",
+                Some(ctrl("rs-1", "ReplicaSet", "api-abc", "apps/v1")),
+            ),
+            instance(
+                "pod-2",
+                "prod",
+                "hand-rolled-1",
+                Some(ctrl("rs-2", "ReplicaSet", "hand-rolled", "apps/v1")),
+            ),
+        ]);
+        let a = assemble(&s, &mut Catalog::new());
+        assert_conforming(&a);
+        assert!(a.index.emitted_owner("dep-1"));
+        assert!(a.index.emitted_owner("rs-2"), "promoted, so it has a card");
+        assert!(
+            !a.index.emitted_owner("rs-1"),
+            "passed through, so it has none"
+        );
+        // A uid that is on the map but is not an owner is not an owner card either.
+        assert!(!a.index.emitted_owner("pod-1"));
+        assert!(!a.index.emitted_owner("ns-1"));
     }
 
     #[test]
