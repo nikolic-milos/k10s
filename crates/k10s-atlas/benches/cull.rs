@@ -7,6 +7,10 @@ use k10s_atlas::{Camera, CullStats, LodPolicy, Scene, StageBlend, cull};
 const VW: f32 = 1600.0;
 const VH: f32 = 1000.0;
 const WARMUP: usize = 200;
+/// The floor exists so the p99 column is a p99: at 51 samples and fewer the 0.99 index rounds to
+/// the last one, which makes the number the maximum, and below a hundred a single sample carries
+/// more than a whole percentile. `iters` is reported per row so a comparator can check rather than
+/// trust.
 const MIN_ITERS: usize = 200;
 const MAX_ITERS: usize = 200_000;
 const BUDGET: Duration = Duration::from_millis(120);
@@ -18,6 +22,7 @@ struct Case {
     blocks_per_region: usize,
     camera_name: &'static str,
     zoom: f32,
+    iters: usize,
     p50_ns: f64,
     p99_ns: f64,
     stats: CullStats,
@@ -31,7 +36,7 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
     sorted[i] as f64
 }
 
-fn measure(scene: &Scene, policy: &LodPolicy, camera: &Camera) -> (f64, f64, CullStats) {
+fn measure(scene: &Scene, policy: &LodPolicy, camera: &Camera) -> (usize, f64, f64, CullStats) {
     let blend = StageBlend::settled(policy.stage_for_zoom(camera.zoom));
     let stats = cull(scene, camera, policy, blend, VW, VH, true, false);
 
@@ -66,6 +71,7 @@ fn measure(scene: &Scene, policy: &LodPolicy, camera: &Camera) -> (f64, f64, Cul
     }
     samples.sort_unstable();
     (
+        samples.len(),
         percentile(&samples, 0.50),
         percentile(&samples, 0.99),
         stats,
@@ -137,7 +143,7 @@ fn main() {
     for (name, spec) in specs() {
         let s = scene(spec);
         for (camera_name, camera) in cameras(&s) {
-            let (p50, p99, stats) = measure(&s, &policy, &camera);
+            let (iters, p50, p99, stats) = measure(&s, &policy, &camera);
             cases.push(Case {
                 scene_name: name.clone(),
                 objects: spec.total_objects(),
@@ -145,6 +151,7 @@ fn main() {
                 blocks_per_region: spec.blocks_per_region,
                 camera_name,
                 zoom: camera.zoom,
+                iters,
                 p50_ns: p50,
                 p99_ns: p99,
                 stats,
@@ -171,11 +178,12 @@ fn print_table(cases: &[Case]) {
             );
         }
         println!(
-            "    {:<12} zoom {:>6.2}  p50 {:>9.0} ns  p99 {:>9.0} ns | quads {:>6} labels {:>4} icons {:>4} sats {:>5} curves {:>5} edges {:>5} | drawn r/b/c {:>5}/{:>6}/{:>7}",
+            "    {:<12} zoom {:>6.2}  p50 {:>9.0} ns  p99 {:>9.0} ns  iters {:>6} | quads {:>6} labels {:>4} icons {:>4} sats {:>5} curves {:>5} edges {:>5} | drawn r/b/c {:>5}/{:>6}/{:>7}",
             c.camera_name,
             c.zoom,
             c.p50_ns,
             c.p99_ns,
+            c.iters,
             c.stats.quads,
             c.stats.labels,
             c.stats.icons,
@@ -191,7 +199,7 @@ fn print_table(cases: &[Case]) {
 
 fn print_json(cases: &[Case]) {
     println!("{{");
-    println!("  \"schema_version\": 1,");
+    println!("  \"schema_version\": 2,");
     println!("  \"viewport\": [{VW}, {VH}],");
     println!("  \"cases\": [");
     for (i, c) in cases.iter().enumerate() {
@@ -203,6 +211,7 @@ fn print_json(cases: &[Case]) {
         println!("      \"blocks_per_region\": {},", c.blocks_per_region);
         println!("      \"camera\": \"{}\",", c.camera_name);
         println!("      \"zoom\": {},", c.zoom);
+        println!("      \"iters\": {},", c.iters);
         println!("      \"p50_ns\": {:.0},", c.p50_ns);
         println!("      \"p99_ns\": {:.0},", c.p99_ns);
         println!("      \"quads\": {},", c.stats.quads);

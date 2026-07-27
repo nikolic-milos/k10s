@@ -14,6 +14,10 @@ const SEED: u64 = 55;
 const VW: f32 = 1600.0;
 const VH: f32 = 1000.0;
 const WARMUP: usize = 100;
+/// The floor exists so the p99 column is a p99: at 51 samples and fewer the 0.99 index rounds to
+/// the last one, which makes the number the maximum, and below a hundred a single sample carries
+/// more than a whole percentile. `iters` is reported per row so a comparator can check rather than
+/// trust.
 const MIN_ITERS: usize = 100;
 const MAX_ITERS: usize = 100_000;
 const BUDGET: Duration = Duration::from_millis(120);
@@ -43,6 +47,7 @@ struct Case {
     wl_degree: usize,
     camera_name: &'static str,
     zoom: f32,
+    iters: usize,
     p50_ns: f64,
     p99_ns: f64,
     p50_no_edges_ns: f64,
@@ -213,6 +218,7 @@ fn main() {
                     wl_degree,
                     camera_name,
                     zoom: camera.zoom,
+                    iters: on.len(),
                     p50_ns: percentile(&on, 0.50),
                     p99_ns: percentile(&on, 0.99),
                     p50_no_edges_ns: percentile(&off, 0.50),
@@ -271,12 +277,13 @@ fn print_table(shapes: &[Shape], cases: &[Case]) {
             );
         }
         println!(
-            "    {:<15} zoom {:>7.3}  p50 {:>10.0} ns  p99 {:>10.0} ns  no-edges p50 {:>10.0} ns | quads {:>6} labels {:>4} icons {:>5} sats {:>5} curves {:>5} edges {:>5} | drawn r/b/c {:>4}/{:>6}/{:>6}",
+            "    {:<15} zoom {:>7.3}  p50 {:>10.0} ns  p99 {:>10.0} ns  no-edges p50 {:>10.0} ns  iters {:>6} | quads {:>6} labels {:>4} icons {:>5} sats {:>5} curves {:>5} edges {:>5} | drawn r/b/c {:>4}/{:>6}/{:>6}",
             c.camera_name,
             c.zoom,
             c.p50_ns,
             c.p99_ns,
             c.p50_no_edges_ns,
+            c.iters,
             c.stats.quads,
             c.stats.labels,
             c.stats.icons,
@@ -292,7 +299,7 @@ fn print_table(shapes: &[Shape], cases: &[Case]) {
 
 fn print_json(shapes: &[Shape], cases: &[Case]) {
     println!("{{");
-    println!("  \"schema_version\": 1,");
+    println!("  \"schema_version\": 2,");
     println!("  \"mode\": \"{}\",", MODE.as_str());
     println!("  \"seed\": {SEED},");
     println!("  \"viewport\": [{VW}, {VH}],");
@@ -323,6 +330,7 @@ fn print_json(shapes: &[Shape], cases: &[Case]) {
         println!("      \"wl_degree\": {},", c.wl_degree);
         println!("      \"camera\": \"{}\",", c.camera_name);
         println!("      \"zoom\": {},", c.zoom);
+        println!("      \"iters\": {},", c.iters);
         println!("      \"p50_ns\": {:.0},", c.p50_ns);
         println!("      \"p99_ns\": {:.0},", c.p99_ns);
         println!("      \"p50_no_edges_ns\": {:.0},", c.p50_no_edges_ns);
