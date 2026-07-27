@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "maximum_packages": 797,
+  "maximum_external_packages": 788,
+  "maximum_git_packages": 28,
+  "allowed_git_sources": [
+    "git+https://github.com/nikolic-milos/zed?rev=1997311daedbd90333b6710634d2cfbd81b33306#1997311daedbd90333b6710634d2cfbd81b33306",
+    "git+https://github.com/rust-x-bindings/rust-xcb?rev=ae3b2cd080e78173223038ccbebdc644eaf4a9ad#ae3b2cd080e78173223038ccbebdc644eaf4a9ad",
+    "git+https://github.com/zed-industries/font-kit?rev=94b0f28166665e8fd2f53ff6d268a14955c82269#94b0f28166665e8fd2f53ff6d268a14955c82269",
+    "git+https://github.com/zed-industries/scap?rev=4afea48c3b002197176fb19cd0f9b180dd36eaac#4afea48c3b002197176fb19cd0f9b180dd36eaac",
+    "git+https://github.com/zed-industries/xim-rs.git?rev=16f35a2c881b815a2b6cdfd6687988e84f8447d8#16f35a2c881b815a2b6cdfd6687988e84f8447d8"
+  ],
+  "forbidden_packages": [
+    "proc-macro-error-attr2",
+    "proc-macro-error2"
+  ]
+}
