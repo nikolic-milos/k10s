@@ -51,7 +51,7 @@ fn viewport(vw: f32, vh: f32) -> Bounds<Pixels> {
 
 /// Counts what the walk emits and drops it. Also refuses non-finite geometry, which would reach
 /// lyon and the GPU as silent garbage.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 struct Tally {
     bg_quads: usize,
     fg_quads: usize,
@@ -60,6 +60,21 @@ struct Tally {
     hexes: usize,
     curves: usize,
     edges: usize,
+    /// Screen-space `(x0, y0, x1, y1)` over every hex ring vertex, or `None` if the grid was off.
+    hex_extent: Option<(f32, f32, f32, f32)>,
+    /// Off by default: only [`every_placement_carries_the_frame_origin`] wants the coordinates
+    /// themselves, and the sweep would allocate a few thousand of them per case for nothing.
+    points: Option<Vec<(f32, f32)>>,
+}
+
+impl Tally {
+    /// Where the walk put a primitive, in emission order. The single control point a curve or an
+    /// edge derives from its own two ends is geometry rather than a placement, so it stays out.
+    fn place(&mut self, x: f32, y: f32) {
+        if let Some(points) = &mut self.points {
+            points.push((x, y));
+        }
+    }
 }
 
 fn finite(p: (f32, f32)) -> bool {
@@ -78,11 +93,19 @@ impl FrameSink for Tally {
     fn bg_quad(&mut self, quad: PaintQuad) {
         assert!(finite_quad(&quad), "non-finite background quad");
         self.bg_quads += 1;
+        self.place(
+            f32::from(quad.bounds.origin.x),
+            f32::from(quad.bounds.origin.y),
+        );
     }
 
     fn fg_quad(&mut self, quad: PaintQuad) {
         assert!(finite_quad(&quad), "non-finite foreground quad");
         self.fg_quads += 1;
+        self.place(
+            f32::from(quad.bounds.origin.x),
+            f32::from(quad.bounds.origin.y),
+        );
     }
 
     fn label(&mut self, label: LabelJob) {
@@ -91,15 +114,25 @@ impl FrameSink for Tally {
             "non-finite label placement"
         );
         self.labels += 1;
+        self.place(label.x, label.y);
     }
 
-    fn icon(&mut self, _icon: IconJob) {
+    fn icon(&mut self, icon: IconJob) {
         self.icons += 1;
+        let b = match icon {
+            IconJob::Wl(_, b) | IconJob::ToolId(_, b) | IconJob::Sat(_, b) => b,
+        };
+        self.place(f32::from(b.origin.x), f32::from(b.origin.y));
     }
 
     fn hex_ring(&mut self, ring: &[(f32, f32); 6]) {
         assert!(ring.iter().copied().all(finite), "non-finite hex ring");
         self.hexes += 1;
+        for &(x, y) in ring {
+            self.place(x, y);
+            let (x0, y0, x1, y1) = self.hex_extent.unwrap_or((x, y, x, y));
+            self.hex_extent = Some((x0.min(x), y0.min(y), x1.max(x), y1.max(y)));
+        }
     }
 
     fn curve(&mut self, hub: (f32, f32), ctrl: (f32, f32), sat: (f32, f32)) {
@@ -108,11 +141,15 @@ impl FrameSink for Tally {
             "non-finite satellite curve"
         );
         self.curves += 1;
+        self.place(hub.0, hub.1);
+        self.place(sat.0, sat.1);
     }
 
     fn edge(&mut self, a: (f32, f32), ctrl: (f32, f32), b: (f32, f32)) {
         assert!(finite(a) && finite(ctrl) && finite(b), "non-finite edge");
         self.edges += 1;
+        self.place(a.0, a.1);
+        self.place(b.0, b.1);
     }
 }
 
@@ -482,12 +519,30 @@ fn check(case: &Case<'_>, scene: &SceneSnapshot, camera: Camera) -> CullStats {
         tally.bg_quads + tally.fg_quads,
         "quad counter drifted from emitted quads: {case}"
     );
+    // Which pass each quad went to, which the sum above cannot see. The backdrop and the namespace
+    // islands are submitted under the hex grid and the curves; the cards, their chrome and the pods
+    // over them. A card that arrived in the background buffer would be painted beneath the grid and
+    // no counter would move.
+    assert_eq!(
+        tally.bg_quads,
+        1 + painted.drawn_regions,
+        "background is the backdrop plus one quad per region: {case}"
+    );
     assert_eq!(
         painted.labels, tally.labels,
         "label counter drifted: {case}"
     );
     assert_eq!(painted.icons, tally.icons, "icon counter drifted: {case}");
+    // `bg_cells` is `hex::for_each_center`'s own return value on both sides of the invariant, so
+    // recounting the rings can only catch a ring the painter's closure declined to emit. What no
+    // count can catch is a grid that stops short of the frame it is the backdrop for.
     assert_eq!(painted.bg_cells, tally.hexes, "hex counter drifted: {case}");
+    if let Some((x0, y0, x1, y1)) = tally.hex_extent {
+        assert!(
+            x0 <= OX && y0 <= OY && x1 >= OX + case.vw && y1 >= OY + case.vh,
+            "hex grid spans only ({x0}, {y0})..({x1}, {y1}) of the frame: {case}"
+        );
+    }
     assert_eq!(
         painted.curves, tally.curves,
         "curve counter drifted: {case}"
@@ -594,59 +649,102 @@ impl Reached {
         self.max_curves = self.max_curves.max(st.curves);
     }
 
-    fn assert_covered(&self, scene: &str) {
-        assert!(self.cases > 0, "{scene}: swept nothing");
+    /// Claimed per budget profile rather than over the pool of all three, because a profile that
+    /// cannot reach a state must not get to hide behind one that can. Pooled, `zero` alone satisfied
+    /// every "budget was hit" claim -- with nothing budgeted, every attempt is a drop -- so nothing
+    /// checked that the shipping budgets are reachable by a cluster or that the drop paths run on a
+    /// budget that also draws something.
+    fn assert_covered(&self, scene: &str, budgets: &str) {
+        let at = format!("{scene} at {budgets} budgets");
+        assert!(self.cases > 0, "{at}: swept nothing");
         for (stage, hit) in self.stages.iter().enumerate() {
-            assert!(hit, "{scene}: never reached stage Z{stage} ({self:?})");
+            assert!(hit, "{at}: never reached stage Z{stage} ({self:?})");
         }
-        assert!(self.hexes, "{scene}: never drew a hex ({self:?})");
-        assert!(self.curves, "{scene}: never drew a curve ({self:?})");
-        assert!(self.icons, "{scene}: never drew an icon ({self:?})");
-        assert!(self.cells, "{scene}: never drew a cell ({self:?})");
-        assert!(
-            self.labels_dropped,
-            "{scene}: never hit the label budget ({self:?})"
-        );
-        assert!(
-            self.icons_dropped,
-            "{scene}: never hit the icon budget ({self:?})"
-        );
-        assert!(
-            self.curves_dropped,
-            "{scene}: never hit the curve budget ({self:?})"
-        );
-        assert!(
-            self.edges_capped,
-            "{scene}: never hit the edge budget ({self:?})"
-        );
+        assert!(self.hexes, "{at}: never drew a hex ({self:?})");
+        assert!(self.cells, "{at}: never drew a cell ({self:?})");
         assert!(
             self.empty_view,
-            "{scene}: never looked at empty space ({self:?})"
+            "{at}: never looked at empty space ({self:?})"
         );
 
-        // The sweep must actually see a busy frame somewhere, or every assertion above is
-        // satisfied by a scene nobody is looking at.
-        assert!(self.max_quads >= 200, "{scene}: too few quads ({self:?})");
-        assert!(self.max_cells >= 100, "{scene}: too few cells ({self:?})");
-        assert!(self.max_sats >= 100, "{scene}: too few sats ({self:?})");
-        assert!(self.max_hexes >= 100, "{scene}: too few hexes ({self:?})");
-        assert!(self.max_edges >= 10, "{scene}: too few edges ({self:?})");
-        assert!(self.max_curves >= 100, "{scene}: too few curves ({self:?})");
-        assert!(self.max_labels >= 10, "{scene}: too few labels ({self:?})");
+        // Nothing above is budgeted, so the busy-frame floors below hold whatever the caps are.
+        assert!(self.max_quads >= 200, "{at}: too few quads ({self:?})");
+        assert!(self.max_cells >= 100, "{at}: too few cells ({self:?})");
+        assert!(self.max_sats >= 100, "{at}: too few sats ({self:?})");
+        assert!(self.max_hexes >= 100, "{at}: too few hexes ({self:?})");
+
+        match budgets {
+            // The only profile loose enough to say what a frame of this scene actually draws.
+            "shipping" => {
+                assert!(self.curves, "{at}: never drew a curve ({self:?})");
+                assert!(self.icons, "{at}: never drew an icon ({self:?})");
+                assert!(self.max_edges >= 10, "{at}: too few edges ({self:?})");
+                assert!(self.max_curves >= 100, "{at}: too few curves ({self:?})");
+                assert!(self.max_labels >= 10, "{at}: too few labels ({self:?})");
+            }
+            // Low enough to overrun on every scene, high enough that each budget still admits
+            // something first, which is what makes a drop a drop rather than a refusal.
+            "tight" => {
+                assert!(self.curves, "{at}: never drew a curve ({self:?})");
+                assert!(self.icons, "{at}: never drew an icon ({self:?})");
+                assert!(self.max_labels > 0, "{at}: never drew a label ({self:?})");
+                assert!(
+                    self.labels_dropped,
+                    "{at}: never hit the label budget ({self:?})"
+                );
+                assert!(
+                    self.icons_dropped,
+                    "{at}: never hit the icon budget ({self:?})"
+                );
+                assert!(
+                    self.curves_dropped,
+                    "{at}: never hit the curve budget ({self:?})"
+                );
+                assert!(
+                    self.edges_capped,
+                    "{at}: never hit the edge budget ({self:?})"
+                );
+            }
+            // A budget of nothing: every attempt lands on a drop path and nothing gets through.
+            // `edges_capped` is unreachable by construction -- a cap of zero reached looks exactly
+            // like a stage that draws no edges at all.
+            "zero" => {
+                assert!(
+                    self.labels_dropped && self.icons_dropped && self.curves_dropped,
+                    "{at}: a budget of nothing never dropped anything ({self:?})"
+                );
+                assert_eq!(
+                    (self.max_labels, self.max_edges),
+                    (0, 0),
+                    "{at}: a budget of nothing let something through ({self:?})"
+                );
+                assert!(!self.icons, "{at}: a zero icon budget drew one ({self:?})");
+                // Curves are the one deliberate exception: `curve_budget` is uncapped under
+                // `K10S_STRESS_CURVES`, so a stress run measures curves instead of the budget.
+                assert!(
+                    self.max_curves > 0,
+                    "{at}: only a stress run beats a zero curve budget, and none did ({self:?})"
+                );
+            }
+            other => panic!("no coverage claim for the {other} budget profile"),
+        }
     }
 }
 
 /// The full cross product per scene: 2 viewports x 12 cameras x 13 blends x 16 knob settings x 3
 /// budget profiles x edges_on x skip_wl x hex = 119,808 combinations, each compared against the
-/// oracle whole.
-fn sweep(scene_name: &str, scene: &SceneSnapshot) -> Reached {
-    let mut reached = Reached::default();
+/// oracle whole. What was reached is returned per budget profile, in `BUDGETS` order.
+fn sweep(scene_name: &str, scene: &SceneSnapshot) -> Vec<(&'static str, Reached)> {
+    let mut reached: Vec<(&'static str, Reached)> = BUDGETS
+        .iter()
+        .map(|(name, _)| (*name, Reached::default()))
+        .collect();
     for (view, vw, vh) in VIEWPORTS {
         for (cam_name, camera) in cameras(scene, vw, vh) {
             for blend in BLENDS {
                 for knobs in knob_set() {
-                    for (budget_name, budgets) in BUDGETS {
-                        let pol = with_budgets(lod::policy(knobs), budgets);
+                    for (slot, (budget_name, budgets)) in BUDGETS.iter().enumerate() {
+                        let pol = with_budgets(lod::policy(knobs), *budgets);
                         for edges_on in [true, false] {
                             for skip_blocks in [false, true] {
                                 for hex in [true, false] {
@@ -666,7 +764,7 @@ fn sweep(scene_name: &str, scene: &SceneSnapshot) -> Reached {
                                             hex,
                                         },
                                     };
-                                    reached.note(&check(&case, scene, camera), &pol);
+                                    reached[slot].1.note(&check(&case, scene, camera), &pol);
                                 }
                             }
                         }
@@ -700,7 +798,8 @@ fn fanout_spec() -> SceneSpec {
     }
 }
 
-/// Enough satellites to blow the shipping curve budget, not just the tight one.
+/// Enough satellites to blow the shipping curve budget, not just the tight one, which
+/// [`oracle_matches_painter_dense_satellites`] holds this spec to.
 fn dense_spec() -> SceneSpec {
     SceneSpec {
         regions: 4,
@@ -714,19 +813,39 @@ fn dense_spec() -> SceneSpec {
 #[test]
 fn oracle_matches_painter_uniform() {
     let scene = snapshot(uniform_spec());
-    sweep("uniform", &scene).assert_covered("uniform");
+    for (budgets, reached) in sweep("uniform", &scene) {
+        reached.assert_covered("uniform", budgets);
+    }
 }
 
 #[test]
 fn oracle_matches_painter_fanout() {
     let scene = snapshot(fanout_spec());
-    sweep("fanout", &scene).assert_covered("fanout");
+    for (budgets, reached) in sweep("fanout", &scene) {
+        reached.assert_covered("fanout", budgets);
+    }
 }
 
 #[test]
 fn oracle_matches_painter_dense_satellites() {
     let scene = snapshot(dense_spec());
-    sweep("dense", &scene).assert_covered("dense");
+    let swept = sweep("dense", &scene);
+    for (budgets, reached) in &swept {
+        reached.assert_covered("dense", budgets);
+    }
+
+    // What this scene is for, and the one claim `assert_covered` cannot make on its own: 1792
+    // satellites overrun the *shipping* curve budget. The tight profile only proves the drop path
+    // runs; this proves 1500 is a number a real cluster reaches.
+    let shipping = swept
+        .iter()
+        .find(|(budgets, _)| *budgets == "shipping")
+        .expect("the shipping profile");
+    assert!(
+        shipping.1.curves_dropped,
+        "dense no longer overruns the shipping curve budget ({:?})",
+        shipping.1
+    );
 }
 
 /// Degenerate scenes: nothing to draw, one of everything, and zero-area rects. No coverage claim
@@ -759,6 +878,16 @@ fn oracle_matches_painter_on_degenerate_scenes() {
     for c in &mut flat.cells {
         c.rect.w = 0.0;
     }
+    // Collapsing the namespace rects moved every card outside the region grouping its edges, and
+    // `k10s_atlas::walk_edges` skips a whole range on one intersection test against that rect. So
+    // the index has to say what the geometry now says: an edge that reaches outside its region is a
+    // cross-region edge, which is the tail the walk always scans. Leaving the ranges as they were
+    // would make the painter drop edges the oracle's flat rescan still finds -- a scene nothing can
+    // produce, not a bug. It also means the cross tail runs non-empty here, which the generated
+    // scenes never do.
+    let flat_edges = flat.edges.len() as u32;
+    flat.region_edges = vec![0..0; flat.regions.len()];
+    flat.cross_edges = 0..flat_edges;
 
     for (name, scene) in [
         ("empty", &empty),
@@ -799,6 +928,95 @@ fn oracle_matches_painter_on_degenerate_scenes() {
                 }
             }
         }
+    }
+}
+
+/// A placement moved by the frame origin, to within a thousandth of a pixel and a millionth of the
+/// coordinate. Not bit equality, because the walk adds the origin *before* a label's or an icon's
+/// constant nudge and f32 addition does not re-associate; both terms stay four orders of magnitude
+/// under the 17 px this is looking for.
+fn shifted(base: f32, moved: f32, by: f32) -> bool {
+    let want = base + by;
+    (moved - want).abs() <= 1e-3 + 1e-6 * want.abs()
+}
+
+/// `viewport`'s origin is not (0, 0) because the map is a canvas inside a window, and every
+/// coordinate the walk emits has to carry it. No counter can see whether it did -- a quad is one
+/// quad wherever it landed -- so walk the same frame twice, 17 px and 23 px apart, and require every
+/// placement to have moved by that. A dropped `ox +` puts a label or a curve at the window's corner
+/// instead of the map's, which is otherwise the kind of thing only a screenshot catches.
+#[test]
+fn every_placement_carries_the_frame_origin() {
+    let scene = snapshot(uniform_spec());
+    let pol = lod::policy(Knobs::default());
+    let opts = FrameOpts {
+        policy: &pol,
+        edges_on: true,
+        skip_blocks: false,
+        hex: true,
+    };
+    let (_, vw, vh) = VIEWPORTS[0];
+    let at = |ox: f32, oy: f32, camera, blend| {
+        let mut tally = Tally {
+            points: Some(Vec::new()),
+            ..Tally::default()
+        };
+        let bounds = Bounds {
+            origin: point(px(ox), px(oy)),
+            size: size(px(vw), px(vh)),
+        };
+        walk(bounds, &scene, camera, blend, opts, &mut tally);
+        tally
+    };
+
+    let mut most = Tally::default();
+    for (cam_name, camera) in cameras(&scene, vw, vh) {
+        for blend in BLENDS {
+            let base = at(0.0, 0.0, camera, blend);
+            let moved = at(OX, OY, camera, blend);
+            let (b, m) = (
+                base.points.as_deref().unwrap(),
+                moved.points.as_deref().unwrap(),
+            );
+            assert_eq!(
+                b.len(),
+                m.len(),
+                "{cam_name} {blend:?}: the frame origin changed what was emitted"
+            );
+            for (i, (&(bx, by), &(mx, my))) in b.iter().zip(m).enumerate() {
+                // The tolerance is relative, so it is only negligible while the coordinates are.
+                assert!(
+                    bx.abs() < 1e5 && by.abs() < 1e5,
+                    "{cam_name} {blend:?}: placement {i} at ({bx}, {by}) is too far out to judge"
+                );
+                assert!(
+                    shifted(bx, mx, OX) && shifted(by, my, OY),
+                    "{cam_name} {blend:?}: placement {i} at ({bx}, {by}) went to ({mx}, {my}), not ({}, {})",
+                    bx + OX,
+                    by + OY
+                );
+            }
+            most.bg_quads = most.bg_quads.max(moved.bg_quads);
+            most.fg_quads = most.fg_quads.max(moved.fg_quads);
+            most.labels = most.labels.max(moved.labels);
+            most.icons = most.icons.max(moved.icons);
+            most.hexes = most.hexes.max(moved.hexes);
+            most.curves = most.curves.max(moved.curves);
+            most.edges = most.edges.max(moved.edges);
+        }
+    }
+
+    // Every emit site has to have run, or this is a statement about quads and nothing else.
+    for (kind, n) in [
+        ("background quad", most.bg_quads),
+        ("foreground quad", most.fg_quads),
+        ("label", most.labels),
+        ("icon", most.icons),
+        ("hex ring", most.hexes),
+        ("curve", most.curves),
+        ("edge", most.edges),
+    ] {
+        assert!(n > 0, "no {kind} was ever placed: {most:?}");
     }
 }
 
