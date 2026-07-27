@@ -43,6 +43,9 @@ pub fn cull<R, B, C, S>(
 ) -> CullStats {
     let visible = camera.visible_world(vw, vh);
     let stage = blend.walk_stage();
+    if stage == 0 {
+        return cull_stage_zero(scene, camera.zoom, &visible, policy);
+    }
     let contiguous = scene.child_ranges_are_direct();
     let single_region_inside = scene.regions.len() == 1 && visible.contains(&scene.regions[0].rect);
     if contiguous && stage != 1 {
@@ -114,6 +117,55 @@ pub fn cull<R, B, C, S>(
         cull_inner::<false, _, _, _, _>(scene, camera, policy, blend, vw, vh, edges_on, skip_blocks)
     } else {
         cull_inner::<true, _, _, _, _>(scene, camera, policy, blend, vw, vh, edges_on, skip_blocks)
+    }
+}
+
+fn cull_stage_zero<R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    zoom: f32,
+    visible: &Rect,
+    policy: &LodPolicy,
+) -> CullStats {
+    let budget = policy.max_labels;
+    let mut drawn_regions = 0usize;
+    let mut labels = 0usize;
+    let mut labels_dropped = 0usize;
+    if scene.region_index_is_selective(visible) {
+        scene.for_each_region_candidate(visible, |_, region| {
+            if !region.rect.intersects(visible) {
+                return;
+            }
+            drawn_regions += 1;
+            if policy.region_label_shown(region.rect.w, zoom) {
+                if labels >= budget {
+                    labels_dropped += 1;
+                } else {
+                    labels += 1;
+                }
+            }
+        });
+    } else {
+        for region in &scene.regions {
+            if !region.rect.intersects(visible) {
+                continue;
+            }
+            drawn_regions += 1;
+            if policy.region_label_shown(region.rect.w, zoom) {
+                if labels >= budget {
+                    labels_dropped += 1;
+                } else {
+                    labels += 1;
+                }
+            }
+        }
+    }
+    CullStats {
+        stage: 0,
+        quads: 1 + drawn_regions,
+        drawn_regions,
+        labels,
+        labels_dropped,
+        ..CullStats::default()
     }
 }
 
