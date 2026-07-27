@@ -1,13 +1,5 @@
 const MIN_DASH: f32 = 1e-3;
 
-/// The most on/off periods one polyline may spend. The floor this puts under `on` and `off` is what
-/// makes [`dash_polyline`] terminate, and terminating is all it is for: a step below one ULP of the
-/// distance already walked leaves the walk where it was, so `on` at [`MIN_DASH`] over a 40,000 px
-/// segment never returns, and 6 px over 1e8 spends 18 million vertices getting there. At 2^-16 of
-/// the line the floor clears one ULP -- 2^-23 of it -- by 128x, and is still slack enough never to
-/// recut a pitch a caller asked for: the curve layer's 6/5 px pattern survives to a 327,680 px
-/// curve, which is 8,192 world px at maximum zoom. It is no kind of vertex budget -- one path holds
-/// nowhere near 65,536 periods -- and how many curves a frame draws is the caller's to bound.
 const MAX_PERIODS: f32 = 65_536.0;
 
 pub fn flatten_quadratic(
@@ -39,8 +31,6 @@ pub fn dash_polyline(
     off: f32,
     mut emit: impl FnMut(bool, (f32, f32)),
 ) {
-    // The floor under the pattern is a fraction of the whole line, so the length comes first. Two
-    // passes over 64 flattened points is nothing next to a walk that does not terminate.
     let mut total = 0.0;
     let mut prev = start;
     for &p in points {
@@ -61,9 +51,6 @@ pub fn dash_polyline(
             continue;
         };
         let (ux, uy) = ((p.0 - prev.0) / full, (p.1 - prev.1) / full);
-        // `walked` is the distance from the segment start, and both points come straight off it, so
-        // the walk neither drifts nor stalls: the step is the rest of the dash or the rest of the
-        // segment, and two distinct floats differ by at least one ULP of the smaller.
         let mut walked = 0.0f32;
         while walked < full {
             let step = remain.min(full - walked);
@@ -87,8 +74,6 @@ pub fn dash_polyline(
     }
 }
 
-/// `None` for a segment the walk has to skip: no length to dash, or an endpoint that arithmetic
-/// upstream turned into a NaN or an infinity, which no pattern can subdivide.
 fn seg_len(a: (f32, f32), b: (f32, f32)) -> Option<f32> {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len = (dx * dx + dy * dy).sqrt();
@@ -215,10 +200,6 @@ mod tests {
         ] {
             let mut emitted = 0usize;
             dash_polyline((0.0, 0.0), &[(40.0, 0.0)], on, off, |_, _| emitted += 1);
-            // 40 px is far too short for [`MAX_PERIODS`] to bind, so [`MIN_DASH`] is the floor here
-            // and the ceiling is a vertex pair per period of it: 40,012 for the patterns that clamp
-            // to it, where the 12 is the walk's own rounding. The 1% is for that rounding and no
-            // more -- the bound this test used to carry was 4x the arithmetic maximum.
             let bound = 2 * (40.0 / (2.0 * MIN_DASH)) as usize;
             assert!(
                 emitted <= bound + bound / 100,
@@ -227,11 +208,6 @@ mod tests {
         }
     }
 
-    /// The lengths the curve layer actually hands [`dash_polyline`]: it dashes in screen space at
-    /// 6/5 px and zooms to 40x, so a few thousand pixels is an ordinary curve and two of them in one
-    /// frame have to come out with the same pitch. A floor at 512 periods gave all three of these
-    /// exactly 256 dashes whatever their length -- 4,000 px gave up 364 for 256, 40,000 px gave up
-    /// 3,637 -- which is a pitch set by the curve instead of by the caller.
     #[test]
     fn long_lines_keep_the_pitch_they_asked_for() {
         for len in [4_000.0f32, 8_000.0, 40_000.0] {
@@ -272,9 +248,6 @@ mod tests {
 
     #[test]
     fn dash_walk_cannot_stall() {
-        // Both of these spin forever against an advance that counts the dash down from the distance
-        // left: 1e-3 disappears under one ULP of 40,000, and nothing subtracts from an infinity. The
-        // test is that they return; the bound says they returned for the right reason.
         for (case, points, on, off) in [
             (
                 "pattern below the arithmetic",

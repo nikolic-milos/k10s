@@ -60,10 +60,6 @@ fn grid_cols(n: usize) -> usize {
     (n as f64).sqrt().ceil().max(1.0) as usize
 }
 
-/// Region and block base names, cycled. A generated label has to carry the *length* of a real one:
-/// the painter copies every visible label into a `SharedString` per frame, and the `SmolStr` behind
-/// it keeps 23 bytes inline, so a fixture full of `pod-3-4-5` puts an allocation counter on a
-/// structural zero that cannot regress.
 const NAMESPACES: [&str; 6] = [
     "platform-observability",
     "team-checkout",
@@ -84,22 +80,10 @@ const WORKLOADS: [&str; 8] = [
     "inventory-sync",
 ];
 
-/// What a satellite is attached as, cycled alongside the workload names.
 const SAT_KINDS: [&str; 4] = ["svc", "pvc", "cm", "secret"];
 
-/// `n` as `width` lowercase base-36 digits.
-///
-/// Kubernetes fills the tail of a pod name with a ReplicaSet hash and a five-character random
-/// suffix, which is what puts a real pod name past the inline capacity. The fixture derives both
-/// from the index so a scene stays reproducible, and mixes first so the result reads like the
-/// string it stands in for rather than like the counter it is.
-///
-/// The mix is a bijection but the truncation to `width` digits is not, so two indices can in
-/// principle land on the same tag. That labels come out distinct is checked by
-/// `labels_stay_unique_within_their_level` below, not assumed here.
 fn tag(n: usize, width: usize) -> String {
     const DIGITS: [u8; 36] = *b"0123456789abcdefghijklmnopqrstuvwxyz";
-    // splitmix64's finalizer.
     let mut x = (n as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -173,8 +157,6 @@ pub fn scene(spec: SceneSpec) -> Scene {
             let halo = Rect::new(bx, by, block_w, block_h);
             let inner = Rect::new(bx + BLOCK_HALO, by + BLOCK_HALO, inner_w, inner_h);
 
-            // Workload names repeat across regions, as they do in a cluster, and are unique inside
-            // one; a cell name hangs off its block's, which is where its length comes from.
             let wl = format!("{}-{b}", WORKLOADS[(r + b) % WORKLOADS.len()]);
             let rs = tag(blocks.len(), 9);
 
@@ -267,19 +249,6 @@ pub fn scene(spec: SceneSpec) -> Scene {
     }
 }
 
-/// [`scene`], plus `count` edges that leave the region they start in.
-///
-/// Every edge [`scene`] builds stays inside the rect of the region grouping it, which is the
-/// precondition that lets `walk_edges` skip a whole `region_edges` range on one intersection test.
-/// An edge that escapes cannot be grouped, so it lands in the `cross_edges` tail -- and that tail
-/// is scanned on every frame wherever the camera is, which makes it the one term in the frame path
-/// still proportional to the whole scene. Nothing else in this fixture reaches it.
-///
-/// Links run first-block to first-block between consecutive regions and cycle once they run out,
-/// because a count far past the number of region pairs is exactly what a scan sweep wants: the
-/// repeated endpoints stay in L1, so the ns/edge such a sweep reports is a floor for the tail
-/// rather than an average over a cold block array. Fewer than two regions has nothing to cross and
-/// leaves the tail empty.
 pub fn cross_scene(spec: SceneSpec, count: usize) -> Scene {
     let mut s = scene(spec);
     if spec.regions < 2 || spec.blocks_per_region == 0 {
@@ -302,10 +271,6 @@ pub fn cross_scene(spec: SceneSpec, count: usize) -> Scene {
 mod tests {
     use super::*;
 
-    /// smol_str 0.3.6's inline capacity, which is the boundary the painter's per-label
-    /// `SharedString` copy either crosses or does not. `k10s-map`'s walk bench measures it from the
-    /// allocator's side; this crate cannot see gpui, so it pins the number the fixture was built
-    /// against.
     const INLINE_CAP: usize = 23;
 
     #[test]
@@ -387,10 +352,6 @@ mod tests {
         }
     }
 
-    /// A cell label is the one the painter emits by the hundred, and the only one whose length is
-    /// guaranteed: Kubernetes hangs a ReplicaSet hash and a five-character suffix off the workload
-    /// name, so a pod name never fits inline. Region, block and satellite names land on both sides
-    /// of the boundary here exactly as they do in a cluster, so nothing pins them.
     #[test]
     fn cell_labels_are_too_long_to_live_inline() {
         let s = scene(SceneSpec::uniform(3, 4));
@@ -410,8 +371,6 @@ mod tests {
         );
     }
 
-    /// Enough cells per block that both tag positions are exercised: the nine-digit one over the
-    /// block index, the five-digit one over the cell index inside a block.
     #[test]
     fn labels_stay_unique_within_their_level() {
         let s = scene(SceneSpec {
@@ -458,8 +417,6 @@ mod tests {
         }
     }
 
-    /// The point of the tail, and the reason it needs a bench: `walk_edges` pays for it even when
-    /// every region misses the viewport, which is the case the grouped path exists to make cheap.
     #[test]
     fn walk_edges_scans_the_cross_tail_with_no_region_visible() {
         let spec = SceneSpec {
@@ -473,7 +430,6 @@ mod tests {
         let (_, ay) = s.blocks[s.regions[0].children.start as usize]
             .inner
             .center();
-        // The gutter between the two regions, on the line the cross edge draws.
         let visible = Rect::new(s.regions[0].rect.max_x() + 10.0, ay - 5.0, 100.0, 10.0);
         assert!(
             !s.regions.iter().any(|r| r.rect.intersects(&visible)),

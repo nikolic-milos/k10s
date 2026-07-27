@@ -30,19 +30,9 @@ unrecognized arguments are reported on stderr and ignored";
 
 const DEFAULT_MACHINE: &str = "unlabeled";
 const DEFAULT_SYNC_TIMEOUT_SECS: f32 = 30.0;
-/// `Duration::from_secs_f32` panics rather than saturating on a value it cannot hold,
-/// so the wait needs an upper bound; an hour is past the point where waiting for an
-/// initial list is a wait rather than a hang.
 const MAX_SYNC_TIMEOUT_SECS: f32 = 3600.0;
-/// The world turns the rate into a flip count per tick and runs all of them before it
-/// reads the control channel again, so an unbounded rate is a thread that never comes
-/// back: it stops publishing and `world.join()` hangs once the window closes. 100k/s is
-/// 5,000 flips a tick, already past anything a map can show.
 const MAX_CHURN_PER_SEC: f32 = 100_000.0;
 
-/// The tokens `--flag=value` may be split on. A `=` on a flag that takes no value is
-/// not that flag, and splitting `--cluster=no` would turn it into `--cluster`, so those
-/// stay whole and go where every unrecognized token goes.
 const VALUE_FLAGS: [&str; 9] = [
     "--objects",
     "--seed",
@@ -55,10 +45,6 @@ const VALUE_FLAGS: [&str; 9] = [
     "--sync-timeout",
 ];
 
-/// The accepted `--scenario` and `--layout` values, spelled by the types that parse
-/// them: the hand-written list in the error message had drifted to three of the five
-/// scenarios, omitting both fan-out shapes. A new variant still has to be added here,
-/// because neither type can enumerate itself.
 const SCENARIOS: [Scenario; 5] = [
     Scenario::Platform,
     Scenario::Observability,
@@ -79,13 +65,8 @@ pub struct Args {
     pub bench: bool,
     pub json: bool,
     pub help: bool,
-    /// Read a real cluster rather than the generator.
     pub cluster: bool,
-    /// Whether `--churn` was named, as opposed to left at its default. Cluster
-    /// mode ignores churn either way, and warning about a default nobody asked for
-    /// would print on every run.
     pub churn_explicit: bool,
-    /// The same question for the flags only one of the two input paths reads.
     pub objects_explicit: bool,
     pub seed_explicit: bool,
     pub scenario_explicit: bool,
@@ -132,16 +113,10 @@ impl Args {
             .to_string()
     }
 
-    /// The churn rate the world should actually run at.
-    ///
-    /// Synthetic churn flips pod states at random, which against a real cluster
-    /// would invent health nobody reported. Cluster mode therefore has no churn
-    /// whatever the flag says, and says so rather than silently ignoring it.
     pub fn effective_churn(&self) -> f32 {
         if self.cluster { 0.0 } else { self.churn }
     }
 
-    /// Whether `--churn` was asked for and will be ignored.
     pub fn churn_was_overridden(&self) -> bool {
         self.cluster && self.churn_explicit && self.churn > 0.0
     }
@@ -150,7 +125,6 @@ impl Args {
         std::time::Duration::from_secs_f32(self.sync_timeout_secs)
     }
 
-    /// Flags that only mean anything with `--cluster`.
     pub fn cluster_flags_without_cluster(&self) -> Vec<&'static str> {
         if self.cluster || self.list_contexts {
             return Vec::new();
@@ -168,11 +142,6 @@ impl Args {
         out
     }
 
-    /// Flags that only mean anything without `--cluster`, so the policy reads the same
-    /// way in both directions.
-    ///
-    /// `--churn` is not here: cluster mode overrides it rather than merely not reading
-    /// it, and [`Args::churn_was_overridden`] says so in its own words.
     pub fn generator_flags_with_cluster(&self) -> Vec<&'static str> {
         if !self.cluster {
             return Vec::new();
@@ -202,9 +171,6 @@ pub enum ArgError {
     },
     BadValue {
         flag: &'static str,
-        /// Owned: the accepted values are asked of the type that parses them and the
-        /// bounds of the constant that holds them, rather than spelled a second time
-        /// here, which is how this message came to name three of five scenarios.
         expected: String,
         got: String,
     },
@@ -241,10 +207,6 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
     let mut args = Args::default();
     let mut rest = argv;
     while let Some(arg) = rest.next() {
-        // `--flag=value` is the universal form and every flag that takes a value has to
-        // accept it. Matching the whole token sent `--objects=50000` to `ignored`, and
-        // `--bench --json` writes its report to stdout, so a caller that keeps stdout
-        // and drops stderr recorded the default scene's numbers as the run's.
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, inline)) if VALUE_FLAGS.contains(&flag) => (flag, Some(inline)),
             _ => (arg.as_str(), None),
@@ -307,9 +269,6 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
         return Ok(args);
     }
     if args.bench && args.cluster {
-        // The bench is a scripted flight over a fixed scene with committed
-        // baselines; running it over whatever a cluster happens to hold would
-        // produce a number nobody can compare against anything.
         return Err(ArgError::BenchWithCluster);
     }
     if args.json && !args.bench {
@@ -346,13 +305,6 @@ fn number<T: std::str::FromStr>(
     })
 }
 
-/// An `f32` flag value the rest of the program can use without re-checking it.
-///
-/// `"inf"`, `"-1"` and `"1e30"` all parse; what each of them does downstream is why the
-/// flag has a maximum at all. This rejects rather than clamps, because clamping a
-/// negative timeout to zero ended the initial list before any stream settled, and the
-/// empty map that came back is the one an RBAC-denied cluster gives. `nan` needs no test
-/// of its own, having already failed the range comparison.
 fn bounded(
     flag: &'static str,
     unit: &'static str,
@@ -503,8 +455,6 @@ mod tests {
                 },
             ),
             (
-                // The two fan-out scenarios are the axis §6.4 says matters, and the
-                // list that used to name three of five left them out.
                 &["--scenario", "Platform"],
                 ArgError::BadValue {
                     flag: "--scenario",
@@ -521,9 +471,6 @@ mod tests {
                 },
             ),
             (
-                // The bound is in the message because it comes from the constant that
-                // enforces it, so someone who typed milliseconds reads the unit and the
-                // limit at the same time.
                 &["--sync-timeout", "1e30"],
                 ArgError::BadValue {
                     flag: "--sync-timeout",
@@ -539,11 +486,6 @@ mod tests {
 
     #[test]
     fn numbers_that_parse_but_cannot_be_used_are_errors() {
-        // Every one of these parses as an f32 and every one of them used to reach the
-        // program: `inf` and `1e30` panic `Duration::from_secs_f32`, `--churn inf`
-        // becomes `usize::MAX` flips in one tick and the world stops publishing, and a
-        // negative timeout was clamped to zero, which ends the initial list before any
-        // stream settles and prints the permissions diagnosis at a typo.
         let cases: &[&[&str]] = &[
             &["--sync-timeout", "inf"],
             &["--sync-timeout", "1e30"],
@@ -562,7 +504,6 @@ mod tests {
                 "argv {argv:?} was accepted: {parsed:?}"
             );
         }
-        // The bounds themselves are values, not errors.
         assert_eq!(
             ok(&["--sync-timeout", "3600"]).sync_timeout().as_secs(),
             3600
@@ -573,11 +514,6 @@ mod tests {
 
     #[test]
     fn the_eq_form_works_for_every_flag_that_takes_a_value() {
-        // `--objects=50000` landing in `ignored` meant a 25,000-object scene, and the
-        // `--bench --json` report agreed with it: `BenchMeta.objects` is `args.objects`,
-        // the same field `generate()` hands the generator as `target_objects`. So the
-        // capture was internally consistent about a scale nobody had asked for, and the
-        // only notice that the flag had been dropped went to stderr.
         let cases: &[FieldCase] = &[
             (&["--objects=50000"], |a| a.objects == 50_000),
             (&["--seed=7"], |a| a.seed == 7),
@@ -604,13 +540,11 @@ mod tests {
             assert!(holds(&args), "{argv:?} did not set its field: {args:?}");
             assert!(args.ignored.is_empty(), "{argv:?} was reported as ignored");
         }
-        // And the value is validated the same way whichever form it arrived in.
         assert!(parse_argv(&["--sync-timeout=-1"]).is_err());
     }
 
     #[test]
     fn repeated_namespaces_accumulate() {
-        // The restricted-developer case: two namespaces, two rules reviews.
         let args = ok(&[
             "--cluster",
             "--namespace",
@@ -623,8 +557,6 @@ mod tests {
 
     #[test]
     fn cluster_mode_has_no_synthetic_churn() {
-        // Flipping pod states at random against a real cluster would invent health
-        // nobody reported, so the flag is overridden rather than honoured.
         let args = ok(&["--cluster", "--churn", "120"]);
         assert_eq!(args.effective_churn(), 0.0);
         assert!(args.churn_was_overridden());
@@ -633,8 +565,6 @@ mod tests {
         assert_eq!(generated.effective_churn(), 120.0);
         assert!(!generated.churn_was_overridden());
 
-        // A default nobody named is not an override to report, or the warning
-        // would print on every cluster run.
         assert!(!ok(&["--cluster"]).churn_was_overridden());
         assert_eq!(ok(&["--cluster"]).effective_churn(), 0.0);
         assert!(!ok(&["--cluster", "--churn", "0"]).churn_was_overridden());
@@ -642,8 +572,6 @@ mod tests {
 
     #[test]
     fn cluster_only_flags_are_reported_when_there_is_no_cluster() {
-        // Otherwise `--context prod` against the generator silently does nothing,
-        // and the user believes they are looking at prod.
         assert_eq!(
             ok(&["--context", "prod"]).cluster_flags_without_cluster(),
             vec!["--context"]
@@ -662,8 +590,6 @@ mod tests {
                 .cluster_flags_without_cluster()
                 .is_empty()
         );
-        // `--sync-timeout` was the gap: nothing waits for a list in generator mode, so
-        // the flag did nothing and nothing said so.
         assert_eq!(
             ok(&["--sync-timeout", "5"]).cluster_flags_without_cluster(),
             vec!["--sync-timeout"]
@@ -673,14 +599,11 @@ mod tests {
                 .cluster_flags_without_cluster()
                 .is_empty()
         );
-        // A default nobody named is not an override to report.
         assert!(ok(&[]).cluster_flags_without_cluster().is_empty());
     }
 
     #[test]
     fn generator_only_flags_are_reported_when_there_is_a_cluster() {
-        // The mirror of the case above: `--cluster --objects 50000` reads whatever the
-        // cluster holds, and the operator believes they asked for a size.
         assert_eq!(
             ok(&["--cluster", "--objects", "50000"]).generator_flags_with_cluster(),
             vec!["--objects"]
@@ -704,7 +627,6 @@ mod tests {
                 .generator_flags_with_cluster()
                 .is_empty()
         );
-        // `--churn` has its own line: cluster mode overrides it rather than ignoring it.
         assert!(
             ok(&["--cluster", "--churn", "5"])
                 .generator_flags_with_cluster()
@@ -714,9 +636,6 @@ mod tests {
 
     #[test]
     fn the_bench_refuses_a_cluster() {
-        // Its baselines are for a fixed synthetic scene; a cluster's numbers are
-        // not comparable to them, and a number nobody can compare is worse than no
-        // number.
         assert_eq!(
             parse_argv(&["--bench", "--cluster"]),
             Err(ArgError::BenchWithCluster)
@@ -735,9 +654,6 @@ mod tests {
 
     #[test]
     fn missing_values_are_errors() {
-        // Driven by VALUE_FLAGS, which is also the list `--flag=value` is split on, so a
-        // flag that takes a value and is left out of it cannot pass this and then quietly
-        // go back to being ignored in its `=` form.
         for flag in VALUE_FLAGS {
             assert_eq!(
                 parse_argv(&[flag]),
@@ -754,8 +670,6 @@ mod tests {
             &["-psn_0_774050"],
             &["/home/user/pod.yaml"],
             &["--gapplication-service"],
-            // Splitting on `=` must not reach these: a session type is not a flag with a
-            // value, and `--cluster=no` says the opposite of the flag it contains.
             &["--gapplication-app-id=org.k10s"],
             &["--cluster=no"],
             &["--bogus-flag=1"],
@@ -834,7 +748,6 @@ mod tests {
 
     #[test]
     fn usage_names_the_numeric_bounds_it_enforces() {
-        // A rejected value is not the place to learn a limit exists.
         for max in [MAX_SYNC_TIMEOUT_SECS, MAX_CHURN_PER_SEC] {
             assert!(USAGE.contains(&max.to_string()), "usage is missing {max}");
         }
@@ -842,8 +755,6 @@ mod tests {
 
     #[test]
     fn usage_lists_every_scenario_and_layout() {
-        // The bad-value messages now ask the types for these; `--help` is the other
-        // place they are written down, and it is where the drift showed first.
         for scenario in SCENARIOS.map(|s| s.as_str()) {
             assert!(USAGE.contains(scenario), "usage is missing {scenario}");
         }

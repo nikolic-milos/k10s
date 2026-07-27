@@ -9,10 +9,6 @@ use k10s_atlas::{
 const VW: f32 = 1600.0;
 const VH: f32 = 1000.0;
 const WARMUP: usize = 200;
-/// The floor exists so the p99 column is a p99: at 51 samples and fewer the 0.99 index rounds to
-/// the last one, which makes the number the maximum, and below a hundred a single sample carries
-/// more than a whole percentile. `iters` is reported per row so a comparator can check rather than
-/// trust.
 const MIN_ITERS: usize = 200;
 const MAX_ITERS: usize = 200_000;
 const BUDGET: Duration = Duration::from_millis(150);
@@ -24,7 +20,6 @@ const BLOCK_ZOOM: f32 = 2.2;
 const CELL_ZOOM: f32 = 30.0;
 const CELL_SWEEP_BLOCKS: usize = 4;
 const EDGE_SWEEP_BLOCKS: usize = 512;
-/// Sweep C's 512 blocks, split so there are two regions for an edge to run between.
 const CROSS_SWEEP_REGIONS: usize = 2;
 const CROSS_SWEEP_BLOCKS: usize = 256;
 const CELLS_PER_BLOCK: usize = 5;
@@ -199,11 +194,6 @@ fn fit_block_camera<R, B, C, S>(s: &Scene<R, B, C, S>, _zoom: f32) -> Camera {
     cam
 }
 
-/// The last block of the first region, which is as far from the first block as one region gets.
-///
-/// `cross_scene` links first block to first block, so a camera parked here sees no cross edge at
-/// all: the sweep that uses it isolates the scan the tail pays unconditionally from the emit that
-/// follows a hit. Its `edges` counter reading zero at every degree is the check on that.
 fn far_block_camera<R, B, C, S>(s: &Scene<R, B, C, S>, zoom: f32) -> Camera {
     let last = s.regions[0].children.end as usize - 1;
     let (cx, cy) = s.blocks[last].inner.center();
@@ -231,8 +221,6 @@ struct Sweep {
     degrees: &'static [usize],
     exts: &'static [&'static str],
     spec: fn(usize) -> SceneSpec,
-    /// The degree counts cross-region edges rather than children, so the scene comes from
-    /// `cross_scene` and the spec ignores its argument.
     cross: bool,
     camera: fn(&Scene, f32) -> Camera,
     unit_bytes: usize,

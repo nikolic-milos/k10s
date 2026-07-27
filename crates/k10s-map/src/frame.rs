@@ -1,21 +1,3 @@
-//! The traversal-and-emit seam between a `SceneSnapshot` and the painter.
-//!
-//! [`walk`] is the single implementation of "what is visible, and where". It never touches a
-//! `Window`: every primitive it produces leaves through [`FrameSink`], so the real painter
-//! ([`PaintSink`], which owns the gpui quad buffers and path builders) and a headless test sink
-//! drive the exact same traversal. The [`CullStats`] it returns is the painter's side of the cull
-//! oracle invariant; [`crate::lod::cull`] re-derives the same struct from `k10s-atlas` and the two
-//! must be equal for every camera, blend and policy.
-//!
-//! Nothing in here reads a process global. Every `K10S_*` knob that can move a counter arrives as
-//! [`FrameOpts`] plus the `LodPolicy` it borrows, which is what lets a test sweep policies in
-//! parallel threads. `K10S_NO_GLOW` stops at [`PaintSink`] and `K10S_REPAINT_ALWAYS` never gets
-//! this far.
-//!
-//! `mod frame` is private, so `pub` in here reaches no further than the crate. `crate::testing`
-//! re-exports the seam under the `testing` feature, which is the only way `benches/walk.rs` -- a
-//! separate crate -- can time the traversal the painter actually runs.
-
 use gpui::{
     Bounds, PaintQuad, PathBuilder, Pixels, SharedString, fill, point, px, quad, rgb, size,
 };
@@ -42,19 +24,11 @@ const CURVE_TOL: f32 = 0.35;
 const CURVE_CORE_W: f32 = 1.5;
 const CURVE_GLOW_W: f32 = 5.0;
 
-/// Everything outside the camera that changes what a frame emits.
-///
-/// `policy` carries the four LOD knobs (`K10S_STRESS_QUADS`, `K10S_STRESS_CURVES`,
-/// `K10S_NO_CURVES`, `K10S_NO_ICONS`) and the budgets; the three fields here carry the rest.
-/// `K10S_NO_GLOW` belongs to the sink, not the walk, because it cannot change a counter.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameOpts<'a> {
     pub policy: &'a LodPolicy,
-    /// The `[e]` toggle.
     pub edges_on: bool,
-    /// `K10S_SKIP_WL`.
     pub skip_blocks: bool,
-    /// `K10S_NO_HEX` inverted.
     pub hex: bool,
 }
 
@@ -63,17 +37,12 @@ impl FrameOpts<'_> {
         self.policy.stress || self.policy.stress_curves
     }
 
-    /// The hex grid is a calm-state backdrop: any stress mode suppresses it.
     pub(crate) fn hex_shown(&self) -> bool {
         self.hex && !self.stress_any()
     }
 }
 
 pub struct LabelJob {
-    /// Always built with `SharedString::from(&Arc<str>)`, never `SharedString::new`. The `SmolStr`
-    /// behind a `SharedString` keeps up to 23 bytes inline and an `Arc<str>` above that, so handing
-    /// it the scene's own `Arc` is a refcount bump where a copy was a malloc per label per frame,
-    /// and pod names run past 23 bytes routinely.
     pub text: SharedString,
     pub x: f32,
     pub y: f32,
@@ -87,26 +56,16 @@ pub enum IconJob {
     Sat(KindId, Bounds<Pixels>),
 }
 
-/// Where a frame's primitives go. Implemented once for real painting ([`PaintSink`]) and once in
-/// the oracle test, which counts and drops.
-///
-/// The walk never reads anything back from a sink, so a sink cannot influence the counters: that
-/// is what makes the headless comparison a test of the painter rather than of the test's own copy.
 pub trait FrameSink {
     fn bg_quad(&mut self, quad: PaintQuad);
     fn fg_quad(&mut self, quad: PaintQuad);
     fn label(&mut self, label: LabelJob);
     fn icon(&mut self, icon: IconJob);
-    /// Six screen-space vertices of one background hex, in ring order.
     fn hex_ring(&mut self, ring: &[(f32, f32); 6]);
-    /// A hub-to-satellite quadratic in screen space.
     fn curve(&mut self, hub: (f32, f32), ctrl: (f32, f32), sat: (f32, f32));
-    /// A block-to-block quadratic in screen space.
     fn edge(&mut self, a: (f32, f32), ctrl: (f32, f32), b: (f32, f32));
 }
 
-/// Mirrors `k10s_atlas::cull::push_label`. The job is built lazily so a dropped label costs
-/// nothing; change one of the two and the oracle test fails.
 fn push_label<S: FrameSink>(
     st: &mut CullStats,
     policy: &LodPolicy,
@@ -121,7 +80,6 @@ fn push_label<S: FrameSink>(
     }
 }
 
-/// Mirrors `k10s_atlas::cull::push_icon`.
 fn push_icon<S: FrameSink>(
     st: &mut CullStats,
     policy: &LodPolicy,
@@ -136,10 +94,6 @@ fn push_icon<S: FrameSink>(
     }
 }
 
-/// Walk the scene once and emit a frame into `sink`, returning what was emitted.
-///
-/// This is the painter's traversal. `crate::paint_map` calls it with a [`PaintSink`] and then
-/// submits the buffers to gpui; nothing else about a frame decides visibility.
 pub fn walk<S: FrameSink>(
     bounds: Bounds<Pixels>,
     scene: &SceneSnapshot,
@@ -498,18 +452,6 @@ pub fn walk<S: FrameSink>(
     st
 }
 
-/// The painting sink: gpui quad buffers, label and icon job lists, and four path builders.
-///
-/// It owns the geometry decisions that cannot change a counter (dash flattening, whether the glow
-/// pass is built), which is why `K10S_NO_GLOW` lives here and not in [`FrameOpts`].
-///
-/// The quad and job buffers are borrowed so the painter keeps their capacity across frames. The
-/// four builders cannot be: each grows two lyon vectors as it is written, and
-/// `PathBuilder::build(self)` moves them into the tessellated path and drops them there, so there
-/// is no storage left to hand back, and gpui exposes neither a capacity constructor nor a reset.
-/// Together with `dash`, which is fresh per frame because `new` takes no scratch from the caller,
-/// that is the whole of `benches/walk.rs`'s `structural` column: two allocations per stroked layer
-/// the camera touches, plus one more when it draws any curve at all.
 pub struct PaintSink<'a> {
     bg: &'a mut Vec<PaintQuad>,
     fg: &'a mut Vec<PaintQuad>,
@@ -523,9 +465,6 @@ pub struct PaintSink<'a> {
     dash: Vec<(f32, f32)>,
 }
 
-/// The four stroked paths a frame builds, handed back once the walk is done so the painter can
-/// tessellate and submit them. `glow` is false when `K10S_NO_GLOW` suppressed the glow pass, in
-/// which case `curve_glow` is empty.
 pub struct FramePaths {
     pub(crate) hex: PathBuilder,
     pub(crate) edges: PathBuilder,
@@ -560,7 +499,6 @@ impl<'a> PaintSink<'a> {
         }
     }
 
-    /// Release the borrowed buffers and hand the built paths to the painter.
     pub fn into_paths(self) -> FramePaths {
         FramePaths {
             hex: self.hex_path,
@@ -645,20 +583,11 @@ mod tests {
     use super::*;
     use crate::lod::{Knobs, policy};
 
-    /// `SmolStr`'s inline capacity, which smol_str does not export.
-    ///
-    /// `a_label_shares_the_arc_only_past_the_inline_cap` is the whole guard on this copy of it, and
-    /// it watches both directions. The `bench-alloc` ratchet watches something else: `From<Arc<str>>`
-    /// stack-copies below the cap and keeps the caller's `Arc` above it, so it allocates at no
-    /// length and the ratchet cannot see the cap move at all. What the ratchet catches is a call
-    /// site going back to `SharedString::new`, which allocates whatever the cap is.
     const INLINE_CAP: usize = 23;
 
     const VW: f32 = 1600.0;
     const VH: f32 = 1000.0;
 
-    /// Close enough that the single region, block, cell and satellite are all inside the visible
-    /// world, and zoomed far enough that every label predicate in `LodPolicy` fires.
     const CAMERA: Camera = Camera {
         cx: 50.0,
         cy: 50.0,
@@ -672,8 +601,6 @@ mod tests {
         }
     }
 
-    /// One node at each level, each labelled past the inline cap except the cell, whose label the
-    /// caller chooses so the cap itself can be walked over.
     fn scene(cell_label: &str) -> SceneSnapshot {
         SceneSnapshot {
             rev: 1,
@@ -720,8 +647,6 @@ mod tests {
         }
     }
 
-    /// Keeps the jobs alive so the scene's refcounts can be read while a frame still holds them,
-    /// which is the whole point: a copy and a share are indistinguishable once the job is dropped.
     #[derive(Default)]
     struct Collect {
         labels: Vec<LabelJob>,
@@ -739,8 +664,6 @@ mod tests {
         fn edge(&mut self, _: (f32, f32), _: (f32, f32), _: (f32, f32)) {}
     }
 
-    /// The hex grid and the edge pass emit no labels, so both are off: this fixture is about the
-    /// five label sites and nothing else.
     fn walk_labels(scene: &SceneSnapshot) -> Collect {
         let pol = policy(Knobs::default());
         let opts = FrameOpts {
@@ -760,9 +683,6 @@ mod tests {
         sink
     }
 
-    /// Every one of `walk`'s five label sites has to hand the job the scene's own `Arc<str>`, which
-    /// shows as a second strong reference for as long as the job lives. A site that built its text
-    /// from a `&str` would leave the count at one and cost a malloc on every frame.
     #[test]
     fn every_label_site_shares_the_scenes_arc() {
         let scene = scene("checkout-api-7f9c8d6b5-tzq4x");
@@ -790,11 +710,6 @@ mod tests {
         drop(sink);
     }
 
-    /// Both sides of [`INLINE_CAP`], through the shipping path: at the cap the text is inlined and
-    /// the scene's refcount is untouched, one byte past it the `Arc` is shared. Each row fails if
-    /// the cap moves the way it is the wrong side of -- a cap of 24 inlines the second row and
-    /// reads 1, a cap of 22 shares the first and reads 2 -- so the pair pins the constant from
-    /// above and below.
     #[test]
     fn a_label_shares_the_arc_only_past_the_inline_cap() {
         for (len, strong) in [(INLINE_CAP, 1), (INLINE_CAP + 1, 2)] {

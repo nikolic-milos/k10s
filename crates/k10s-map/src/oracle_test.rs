@@ -1,26 +1,3 @@
-//! The cull oracle, promoted from a `debug_assert` behind a window to a headless test.
-//!
-//! The invariant (ROADMAP §6.7): *painter and cull oracle agreeing exactly, swept across zoom
-//! stages, blend states and stress flags, in release CI rather than only in a debug build with a
-//! window.*
-//!
-//! How it holds up:
-//!
-//! * **Same logic, not a copy.** [`crate::frame::walk`] *is* the painter's traversal. `paint_map`
-//!   calls it with a [`PaintSink`] and then submits the buffers; this test calls it with a
-//!   [`Tally`] that counts and drops. `walk` never reads anything back from its sink, so a sink
-//!   cannot influence a counter, and there is no second implementation to drift.
-//! * **Release-safe.** Plain `assert_eq!`, so `cargo test --release -p k10s-map` checks it.
-//! * **No globals.** The LOD policy used to be a process-wide `OnceLock` fed by eight `K10S_*`
-//!   variables, which cannot vary per test and would race across cargo's test threads. It now
-//!   arrives as [`FrameOpts`] plus a borrowed `LodPolicy` built by `lod::policy(Knobs)`, a pure
-//!   function of the knobs. The process still reads the environment once; nothing under test does.
-//!
-//! Two of the eight knobs are deliberately absent from the sweep because neither can move a
-//! counter: `K10S_REPAINT_ALWAYS` only asks the pacer for another frame, and `K10S_NO_GLOW` only
-//! decides whether the sink builds the glow pass. Glow is still exercised, both ways, by
-//! [`painter_sink_agrees_with_tally`].
-
 use gpui::{Bounds, PaintQuad, Pixels, point, px, size};
 use k10s_atlas::testing::{SceneSpec, scene as base_scene};
 use k10s_atlas::{Camera, CullStats, LodPolicy, MAX_ZOOM, MIN_ZOOM, StageBlend};
@@ -33,10 +10,6 @@ use std::sync::Arc;
 use crate::frame::{FrameOpts, FrameSink, IconJob, LabelJob, PaintSink, walk};
 use crate::lod::{self, Knobs};
 
-/// Pinned logical viewports, so a case is reproducible on any machine (ROADMAP §6.6): the app's
-/// requested 1600x1000 and the portrait 1251x1350 the compositor actually handed the baseline run.
-/// Two aspect ratios also mean a transposed `vw`/`vh` on either side of the invariant cannot hide.
-/// The origin is deliberately not (0, 0): the painter offsets every emitted coordinate by it.
 const VIEWPORTS: [(&str, f32, f32); 2] =
     [("1600x1000", 1600.0, 1000.0), ("1251x1350", 1251.0, 1350.0)];
 const OX: f32 = 17.0;
@@ -49,8 +22,6 @@ fn viewport(vw: f32, vh: f32) -> Bounds<Pixels> {
     }
 }
 
-/// Counts what the walk emits and drops it. Also refuses non-finite geometry, which would reach
-/// lyon and the GPU as silent garbage.
 #[derive(Debug, Default)]
 struct Tally {
     bg_quads: usize,
@@ -60,16 +31,11 @@ struct Tally {
     hexes: usize,
     curves: usize,
     edges: usize,
-    /// Screen-space `(x0, y0, x1, y1)` over every hex ring vertex, or `None` if the grid was off.
     hex_extent: Option<(f32, f32, f32, f32)>,
-    /// Off by default: only [`every_placement_carries_the_frame_origin`] wants the coordinates
-    /// themselves, and the sweep would allocate a few thousand of them per case for nothing.
     points: Option<Vec<(f32, f32)>>,
 }
 
 impl Tally {
-    /// Where the walk put a primitive, in emission order. The single control point a curve or an
-    /// edge derives from its own two ends is geometry rather than a placement, so it stays out.
     fn place(&mut self, x: f32, y: f32) {
         if let Some(points) = &mut self.points {
             points.push((x, y));
@@ -153,9 +119,6 @@ impl FrameSink for Tally {
     }
 }
 
-/// Give the engine's generic test scene the extensions the painter looks up, cycling through
-/// every `Severity`, built-in `KindId`, `ToolId` and `ReasonId` so no colour or glyph branch is
-/// unreached, plus ids past the built-in tables so the fallback paths are swept too.
 fn snapshot(spec: SceneSpec) -> SceneSnapshot {
     let base = base_scene(spec);
     const SEVERITIES: [Severity; 4] = [
@@ -169,7 +132,6 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
         ReasonId::NOT_READY,
         ReasonId::CRASH_LOOP_BACK_OFF,
         ReasonId::UNKNOWN,
-        // Past the built-in table: the severity must degrade to Unknown, never Ok.
         ReasonId(9_001),
     ];
     const KINDS: [KindId; 6] = [
@@ -178,8 +140,6 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
         KindId::DAEMON_SET,
         KindId::JOB,
         KindId::CRON_JOB,
-        // Stands in for a CRD: no compiled-in colour or glyph, so this sweeps the
-        // fallback the whole open model depends on.
         KindId(9_000),
     ];
     const TOOLS: [ToolId; 5] = [
@@ -209,7 +169,6 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
                 weight: r.weight,
                 children: r.children.clone(),
                 ext: NsExt {
-                    // 0.0, 0.15, 0.3, 0.45, 0.6: below, inside and above every heat breakpoint.
                     unhealthy_frac: (i % 5) as f32 * 0.15,
                     rollup: SEVERITIES[i % SEVERITIES.len()],
                 },
@@ -265,9 +224,6 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
     }
 }
 
-/// Cameras spanning every zoom stage plus the boundaries between them, at three framings: the
-/// whole scene, one block, and a corner where regions straddle the viewport edge (so the
-/// `region_inside` / `block_inside` containment shortcuts are taken both ways).
 fn cameras(scene: &SceneSnapshot, vw: f32, vh: f32) -> Vec<(&'static str, Camera)> {
     let b = scene.bounds;
     let (cx, cy) = b.center();
@@ -357,10 +313,6 @@ fn cameras(scene: &SceneSnapshot, vw: f32, vh: f32) -> Vec<(&'static str, Camera
     ]
 }
 
-/// Settled stages and every fade the `StageMachine` can produce, including reversals and the
-/// two-stage jump. `walk_stage()` is `max(from, to)`, so these pair a low zoom with a high walk
-/// stage and vice versa: exactly where a painter that consults `stage` and an oracle that consults
-/// the blend would part company.
 const BLENDS: [StageBlend; 13] = [
     StageBlend {
         from: 0,
@@ -429,8 +381,6 @@ const BLENDS: [StageBlend; 13] = [
     },
 ];
 
-/// All 16 settings of the four LOD knobs. `policy()` collapses the two stress modes when both are
-/// set, which is part of what this sweeps.
 fn knob_set() -> Vec<Knobs> {
     (0..16u8)
         .map(|m| Knobs {
@@ -442,10 +392,8 @@ fn knob_set() -> Vec<Knobs> {
         .collect()
 }
 
-/// `max_labels`, `max_icons`, `max_edges`, `max_curves`. `None` keeps the shipping budgets.
 type Caps = Option<(usize, usize, usize, usize)>;
 
-/// Production budgets, and budgets tight enough that every drop path runs on every scene.
 const BUDGETS: [(&str, Caps); 3] = [
     ("shipping", None),
     ("tight", Some((7, 3, 2, 5))),
@@ -462,7 +410,6 @@ fn with_budgets(mut pol: LodPolicy, caps: Caps) -> LodPolicy {
     pol
 }
 
-/// One combination: what the case was, for a failure message that names it exactly.
 struct Case<'a> {
     scene: &'a str,
     view: &'a str,
@@ -496,10 +443,6 @@ impl std::fmt::Display for Case<'_> {
     }
 }
 
-/// Walk one combination and check every invariant the oracle can express.
-///
-/// Returns the counters so callers can assert that the sweep actually reached the interesting
-/// states rather than quietly walking an empty scene a hundred thousand times.
 fn check(case: &Case<'_>, scene: &SceneSnapshot, camera: Camera) -> CullStats {
     let opts = case.opts;
     let pol = opts.policy;
@@ -508,21 +451,13 @@ fn check(case: &Case<'_>, scene: &SceneSnapshot, camera: Camera) -> CullStats {
     let painted = walk(view, scene, camera, case.blend, opts, &mut tally);
     let oracle = lod::cull(scene, &camera, case.blend, case.vw, case.vh, opts);
 
-    // The invariant. `CullStats` is compared whole, so a field added in Phase B is covered the day
-    // it appears instead of the day someone remembers to extend this test.
     assert_eq!(oracle, painted, "cull oracle diverged from painter: {case}");
 
-    // The painter's counters against what the painter actually handed the sink. The oracle
-    // re-derives; these two catch a hand-maintained counter drifting from the emit next to it.
     assert_eq!(
         painted.quads,
         tally.bg_quads + tally.fg_quads,
         "quad counter drifted from emitted quads: {case}"
     );
-    // Which pass each quad went to, which the sum above cannot see. The backdrop and the namespace
-    // islands are submitted under the hex grid and the curves; the cards, their chrome and the pods
-    // over them. A card that arrived in the background buffer would be painted beneath the grid and
-    // no counter would move.
     assert_eq!(
         tally.bg_quads,
         1 + painted.drawn_regions,
@@ -533,9 +468,6 @@ fn check(case: &Case<'_>, scene: &SceneSnapshot, camera: Camera) -> CullStats {
         "label counter drifted: {case}"
     );
     assert_eq!(painted.icons, tally.icons, "icon counter drifted: {case}");
-    // `bg_cells` is `hex::for_each_center`'s own return value on both sides of the invariant, so
-    // recounting the rings can only catch a ring the painter's closure declined to emit. What no
-    // count can catch is a grid that stops short of the frame it is the backdrop for.
     assert_eq!(painted.bg_cells, tally.hexes, "hex counter drifted: {case}");
     if let Some((x0, y0, x1, y1)) = tally.hex_extent {
         assert!(
@@ -549,8 +481,6 @@ fn check(case: &Case<'_>, scene: &SceneSnapshot, camera: Camera) -> CullStats {
     );
     assert_eq!(painted.edges, tally.edges, "edge counter drifted: {case}");
 
-    // Bounded visible work: every budget is a ceiling, and nothing may be reported as dropped
-    // unless the corresponding budget is actually full.
     assert_eq!(
         painted.stage,
         case.blend.walk_stage(),
@@ -603,7 +533,6 @@ fn check(case: &Case<'_>, scene: &SceneSnapshot, camera: Camera) -> CullStats {
     painted
 }
 
-/// What the sweep managed to reach, so the suite can prove it is not testing an empty scene.
 #[derive(Debug, Default)]
 struct Reached {
     cases: usize,
@@ -633,7 +562,6 @@ impl Reached {
         self.labels_dropped |= st.labels_dropped > 0;
         self.icons_dropped |= st.icons_dropped > 0;
         self.curves_dropped |= st.curves_dropped > 0;
-        // A zero budget would make "capped" vacuous, so only a non-empty cap counts.
         self.edges_capped |= pol.max_edges > 0 && st.edges == pol.max_edges;
         self.hexes |= st.bg_cells > 0;
         self.curves |= st.curves > 0;
@@ -649,11 +577,6 @@ impl Reached {
         self.max_curves = self.max_curves.max(st.curves);
     }
 
-    /// Claimed per budget profile rather than over the pool of all three, because a profile that
-    /// cannot reach a state must not get to hide behind one that can. Pooled, `zero` alone satisfied
-    /// every "budget was hit" claim -- with nothing budgeted, every attempt is a drop -- so nothing
-    /// checked that the shipping budgets are reachable by a cluster or that the drop paths run on a
-    /// budget that also draws something.
     fn assert_covered(&self, scene: &str, budgets: &str) {
         let at = format!("{scene} at {budgets} budgets");
         assert!(self.cases > 0, "{at}: swept nothing");
@@ -667,14 +590,12 @@ impl Reached {
             "{at}: never looked at empty space ({self:?})"
         );
 
-        // Nothing above is budgeted, so the busy-frame floors below hold whatever the caps are.
         assert!(self.max_quads >= 200, "{at}: too few quads ({self:?})");
         assert!(self.max_cells >= 100, "{at}: too few cells ({self:?})");
         assert!(self.max_sats >= 100, "{at}: too few sats ({self:?})");
         assert!(self.max_hexes >= 100, "{at}: too few hexes ({self:?})");
 
         match budgets {
-            // The only profile loose enough to say what a frame of this scene actually draws.
             "shipping" => {
                 assert!(self.curves, "{at}: never drew a curve ({self:?})");
                 assert!(self.icons, "{at}: never drew an icon ({self:?})");
@@ -682,8 +603,6 @@ impl Reached {
                 assert!(self.max_curves >= 100, "{at}: too few curves ({self:?})");
                 assert!(self.max_labels >= 10, "{at}: too few labels ({self:?})");
             }
-            // Low enough to overrun on every scene, high enough that each budget still admits
-            // something first, which is what makes a drop a drop rather than a refusal.
             "tight" => {
                 assert!(self.curves, "{at}: never drew a curve ({self:?})");
                 assert!(self.icons, "{at}: never drew an icon ({self:?})");
@@ -705,9 +624,6 @@ impl Reached {
                     "{at}: never hit the edge budget ({self:?})"
                 );
             }
-            // A budget of nothing: every attempt lands on a drop path and nothing gets through.
-            // `edges_capped` is unreachable by construction -- a cap of zero reached looks exactly
-            // like a stage that draws no edges at all.
             "zero" => {
                 assert!(
                     self.labels_dropped && self.icons_dropped && self.curves_dropped,
@@ -719,8 +635,6 @@ impl Reached {
                     "{at}: a budget of nothing let something through ({self:?})"
                 );
                 assert!(!self.icons, "{at}: a zero icon budget drew one ({self:?})");
-                // Curves are the one deliberate exception: `curve_budget` is uncapped under
-                // `K10S_STRESS_CURVES`, so a stress run measures curves instead of the budget.
                 assert!(
                     self.max_curves > 0,
                     "{at}: only a stress run beats a zero curve budget, and none did ({self:?})"
@@ -731,9 +645,6 @@ impl Reached {
     }
 }
 
-/// The full cross product per scene: 2 viewports x 12 cameras x 13 blends x 16 knob settings x 3
-/// budget profiles x edges_on x skip_wl x hex = 119,808 combinations, each compared against the
-/// oracle whole. What was reached is returned per budget profile, in `BUDGETS` order.
 fn sweep(scene_name: &str, scene: &SceneSnapshot) -> Vec<(&'static str, Reached)> {
     let mut reached: Vec<(&'static str, Reached)> = BUDGETS
         .iter()
@@ -776,7 +687,6 @@ fn sweep(scene_name: &str, scene: &SceneSnapshot) -> Vec<(&'static str, Reached)
     reached
 }
 
-/// A cluster shaped like the benchmark scenarios: many namespaces, a handful of workloads each.
 fn uniform_spec() -> SceneSpec {
     SceneSpec {
         regions: 16,
@@ -787,7 +697,6 @@ fn uniform_spec() -> SceneSpec {
     }
 }
 
-/// ROADMAP §6.4's fan-out shape: one namespace holding everything.
 fn fanout_spec() -> SceneSpec {
     SceneSpec {
         regions: 1,
@@ -798,8 +707,6 @@ fn fanout_spec() -> SceneSpec {
     }
 }
 
-/// Enough satellites to blow the shipping curve budget, not just the tight one, which
-/// [`oracle_matches_painter_dense_satellites`] holds this spec to.
 fn dense_spec() -> SceneSpec {
     SceneSpec {
         regions: 4,
@@ -834,9 +741,6 @@ fn oracle_matches_painter_dense_satellites() {
         reached.assert_covered("dense", budgets);
     }
 
-    // What this scene is for, and the one claim `assert_covered` cannot make on its own: 1792
-    // satellites overrun the *shipping* curve budget. The tight profile only proves the drop path
-    // runs; this proves 1500 is a number a real cluster reaches.
     let shipping = swept
         .iter()
         .find(|(budgets, _)| *budgets == "shipping")
@@ -848,8 +752,6 @@ fn oracle_matches_painter_dense_satellites() {
     );
 }
 
-/// Degenerate scenes: nothing to draw, one of everything, and zero-area rects. No coverage claim
-/// here, only that painter and oracle stay in step where the interesting counters are all zero.
 #[test]
 fn oracle_matches_painter_on_degenerate_scenes() {
     let empty = SceneSnapshot::default();
@@ -878,13 +780,6 @@ fn oracle_matches_painter_on_degenerate_scenes() {
     for c in &mut flat.cells {
         c.rect.w = 0.0;
     }
-    // Collapsing the namespace rects moved every card outside the region grouping its edges, and
-    // `k10s_atlas::walk_edges` skips a whole range on one intersection test against that rect. So
-    // the index has to say what the geometry now says: an edge that reaches outside its region is a
-    // cross-region edge, which is the tail the walk always scans. Leaving the ranges as they were
-    // would make the painter drop edges the oracle's flat rescan still finds -- a scene nothing can
-    // produce, not a bug. It also means the cross tail runs non-empty here, which the generated
-    // scenes never do.
     let flat_edges = flat.edges.len() as u32;
     flat.region_edges = vec![0..0; flat.regions.len()];
     flat.cross_edges = 0..flat_edges;
@@ -931,20 +826,11 @@ fn oracle_matches_painter_on_degenerate_scenes() {
     }
 }
 
-/// A placement moved by the frame origin, to within a thousandth of a pixel and a millionth of the
-/// coordinate. Not bit equality, because the walk adds the origin *before* a label's or an icon's
-/// constant nudge and f32 addition does not re-associate; both terms stay four orders of magnitude
-/// under the 17 px this is looking for.
 fn shifted(base: f32, moved: f32, by: f32) -> bool {
     let want = base + by;
     (moved - want).abs() <= 1e-3 + 1e-6 * want.abs()
 }
 
-/// `viewport`'s origin is not (0, 0) because the map is a canvas inside a window, and every
-/// coordinate the walk emits has to carry it. No counter can see whether it did -- a quad is one
-/// quad wherever it landed -- so walk the same frame twice, 17 px and 23 px apart, and require every
-/// placement to have moved by that. A dropped `ox +` puts a label or a curve at the window's corner
-/// instead of the map's, which is otherwise the kind of thing only a screenshot catches.
 #[test]
 fn every_placement_carries_the_frame_origin() {
     let scene = snapshot(uniform_spec());
@@ -984,7 +870,6 @@ fn every_placement_carries_the_frame_origin() {
                 "{cam_name} {blend:?}: the frame origin changed what was emitted"
             );
             for (i, (&(bx, by), &(mx, my))) in b.iter().zip(m).enumerate() {
-                // The tolerance is relative, so it is only negligible while the coordinates are.
                 assert!(
                     bx.abs() < 1e5 && by.abs() < 1e5,
                     "{cam_name} {blend:?}: placement {i} at ({bx}, {by}) is too far out to judge"
@@ -1006,7 +891,6 @@ fn every_placement_carries_the_frame_origin() {
         }
     }
 
-    // Every emit site has to have run, or this is a statement about quads and nothing else.
     for (kind, n) in [
         ("background quad", most.bg_quads),
         ("foreground quad", most.fg_quads),
@@ -1020,9 +904,6 @@ fn every_placement_carries_the_frame_origin() {
     }
 }
 
-/// The real painting sink, headless: same walk, but every primitive is turned into a `PaintQuad`,
-/// a `SharedString` label job and lyon path segments, with the glow pass both on and off. This is
-/// the `K10S_NO_GLOW` axis, and it proves the sink the app actually uses cannot change a counter.
 #[test]
 fn painter_sink_agrees_with_tally() {
     let scene = snapshot(uniform_spec());
@@ -1075,8 +956,6 @@ fn painter_sink_agrees_with_tally() {
                         assert_eq!(painted.labels, labels.len(), "label jobs: {case}");
                         assert_eq!(painted.icons, icons.len(), "icon jobs: {case}");
 
-                        // Tessellating is the last thing the painter does before submitting, and
-                        // the only step that can reject the geometry the walk produced.
                         assert!(paths.hex.build().is_ok(), "hex path: {case}");
                         assert!(paths.edges.build().is_ok(), "edge path: {case}");
                         assert!(paths.curve_core.build().is_ok(), "curve path: {case}");
@@ -1091,8 +970,6 @@ fn painter_sink_agrees_with_tally() {
     assert!(checked > 0);
 }
 
-/// The knob interlock the painter depends on: the two stress modes must never both be live, or
-/// `block_chrome_shown` and `sat_painted` disagree about which one is in charge.
 #[test]
 fn stress_modes_are_mutually_exclusive() {
     for knobs in knob_set() {

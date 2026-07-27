@@ -1,22 +1,9 @@
-//! The generator as an implementation of the ingestion contract.
-//!
-//! A snapshot is a replay of [`Op::Added`], so describing a whole cluster and
-//! streaming one is the same act. This is what lets the world take an event
-//! stream as its input rather than this crate's [`ClusterSpec`], and it is the
-//! reference producer the kube data plane gets checked against.
-//!
-//! Emission is hierarchical: a scope, then its owners, then each owner's
-//! instances and attachments. Consumers folding an initial sync can rely on a
-//! parent arriving before its children.
-
 use std::sync::Arc;
 
 use k10s_core::{Capability, IngestEvent, KindId, Op, Payload, ResourceEvent};
 
 use crate::ClusterSpec;
 
-/// Synthetic uids, derived from position so a regenerated cluster yields the same
-/// identities. A real cluster supplies its own.
 pub fn scope_uid(ns: usize) -> Arc<str> {
     format!("ns-{ns}").into()
 }
@@ -33,27 +20,17 @@ pub fn attachment_uid(sat: usize) -> Arc<str> {
     format!("sat-{sat}").into()
 }
 
-/// Replays `spec` as an initial sync.
-///
-/// `with_attachments` mirrors the layout mode's choice to omit attachments: dense
-/// mode never places them, so streaming them would make the consumer discard work
-/// the producer paid for.
 pub fn snapshot(spec: &ClusterSpec, with_attachments: bool) -> Vec<IngestEvent> {
     let mut out = Vec::new();
     emit_snapshot(spec, with_attachments, &mut out);
     out
 }
 
-/// Same as [`snapshot`], appending into a caller's buffer.
 pub fn emit_snapshot(spec: &ClusterSpec, with_attachments: bool, out: &mut Vec<IngestEvent>) {
-    // Global running indices, in exactly the order the world folds them, so a
-    // replay reconstructs identical topology.
     let mut wl_i = 0usize;
     let mut pod_i = 0usize;
     let mut sat_i = 0usize;
 
-    // First workload index of each namespace, needed to turn the generator's
-    // namespace-local deps into global uids.
     let mut ns_first_wl = Vec::with_capacity(spec.namespaces.len());
     let mut running = 0usize;
     for ns in &spec.namespaces {
@@ -61,8 +38,6 @@ pub fn emit_snapshot(spec: &ClusterSpec, with_attachments: bool, out: &mut Vec<I
         running += ns.workloads.len();
     }
 
-    // Cross-namespace links are keyed by the global index of their source, so each
-    // owner can carry its own outgoing links.
     let mut cross_by_src: Vec<Vec<u32>> = vec![Vec::new(); running];
     for &(a, b) in &spec.cross_deps {
         if let Some(slot) = cross_by_src.get_mut(a as usize) {
@@ -144,8 +119,6 @@ pub fn emit_snapshot(spec: &ClusterSpec, with_attachments: bool, out: &mut Vec<I
         }
     }
 
-    // Every kind the generator can emit is fully listed by construction, and the
-    // consumer needs to know that to tell empty from not-yet-loaded.
     for kind in [
         KindId::NAMESPACE,
         KindId::DEPLOYMENT,
@@ -220,8 +193,6 @@ mod tests {
 
     #[test]
     fn a_parent_always_arrives_before_its_children() {
-        // Consumers folding an initial sync depend on this, so it is a property of
-        // the contract rather than an accident of the loop order.
         let spec = spec(7, 4_000);
         let events = snapshot(&spec, true);
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -274,7 +245,6 @@ mod tests {
 
     #[test]
     fn every_kind_is_declared_synced_and_watchable() {
-        // Without Synced, an empty kind is indistinguishable from an unloaded one.
         let events = snapshot(&spec(1, 2_000), true);
         let synced: Vec<KindId> = events
             .iter()
@@ -287,7 +257,6 @@ mod tests {
         assert!(synced.contains(&KindId::NAMESPACE));
         assert!(synced.contains(&KindId::VOLUME));
 
-        // And every kind that appears in the stream must be declared synced.
         for r in resources(&events) {
             assert!(
                 synced.contains(&r.kind),

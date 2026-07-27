@@ -25,13 +25,6 @@ pub use frame::FrameOpts;
 pub use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 pub use lod::{cull, stage_for_zoom};
 
-/// The painter's traversal seam, opened for `benches/walk.rs`.
-///
-/// `frame::walk` and its sink are crate-private because `paint_map` is their only caller and
-/// this crate's public surface is already wider than its one consumer uses. A bench target is a
-/// separate crate, so it can see nothing else; this feature -- and only this feature -- lifts the
-/// seam out, the same way `k10s-atlas` opens its scene generator. Timing anything narrower than
-/// `walk` would time the cull oracle again, which is the whole reason the bench exists.
 #[cfg(feature = "testing")]
 pub mod testing {
     pub use crate::frame::{FramePaths, FrameSink, IconJob, LabelJob, PaintSink, walk};
@@ -42,9 +35,6 @@ use colors::*;
 use frame::{IconJob, LabelJob, PaintSink};
 use lod::lod;
 
-/// A rasterised glyph: the cache key gpui dedupes on, and the bytes behind it.
-/// Stored as a plain `&str` rather than a `SharedString` so the tables stay
-/// `static`; `SharedString::new_static` is free at the call site.
 type Glyph = (&'static str, &'static [u8]);
 
 macro_rules! glyph {
@@ -65,25 +55,22 @@ macro_rules! tool_glyph {
     };
 }
 
-/// Drawn for any kind or vendor with no compiled-in glyph, which is what lets a
-/// CRD render at all. Original artwork, so it carries no attribution burden.
 const UNKNOWN_GLYPH: Glyph = glyph!("unknown.svg");
 
-/// Indexed by [`KindId`], in `k10s_core::BUILTIN_KINDS` order.
 static KIND_GLYPHS: &[Glyph] = &[
-    glyph!("deploy.svg"),  // Deployment
-    glyph!("sts.svg"),     // StatefulSet
-    glyph!("ds.svg"),      // DaemonSet
-    glyph!("job.svg"),     // Job
-    glyph!("job.svg"),     // CronJob
-    glyph!("unknown.svg"), // Pod
-    glyph!("unknown.svg"), // Namespace
-    glyph!("pvc.svg"),     // PersistentVolumeClaim
-    glyph!("svc.svg"),     // Service
-    glyph!("cm.svg"),      // ConfigMap
-    glyph!("secret.svg"),  // Secret
-    glyph!("svc.svg"),     // Ingress
-    glyph!("unknown.svg"), // Node
+    glyph!("deploy.svg"),
+    glyph!("sts.svg"),
+    glyph!("ds.svg"),
+    glyph!("job.svg"),
+    glyph!("job.svg"),
+    glyph!("unknown.svg"),
+    glyph!("unknown.svg"),
+    glyph!("pvc.svg"),
+    glyph!("svc.svg"),
+    glyph!("cm.svg"),
+    glyph!("secret.svg"),
+    glyph!("svc.svg"),
+    glyph!("unknown.svg"),
 ];
 
 const _: () = assert!(
@@ -91,44 +78,42 @@ const _: () = assert!(
     "every built-in kind needs a glyph"
 );
 
-/// Indexed by [`ToolId`], in `k10s_core::BUILTIN_TOOLS` order. Slot zero is
-/// `ToolId::NONE`: a generic workload falls out of the table, not off a cliff.
 static TOOL_GLYPHS: &[Glyph] = &[
-    UNKNOWN_GLYPH,                      // None
-    tool_glyph!("apacheairflow.svg"),   // Airflow
-    tool_glyph!("argo.svg"),            // Argo CD
-    tool_glyph!("apachecassandra.svg"), // Cassandra
-    tool_glyph!("clickhouse.svg"),      // ClickHouse
-    tool_glyph!("consul.svg"),          // Consul
-    tool_glyph!("elasticsearch.svg"),   // Elasticsearch
-    tool_glyph!("envoyproxy.svg"),      // Envoy
-    tool_glyph!("etcd.svg"),            // etcd
-    tool_glyph!("fluentbit.svg"),       // Fluent Bit
-    tool_glyph!("fluentd.svg"),         // Fluentd
-    tool_glyph!("flux.svg"),            // Flux
-    tool_glyph!("grafana.svg"),         // Grafana
-    tool_glyph!("harbor.svg"),          // Harbor
-    tool_glyph!("istio.svg"),           // Istio
-    tool_glyph!("jaeger.svg"),          // Jaeger
-    tool_glyph!("jenkins.svg"),         // Jenkins
-    tool_glyph!("apachekafka.svg"),     // Kafka
-    tool_glyph!("keycloak.svg"),        // Keycloak
-    tool_glyph!("kibana.svg"),          // Kibana
-    tool_glyph!("kubernetes.svg"),      // Kubernetes
-    tool_glyph!("mariadb.svg"),         // MariaDB
-    tool_glyph!("minio.svg"),           // MinIO
-    tool_glyph!("mongodb.svg"),         // MongoDB
-    tool_glyph!("mysql.svg"),           // MySQL
-    tool_glyph!("natsdotio.svg"),       // NATS
-    tool_glyph!("nginx.svg"),           // nginx
-    tool_glyph!("opentelemetry.svg"),   // OpenTelemetry
-    tool_glyph!("postgresql.svg"),      // PostgreSQL
-    tool_glyph!("prometheus.svg"),      // Prometheus
-    tool_glyph!("rabbitmq.svg"),        // RabbitMQ
-    tool_glyph!("redis.svg"),           // Redis
-    tool_glyph!("temporal.svg"),        // Temporal
-    tool_glyph!("traefikproxy.svg"),    // Traefik
-    tool_glyph!("vault.svg"),           // Vault
+    UNKNOWN_GLYPH,
+    tool_glyph!("apacheairflow.svg"),
+    tool_glyph!("argo.svg"),
+    tool_glyph!("apachecassandra.svg"),
+    tool_glyph!("clickhouse.svg"),
+    tool_glyph!("consul.svg"),
+    tool_glyph!("elasticsearch.svg"),
+    tool_glyph!("envoyproxy.svg"),
+    tool_glyph!("etcd.svg"),
+    tool_glyph!("fluentbit.svg"),
+    tool_glyph!("fluentd.svg"),
+    tool_glyph!("flux.svg"),
+    tool_glyph!("grafana.svg"),
+    tool_glyph!("harbor.svg"),
+    tool_glyph!("istio.svg"),
+    tool_glyph!("jaeger.svg"),
+    tool_glyph!("jenkins.svg"),
+    tool_glyph!("apachekafka.svg"),
+    tool_glyph!("keycloak.svg"),
+    tool_glyph!("kibana.svg"),
+    tool_glyph!("kubernetes.svg"),
+    tool_glyph!("mariadb.svg"),
+    tool_glyph!("minio.svg"),
+    tool_glyph!("mongodb.svg"),
+    tool_glyph!("mysql.svg"),
+    tool_glyph!("natsdotio.svg"),
+    tool_glyph!("nginx.svg"),
+    tool_glyph!("opentelemetry.svg"),
+    tool_glyph!("postgresql.svg"),
+    tool_glyph!("prometheus.svg"),
+    tool_glyph!("rabbitmq.svg"),
+    tool_glyph!("redis.svg"),
+    tool_glyph!("temporal.svg"),
+    tool_glyph!("traefikproxy.svg"),
+    tool_glyph!("vault.svg"),
 ];
 
 const _: () = assert!(
@@ -141,8 +126,6 @@ fn glyph_of(table: &'static [Glyph], idx: usize) -> (SharedString, &'static [u8]
     (SharedString::new_static(key), data)
 }
 
-/// Table lookups, not exhaustive matches. An id the cluster reported and nobody
-/// compiled in paints the fallback instead of failing to build.
 fn kind_icon(kind: KindId) -> (SharedString, &'static [u8]) {
     glyph_of(KIND_GLYPHS, kind.0 as usize)
 }
@@ -290,9 +273,6 @@ impl Render for MapView {
 
         div()
             .size_full()
-            // No `.bg()` here: the canvas below fills this element exactly, and `frame::walk`
-            // opens every frame with a full-bounds quad in the same colour. Two fills of one
-            // viewport-sized rect per frame, and the second one is the one the cull oracle counts.
             .track_focus(&self.focus_handle)
             .on_mouse_down(
                 MouseButton::Left,
@@ -453,9 +433,6 @@ fn paint_map(
 
     #[cfg(debug_assertions)]
     {
-        // `oracle_test.rs` sweeps this same comparison headless, in release, across zoom stages,
-        // blend states and stress flags. Keeping it here too costs nothing in release and is the
-        // only version that sees real scenes, real churn and real camera paths.
         let vw = f32::from(bounds.size.width);
         let vh = f32::from(bounds.size.height);
         debug_assert_eq!(
@@ -476,11 +453,6 @@ fn paint_map(
     window.paint_quads(&bg);
 
     let paths_start = std::time::Instant::now();
-    // Tessellation is the one step that can reject the geometry the walk produced: a layer too big
-    // for the `u16` index buffer gpui builds a path into fails whole, and dropping the `Err` costs
-    // the frame that entire layer -- which reads as "the hex grid is off", not as an error. Release
-    // still degrades rather than dying; a debug build names the layer. The oracle test makes the
-    // same four assertions headless, but only over pinned viewports and cameras.
     if counts.bg_cells > 0 {
         let hex = paths.hex.build();
         debug_assert!(hex.is_ok(), "hex layer failed to tessellate");
@@ -631,8 +603,6 @@ fn paint_map(
     );
     let hud_end = std::time::Instant::now();
 
-    // `walk_us` covers the whole traversal, hex grid and edges included; `paths_us` is now
-    // tessellation and submission only.
     stats.borrow_mut().push_spans(FrameSpans {
         walk_us: span_us(walk_start, bg_quads_start),
         quads_us: span_us(bg_quads_start, paths_start) + span_us(fg_quads_start, icons_start),
@@ -647,10 +617,6 @@ fn span_us(from: std::time::Instant, to: std::time::Instant) -> f32 {
     (to - from).as_secs_f32() * 1_000_000.0
 }
 
-/// The `[h]` toggle gates everything below, not just the drawing: `frame_percentiles` and
-/// `cpu_percentiles` each sort up to 240 samples, and both run after `end_cpu`, so no §6.7 gate
-/// metric sees them. `spans.hud_us` is the only span that does, which is what makes the toggle the
-/// way to find out what they cost.
 #[expect(clippy::too_many_arguments)]
 fn paint_hud(
     scene: &SceneSnapshot,
@@ -744,8 +710,6 @@ fn paint_hud(
 
     let font = gpui::font("JetBrains Mono");
     for (i, text) in lines.iter().enumerate() {
-        // `from(&str)` and not `from(text.clone())`: `SmolStr` copies either way at these lengths,
-        // and cloning the `String` first is the copy that buys nothing.
         let s = SharedString::from(text.as_str());
         let run = TextRun {
             len: s.len(),

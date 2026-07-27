@@ -14,10 +14,6 @@ const SEED: u64 = 55;
 const VW: f32 = 1600.0;
 const VH: f32 = 1000.0;
 const WARMUP: usize = 100;
-/// The floor exists so the p99 column is a p99: at 51 samples and fewer the 0.99 index rounds to
-/// the last one, which makes the number the maximum, and below a hundred a single sample carries
-/// more than a whole percentile. `iters` is reported per row so a comparator can check rather than
-/// trust.
 const MIN_ITERS: usize = 100;
 const MAX_ITERS: usize = 100_000;
 const BUDGET: Duration = Duration::from_millis(120);

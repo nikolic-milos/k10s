@@ -1,29 +1,3 @@
-//! Turning a set of watched objects into a conforming initial sync.
-//!
-//! Watches arrive per kind, concurrently, in whatever order the API server lists
-//! them. The contract wants the opposite: a hierarchy, parents before children,
-//! every event an [`Op::Added`], and no child whose parent never arrived.
-//! `k10s_world::input::fold` asserts exactly that in debug builds, so the streams
-//! stage into a [`Store`] and this module emits once, in order.
-//!
-//! The joins that make it a hierarchy are the substance:
-//!
-//! - **A pod's parent is the workload, not the ReplicaSet.** Kubernetes puts a
-//!   ReplicaSet between a Deployment and its pods, and showing it would double
-//!   every Deployment on the map. The walk steps over it.
-//! - **A controller we do not watch still becomes one card.** A pod owned by an
-//!   Argo `Rollout` has an owner reference naming a kind, a name and an
-//!   `apiVersion`, which is a GVK, which is enough to intern the kind and emit an
-//!   owner. Falling back to "standalone pod" would scatter one workload across
-//!   fifty cards.
-//! - **An attachment's parent is the workload that uses it.** A ConfigMap sits
-//!   under whatever mounts it, a Service under whatever its selector matches.
-//!   Both are joins over the whole set, which is why they cannot happen while
-//!   staging one object.
-//!
-//! Everything unplaceable is counted, never dropped quietly: a producer bug has
-//! to show up as a number rather than as a quietly smaller cluster.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -31,31 +5,13 @@ use k10s_core::{Catalog, IngestEvent, KindId, Op, Payload, ResourceEvent, Role, 
 
 use crate::mapping::{AttachRef, Controller, Detail, Labels, Staged};
 
-/// How far up an owner chain the walk goes before giving up.
-///
-/// Kubernetes chains are short (CronJob to Job to pod is the deepest built-in),
-/// and a cycle in owner references is possible in a cluster someone has been
-/// editing by hand. A bound turns that from a hang into a counted miss.
 const MAX_OWNER_HOPS: usize = 8;
 
-/// Prefix for the owner synthesised for a pod that has no controller at all.
-///
-/// A slash cannot appear in a Kubernetes uid, so this can never collide with one.
 pub const STANDALONE_PREFIX: &str = "k10s:standalone/";
 
-/// The reflector cache: every object we have seen, by uid.
-///
-/// This is what a reflector is, and holding it is what makes the joins possible.
-/// It is also the largest thing the data plane owns, which is why staging keeps
-/// labels only where a join needs them.
-///
-/// Deliberately unordered: emission order comes from a sort on
-/// `(namespace, name, uid)`, which is total because uids are unique, so keeping an
-/// insertion order here would only add a tombstone problem on every delete.
 #[derive(Debug, Default)]
 pub struct Store {
     objects: HashMap<Arc<str>, Staged>,
-    /// Kinds watched only to resolve ownership, never emitted.
     pass_through: Vec<KindId>,
 }
 
@@ -91,11 +47,6 @@ impl Store {
         self.objects.is_empty()
     }
 
-    /// Every object of one role, in hash order.
-    ///
-    /// Never emitted in this order: every caller sorts. `(namespace, name, uid)` is
-    /// a total order because a uid is unique, so the sort alone gives determinism
-    /// and the store needs no insertion order of its own.
     fn by_role(&self, role: Role) -> impl Iterator<Item = &Staged> {
         self.objects.values().filter(move |s| s.role == role)
     }
@@ -107,37 +58,18 @@ impl Store {
     }
 }
 
-/// What the assembly could not place.
-///
-/// Every field is a shape a real cluster has and this pass does not draw. A
-/// nonzero count is information, not necessarily a bug.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AssembleStats {
     pub scopes: u32,
     pub owners: u32,
     pub instances: u32,
     pub attachments: u32,
-    /// Owners invented for a controller we do not watch, plus one per pod with no
-    /// controller at all.
     pub synthetic_owners: u32,
-    /// Objects in a namespace we never saw. Happens when the Namespace watch is
-    /// forbidden and a namespaced kind is not.
     pub unknown_namespace: u32,
-    /// Attachments nothing references. A ConfigMap no pod mounts has no owner to
-    /// sit under, so it is invisible until the scene can hold a namespace-level
-    /// attachment.
     pub unattached: u32,
-    /// Owner chains longer than the walk bound, which means a cycle.
     pub owner_cycles: u32,
 }
 
-/// The resolved parents and the owners that got a card, kept so live events after
-/// the initial sync can be placed without redoing the joins.
-///
-/// Only owners the sync emitted appear here. An object whose owner was dropped —
-/// its namespace unreadable, so its card never arrived — has nothing to be named
-/// under, and naming it anyway would put an orphan in the stream the first time it
-/// changed.
 #[derive(Debug, Default)]
 pub struct Index {
     scope_of: HashMap<Arc<str>, Arc<str>>,
@@ -147,35 +79,24 @@ pub struct Index {
 }
 
 impl Index {
-    /// The uid of a namespace by name.
     pub fn scope_uid(&self, namespace: &str) -> Option<&Arc<str>> {
         self.scope_of.get(namespace)
     }
 
-    /// Whether the sync drew an owner card for this uid.
-    ///
-    /// The question the live phase cannot answer from a kind: a pass-through
-    /// ReplicaSet is [`Role::Owner`] in the store whether or not it was promoted,
-    /// so only the set of cards actually emitted says which one has something to
-    /// update.
     pub fn emitted_owner(&self, uid: &str) -> bool {
         self.owners.contains(uid)
     }
 
-    /// The owner an already-placed object sits under.
     pub fn parent_of(&self, uid: &str) -> Option<&Arc<str>> {
         self.parent_of.get(uid)
     }
 
-    /// The owner an attachment sits under, by identity rather than uid, because a
-    /// recreated ConfigMap keeps its name and loses its uid.
     pub fn attachment_owner(&self, kind: KindId, namespace: &str, name: &str) -> Option<&Arc<str>> {
         self.attach_owner
             .get(&(kind, Arc::from(namespace), Arc::from(name)))
     }
 }
 
-/// A conforming initial sync plus what it could not place.
 #[derive(Debug, Default)]
 pub struct Assembled {
     pub events: Vec<IngestEvent>,
@@ -183,32 +104,20 @@ pub struct Assembled {
     pub index: Index,
 }
 
-/// Where an instance's owner came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnerOf {
-    /// An owner we watch and emit anyway.
     Watched(Arc<str>),
-    /// A pass-through object with nothing above it: a bare ReplicaSet. Emitted as
-    /// an owner using the kind id we already hold.
     Promote(Arc<str>),
-    /// A controller we do not watch, to be emitted from its owner reference.
     Reference(Controller),
-    /// No controller at all: a standalone pod.
     Standalone,
-    /// The chain cycled.
     Cyclic,
 }
 
-/// Walks up from a controller reference to the owner that should hold the
-/// instance.
 fn owner_for(store: &Store, controller: Option<&Controller>) -> OwnerOf {
     let Some(mut cur) = controller.cloned() else {
         return OwnerOf::Standalone;
     };
     for _ in 0..MAX_OWNER_HOPS {
-        // A reference to something we do not hold: either a kind outside the
-        // watch set, or one whose watch is forbidden. Either way the reference
-        // carries enough to draw a card.
         let Some(found) = store.get(&cur.uid) else {
             return OwnerOf::Reference(cur);
         };
@@ -216,9 +125,6 @@ fn owner_for(store: &Store, controller: Option<&Controller>) -> OwnerOf {
             return if found.role == Role::Owner {
                 OwnerOf::Watched(found.uid.clone())
             } else {
-                // Controlled by something that is not an owner in our model.
-                // Nothing sensible to parent it to, so it stands alone rather
-                // than inventing a hierarchy.
                 OwnerOf::Standalone
             };
         }
@@ -230,11 +136,6 @@ fn owner_for(store: &Store, controller: Option<&Controller>) -> OwnerOf {
     OwnerOf::Cyclic
 }
 
-/// Whether a set of labels satisfies a selector.
-///
-/// An empty selector matches nothing: a Service with no selector selects no pods,
-/// and treating it as matching everything would attach every headless Service to
-/// an arbitrary workload.
 pub fn selector_matches(selector: &Labels, labels: &Labels) -> bool {
     if selector.is_empty() {
         return false;
@@ -244,11 +145,6 @@ pub fn selector_matches(selector: &Labels, labels: &Labels) -> bool {
         .all(|(k, v)| labels.iter().any(|(lk, lv)| lk == k && lv == v))
 }
 
-/// Whether `candidate` beats what is already recorded.
-///
-/// A ConfigMap mounted by three workloads has one parent in a four-level scene.
-/// Smallest uid is arbitrary but stable, which is the property that matters: an
-/// unstable choice makes the map reshuffle for no reason.
 fn prefer(existing: Option<&Arc<str>>, candidate: &Arc<str>) -> bool {
     match existing {
         None => true,
@@ -256,31 +152,22 @@ fn prefer(existing: Option<&Arc<str>>, candidate: &Arc<str>) -> bool {
     }
 }
 
-/// An attachment's identity: kind, namespace, name. Not its uid, because a
-/// recreated ConfigMap keeps its name and loses its uid, and a pod spec names it by
-/// name.
 type AttachKey = (KindId, Arc<str>, Arc<str>);
 
-/// A label pair inside one namespace, which is what a Service selector is matched
-/// against.
 type LabelKey = (Arc<str>, Arc<str>, Arc<str>);
 
-/// An owner to emit.
 struct Emit<'a> {
     uid: Arc<str>,
     kind: KindId,
     name: Arc<str>,
     namespace: Arc<str>,
     resource_version: u64,
-    /// The staged object behind it, absent for a synthesised owner.
     watched: Option<&'a Staged>,
 }
 
-/// Assembles the store into a conforming initial sync.
 pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
     let mut out = Assembled::default();
 
-    // Scopes first, by name, so islands land in a stable order.
     let mut scopes: Vec<&Staged> = store.by_role(Role::Scope).collect();
     scopes.sort_by(|a, b| (&a.name, &a.uid).cmp(&(&b.name, &b.uid)));
     for scope in &scopes {
@@ -321,8 +208,6 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
         });
     }
 
-    // Resolve every instance's owner. This is also where owners we do not watch
-    // are discovered, which is why it runs before owners are emitted.
     let instances = store.sorted_by_role(Role::Instance);
     let mut parent_of: HashMap<Arc<str>, Arc<str>> = HashMap::new();
     for inst in &instances {
@@ -377,12 +262,7 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
         parent_of.insert(inst.uid.clone(), uid);
     }
 
-    // What each attachment sits under, from what pods reference and from Service
-    // selectors.
     let mut attach_owner: HashMap<AttachKey, Arc<str>> = HashMap::new();
-    // Label pair to the pods carrying it. One namespace holding thousands of pods
-    // is a shape real clusters have, and a selector join that scanned every pod
-    // per Service would stall startup on it.
     let mut by_label: HashMap<LabelKey, Vec<usize>> = HashMap::new();
     for (i, inst) in instances.iter().enumerate() {
         let Some(owner) = parent_of.get(&inst.uid) else {
@@ -436,15 +316,12 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
         }
     }
 
-    // Owners, each under its scope.
     let mut emitted: HashSet<Arc<str>> = HashSet::new();
     for owner in &owners {
         let Some(scope) = out.index.scope_of.get(&owner.namespace) else {
             out.stats.unknown_namespace += 1;
             continue;
         };
-        // An owner-to-owner dependency: a Job under a CronJob is the built-in
-        // case. The endpoint must be an owner we are actually emitting.
         let depends_on = owner
             .watched
             .and_then(|s| s.controller.as_ref())
@@ -475,9 +352,6 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
 
     for inst in &instances {
         let Some(parent) = parent_of.get(&inst.uid).filter(|p| emitted.contains(*p)) else {
-            // Either no owner resolved, or the owner sat in a namespace we never
-            // saw. Both counted, neither emitted: an orphan makes the world's
-            // fold assert.
             if parent_of.contains_key(&inst.uid) {
                 out.stats.unknown_namespace += 1;
             }
@@ -486,7 +360,6 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
         let Detail::Instance { reason, .. } = &inst.detail else {
             continue;
         };
-        // The one place a reason string becomes an id, on a single thread.
         let state = State {
             severity: reason.severity,
             reason: catalog.intern_reason(&reason.display),
@@ -529,9 +402,6 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
         out.stats.attachments += 1;
     }
 
-    // The index's invariant, applied here rather than where the parents are
-    // resolved, because the resolution that lands on an owner nobody can see is
-    // exactly what `unknown_namespace` and `unattached` count.
     parent_of.retain(|_, owner| emitted.contains(owner));
     attach_owner.retain(|_, owner| emitted.contains(owner));
     out.index.attach_owner = attach_owner;
@@ -540,18 +410,11 @@ pub fn assemble(store: &Store, catalog: &mut Catalog) -> Assembled {
     out
 }
 
-/// Interns the kind an owner reference names.
-///
-/// An `ownerReferences` entry carries `apiVersion` and `kind`, which is a GVK, so
-/// a controller we do not watch still gets a real [`KindId`] rather than a
-/// placeholder. This is where an Argo `Rollout` becomes nameable with nobody
-/// having compiled it in.
 fn intern_reference(catalog: &mut Catalog, controller: &Controller) -> KindId {
     let (group, version) = split_api_version(&controller.api_version);
     catalog.intern_gvk_as(group, version, &controller.kind, Role::Owner)
 }
 
-/// Splits `group/version`. A bare `v1` is the core group.
 pub fn split_api_version(api_version: &str) -> (&str, &str) {
     match api_version.split_once('/') {
         Some((group, version)) => (group, version),
@@ -565,8 +428,6 @@ mod tests {
     use crate::mapping::Reason;
     use k10s_core::{ReasonId, Severity};
 
-    /// The fake ReplicaSet id: a pass-through kind that is not a built-in, which
-    /// also proves pass-through is not hard-coded to a compiled-in id.
     const RS: KindId = KindId(9_500);
 
     fn scope(uid: &str, name: &str) -> Staged {
@@ -692,7 +553,6 @@ mod tests {
             .unwrap_or_else(|| panic!("{uid} was not emitted"))
     }
 
-    /// The property the world's fold asserts on.
     fn assert_conforming(a: &Assembled) {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for r in resources(a) {
@@ -710,8 +570,6 @@ mod tests {
 
     #[test]
     fn a_deployment_pod_parents_to_the_deployment_not_the_replicaset() {
-        // The join that makes a real cluster look like the map's model. Emitting
-        // the ReplicaSet as an owner would double every Deployment.
         let s = store(vec![
             scope("ns-1", "prod"),
             owner("dep-1", "prod", "api", KindId::DEPLOYMENT),
@@ -747,8 +605,6 @@ mod tests {
 
     #[test]
     fn a_pod_owned_by_a_kind_we_do_not_watch_still_groups_under_one_card() {
-        // An Argo Rollout, a KubeVirt VMI, any operator's CRD. One card per pod
-        // would make a fifty-replica rollout look like fifty workloads.
         let s = store(vec![
             scope("ns-1", "prod"),
             instance(
@@ -786,8 +642,6 @@ mod tests {
 
     #[test]
     fn a_standalone_pod_gets_its_own_card_rather_than_vanishing() {
-        // A bare pod is a real thing people run, and dropping it makes the map
-        // lie about what is in the namespace.
         let s = store(vec![
             scope("ns-1", "prod"),
             instance("pod-1", "prod", "debug", None),
@@ -801,15 +655,12 @@ mod tests {
             .expect("a card for the standalone pod");
         assert_eq!(&*card.name, "debug");
         assert_eq!(card.kind, KindId::POD);
-        // The real uid stays on the real object.
         assert_eq!(find(&a, "pod-1").parent.as_deref(), Some(&*card.uid));
         assert_eq!(a.stats.synthetic_owners, 1);
     }
 
     #[test]
     fn a_bare_replicaset_is_promoted_to_an_owner() {
-        // Pass-through only makes sense when something sits above it; a
-        // ReplicaSet created by hand has to hold its own pods.
         let s = store(vec![
             scope("ns-1", "prod"),
             replicaset("rs-1", "prod", "hand-rolled", None),
@@ -829,8 +680,6 @@ mod tests {
 
     #[test]
     fn a_job_depends_on_its_cronjob() {
-        // The one owner-to-owner edge the built-in kinds produce, and the reason
-        // `depends_on` is not always empty.
         let mut job = owner("job-1", "prod", "nightly-123", KindId::JOB);
         job.controller = Some(ctrl("cj-1", "CronJob", "nightly", "batch/v1"));
         let s = store(vec![
@@ -848,8 +697,6 @@ mod tests {
 
     #[test]
     fn an_attachment_sits_under_the_workload_that_uses_it() {
-        // Mounted ConfigMaps, referenced Secrets, claimed volumes: the join that
-        // gives attachments a home in a four-level scene.
         let pod = with_detail(
             instance(
                 "pod-1",
@@ -969,8 +816,6 @@ mod tests {
 
     #[test]
     fn an_object_in_a_namespace_we_cannot_see_is_counted_not_emitted() {
-        // The RBAC shape: pods readable, namespaces not. The world's fold asserts
-        // on an orphan in debug, so this has to be dropped and counted.
         let s = store(vec![
             owner("dep-1", "prod", "api", KindId::DEPLOYMENT),
             instance(
@@ -989,9 +834,6 @@ mod tests {
 
     #[test]
     fn the_index_names_only_owners_the_sync_emitted() {
-        // The index is what parents live events, so an entry naming an owner that
-        // was never emitted is a promise to emit an orphan the first time the
-        // object changes. Same RBAC shape as above: pods readable, namespaces not.
         let objects = |scoped: bool| {
             let mut out = vec![
                 owner("dep-1", "prod", "api", KindId::DEPLOYMENT),
@@ -1016,8 +858,6 @@ mod tests {
             out
         };
 
-        // Both joins hold when the namespace is readable, which is what makes the
-        // absences below mean something rather than passing on an empty index.
         let placed = assemble(&store(objects(true)), &mut Catalog::new());
         assert_eq!(placed.index.parent_of("pod-1").map(|u| &**u), Some("dep-1"));
         assert_eq!(
@@ -1037,17 +877,12 @@ mod tests {
                 .attachment_owner(KindId::CONFIG_MAP, "prod", "api-config")
                 .is_none()
         );
-        // And the counts are the half that must not change: the joins did resolve,
-        // onto an owner nobody can see.
         assert_eq!(dropped.stats.unknown_namespace, 2);
         assert_eq!(dropped.stats.unattached, 1);
     }
 
     #[test]
     fn the_index_names_the_promoted_replicaset_and_not_the_passed_through_one() {
-        // The two ReplicaSets are indistinguishable by kind and by role, and only
-        // one of them was drawn. The live phase has no other way to tell them apart,
-        // and suppressing both would freeze the hand-rolled one's card.
         let s = store(vec![
             scope("ns-1", "prod"),
             owner("dep-1", "prod", "api", KindId::DEPLOYMENT),
@@ -1079,15 +914,12 @@ mod tests {
             !a.index.emitted_owner("rs-1"),
             "passed through, so it has none"
         );
-        // A uid that is on the map but is not an owner is not an owner card either.
         assert!(!a.index.emitted_owner("pod-1"));
         assert!(!a.index.emitted_owner("ns-1"));
     }
 
     #[test]
     fn an_owner_reference_cycle_is_bounded_rather_than_hanging() {
-        // Possible in a cluster someone has been editing by hand, and a walk with
-        // no bound is a hang rather than an error.
         let s = store(vec![
             scope("ns-1", "prod"),
             replicaset(
@@ -1134,9 +966,6 @@ mod tests {
         assert_eq!(state.reason, ReasonId::CRASH_LOOP_BACK_OFF);
         assert_eq!(state.severity, Severity::Err);
 
-        // A reason nobody compiled in keeps the severity the mapping decided,
-        // which `State::of` could not do because `reason_severity` only knows
-        // built-ins.
         let mut pull = instance("pod-2", "prod", "api-2", None);
         pull.detail = Detail::Instance {
             reason: Reason {
@@ -1161,8 +990,6 @@ mod tests {
 
     #[test]
     fn assembling_the_same_objects_twice_gives_identical_output() {
-        // Determinism is what makes a golden fixture possible, and what stops the
-        // map reshuffling between two runs against the same cluster.
         let mut objects = vec![
             scope("ns-2", "staging"),
             scope("ns-1", "prod"),
@@ -1245,8 +1072,6 @@ mod tests {
 
     #[test]
     fn a_uid_re_added_after_a_delete_appears_once() {
-        // Kubernetes does not reuse uids, but the store must not depend on that:
-        // yielding one object twice would double it on the map.
         let mut s = store(vec![scope("ns-1", "prod")]);
         s.apply(owner("dep-1", "prod", "api", KindId::DEPLOYMENT));
         s.remove("dep-1");

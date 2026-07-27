@@ -1,43 +1,14 @@
-//! The open model: interned dense ids for kinds, vendors and state reasons.
-//!
-//! Closed enums could not name a CronJob, an Ingress, a Node or any CRD, and
-//! `k10s-map` matched them exhaustively, so adding a kind meant editing the
-//! painter. Identity is now an integer and presentation is a table lookup.
-//!
-//! The contract that makes this safe for the frame path: an id stays a plain
-//! integer. No `Arc<str>`, no trait object and no string comparison below the
-//! [`Catalog`], because the paint loop indexes tables by these ids once per
-//! visible node. The catalog itself is startup-and-discovery machinery and must
-//! never be consulted while painting.
-//!
-//! Built-ins occupy a dense prefix with stable constants, so the generator and
-//! the tests keep compile-time names. Anything a cluster reports that we do not
-//! know about is appended at runtime and renders through a fallback.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Where a kind sits in the four-level scene, independent of what it is.
-///
-/// The scene stays four levels deep, reinterpreted as a role hierarchy rather
-/// than a kind hierarchy: a Deployment and a CRD can both be owners, and a PVC
-/// and a Service can both be attachments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
-    /// A namespace today, a cluster once clusters are super-regions.
     Scope,
-    /// The thing that owns instances: Deployment, StatefulSet, a CRD.
     Owner,
-    /// A single instance: a Pod.
     Instance,
-    /// Attached to an owner rather than owning anything: PVC, Service, Secret.
     Attached,
 }
 
-/// Severity is deliberately closed: it is the rollup axis, and a lattice with a
-/// variable number of levels cannot be `max`ed. The open part of a state is its
-/// [`ReasonId`], so `CrashLoopBackOff` is a distinct reason at [`Severity::Err`]
-/// rather than collapsing into a generic warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(u8)]
 pub enum Severity {
@@ -53,8 +24,6 @@ impl Severity {
         matches!(self, Severity::Warn | Severity::Err)
     }
 
-    /// The four-level rollup. Associative and commutative, so a parent can fold
-    /// its children in any order.
     pub fn rollup(self, other: Severity) -> Severity {
         if other > self { other } else { self }
     }
@@ -64,21 +33,15 @@ impl Severity {
     }
 }
 
-/// A dense id for a resource kind. A GVK for a real cluster, a built-in for the
-/// generator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KindId(pub u32);
 
-/// A dense id for a vendor whose branding we can present. [`ToolId::NONE`] means
-/// "no vendor", which is the common case and why it holds slot zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ToolId(pub u16);
 
-/// A dense id for the reason a thing is in the state it is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ReasonId(pub u32);
 
-/// A severity paired with the reason that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct State {
     pub severity: Severity,
@@ -91,8 +54,6 @@ impl State {
         reason: ReasonId::RUNNING,
     };
 
-    /// Takes the severity a built-in reason implies, so callers cannot pair
-    /// `CrashLoopBackOff` with `Ok`.
     pub fn of(reason: ReasonId) -> State {
         State {
             severity: reason_severity(reason),
@@ -105,16 +66,12 @@ impl State {
     }
 }
 
-/// Declares a dense registry: a static table plus one stable constant per entry,
-/// generated together so an id can never drift from its metadata.
 macro_rules! registry {
     (
         $Id:ident : $repr:ty, $Info:ty, $TABLE:ident, $COUNT:ident,
         $( $konst:ident => $info:expr ),+ $(,)?
     ) => {
         pub static $TABLE: &[$Info] = &[ $( $info ),+ ];
-        /// How many ids are compiled in. Everything at or above this was
-        /// discovered at runtime and has no static presentation.
         pub const $COUNT: $repr = $TABLE.len() as $repr;
         registry_consts!($Id, 0, $($konst),+);
     };
@@ -130,13 +87,9 @@ macro_rules! registry_consts {
     ($Id:ident, $i:expr) => {};
 }
 
-/// Static metadata for a built-in kind. Runtime-discovered kinds carry the same
-/// fields owned, in [`KindEntry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KindInfo {
-    /// Stable machine name. Used by settings, saved views and tests.
     pub slug: &'static str,
-    /// What a badge shows when there is no room for the full kind.
     pub short: &'static str,
     pub role: Role,
     pub group: &'static str,
@@ -179,7 +132,6 @@ registry! {
     NODE         => kind("node", "node", Role::Scope, "", "v1", "Node"),
 }
 
-/// Static metadata for a built-in vendor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolInfo {
     pub slug: &'static str,
@@ -229,11 +181,9 @@ registry! {
     VAULT          => tool("vault", "Vault"),
 }
 
-/// Static metadata for a built-in reason, including the severity it implies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReasonInfo {
     pub slug: &'static str,
-    /// What the API server calls it, which is what a user recognises.
     pub display: &'static str,
     pub severity: Severity,
 }
@@ -262,8 +212,6 @@ registry! {
     FAILED               => reason("failed", "Failed", Severity::Err),
 }
 
-/// The severity a reason implies. Falls back to [`Severity::Unknown`] for a
-/// reason the cluster reported that we have no static entry for.
 pub fn reason_severity(reason: ReasonId) -> Severity {
     match BUILTIN_REASONS.get(reason.0 as usize) {
         Some(info) => info.severity,
@@ -271,9 +219,6 @@ pub fn reason_severity(reason: ReasonId) -> Severity {
     }
 }
 
-/// The short badge label for a kind, falling back to a marker for a kind
-/// discovered at runtime. Static-only, so the frame path can call it without a
-/// catalog; use [`Catalog::kind_short`] when discovered kinds must read well.
 pub fn kind_short(id: KindId) -> &'static str {
     match BUILTIN_KINDS.get(id.0 as usize) {
         Some(info) => info.short,
@@ -281,8 +226,6 @@ pub fn kind_short(id: KindId) -> &'static str {
     }
 }
 
-/// The role a kind plays, falling back to [`Role::Owner`] so an unknown kind
-/// still lands somewhere paintable rather than being dropped.
 pub fn kind_role(id: KindId) -> Role {
     match BUILTIN_KINDS.get(id.0 as usize) {
         Some(info) => info.role,
@@ -291,8 +234,6 @@ pub fn kind_role(id: KindId) -> Role {
 }
 
 impl KindId {
-    /// Whether this id has compiled-in presentation. False means the map draws
-    /// it through the fallback.
     pub fn is_builtin(self) -> bool {
         self.0 < BUILTIN_KIND_COUNT
     }
@@ -308,8 +249,6 @@ impl ToolId {
     }
 }
 
-/// An owned kind entry, so runtime-discovered kinds carry the same metadata as
-/// built-ins.
 #[derive(Debug, Clone)]
 pub struct KindEntry {
     pub slug: Arc<str>,
@@ -320,13 +259,6 @@ pub struct KindEntry {
     pub kind: Arc<str>,
 }
 
-/// Interns kinds, vendors and reasons discovered at runtime, keeping built-ins
-/// at their compiled-in ids.
-///
-/// Not for the frame path. Discovery and ingestion own this; the scene carries
-/// only the ids it hands out.
-/// Group, version, kind. Interned as `Arc<str>` so the entry and the lookup key
-/// share one allocation per string.
 type GvkKey = (Arc<str>, Arc<str>, Arc<str>);
 
 #[derive(Debug, Clone)]
@@ -385,9 +317,6 @@ impl Catalog {
         c
     }
 
-    /// Interns a GVK, returning its existing id if it is already known. A CRD
-    /// gets `Role::Owner` unless it is namespaced-attached, which discovery
-    /// cannot tell us, so callers refine it with [`Catalog::intern_gvk_as`].
     pub fn intern_gvk(&mut self, group: &str, version: &str, kind: &str) -> KindId {
         self.intern_gvk_as(group, version, kind, Role::Owner)
     }
@@ -426,8 +355,6 @@ impl Catalog {
         id
     }
 
-    /// Interns a reason by the name the API server uses, so an unrecognised
-    /// `reason` field becomes a first-class id instead of collapsing to Unknown.
     pub fn intern_reason(&mut self, display: &str) -> ReasonId {
         if let Some(&id) = self.by_reason.get(display) {
             return id;
@@ -460,8 +387,6 @@ impl Catalog {
     }
 }
 
-/// Derives a badge label for a kind nobody compiled in: the leading capitals of
-/// a CamelCase kind, so `VirtualMachineInstance` reads as `vmi`.
 fn shorten(kind: &str) -> String {
     let caps: String = kind
         .chars()
@@ -484,9 +409,6 @@ mod tests {
 
     #[test]
     fn builtin_constants_match_their_table_slots() {
-        // The registry macro generates ids and metadata together; this pins that
-        // the hand-written constant names still line up with the intended slugs,
-        // because a reordered table would silently repoint every stored id.
         assert_eq!(
             BUILTIN_KINDS[KindId::DEPLOYMENT.0 as usize].slug,
             "deployment"
@@ -531,8 +453,6 @@ mod tests {
 
     #[test]
     fn none_holds_tool_slot_zero() {
-        // ToolId::default() is what a workload with no vendor gets, and the map
-        // presentation table relies on slot zero being the generic entry.
         assert_eq!(ToolId::default(), ToolId::NONE);
         assert_eq!(ToolId::NONE.0, 0);
         assert!(ToolId::NONE.is_none());
@@ -571,13 +491,11 @@ mod tests {
             Severity::Err
         );
         assert_eq!(State::of(ReasonId::OOM_KILLED).severity, Severity::Err);
-        // The distinction the closed Health enum could not express.
         assert_ne!(
             State::of(ReasonId::CRASH_LOOP_BACK_OFF).reason,
             State::of(ReasonId::FAILED).reason
         );
         assert_eq!(State::OK.severity, Severity::Ok);
-        // A reason nobody compiled in is Unknown, never accidentally Ok.
         assert_eq!(reason_severity(ReasonId(9999)), Severity::Unknown);
     }
 
@@ -611,7 +529,6 @@ mod tests {
         );
         assert_eq!(c.kind_count(), before + 1, "interned twice");
 
-        // Same kind name in a different group is a different kind.
         let other = c.intern_gvk("example.com", "v1", "VirtualMachineInstance");
         assert_ne!(other, vmi);
 
@@ -627,7 +544,6 @@ mod tests {
 
     #[test]
     fn unknown_ids_fall_back_instead_of_panicking() {
-        // The frame path must render a kind it has never seen, not crash.
         let unknown = KindId(9_999);
         assert!(!unknown.is_builtin());
         assert_eq!(kind_short(unknown), "?");
