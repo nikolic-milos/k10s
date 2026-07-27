@@ -9,13 +9,13 @@ cluster options:
   --context NAME                          kubeconfig context (default: current-context)
   --namespace NS                          namespace to probe RBAC in; repeatable.
                                           only needed where cluster-wide list is denied
-  --sync-timeout SECS                     how long to wait for the initial list (default 30)
+  --sync-timeout SECS                     how long to wait for the initial list (default 30, max 3600)
   --list-contexts                         print the kubeconfig's contexts and exit
 
 generator options:
   --objects N                             objects to generate (default 25000)
   --seed S                                generator seed (default 55)
-  --churn EVENTS_PER_SEC                  churn events per second (default 120)
+  --churn EVENTS_PER_SEC                  churn events per second (default 120, max 100000)
   --scenario NAME                         platform|observability|data|ns-fanout|wl-fanout
                                           (default platform)
 
@@ -30,6 +30,43 @@ unrecognized arguments are reported on stderr and ignored";
 
 const DEFAULT_MACHINE: &str = "unlabeled";
 const DEFAULT_SYNC_TIMEOUT_SECS: f32 = 30.0;
+/// `Duration::from_secs_f32` panics rather than saturating on a value it cannot hold,
+/// so the wait needs an upper bound; an hour is past the point where waiting for an
+/// initial list is a wait rather than a hang.
+const MAX_SYNC_TIMEOUT_SECS: f32 = 3600.0;
+/// The world turns the rate into a flip count per tick and runs all of them before it
+/// reads the control channel again, so an unbounded rate is a thread that never comes
+/// back: it stops publishing and `world.join()` hangs once the window closes. 100k/s is
+/// 5,000 flips a tick, already past anything a map can show.
+const MAX_CHURN_PER_SEC: f32 = 100_000.0;
+
+/// The tokens `--flag=value` may be split on. A `=` on a flag that takes no value is
+/// not that flag, and splitting `--cluster=no` would turn it into `--cluster`, so those
+/// stay whole and go where every unrecognized token goes.
+const VALUE_FLAGS: [&str; 9] = [
+    "--objects",
+    "--seed",
+    "--churn",
+    "--scenario",
+    "--layout",
+    "--machine",
+    "--context",
+    "--namespace",
+    "--sync-timeout",
+];
+
+/// The accepted `--scenario` and `--layout` values, spelled by the types that parse
+/// them: the hand-written list in the error message had drifted to three of the five
+/// scenarios, omitting both fan-out shapes. A new variant still has to be added here,
+/// because neither type can enumerate itself.
+const SCENARIOS: [Scenario; 5] = [
+    Scenario::Platform,
+    Scenario::Observability,
+    Scenario::Data,
+    Scenario::NsFanOut,
+    Scenario::WlFanOut,
+];
+const LAYOUTS: [LayoutMode; 2] = [LayoutMode::Spread, LayoutMode::Dense];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Args {
@@ -48,9 +85,14 @@ pub struct Args {
     /// mode ignores churn either way, and warning about a default nobody asked for
     /// would print on every run.
     pub churn_explicit: bool,
+    /// The same question for the flags only one of the two input paths reads.
+    pub objects_explicit: bool,
+    pub seed_explicit: bool,
+    pub scenario_explicit: bool,
     pub context: Option<String>,
     pub namespaces: Vec<String>,
     pub sync_timeout_secs: f32,
+    pub sync_timeout_explicit: bool,
     pub list_contexts: bool,
     pub ignored: Vec<String>,
 }
@@ -69,9 +111,13 @@ impl Default for Args {
             help: false,
             cluster: false,
             churn_explicit: false,
+            objects_explicit: false,
+            seed_explicit: false,
+            scenario_explicit: false,
             context: None,
             namespaces: Vec::new(),
             sync_timeout_secs: DEFAULT_SYNC_TIMEOUT_SECS,
+            sync_timeout_explicit: false,
             list_contexts: false,
             ignored: Vec::new(),
         }
@@ -101,7 +147,7 @@ impl Args {
     }
 
     pub fn sync_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs_f32(self.sync_timeout_secs.max(0.0))
+        std::time::Duration::from_secs_f32(self.sync_timeout_secs)
     }
 
     /// Flags that only mean anything with `--cluster`.
@@ -115,6 +161,31 @@ impl Args {
         }
         if !self.namespaces.is_empty() {
             out.push("--namespace");
+        }
+        if self.sync_timeout_explicit {
+            out.push("--sync-timeout");
+        }
+        out
+    }
+
+    /// Flags that only mean anything without `--cluster`, so the policy reads the same
+    /// way in both directions.
+    ///
+    /// `--churn` is not here: cluster mode overrides it rather than merely not reading
+    /// it, and [`Args::churn_was_overridden`] says so in its own words.
+    pub fn generator_flags_with_cluster(&self) -> Vec<&'static str> {
+        if !self.cluster {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if self.objects_explicit {
+            out.push("--objects");
+        }
+        if self.seed_explicit {
+            out.push("--seed");
+        }
+        if self.scenario_explicit {
+            out.push("--scenario");
         }
         out
     }
@@ -131,7 +202,10 @@ pub enum ArgError {
     },
     BadValue {
         flag: &'static str,
-        expected: &'static str,
+        /// Owned: the accepted values are asked of the type that parses them and the
+        /// bounds of the constant that holds them, rather than spelled a second time
+        /// here, which is how this message came to name three of five scenarios.
+        expected: String,
         got: String,
     },
     JsonWithoutBench,
@@ -166,46 +240,60 @@ impl std::error::Error for ArgError {}
 pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
     let mut args = Args::default();
     let mut rest = argv;
-    while let Some(flag) = rest.next() {
-        match flag.as_str() {
-            "--objects" => args.objects = number("--objects", "a u32", &mut rest)?,
-            "--seed" => args.seed = number("--seed", "a u64", &mut rest)?,
+    while let Some(arg) = rest.next() {
+        // `--flag=value` is the universal form and every flag that takes a value has to
+        // accept it. Matching the whole token sent `--objects=50000` to `ignored`, and
+        // `--bench --json` writes its report to stdout, so a caller that keeps stdout
+        // and drops stderr recorded the default scene's numbers as the run's.
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, inline)) if VALUE_FLAGS.contains(&flag) => (flag, Some(inline)),
+            _ => (arg.as_str(), None),
+        };
+        match flag {
+            "--objects" => {
+                args.objects = number("--objects", "a u32", inline, &mut rest)?;
+                args.objects_explicit = true;
+            }
+            "--seed" => {
+                args.seed = number("--seed", "a u64", inline, &mut rest)?;
+                args.seed_explicit = true;
+            }
             "--churn" => {
-                args.churn = number("--churn", "an f32", &mut rest)?;
+                args.churn = bounded("--churn", "a rate", MAX_CHURN_PER_SEC, inline, &mut rest)?;
                 args.churn_explicit = true;
             }
             "--scenario" => {
-                let got = value("--scenario", &mut rest)?;
-                args.scenario = match Scenario::parse(&got) {
-                    Some(scenario) => scenario,
-                    None => {
-                        return Err(ArgError::BadValue {
-                            flag: "--scenario",
-                            expected: "platform|observability|data",
-                            got,
-                        });
-                    }
-                };
+                let got = value("--scenario", inline, &mut rest)?;
+                args.scenario = Scenario::parse(&got).ok_or_else(|| ArgError::BadValue {
+                    flag: "--scenario",
+                    expected: SCENARIOS.map(|s| s.as_str()).join("|"),
+                    got,
+                })?;
+                args.scenario_explicit = true;
             }
             "--layout" => {
-                let got = value("--layout", &mut rest)?;
-                args.layout = match LayoutMode::parse(&got) {
-                    Some(layout) => layout,
-                    None => {
-                        return Err(ArgError::BadValue {
-                            flag: "--layout",
-                            expected: "spread|dense",
-                            got,
-                        });
-                    }
-                };
+                let got = value("--layout", inline, &mut rest)?;
+                args.layout = LayoutMode::parse(&got).ok_or_else(|| ArgError::BadValue {
+                    flag: "--layout",
+                    expected: LAYOUTS.map(|l| l.as_str()).join("|"),
+                    got,
+                })?;
             }
-            "--machine" => args.machine = Some(value("--machine", &mut rest)?),
+            "--machine" => args.machine = Some(value("--machine", inline, &mut rest)?),
             "--cluster" => args.cluster = true,
-            "--context" => args.context = Some(value("--context", &mut rest)?),
-            "--namespace" => args.namespaces.push(value("--namespace", &mut rest)?),
+            "--context" => args.context = Some(value("--context", inline, &mut rest)?),
+            "--namespace" => args
+                .namespaces
+                .push(value("--namespace", inline, &mut rest)?),
             "--sync-timeout" => {
-                args.sync_timeout_secs = number("--sync-timeout", "an f32", &mut rest)?;
+                args.sync_timeout_secs = bounded(
+                    "--sync-timeout",
+                    "seconds",
+                    MAX_SYNC_TIMEOUT_SECS,
+                    inline,
+                    &mut rest,
+                )?;
+                args.sync_timeout_explicit = true;
             }
             "--list-contexts" => args.list_contexts = true,
             "--bench" => args.bench = true,
@@ -233,21 +321,51 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
     Ok(args)
 }
 
-fn value(flag: &'static str, rest: &mut impl Iterator<Item = String>) -> Result<String, ArgError> {
-    rest.next().ok_or(ArgError::MissingValue { flag })
+fn value(
+    flag: &'static str,
+    inline: Option<&str>,
+    rest: &mut impl Iterator<Item = String>,
+) -> Result<String, ArgError> {
+    match inline {
+        Some(inline) => Ok(inline.to_string()),
+        None => rest.next().ok_or(ArgError::MissingValue { flag }),
+    }
 }
 
 fn number<T: std::str::FromStr>(
     flag: &'static str,
     expected: &'static str,
+    inline: Option<&str>,
     rest: &mut impl Iterator<Item = String>,
 ) -> Result<T, ArgError> {
-    let got = value(flag, rest)?;
-    match got.parse::<T>() {
-        Ok(parsed) => Ok(parsed),
-        Err(_) => Err(ArgError::BadValue {
+    let got = value(flag, inline, rest)?;
+    got.parse::<T>().map_err(|_| ArgError::BadValue {
+        flag,
+        expected: expected.to_string(),
+        got,
+    })
+}
+
+/// An `f32` flag value the rest of the program can use without re-checking it.
+///
+/// `"inf"`, `"-1"` and `"1e30"` all parse; what each of them does downstream is why the
+/// flag has a maximum at all. This rejects rather than clamps, because clamping a
+/// negative timeout to zero ended the initial list before any stream settled, and the
+/// empty map that came back is the one an RBAC-denied cluster gives. `nan` needs no test
+/// of its own, having already failed the range comparison.
+fn bounded(
+    flag: &'static str,
+    unit: &'static str,
+    max: f32,
+    inline: Option<&str>,
+    rest: &mut impl Iterator<Item = String>,
+) -> Result<f32, ArgError> {
+    let got = value(flag, inline, rest)?;
+    match got.parse::<f32>() {
+        Ok(parsed) if (0.0..=max).contains(&parsed) => Ok(parsed),
+        _ => Err(ArgError::BadValue {
             flag,
-            expected,
+            expected: format!("{unit} from 0 to {max}"),
             got,
         }),
     }
@@ -287,6 +405,12 @@ mod tests {
                 a.scenario == Scenario::Observability
             }),
             (&["--scenario", "data"], |a| a.scenario == Scenario::Data),
+            (&["--scenario", "ns-fanout"], |a| {
+                a.scenario == Scenario::NsFanOut
+            }),
+            (&["--scenario", "wl-fanout"], |a| {
+                a.scenario == Scenario::WlFanOut
+            }),
             (&["--layout", "spread"], |a| a.layout == LayoutMode::Spread),
             (&["--layout", "dense"], |a| a.layout == LayoutMode::Dense),
             (&["--machine", "m2-air"], |a| {
@@ -350,7 +474,7 @@ mod tests {
                 &["--objects", "many"],
                 ArgError::BadValue {
                     flag: "--objects",
-                    expected: "a u32",
+                    expected: "a u32".to_string(),
                     got: "many".to_string(),
                 },
             ),
@@ -358,7 +482,7 @@ mod tests {
                 &["--objects", "-1"],
                 ArgError::BadValue {
                     flag: "--objects",
-                    expected: "a u32",
+                    expected: "a u32".to_string(),
                     got: "-1".to_string(),
                 },
             ),
@@ -366,7 +490,7 @@ mod tests {
                 &["--seed", "1.5"],
                 ArgError::BadValue {
                     flag: "--seed",
-                    expected: "a u64",
+                    expected: "a u64".to_string(),
                     got: "1.5".to_string(),
                 },
             ),
@@ -374,15 +498,17 @@ mod tests {
                 &["--churn", "fast"],
                 ArgError::BadValue {
                     flag: "--churn",
-                    expected: "an f32",
+                    expected: "a rate from 0 to 100000".to_string(),
                     got: "fast".to_string(),
                 },
             ),
             (
+                // The two fan-out scenarios are the axis §6.4 says matters, and the
+                // list that used to name three of five left them out.
                 &["--scenario", "Platform"],
                 ArgError::BadValue {
                     flag: "--scenario",
-                    expected: "platform|observability|data",
+                    expected: "platform|observability|data|ns-fanout|wl-fanout".to_string(),
                     got: "Platform".to_string(),
                 },
             ),
@@ -390,14 +516,96 @@ mod tests {
                 &["--layout", "sparse"],
                 ArgError::BadValue {
                     flag: "--layout",
-                    expected: "spread|dense",
+                    expected: "spread|dense".to_string(),
                     got: "sparse".to_string(),
+                },
+            ),
+            (
+                // The bound is in the message because it comes from the constant that
+                // enforces it, so someone who typed milliseconds reads the unit and the
+                // limit at the same time.
+                &["--sync-timeout", "1e30"],
+                ArgError::BadValue {
+                    flag: "--sync-timeout",
+                    expected: "seconds from 0 to 3600".to_string(),
+                    got: "1e30".to_string(),
                 },
             ),
         ];
         for (argv, expected) in cases {
             assert_eq!(parse_argv(argv).as_ref(), Err(expected), "argv {argv:?}");
         }
+    }
+
+    #[test]
+    fn numbers_that_parse_but_cannot_be_used_are_errors() {
+        // Every one of these parses as an f32 and every one of them used to reach the
+        // program: `inf` and `1e30` panic `Duration::from_secs_f32`, `--churn inf`
+        // becomes `usize::MAX` flips in one tick and the world stops publishing, and a
+        // negative timeout was clamped to zero, which ends the initial list before any
+        // stream settles and prints the permissions diagnosis at a typo.
+        let cases: &[&[&str]] = &[
+            &["--sync-timeout", "inf"],
+            &["--sync-timeout", "1e30"],
+            &["--sync-timeout", "-1"],
+            &["--sync-timeout", "nan"],
+            &["--sync-timeout", "3601"],
+            &["--churn", "inf"],
+            &["--churn", "-1"],
+            &["--churn", "-inf"],
+            &["--churn", "1e30"],
+        ];
+        for &argv in cases {
+            let parsed = parse_argv(argv);
+            assert!(
+                matches!(parsed, Err(ArgError::BadValue { .. })),
+                "argv {argv:?} was accepted: {parsed:?}"
+            );
+        }
+        // The bounds themselves are values, not errors.
+        assert_eq!(
+            ok(&["--sync-timeout", "3600"]).sync_timeout().as_secs(),
+            3600
+        );
+        assert_eq!(ok(&["--churn", "0"]).churn, 0.0);
+        assert_eq!(ok(&["--churn", "100000"]).churn, 100_000.0);
+    }
+
+    #[test]
+    fn the_eq_form_works_for_every_flag_that_takes_a_value() {
+        // `--objects=50000` landing in `ignored` meant a 25,000-object scene, and the
+        // `--bench --json` report agreed with it: `BenchMeta.objects` is `args.objects`,
+        // the same field `generate()` hands the generator as `target_objects`. So the
+        // capture was internally consistent about a scale nobody had asked for, and the
+        // only notice that the flag had been dropped went to stderr.
+        let cases: &[FieldCase] = &[
+            (&["--objects=50000"], |a| a.objects == 50_000),
+            (&["--seed=7"], |a| a.seed == 7),
+            (&["--churn=12.5"], |a| (a.churn - 12.5).abs() < f32::EPSILON),
+            (&["--scenario=ns-fanout"], |a| {
+                a.scenario == Scenario::NsFanOut
+            }),
+            (&["--layout=dense"], |a| a.layout == LayoutMode::Dense),
+            (&["--machine=m2-air"], |a| {
+                a.machine.as_deref() == Some("m2-air")
+            }),
+            (&["--context=prod"], |a| {
+                a.context.as_deref() == Some("prod")
+            }),
+            (&["--namespace=payments"], |a| {
+                a.namespaces == vec!["payments".to_string()]
+            }),
+            (&["--sync-timeout=5"], |a| {
+                (a.sync_timeout_secs - 5.0).abs() < f32::EPSILON
+            }),
+        ];
+        for &(argv, holds) in cases {
+            let args = ok(argv);
+            assert!(holds(&args), "{argv:?} did not set its field: {args:?}");
+            assert!(args.ignored.is_empty(), "{argv:?} was reported as ignored");
+        }
+        // And the value is validated the same way whichever form it arrived in.
+        assert!(parse_argv(&["--sync-timeout=-1"]).is_err());
     }
 
     #[test]
@@ -454,6 +662,54 @@ mod tests {
                 .cluster_flags_without_cluster()
                 .is_empty()
         );
+        // `--sync-timeout` was the gap: nothing waits for a list in generator mode, so
+        // the flag did nothing and nothing said so.
+        assert_eq!(
+            ok(&["--sync-timeout", "5"]).cluster_flags_without_cluster(),
+            vec!["--sync-timeout"]
+        );
+        assert!(
+            ok(&["--cluster", "--sync-timeout", "5"])
+                .cluster_flags_without_cluster()
+                .is_empty()
+        );
+        // A default nobody named is not an override to report.
+        assert!(ok(&[]).cluster_flags_without_cluster().is_empty());
+    }
+
+    #[test]
+    fn generator_only_flags_are_reported_when_there_is_a_cluster() {
+        // The mirror of the case above: `--cluster --objects 50000` reads whatever the
+        // cluster holds, and the operator believes they asked for a size.
+        assert_eq!(
+            ok(&["--cluster", "--objects", "50000"]).generator_flags_with_cluster(),
+            vec!["--objects"]
+        );
+        assert_eq!(
+            ok(&[
+                "--cluster",
+                "--scenario",
+                "data",
+                "--seed",
+                "9",
+                "--objects",
+                "1"
+            ])
+            .generator_flags_with_cluster(),
+            vec!["--objects", "--seed", "--scenario"]
+        );
+        assert!(ok(&["--cluster"]).generator_flags_with_cluster().is_empty());
+        assert!(
+            ok(&["--objects", "50000"])
+                .generator_flags_with_cluster()
+                .is_empty()
+        );
+        // `--churn` has its own line: cluster mode overrides it rather than ignoring it.
+        assert!(
+            ok(&["--cluster", "--churn", "5"])
+                .generator_flags_with_cluster()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -469,33 +725,24 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_timeout_is_a_duration_and_never_negative() {
+    fn a_sync_timeout_is_a_duration_it_was_asked_for() {
         assert_eq!(
             ok(&["--sync-timeout", "2.5"]).sync_timeout().as_millis(),
             2500
         );
-        assert_eq!(ok(&["--sync-timeout", "-1"]).sync_timeout().as_millis(), 0);
         assert_eq!(Args::default().sync_timeout().as_secs(), 30);
     }
 
     #[test]
     fn missing_values_are_errors() {
-        let cases: &[(&[&str], &'static str)] = &[
-            (&["--objects"], "--objects"),
-            (&["--seed"], "--seed"),
-            (&["--churn"], "--churn"),
-            (&["--scenario"], "--scenario"),
-            (&["--layout"], "--layout"),
-            (&["--machine"], "--machine"),
-            (&["--context"], "--context"),
-            (&["--namespace"], "--namespace"),
-            (&["--sync-timeout"], "--sync-timeout"),
-        ];
-        for &(argv, flag) in cases {
+        // Driven by VALUE_FLAGS, which is also the list `--flag=value` is split on, so a
+        // flag that takes a value and is left out of it cannot pass this and then quietly
+        // go back to being ignored in its `=` form.
+        for flag in VALUE_FLAGS {
             assert_eq!(
-                parse_argv(argv),
+                parse_argv(&[flag]),
                 Err(ArgError::MissingValue { flag }),
-                "argv {argv:?}"
+                "argv {flag:?}"
             );
         }
     }
@@ -507,11 +754,17 @@ mod tests {
             &["-psn_0_774050"],
             &["/home/user/pod.yaml"],
             &["--gapplication-service"],
+            // Splitting on `=` must not reach these: a session type is not a flag with a
+            // value, and `--cluster=no` says the opposite of the flag it contains.
+            &["--gapplication-app-id=org.k10s"],
+            &["--cluster=no"],
+            &["--bogus-flag=1"],
         ];
         for &argv in cases {
             let args = ok(argv);
             assert_eq!(args.ignored, vec![argv[0].to_string()], "argv {argv:?}");
         }
+        assert!(!ok(&["--cluster=no"]).cluster);
     }
 
     #[test]
@@ -576,6 +829,26 @@ mod tests {
             "--list-contexts",
         ] {
             assert!(USAGE.contains(flag), "usage is missing {flag}");
+        }
+    }
+
+    #[test]
+    fn usage_names_the_numeric_bounds_it_enforces() {
+        // A rejected value is not the place to learn a limit exists.
+        for max in [MAX_SYNC_TIMEOUT_SECS, MAX_CHURN_PER_SEC] {
+            assert!(USAGE.contains(&max.to_string()), "usage is missing {max}");
+        }
+    }
+
+    #[test]
+    fn usage_lists_every_scenario_and_layout() {
+        // The bad-value messages now ask the types for these; `--help` is the other
+        // place they are written down, and it is where the drift showed first.
+        for scenario in SCENARIOS.map(|s| s.as_str()) {
+            assert!(USAGE.contains(scenario), "usage is missing {scenario}");
+        }
+        for layout in LAYOUTS.map(|l| l.as_str()) {
+            assert!(USAGE.contains(layout), "usage is missing {layout}");
         }
     }
 
