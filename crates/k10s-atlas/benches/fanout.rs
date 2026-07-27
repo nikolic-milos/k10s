@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use k10s_atlas::testing::{SceneSpec, lod_policy, scene};
+use k10s_atlas::testing::{SceneSpec, cross_scene, lod_policy, scene};
 use k10s_atlas::{
     BlockNode, Camera, CellNode, CullStats, Edge, LodPolicy, RegionNode, Scene, StageBlend, cull,
 };
@@ -9,6 +9,10 @@ use k10s_atlas::{
 const VW: f32 = 1600.0;
 const VH: f32 = 1000.0;
 const WARMUP: usize = 200;
+/// The floor exists so the p99 column is a p99: at 51 samples and fewer the 0.99 index rounds to
+/// the last one, which makes the number the maximum, and below a hundred a single sample carries
+/// more than a whole percentile. `iters` is reported per row so a comparator can check rather than
+/// trust.
 const MIN_ITERS: usize = 200;
 const MAX_ITERS: usize = 200_000;
 const BUDGET: Duration = Duration::from_millis(150);
@@ -20,6 +24,9 @@ const BLOCK_ZOOM: f32 = 2.2;
 const CELL_ZOOM: f32 = 30.0;
 const CELL_SWEEP_BLOCKS: usize = 4;
 const EDGE_SWEEP_BLOCKS: usize = 512;
+/// Sweep C's 512 blocks, split so there are two regions for an edge to run between.
+const CROSS_SWEEP_REGIONS: usize = 2;
+const CROSS_SWEEP_BLOCKS: usize = 256;
 const CELLS_PER_BLOCK: usize = 5;
 const SATS_PER_BLOCK: usize = 2;
 
@@ -51,6 +58,7 @@ struct Case {
     child_bytes: usize,
     child_kib: f64,
     zoom: f32,
+    iters: usize,
     p50_ns: f64,
     p99_ns: f64,
     ns_per_child: f64,
@@ -70,7 +78,7 @@ fn measure<R, B, C, S>(
     scene: &Scene<R, B, C, S>,
     policy: &LodPolicy,
     camera: &Camera,
-) -> (f64, f64, CullStats) {
+) -> (usize, f64, f64, CullStats) {
     let blend = StageBlend::settled(policy.stage_for_zoom(camera.zoom));
     let stats = cull(scene, camera, policy, blend, VW, VH, true, false);
 
@@ -105,6 +113,7 @@ fn measure<R, B, C, S>(
     }
     samples.sort_unstable();
     (
+        samples.len(),
         percentile(&samples, 0.50),
         percentile(&samples, 0.99),
         stats,
@@ -190,6 +199,17 @@ fn fit_block_camera<R, B, C, S>(s: &Scene<R, B, C, S>, _zoom: f32) -> Camera {
     cam
 }
 
+/// The last block of the first region, which is as far from the first block as one region gets.
+///
+/// `cross_scene` links first block to first block, so a camera parked here sees no cross edge at
+/// all: the sweep that uses it isolates the scan the tail pays unconditionally from the emit that
+/// follows a hit. Its `edges` counter reading zero at every degree is the check on that.
+fn far_block_camera<R, B, C, S>(s: &Scene<R, B, C, S>, zoom: f32) -> Camera {
+    let last = s.regions[0].children.end as usize - 1;
+    let (cx, cy) = s.blocks[last].inner.center();
+    Camera { cx, cy, zoom }
+}
+
 fn drawn_work(st: &CullStats) -> [usize; 9] {
     [
         st.quads,
@@ -211,6 +231,9 @@ struct Sweep {
     degrees: &'static [usize],
     exts: &'static [&'static str],
     spec: fn(usize) -> SceneSpec,
+    /// The degree counts cross-region edges rather than children, so the scene comes from
+    /// `cross_scene` and the spec ignores its argument.
+    cross: bool,
     camera: fn(&Scene, f32) -> Camera,
     unit_bytes: usize,
     padded_bytes: usize,
@@ -246,6 +269,16 @@ fn edge_fan_spec(degree: usize) -> SceneSpec {
     }
 }
 
+fn cross_fan_spec(_degree: usize) -> SceneSpec {
+    SceneSpec {
+        regions: CROSS_SWEEP_REGIONS,
+        blocks_per_region: CROSS_SWEEP_BLOCKS,
+        cells_per_block: CELLS_PER_BLOCK,
+        sats_per_block: SATS_PER_BLOCK,
+        edges_per_region: 0,
+    }
+}
+
 fn sweeps() -> Vec<Sweep> {
     vec![
         Sweep {
@@ -255,6 +288,7 @@ fn sweeps() -> Vec<Sweep> {
             degrees: &DEGREES,
             exts: BOTH_EXTS,
             spec: block_fan_spec,
+            cross: false,
             camera: block_camera,
             unit_bytes: size_of::<BlockNode>(),
             padded_bytes: size_of::<BlockNode<WlPad>>(),
@@ -266,6 +300,7 @@ fn sweeps() -> Vec<Sweep> {
             degrees: &DEGREES,
             exts: BOTH_EXTS,
             spec: cell_fan_spec,
+            cross: false,
             camera: cell_camera,
             unit_bytes: size_of::<CellNode>(),
             padded_bytes: size_of::<CellNode<PodPad>>(),
@@ -277,7 +312,20 @@ fn sweeps() -> Vec<Sweep> {
             degrees: &EDGE_DEGREES,
             exts: BOTH_EXTS,
             spec: edge_fan_spec,
+            cross: false,
             camera: block_camera,
+            unit_bytes: size_of::<Edge>(),
+            padded_bytes: size_of::<Edge>(),
+        },
+        Sweep {
+            name: "C-cross edge fan-out in the ungated tail, 2 regions x 256 blocks",
+            child: "edge",
+            zoom: BLOCK_ZOOM,
+            degrees: &EDGE_DEGREES,
+            exts: BOTH_EXTS,
+            spec: cross_fan_spec,
+            cross: true,
+            camera: far_block_camera,
             unit_bytes: size_of::<Edge>(),
             padded_bytes: size_of::<Edge>(),
         },
@@ -288,6 +336,7 @@ fn sweeps() -> Vec<Sweep> {
             degrees: &DEGREES,
             exts: PADDED_ONLY,
             spec: block_fan_spec,
+            cross: false,
             camera: fit_region_camera,
             unit_bytes: size_of::<BlockNode>(),
             padded_bytes: size_of::<BlockNode<WlPad>>(),
@@ -299,6 +348,7 @@ fn sweeps() -> Vec<Sweep> {
             degrees: &DEGREES,
             exts: PADDED_ONLY,
             spec: cell_fan_spec,
+            cross: false,
             camera: fit_block_camera,
             unit_bytes: size_of::<CellNode>(),
             padded_bytes: size_of::<CellNode<PodPad>>(),
@@ -315,9 +365,14 @@ fn main() {
         for &ext in sweep.exts {
             let mut baseline: Option<[usize; 9]> = None;
             for &degree in sweep.degrees {
-                let unit = scene((sweep.spec)(degree));
+                let spec = (sweep.spec)(degree);
+                let unit = if sweep.cross {
+                    cross_scene(spec, degree)
+                } else {
+                    scene(spec)
+                };
                 let camera = (sweep.camera)(&unit, sweep.zoom);
-                let (p50, p99, stats) = if ext == UNIT {
+                let (iters, p50, p99, stats) = if ext == UNIT {
                     measure(&unit, &policy, &camera)
                 } else {
                     measure(&pad_ext(unit), &policy, &camera)
@@ -337,6 +392,7 @@ fn main() {
                     child_bytes,
                     child_kib: (degree * child_bytes) as f64 / 1024.0,
                     zoom: camera.zoom,
+                    iters,
                     p50_ns: p50,
                     p99_ns: p99,
                     ns_per_child: if degree == 0 {
@@ -382,12 +438,13 @@ fn print_table(cases: &[Case]) {
             );
         }
         println!(
-            "    {:>6} {:<5} zoom {:>6.3}  p50 {:>9.0} ns  p99 {:>9.0} ns  {:>7.3} ns/{:<5} {:>8.1} KiB{} | quads {:>6} labels {:>4} icons {:>5} sats {:>5} curves {:>5} edges {:>5} | drawn r/b/c {:>3}/{:>6}/{:>6}",
+            "    {:>6} {:<5} zoom {:>6.3}  p50 {:>9.0} ns  p99 {:>9.0} ns  iters {:>6}  {:>7.3} ns/{:<5} {:>8.1} KiB{} | quads {:>6} labels {:>4} icons {:>5} sats {:>5} curves {:>5} edges {:>5} | drawn r/b/c {:>3}/{:>6}/{:>6}",
             c.degree,
             c.child,
             c.zoom,
             c.p50_ns,
             c.p99_ns,
+            c.iters,
             c.ns_per_child,
             c.child,
             c.child_kib,
@@ -407,7 +464,7 @@ fn print_table(cases: &[Case]) {
 
 fn print_json(cases: &[Case]) {
     println!("{{");
-    println!("  \"schema_version\": 1,");
+    println!("  \"schema_version\": 2,");
     println!("  \"viewport\": [{VW}, {VH}],");
     println!("  \"cases\": [");
     for (i, c) in cases.iter().enumerate() {
@@ -420,6 +477,7 @@ fn print_json(cases: &[Case]) {
         println!("      \"child_bytes\": {},", c.child_bytes);
         println!("      \"child_kib\": {:.1},", c.child_kib);
         println!("      \"zoom\": {},", c.zoom);
+        println!("      \"iters\": {},", c.iters);
         println!("      \"p50_ns\": {:.0},", c.p50_ns);
         println!("      \"p99_ns\": {:.0},", c.p99_ns);
         println!("      \"ns_per_child\": {:.4},", c.ns_per_child);
