@@ -8,12 +8,7 @@ license.workspace = true
 workspace = true
 
 [features]
-# Opens `frame::walk` and its sink to `benches/walk.rs`, which is a separate crate. Off in every
-# shipping build, so the public surface is unchanged there.
 testing = []
-# Installs the counting allocator. A second build rather than a second bench target: two atomic
-# read-modify-writes per allocation land on `walk` and on nothing else, and `walk` against the cull
-# oracle is the comparison this bench exists to make.
 bench-alloc = []
 
 [dependencies]
@@ -29,9 +24,6 @@ serde_json.workspace = true
 [dev-dependencies]
 k10s-atlas = { workspace = true, features = ["testing"] }
 k10s-clustergen.workspace = true
-# ROADMAP §6.7 gates the paint path on a counting allocator, and `unsafe_code = "forbid"` means we
-# cannot write the twenty lines that make one. Zero dependencies, MIT, dev-only, and it separates
-# allocations from reallocations, which is what splits the label copies from the path builders.
 stats_alloc = "0.1.10"
 
 [[bench]]

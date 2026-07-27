@@ -16,8 +16,6 @@ rand_chacha.workspace = true
 
 [dev-dependencies]
 k10s-atlas = { workspace = true, features = ["testing"] }
-# The generator is a producer to test and bench against, not something the world
-# builds on: its only input contract is the ingest stream.
 k10s-clustergen.workspace = true
 
 [[bench]]
@@ -27,4 +25,3 @@ harness = false
 [[bench]]
 name = "fanout_cull"
 harness = false
-

@@ -14,17 +14,10 @@ k8s-openapi.workspace = true
 tokio.workspace = true
 crossbeam-channel.workspace = true
 futures.workspace = true
-# Only for the `DeserializeOwned` bound a watched kind has to satisfy; no type in
-# this crate is serialized.
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-# The world is the consumer whose input contract this crate has to satisfy, so the
-# conforming-initial-sync property is checked against its own fold rather than
-# against a restatement of it.
 k10s-world.workspace = true
-# `kube::Client` is a tower service, so a test can be the API server. These are
-# what it takes to be one, and they are already in the tree via kube-client.
 http = "1"
 tower = { version = "0.5", features = ["util"] }
