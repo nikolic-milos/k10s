@@ -2,6 +2,8 @@
 name = "k10s-world"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 
 [lints]
@@ -15,6 +17,7 @@ rand.workspace = true
 rand_chacha.workspace = true
 
 [dev-dependencies]
+k10s-bench.workspace = true
 k10s-atlas = { workspace = true, features = ["testing"] }
 k10s-clustergen.workspace = true
 
