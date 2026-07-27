@@ -2,6 +2,8 @@
 name = "k10s-map"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 
 [lints]
@@ -22,6 +24,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 [dev-dependencies]
+k10s-bench.workspace = true
 k10s-atlas = { workspace = true, features = ["testing"] }
 k10s-clustergen.workspace = true
 stats_alloc = "0.1.10"

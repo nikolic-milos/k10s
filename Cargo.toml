@@ -8,11 +8,18 @@ members = [
     "crates/k10s-map",
     "crates/k10s-app",
     "crates/k10s-data",
+    "crates/k10s-bench",
+]
+exclude = [
+    "third-party/stacksafe-macro",
+    "tools/k10s-paint-bench",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97"
+publish = false
 license = "AGPL-3.0-or-later"
 authors = ["Miloš Nikolić <milosnikolic@milosnikolic.de>"]
 repository = "https://github.com/nikolic-milos/k10s"
@@ -25,6 +32,7 @@ k10s-world = { path = "crates/k10s-world" }
 k10s-map = { path = "crates/k10s-map" }
 k10s-app = { path = "crates/k10s-app" }
 k10s-data = { path = "crates/k10s-data" }
+k10s-bench = { path = "crates/k10s-bench" }
 
 gpui = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
 gpui_platform = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
@@ -37,6 +45,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 serde = "1"
 serde_json = "1"
+rustix = { version = "1.1", features = ["param"] }
 
 kube = { version = "4.0", features = [
     "runtime",
@@ -58,6 +67,10 @@ dbg_macro = "deny"
 todo = "deny"
 redundant_clone = "deny"
 disallowed_methods = "deny"
+
+[patch.crates-io]
+stacksafe-macro = { path = "third-party/stacksafe-macro" }
+xcb = { git = "https://github.com/rust-x-bindings/rust-xcb", rev = "ae3b2cd080e78173223038ccbebdc644eaf4a9ad" }
 
 [profile.dev]
 opt-level = 1
