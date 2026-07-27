@@ -21,7 +21,7 @@
 //! A snapshot is a replay of [`Op::Added`], so a producer that only knows how to
 //! describe a whole cluster is still a producer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::model::{KindId, State, ToolId};
@@ -110,9 +110,9 @@ pub enum DesyncReason {
     /// An event we could not decode. Recoverable, but worth counting: a stream
     /// that produces these steadily is a bug somewhere.
     Malformed,
-    /// Intake could not hold the pending set. Recoverable only by relisting,
-    /// which is the point: dropping to a resync beats growing without bound or
-    /// blocking the watch until it expires.
+    /// Intake could not hold what the producer was pushing. Recoverable only by
+    /// relisting, which is the point: dropping to a resync beats growing without
+    /// bound or blocking the watch until it expires.
     Overflow,
 }
 
@@ -159,6 +159,13 @@ pub enum IngestEvent {
 /// runaway producer cannot exhaust memory.
 pub const DEFAULT_INTAKE_CAPACITY: usize = 262_144;
 
+/// How many control events may queue before intake gives up and asks for a
+/// resync. Separate from [`DEFAULT_INTAKE_CAPACITY`] because control events have
+/// no uid to coalesce on: a reconnect emits a `Desync` plus a `Synced` per kind,
+/// a few hundred on a large cluster, so this holds several storms' worth of them
+/// between ticks.
+pub const CONTROL_CAPACITY: usize = 4_096;
+
 /// Counters for what intake did, so a resync storm is visible rather than
 /// inferred from a stall.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -168,9 +175,13 @@ pub struct IntakeStats {
     /// Events that replaced an earlier pending event for the same object. This is
     /// the win: a pod flapping 50 times between ticks costs one publish.
     pub coalesced: u64,
+    /// Updates thrown away because a pending `Deleted` for the same object
+    /// outranks them. Kept apart from `coalesced` because nothing was replaced,
+    /// and §6.7 gates sustained ingest rate on these counters.
+    pub superseded: u64,
     /// Objects added and deleted before anyone observed them, elided entirely.
     pub elided: u64,
-    /// Events dropped because the pending set was full.
+    /// Events dropped because intake was full, resource or control.
     pub dropped: u64,
     /// Kinds put into desync, including by overflow.
     pub desyncs: u64,
@@ -191,8 +202,15 @@ pub struct Intake {
     /// Pending resource event per object, in first-touch order so a replay is
     /// deterministic.
     pending: Vec<Option<ResourceEvent>>,
+    /// Whether the slot's first event this tick was an `Added`. Parallel to
+    /// `pending` because it is a fact about the slot rather than about the event
+    /// sitting in it, and eliding is only sound when it holds.
+    first_added: Vec<bool>,
     by_uid: HashMap<Arc<str>, usize>,
     control: Vec<IngestEvent>,
+    /// Kinds already asked to resync this tick. A set rather than a scan of
+    /// `control`, because the drop path runs once per dropped event.
+    overflowed: HashSet<KindId>,
     capacity: usize,
     stats: IntakeStats,
 }
@@ -211,8 +229,10 @@ impl Intake {
     pub fn with_capacity(capacity: usize) -> Self {
         Intake {
             pending: Vec::new(),
+            first_added: Vec::new(),
             by_uid: HashMap::new(),
             control: Vec::new(),
+            overflowed: HashSet::new(),
             capacity,
             stats: IntakeStats::default(),
         }
@@ -231,12 +251,38 @@ impl Intake {
     pub fn push(&mut self, event: IngestEvent) {
         match event {
             IngestEvent::Resource(ev) => self.push_resource(ev),
-            other => {
-                if let IngestEvent::Desync { .. } = other {
-                    self.stats.desyncs += 1;
-                }
-                self.control.push(other);
-            }
+            IngestEvent::Synced { kind }
+            | IngestEvent::Desync { kind, .. }
+            | IngestEvent::Capability { kind, .. } => self.push_control(kind, event),
+        }
+    }
+
+    /// Control events queue rather than coalesce — a `Synced` is not a
+    /// replacement for the `Desync` before it — so they need a bound of their
+    /// own. A reconnect loop emitting both per kind is the exact storm the
+    /// pending set's capacity exists to survive, and the one it never saw.
+    fn push_control(&mut self, kind: KindId, event: IngestEvent) {
+        if self.control.len() >= CONTROL_CAPACITY {
+            self.stats.dropped += 1;
+            self.signal_overflow(kind);
+            return;
+        }
+        if let IngestEvent::Desync { .. } = event {
+            self.stats.desyncs += 1;
+        }
+        self.control.push(event);
+    }
+
+    /// Asks a kind to relist because intake could not hold its news. Once per
+    /// kind per tick; the signal is allowed past the control bound, because a
+    /// bound nobody is told about is a stall rather than a bound.
+    fn signal_overflow(&mut self, kind: KindId) {
+        if self.overflowed.insert(kind) {
+            self.stats.desyncs += 1;
+            self.control.push(IngestEvent::Desync {
+                kind,
+                reason: DesyncReason::Overflow,
+            });
         }
     }
 
@@ -245,18 +291,38 @@ impl Intake {
             let prev = self.pending[slot]
                 .as_ref()
                 .expect("an indexed slot always holds an event");
-            // Added then Deleted inside one tick: nothing downstream ever saw the
-            // object, so there is nothing to tell it about.
-            if prev.op == Op::Added && ev.op == Op::Deleted {
-                self.pending[slot] = None;
+            // Added then Deleted inside one tick, with the Added first: nothing
+            // downstream ever saw the object, so there is nothing to tell it
+            // about. Deleted then Added then Deleted looks the same at the slot
+            // and is not the same thing — the object outlived an earlier tick, so
+            // the net "gone" has to survive. A relist repeats live objects as
+            // `Added`, so a pod dying mid-relist still elides a delete downstream
+            // needs; telling a relist's `Added` from a birth wants a marker the
+            // stream does not carry.
+            if prev.op == Op::Added && ev.op == Op::Deleted && self.first_added[slot] {
                 self.by_uid.remove(&ev.uid);
+                if slot + 1 == self.pending.len() {
+                    // The commonest ghost is whatever arrived last, and its slot
+                    // can go straight back.
+                    self.pending.pop();
+                    self.first_added.pop();
+                } else {
+                    // An interior slot has to stay a hole for the moment: the
+                    // slots after it are indexed, and fixing every index up per
+                    // elide is quadratic in a storm.
+                    self.pending[slot] = None;
+                }
                 self.stats.elided += 1;
+                let holes = self.pending.len() - self.by_uid.len();
+                if holes >= self.by_uid.len() {
+                    self.compact();
+                }
                 return;
             }
             // A Deleted must not be downgraded by a late Modified from the same
             // batch; ordering within a uid is last-write-wins otherwise.
             if prev.op == Op::Deleted && ev.op != Op::Added {
-                self.stats.coalesced += 1;
+                self.stats.superseded += 1;
                 return;
             }
             self.pending[slot] = Some(ev);
@@ -269,29 +335,50 @@ impl Intake {
             // producer instead would just stall the watch until it expires, which
             // ends in the same resync with worse latency.
             self.stats.dropped += 1;
-            let kind = ev.kind;
-            if !self.control.iter().any(|c| {
-                matches!(
-                    c,
-                    IngestEvent::Desync {
-                        kind: k,
-                        reason: DesyncReason::Overflow
-                    } if *k == kind
-                )
-            }) {
-                self.stats.desyncs += 1;
-                self.control.push(IngestEvent::Desync {
-                    kind,
-                    reason: DesyncReason::Overflow,
-                });
-            }
+            self.signal_overflow(ev.kind);
             return;
         }
 
         let slot = self.pending.len();
         self.by_uid.insert(ev.uid.clone(), slot);
+        self.first_added.push(ev.op == Op::Added);
         self.pending.push(Some(ev));
         self.stats.accepted += 1;
+    }
+
+    /// Squeezes out the holes elided objects leave, so the arena stays within
+    /// twice the live set.
+    ///
+    /// This, not the tail-pop, is what bounds intake: `capacity` counts live uids,
+    /// so a storm that keeps one uid live above each hole ratchets `pending` for
+    /// the whole tick, and `Vec::drain` keeps the high-water capacity for the life
+    /// of the process (§6.7).
+    ///
+    /// Moving the survivors down rather than handing a vacated slot to the next
+    /// uid, which would be cheaper: the drain order is the producer's own order,
+    /// and the world's fold takes parent-before-child from it, so an elided
+    /// owner's slot going to a pod touched later would orphan the pod. The cost is
+    /// amortized constant per elide, because a pass only runs once the holes it
+    /// removes have caught up with the live slots it walks.
+    fn compact(&mut self) {
+        let mut live = 0;
+        for slot in 0..self.pending.len() {
+            if self.pending[slot].is_none() {
+                continue;
+            }
+            if slot != live {
+                self.pending.swap(slot, live);
+                self.first_added.swap(slot, live);
+            }
+            let uid = &self.pending[live]
+                .as_ref()
+                .expect("the slot just took a live event")
+                .uid;
+            *self.by_uid.get_mut(uid).expect("a live event is indexed") = live;
+            live += 1;
+        }
+        self.pending.truncate(live);
+        self.first_added.truncate(live);
     }
 
     /// Moves one tick's worth of events into `out`, resource events first.
@@ -305,7 +392,9 @@ impl Intake {
             out.push(IngestEvent::Resource(ev));
         }
         out.append(&mut self.control);
+        self.first_added.clear();
         self.by_uid.clear();
+        self.overflowed.clear();
     }
 
     pub fn drain(&mut self) -> Vec<IngestEvent> {
@@ -376,6 +465,102 @@ mod tests {
     }
 
     #[test]
+    fn an_elide_storm_does_not_ratchet_the_arena() {
+        // Slots come from a monotonically growing arena while `capacity` counts
+        // live uids, so nothing used to stop a storm from taking a fresh slot per
+        // pair for the whole tick — and `Vec::drain` keeps the capacity it grew, so
+        // one storm raised the intake's footprint for good. Two ghosts interleaved
+        // under a live anchor is the shape that matters: one of the pair always
+        // elides from an interior slot, so reclaiming the tail cannot bound this on
+        // its own.
+        let mut i = Intake::with_capacity(8);
+        i.push(res("anchor", Op::Added, 1));
+        for rv in 0..250_000 {
+            i.push(res("ghost-x", Op::Added, rv * 4));
+            i.push(res("ghost-y", Op::Added, rv * 4 + 1));
+            i.push(res("ghost-x", Op::Deleted, rv * 4 + 2));
+            i.push(res("ghost-y", Op::Deleted, rv * 4 + 3));
+        }
+        assert_eq!(i.stats().elided, 500_000);
+        assert_eq!(
+            i.stats().dropped,
+            0,
+            "three live uids never exceed capacity"
+        );
+        assert!(
+            i.pending.capacity() <= 2 * 8,
+            "arena ratcheted past twice the live set, to {} slots of {} bytes",
+            i.pending.capacity(),
+            size_of::<Option<ResourceEvent>>()
+        );
+        assert_eq!(
+            uids(&i.drain()),
+            vec![("anchor".into(), Op::Added, 1)],
+            "the storm's only survivor"
+        );
+    }
+
+    #[test]
+    fn compacting_the_arena_keeps_first_touch_order() {
+        // A free list of vacated slots would bound the arena too, and cheaper. It
+        // is not usable here: the world's fold takes parent-before-child from the
+        // drain order, so a uid touched later must never come back ahead of one
+        // touched earlier just because a ghost freed a low slot.
+        let mut i = Intake::with_capacity(8);
+        i.push(res("ghost", Op::Added, 1));
+        i.push(res("first", Op::Added, 1));
+        i.push(res("ghost", Op::Deleted, 2));
+        i.push(res("last", Op::Added, 1));
+        assert_eq!(i.pending.len(), 2, "the ghost's slot is gone, not vacant");
+        // And the survivor's index moved with it, or this lands on `last`.
+        i.push(res("first", Op::Modified, 7));
+        assert_eq!(
+            uids(&i.drain()),
+            vec![
+                ("first".into(), Op::Modified, 7),
+                ("last".into(), Op::Added, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_elided_slot_never_moves_the_uids_around_it() {
+        // The tail-pop hands its index straight to the next uid, and an interior
+        // elide has to stay a hole for the same reason: shifting either one would
+        // leave `by_uid` pointing at somebody else's event.
+        let mut i = Intake::new();
+        for uid in ["a", "ghost-mid", "b", "ghost-tail"] {
+            i.push(res(uid, Op::Added, 1));
+        }
+        i.push(res("ghost-mid", Op::Deleted, 2));
+        i.push(res("ghost-tail", Op::Deleted, 2));
+        i.push(res("c", Op::Added, 1));
+        i.push(res("b", Op::Modified, 7));
+        assert_eq!(i.stats().elided, 2);
+        assert_eq!(
+            uids(&i.drain()),
+            vec![
+                ("a".into(), Op::Added, 1),
+                ("b".into(), Op::Modified, 7),
+                ("c".into(), Op::Added, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_delete_after_a_readd_is_not_elided() {
+        // Deleted then Added then Deleted leaves the slot holding an Added
+        // followed by a Deleted, which looks exactly like a ghost and is not one:
+        // the object was there before this tick, so the net "gone" must survive.
+        let mut i = Intake::new();
+        i.push(res("pod-a", Op::Deleted, 1));
+        i.push(res("pod-a", Op::Added, 2));
+        i.push(res("pod-a", Op::Deleted, 3));
+        assert_eq!(uids(&i.drain()), vec![("pod-a".into(), Op::Deleted, 3)]);
+        assert_eq!(i.stats().elided, 0);
+    }
+
+    #[test]
     fn a_delete_is_not_downgraded_by_a_late_modify() {
         // Producers can interleave; a Modified arriving after a Deleted for the
         // same uid must not resurrect it.
@@ -384,6 +569,19 @@ mod tests {
         i.push(res("pod-a", Op::Deleted, 2));
         i.push(res("pod-a", Op::Modified, 3));
         assert_eq!(uids(&i.drain()), vec![("pod-a".into(), Op::Deleted, 2)]);
+    }
+
+    #[test]
+    fn an_update_thrown_away_after_a_delete_is_not_a_coalesce() {
+        // `coalesced` is the win counter, so booking a discard as one hides the
+        // one case where intake loses information rather than compressing it.
+        let mut i = Intake::new();
+        i.push(res("pod-a", Op::Modified, 1));
+        i.push(res("pod-a", Op::Deleted, 2));
+        i.push(res("pod-a", Op::Modified, 3));
+        let s = i.stats();
+        assert_eq!(s.coalesced, 1, "only the Deleted replaced anything");
+        assert_eq!(s.superseded, 1);
     }
 
     #[test]
@@ -450,6 +648,39 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn a_control_storm_hits_the_control_bound_and_says_so() {
+        // A reconnect loop emits a Desync plus a Synced per kind and neither
+        // coalesces, so control used to grow with no bound, no counter, and no way
+        // to reach the resync that would end it.
+        let mut i = Intake::new();
+        for _ in 0..CONTROL_CAPACITY {
+            i.push(IngestEvent::Desync {
+                kind: KindId::POD,
+                reason: DesyncReason::Closed,
+            });
+            i.push(IngestEvent::Synced { kind: KindId::POD });
+        }
+        assert!(
+            i.control.len() <= CONTROL_CAPACITY + 1,
+            "control grew to {}",
+            i.control.len()
+        );
+        assert!(i.stats().dropped > 0, "the bound has to be counted");
+
+        let out = i.drain();
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                IngestEvent::Desync {
+                    reason: DesyncReason::Overflow,
+                    ..
+                }
+            )),
+            "a bound nobody is told about is a stall"
+        );
     }
 
     #[test]
