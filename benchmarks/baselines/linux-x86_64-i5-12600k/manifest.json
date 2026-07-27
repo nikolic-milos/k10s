@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "label": "linux-x86_64-i5-12600k",
+    "recorded_at": "2026-07-27",
+    "os": "Arch Linux",
+    "kernel": "7.1.4-arch1-1",
+    "architecture": "x86_64",
+    "cpu": "12th Gen Intel(R) Core(TM) i5-12600K",
+    "governor": "intel_pstate powersave",
+    "turbo": true,
+    "cpu_affinity": 4,
+    "rustc": "1.97.1 (8bab26f4f 2026-07-14)"
+  },
+  "suites": [
+    {
+      "name": "atlas cull",
+      "file": "atlas-cull.json",
+      "source_schema": 3,
+      "case_keys": ["scene", "camera"],
+      "top_exact": ["viewport"],
+      "exact": [
+        "objects", "regions", "blocks_per_region", "zoom", "quads", "labels",
+        "icons", "sats", "curves", "edges", "drawn_regions", "drawn_blocks",
+        "drawn_cells"
+      ],
+      "ceilings": [{ "field": "p50_rmad", "maximum": 0.10 }],
+      "metrics": [
+        { "field": "p50_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 },
+        { "field": "p99_ns", "maximum_ratio": 1.35, "absolute_slack": 5.0, "minimum_samples": 100 }
+      ]
+    },
+    {
+      "name": "atlas fan-out",
+      "file": "atlas-fanout.json",
+      "source_schema": 5,
+      "case_keys": ["sweep", "ext", "degree"],
+      "top_exact": ["viewport"],
+      "exact": [
+        "child", "child_bytes", "zoom", "drawn_constant", "quads", "labels",
+        "icons", "sats", "curves", "edges", "drawn_regions", "drawn_blocks",
+        "drawn_cells", "aggregated_blocks", "aggregated_cells"
+      ],
+      "ceilings": [{ "field": "p50_rmad", "maximum": 0.10 }],
+      "metrics": [
+        { "field": "p50_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 },
+        { "field": "p99_ns", "maximum_ratio": 1.35, "absolute_slack": 5.0, "minimum_samples": 100 },
+        { "field": "p50_flat_edges_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0, "optional": true }
+      ]
+    },
+    {
+      "name": "world fan-out cull",
+      "file": "world-fanout-cull.json",
+      "source_schema": 5,
+      "case_keys": ["scenario", "objects", "ns_degree", "wl_degree", "camera"],
+      "top_exact": ["mode", "seed", "viewport", "shapes"],
+      "exact": [
+        "zoom", "quads", "labels", "icons", "sats", "curves", "edges",
+        "drawn_regions", "drawn_blocks", "drawn_cells", "aggregated_blocks",
+        "aggregated_cells", "indexed_region_nodes", "indexed_region_candidates",
+        "indexed_cell_nodes", "indexed_cell_candidates"
+      ],
+      "ceilings": [{ "field": "p50_rmad", "maximum": 0.10 }],
+      "metrics": [
+        { "field": "p50_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 },
+        { "field": "p99_ns", "maximum_ratio": 1.35, "absolute_slack": 5.0, "minimum_samples": 100 },
+        { "field": "p50_flat_spatial_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 },
+        { "field": "p50_flat_edges_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 },
+        { "field": "p50_no_edges_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 }
+      ]
+    },
+    {
+      "name": "world publication",
+      "file": "world-publish.json",
+      "source_schema": 3,
+      "case_keys": ["op", "objects", "changed"],
+      "top_exact": ["mode", "snapshot_pool_depth"],
+      "exact": ["pods", "changed"],
+      "ceilings": [{ "field": "p50_rmad", "maximum": 0.10 }],
+      "metrics": [
+        { "field": "p50_us", "maximum_ratio": 1.12, "absolute_slack": 0.10 },
+        { "field": "p99_us", "maximum_ratio": 1.35, "absolute_slack": 0.50, "minimum_samples": 100 }
+      ]
+    },
+    {
+      "name": "map walk",
+      "file": "map-walk.json",
+      "source_schema": 2,
+      "case_keys": ["scene", "camera"],
+      "top_exact": ["mode", "viewport"],
+      "exact": [
+        "objects", "zoom", "quads", "labels", "heap_labels", "label_bytes",
+        "labels_dropped", "icons", "sats", "curves", "edges", "bg_cells",
+        "drawn_regions", "drawn_blocks", "drawn_cells", "aggregated_blocks",
+        "aggregated_cells"
+      ],
+      "ceilings": [{ "field": "p50_rmad", "maximum": 0.10 }],
+      "metrics": [
+        { "field": "walk_paint_p50_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 },
+        { "field": "walk_paint_p99_ns", "maximum_ratio": 1.35, "absolute_slack": 5.0, "minimum_samples": 100 },
+        { "field": "walk_count_p50_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 },
+        { "field": "walk_count_p99_ns", "maximum_ratio": 1.35, "absolute_slack": 5.0, "minimum_samples": 100 },
+        { "field": "atlas_cull_p50_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 },
+        { "field": "atlas_cull_p99_ns", "maximum_ratio": 1.35, "absolute_slack": 5.0, "minimum_samples": 100 },
+        { "field": "map_cull_p50_ns", "maximum_ratio": 1.12, "absolute_slack": 2.0 },
+        { "field": "map_cull_p99_ns", "maximum_ratio": 1.35, "absolute_slack": 5.0, "minimum_samples": 100 }
+      ]
+    },
+    {
+      "name": "map allocation",
+      "file": "map-alloc.json",
+      "source_schema": 1,
+      "case_keys": ["scene", "camera"],
+      "top_exact": ["mode", "viewport", "inline_cap", "iters"],
+      "exact": [
+        "objects", "zoom", "quads", "labels", "heap_labels", "label_bytes",
+        "labels_dropped", "icons", "sats", "curves", "edges", "bg_cells",
+        "drawn_regions", "drawn_blocks", "drawn_cells", "aggregated_blocks",
+        "aggregated_cells", "label_allocs", "label_reallocs", "label_bytes_alloc"
+      ],
+      "ceilings": [],
+      "metrics": [
+        { "field": "structural_allocs", "maximum_ratio": 1.05, "absolute_slack": 0.25 },
+        { "field": "total_allocs", "maximum_ratio": 1.05, "absolute_slack": 0.25 },
+        { "field": "total_reallocs", "maximum_ratio": 1.05, "absolute_slack": 0.25 },
+        { "field": "total_bytes_alloc", "maximum_ratio": 1.05, "absolute_slack": 1024.0 }
+      ]
+    },
+    {
+      "name": "full GPUI paint allocation",
+      "file": "map-paint.json",
+      "source_schema": 2,
+      "case_keys": ["cache"],
+      "top_exact": ["mode", "objects", "viewport", "warmup", "iters"],
+      "exact": ["text_cache_hits", "text_cache_misses", "text_cache_evictions"],
+      "ceilings": [],
+      "metrics": [
+        { "field": "allocations_per_paint", "maximum_ratio": 1.05, "absolute_slack": 1.0 },
+        { "field": "reallocations_per_paint", "maximum_ratio": 1.05, "absolute_slack": 1.0 },
+        { "field": "bytes_per_paint", "maximum_ratio": 1.05, "absolute_slack": 4096.0 }
+      ]
+    }
+  ]
+}

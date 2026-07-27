@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+          - windows-2025
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install --yes
+          clang
+          cmake
+          gcc
+          g++
+          libasound2-dev
+          libfontconfig-dev
+          libgit2-dev
+          libglib2.0-dev
+          libssl-dev
+          libstdc++-14-dev
+          libva-dev
+          libvulkan1
+          libwayland-dev
+          libx11-xcb-dev
+          libxkbcommon-x11-dev
+          libzstd-dev
+          lld
+          llvm
+          make
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Lint workflows
+        if: runner.os == 'Linux'
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: Lint every target and feature
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test every feature
+        run: cargo test --workspace --all-features --locked
