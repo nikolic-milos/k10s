@@ -116,6 +116,7 @@ pub fn lod_policy() -> LodPolicy {
         max_icons: 1024,
         max_edges: 3000,
         max_curves: 1500,
+        max_cells_per_block: 1024,
         sat_curves: true,
         stress: false,
         stress_curves: false,
@@ -229,7 +230,7 @@ pub fn scene(spec: SceneSpec) -> Scene {
     );
     let edge_count = edges.len() as u32;
 
-    Scene {
+    let mut scene = Scene {
         rev: 1,
         bounds,
         totals: Totals {
@@ -243,10 +244,20 @@ pub fn scene(spec: SceneSpec) -> Scene {
         blocks,
         cells,
         sats,
+        region_blocks: vec![],
+        block_cells: vec![],
+        block_sats: vec![],
+        spatial_index: Default::default(),
         edges,
+        edge_segments: vec![],
         region_edges,
+        region_edge_indexes: vec![],
         cross_edges: edge_count..edge_count,
-    }
+        cross_edge_index: Default::default(),
+    };
+    scene.rebuild_spatial_index();
+    scene.rebuild_edge_indexes();
+    scene
 }
 
 pub fn cross_scene(spec: SceneSpec, count: usize) -> Scene {
@@ -264,6 +275,7 @@ pub fn cross_scene(spec: SceneSpec, count: usize) -> Scene {
     }
     s.cross_edges = start..s.edges.len() as u32;
     s.totals.edges = s.edges.len() as u32;
+    s.rebuild_cross_edge_index();
     s
 }
 

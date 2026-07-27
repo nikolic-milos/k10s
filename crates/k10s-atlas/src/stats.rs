@@ -54,6 +54,13 @@ pub struct DrawnCounts {
     pub cells: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TextCacheCounts {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
 pub struct FrameSpans {
     pub walk_us: f32,
@@ -132,6 +139,7 @@ pub struct FrameStats {
     pub drawn: DrawnCounts,
     pub labels_dropped: usize,
     pub icons_dropped: usize,
+    pub text_cache: TextCacheCounts,
 }
 
 impl FrameStats {

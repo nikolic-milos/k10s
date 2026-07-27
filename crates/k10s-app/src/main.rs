@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use k10s_clustergen::GenConfig;
-use k10s_core::{Capability, IngestEvent, Intake, WorldCtrl, new_shared_scene};
-use k10s_data::DataPlane;
+use k10s_core::{Capability, IngestEvent, WorldCtrl, new_shared_scene};
+use k10s_data::{DEFAULT_EVENT_SINK_CAPACITY, DataPlane};
 use k10s_map::{BenchMeta, MapView};
 
 fn install_panic_hook() {
@@ -24,9 +24,10 @@ fn install_panic_hook() {
 
 struct Live {
     _plane: DataPlane,
-    drain: std::thread::JoinHandle<()>,
-    stop: Arc<AtomicBool>,
+    events: crossbeam_channel::Receiver<IngestEvent>,
 }
+
+const WORLD_CONTROL_CAPACITY: usize = 64;
 
 fn main() {
     install_panic_hook();
@@ -72,11 +73,16 @@ fn main() {
     };
 
     let scene = new_shared_scene();
-    let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
+    let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded(WORLD_CONTROL_CAPACITY);
+    let live_events = live
+        .as_ref()
+        .map(|connection| connection.events.clone())
+        .unwrap_or_else(crossbeam_channel::never);
 
-    let (damage_tx, damage_rx) = futures::channel::mpsc::unbounded();
+    let (mut damage_tx, damage_rx) = futures::channel::mpsc::channel(1);
     let world = k10s_world::spawn_world(
         events,
+        live_events,
         scene.clone(),
         ctrl_rx,
         args.seed,
@@ -84,7 +90,7 @@ fn main() {
         args.layout,
         {
             move || {
-                let _ = damage_tx.unbounded_send(());
+                let _ = damage_tx.try_send(());
             }
         },
     );
@@ -136,10 +142,7 @@ fn main() {
     if !world_ended_cleanly {
         eprintln!("k10s: the world thread panicked, cluster updates had stopped");
     }
-    if let Some(live) = live {
-        live.stop.store(true, Ordering::Relaxed);
-        let _ = live.drain.join();
-    }
+    drop(live);
     if !world_ended_cleanly || window_failed.load(Ordering::Relaxed) {
         std::process::exit(1);
     }
@@ -168,7 +171,7 @@ fn generate(args: &cli::Args) -> Vec<IngestEvent> {
 }
 
 fn list_contexts() -> i32 {
-    let (tx, _rx) = crossbeam_channel::unbounded();
+    let (tx, _rx) = crossbeam_channel::bounded(1);
     let plane = match k10s_data::spawn(tx) {
         Ok(plane) => plane,
         Err(err) => {
@@ -195,7 +198,7 @@ fn list_contexts() -> i32 {
 }
 
 fn connect_cluster(args: &cli::Args) -> Result<(Vec<IngestEvent>, Option<Live>), String> {
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = crossbeam_channel::bounded(DEFAULT_EVENT_SINK_CAPACITY);
     let plane = k10s_data::spawn(tx).map_err(|e| format!("cannot start the data plane: {e}"))?;
     let options = k10s_data::Options {
         context: args.context.clone(),
@@ -207,36 +210,11 @@ fn connect_cluster(args: &cli::Args) -> Result<(Vec<IngestEvent>, Option<Live>),
     eprintln!("k10s: {}", sync.report.summary());
     report_degradation(&sync);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let drain = {
-        let stop = stop.clone();
-        std::thread::Builder::new()
-            .name("k10s-live-drain".into())
-            .spawn(move || {
-                const TICK: std::time::Duration = std::time::Duration::from_millis(200);
-                let mut intake = Intake::new();
-                let mut batch = Vec::new();
-                while !stop.load(Ordering::Relaxed) {
-                    match rx.recv_timeout(TICK) {
-                        Ok(event) => intake.push(event),
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    }
-                    if !intake.is_empty() {
-                        intake.drain_into(&mut batch);
-                        batch.clear();
-                    }
-                }
-            })
-            .map_err(|e| format!("cannot start the live drain thread: {e}"))?
-    };
-
     Ok((
         sync.events,
         Some(Live {
             _plane: plane,
-            drain,
-            stop,
+            events: rx,
         }),
     ))
 }

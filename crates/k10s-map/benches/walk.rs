@@ -1,11 +1,13 @@
 use std::hint::black_box;
 use std::sync::Arc;
 #[cfg(not(feature = "bench-alloc"))]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui::{Bounds, PaintQuad, Pixels, point, px, size};
 use k10s_atlas::testing::{SceneSpec, lod_policy, scene as base_scene};
 use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
+#[cfg(not(feature = "bench-alloc"))]
+use k10s_bench::{Config, Samples, measure as measure_samples};
 use k10s_core::{
     KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, SatExt, SatNode, SceneSnapshot, Severity,
     State, ToolId, WlExt, WorkloadNode,
@@ -213,9 +215,16 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
                 },
             })
             .collect(),
+        region_blocks: base.region_blocks.clone(),
+        block_cells: base.block_cells.clone(),
+        block_sats: base.block_sats.clone(),
+        spatial_index: base.spatial_index.clone(),
         edges: base.edges.clone(),
+        edge_segments: base.edge_segments.clone(),
         region_edges: base.region_edges.clone(),
+        region_edge_indexes: base.region_edge_indexes.clone(),
         cross_edges: base.cross_edges.clone(),
+        cross_edge_index: base.cross_edge_index.clone(),
         totals: base.totals,
     }
 }
@@ -294,15 +303,6 @@ type Payload = Timing;
 #[cfg(feature = "bench-alloc")]
 type Payload = Alloc;
 
-#[cfg(not(feature = "bench-alloc"))]
-fn percentile(sorted: &[u64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let i = (((sorted.len() - 1) as f64) * p).round() as usize;
-    sorted[i] as f64
-}
-
 fn main() {
     let json = std::env::args().any(|a| a == "--json");
     let policy = lod_policy();
@@ -369,6 +369,9 @@ fn label_ratchet_holds(rows: &[Row]) -> bool {
 #[cfg(not(feature = "bench-alloc"))]
 struct Timing {
     iters: usize,
+    samples: usize,
+    batch_size: usize,
+    p50_rmad: f64,
     walk_paint: (f64, f64),
     walk_count: (f64, f64),
     atlas_cull: (f64, f64),
@@ -376,30 +379,23 @@ struct Timing {
 }
 
 #[cfg(not(feature = "bench-alloc"))]
-fn samples(mut run: impl FnMut()) -> (f64, f64, usize) {
-    for _ in 0..WARMUP {
-        run();
-    }
-    let mut out = Vec::with_capacity(MIN_ITERS);
-    let start = Instant::now();
-    while out.len() < MAX_ITERS && (out.len() < MIN_ITERS || start.elapsed() < BUDGET) {
-        let t = Instant::now();
-        run();
-        out.push(t.elapsed().as_nanos() as u64);
-    }
-    out.sort_unstable();
-    (percentile(&out, 0.50), percentile(&out, 0.99), out.len())
+fn samples(run: impl FnMut()) -> Samples {
+    measure_samples(Config::new(WARMUP, MIN_ITERS, MAX_ITERS, BUDGET), run)
+}
+
+#[cfg(not(feature = "bench-alloc"))]
+fn p50_p99(samples: &Samples) -> (f64, f64) {
+    (samples.percentile(0.50), samples.percentile(0.99))
 }
 
 #[cfg(not(feature = "bench-alloc"))]
 fn measure(scene: &SceneSnapshot, camera: Camera, blend: StageBlend, policy: &LodPolicy) -> Timing {
     let o = opts(policy);
     let mut buffers = Buffers::default();
-    let (paint_p50, paint_p99, iters) =
-        samples(|| buffers.walk(black_box(scene), black_box(camera), blend, o));
+    let paint = samples(|| buffers.walk(black_box(scene), black_box(camera), blend, o));
 
     let mut count = Count::default();
-    let (count_p50, count_p99, _) = samples(|| {
+    let count = samples(|| {
         black_box(walk(
             viewport(),
             black_box(scene),
@@ -411,7 +407,7 @@ fn measure(scene: &SceneSnapshot, camera: Camera, blend: StageBlend, policy: &Lo
     });
     black_box(&count);
 
-    let (atlas_p50, atlas_p99, _) = samples(|| {
+    let atlas = samples(|| {
         black_box(k10s_atlas::cull(
             black_box(scene),
             black_box(&camera),
@@ -424,7 +420,7 @@ fn measure(scene: &SceneSnapshot, camera: Camera, blend: StageBlend, policy: &Lo
         ));
     });
 
-    let (map_p50, map_p99, _) = samples(|| {
+    let map = samples(|| {
         black_box(map_cull(
             black_box(scene),
             black_box(&camera),
@@ -436,11 +432,14 @@ fn measure(scene: &SceneSnapshot, camera: Camera, blend: StageBlend, policy: &Lo
     });
 
     Timing {
-        iters,
-        walk_paint: (paint_p50, paint_p99),
-        walk_count: (count_p50, count_p99),
-        atlas_cull: (atlas_p50, atlas_p99),
-        map_cull: (map_p50, map_p99),
+        iters: paint.iterations(),
+        samples: paint.sample_count(),
+        batch_size: paint.batch_size(),
+        p50_rmad: paint.p50_relative_mad(),
+        walk_paint: p50_p99(&paint),
+        walk_count: p50_p99(&count),
+        atlas_cull: p50_p99(&atlas),
+        map_cull: p50_p99(&map),
     }
 }
 
@@ -463,7 +462,7 @@ fn print_table(rows: &[Row]) {
         }
         let t = &r.payload;
         println!(
-            "    {:<13} zoom {:>6.2}  walk>paint p50 {:>9.0} p99 {:>9.0} | walk>count p50 {:>9.0} | atlas cull p50 {:>9.0} | map cull p50 {:>9.0} ns | ratio {:>6.2}x | iters {:>6} | quads {:>6} labels {:>4} (heap {:>4}, {:>6} B) icons {:>4} sats {:>4} curves {:>4} edges {:>4} hex {:>4}",
+            "    {:<13} zoom {:>6.2}  walk>paint p50 {:>9.1} p99 {:>9.1} | walk>count p50 {:>9.1} | atlas cull p50 {:>9.1} | map cull p50 {:>9.1} ns | ratio {:>6.2}x | samples {:>6} x {:>4} rMAD {:>5.1}% | quads {:>6} labels {:>4} (heap {:>4}, {:>6} B) icons {:>4} sats {:>4} curves {:>4} edges {:>4} hex {:>4}",
             r.camera,
             r.zoom,
             t.walk_paint.0,
@@ -472,7 +471,9 @@ fn print_table(rows: &[Row]) {
             t.atlas_cull.0,
             t.map_cull.0,
             ratio(t.walk_paint.0, t.atlas_cull.0),
-            t.iters,
+            t.samples,
+            t.batch_size,
+            t.p50_rmad * 100.0,
             r.stats.quads,
             r.stats.labels,
             r.heap_labels,
@@ -494,7 +495,7 @@ fn ratio(walk: f64, cull: f64) -> f64 {
 #[cfg(not(feature = "bench-alloc"))]
 fn print_json(rows: &[Row]) {
     println!("{{");
-    println!("  \"schema_version\": 1,");
+    println!("  \"schema_version\": 2,");
     println!("  \"mode\": \"timing\",");
     println!("  \"viewport\": [{VW}, {VH}],");
     println!("  \"cases\": [");
@@ -504,14 +505,17 @@ fn print_json(rows: &[Row]) {
         println!("    {{");
         print_common(r);
         println!("      \"iters\": {},", t.iters);
-        println!("      \"walk_paint_p50_ns\": {:.0},", t.walk_paint.0);
-        println!("      \"walk_paint_p99_ns\": {:.0},", t.walk_paint.1);
-        println!("      \"walk_count_p50_ns\": {:.0},", t.walk_count.0);
-        println!("      \"walk_count_p99_ns\": {:.0},", t.walk_count.1);
-        println!("      \"atlas_cull_p50_ns\": {:.0},", t.atlas_cull.0);
-        println!("      \"atlas_cull_p99_ns\": {:.0},", t.atlas_cull.1);
-        println!("      \"map_cull_p50_ns\": {:.0},", t.map_cull.0);
-        println!("      \"map_cull_p99_ns\": {:.0},", t.map_cull.1);
+        println!("      \"samples\": {},", t.samples);
+        println!("      \"batch_size\": {},", t.batch_size);
+        println!("      \"p50_rmad\": {:.6},", t.p50_rmad);
+        println!("      \"walk_paint_p50_ns\": {:.3},", t.walk_paint.0);
+        println!("      \"walk_paint_p99_ns\": {:.3},", t.walk_paint.1);
+        println!("      \"walk_count_p50_ns\": {:.3},", t.walk_count.0);
+        println!("      \"walk_count_p99_ns\": {:.3},", t.walk_count.1);
+        println!("      \"atlas_cull_p50_ns\": {:.3},", t.atlas_cull.0);
+        println!("      \"atlas_cull_p99_ns\": {:.3},", t.atlas_cull.1);
+        println!("      \"map_cull_p50_ns\": {:.3},", t.map_cull.0);
+        println!("      \"map_cull_p99_ns\": {:.3},", t.map_cull.1);
         println!(
             "      \"oracle_ratio\": {:.3}",
             ratio(t.walk_paint.0, t.atlas_cull.0)
@@ -671,4 +675,9 @@ fn print_common(r: &Row) {
     println!("      \"drawn_regions\": {},", r.stats.drawn_regions);
     println!("      \"drawn_blocks\": {},", r.stats.drawn_blocks);
     println!("      \"drawn_cells\": {},", r.stats.drawn_cells);
+    println!(
+        "      \"aggregated_blocks\": {},",
+        r.stats.aggregated_blocks
+    );
+    println!("      \"aggregated_cells\": {},", r.stats.aggregated_cells);
 }

@@ -147,7 +147,7 @@ impl Bench {
 
     fn report(&self, r: &FlightResult) -> BenchReport {
         BenchReport {
-            schema_version: 2,
+            schema_version: 3,
             machine: self.meta.machine.clone(),
             arch: self.meta.arch.clone(),
             objects: self.meta.objects,
@@ -211,7 +211,7 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
         }
         let _ = writeln!(
             out,
-            "  {:<28} quads {:>6}  lines {:>4}  glyphs {:>6}  icons {:>4}  sats {:>4}  curves {:>4}  edges {:>4}  hex {:>4}  drawn ns/wl/pods {}/{}/{}  dropped {}L/{}I/{}C",
+            "  {:<28} quads {:>6}  lines {:>4}  glyphs {:>6}  icons {:>4}  sats {:>4}  curves {:>4}  edges {:>4}  hex {:>4}  drawn ns/wl/pods {}/{}/{}  dropped {}L/{}I/{}C  text cache {}H/{}M/{}E",
             r.name,
             r.quads,
             r.lines,
@@ -227,6 +227,9 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
             r.labels_dropped,
             r.icons_dropped,
             r.curves_dropped,
+            r.text_cache.hits,
+            r.text_cache.misses,
+            r.text_cache.evictions,
         );
         let _ = writeln!(
             out,
@@ -252,7 +255,7 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
 mod tests {
     use super::*;
     use k10s_atlas::flight::{CpuPercentiles, IdleResult, Percentiles};
-    use k10s_atlas::{DrawnCounts, FrameSpans};
+    use k10s_atlas::{DrawnCounts, FrameSpans, TextCacheCounts};
 
     fn anchors() -> FlightAnchors {
         let mut fit = Camera::default();
@@ -340,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn report_json_keeps_schema_v2_keys() {
+    fn report_json_keeps_schema_v3_keys() {
         let meta = BenchMeta {
             machine: "m".into(),
             arch: "x".into(),
@@ -368,6 +371,11 @@ mod tests {
             labels_dropped: 7,
             icons_dropped: 8,
             curves_dropped: 9,
+            text_cache: TextCacheCounts {
+                hits: 11,
+                misses: 12,
+                evictions: 13,
+            },
             spans: FrameSpans {
                 walk_us: 80.0,
                 quads_us: 14.0,
@@ -408,7 +416,7 @@ mod tests {
         };
         let v = serde_json::to_value(bench.report(&result)).unwrap();
 
-        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["schema_version"], 3);
         assert_eq!(v["layout"], "spread");
         let totals = v["totals"].as_object().unwrap();
         let mut keys: Vec<_> = totals.keys().map(String::as_str).collect();
@@ -433,6 +441,7 @@ mod tests {
             "labels_dropped",
             "icons_dropped",
             "curves_dropped",
+            "text_cache",
             "spans",
             "cpu_ms",
             "frame_ms",
@@ -451,6 +460,7 @@ mod tests {
         assert_eq!(v["segments"][0]["labels_dropped"], 7);
         assert_eq!(v["segments"][0]["bg_cells"], 96);
         assert_eq!(v["segments"][0]["drawn"]["cells"], 100);
+        assert_eq!(v["segments"][0]["text_cache"]["hits"], 11);
         let spans = v["segments"][0]["spans"].as_object().unwrap();
         let mut keys: Vec<_> = spans.keys().map(String::as_str).collect();
         keys.sort_unstable();

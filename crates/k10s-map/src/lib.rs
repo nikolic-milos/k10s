@@ -5,13 +5,15 @@ mod hex;
 mod lod;
 #[cfg(test)]
 mod oracle_test;
+mod text;
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::rc::Rc;
 
 use crossbeam_channel::Sender;
 use futures::StreamExt as _;
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::Receiver;
 use gpui::{
     App, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString, TextAlign,
@@ -34,6 +36,7 @@ use bench::{Bench, BenchFrame};
 use colors::*;
 use frame::{IconJob, LabelJob, PaintSink};
 use lod::lod;
+use text::TextCache;
 
 type Glyph = (&'static str, &'static [u8]);
 
@@ -152,6 +155,7 @@ pub struct MapView {
     fg_buf: Rc<RefCell<Vec<PaintQuad>>>,
     label_buf: Rc<RefCell<Vec<LabelJob>>>,
     icon_buf: Rc<RefCell<Vec<IconJob>>>,
+    text_cache: Rc<RefCell<TextCache>>,
 
     pacer: FramePacer,
     stage: StageMachine,
@@ -164,7 +168,7 @@ impl MapView {
         scene: SharedScene,
         ctrl: Sender<WorldCtrl>,
         bench: Option<BenchMeta>,
-        damage: UnboundedReceiver<()>,
+        damage: Receiver<()>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.spawn(async move |this, cx| {
@@ -195,6 +199,7 @@ impl MapView {
             fg_buf: Rc::new(RefCell::new(Vec::new())),
             label_buf: Rc::new(RefCell::new(Vec::new())),
             icon_buf: Rc::new(RefCell::new(Vec::new())),
+            text_cache: Rc::new(RefCell::new(TextCache::default())),
             pacer: FramePacer::default(),
             stage: StageMachine::new(lod::STAGE_FADE_SECS),
             last_stage_tick: None,
@@ -204,6 +209,25 @@ impl MapView {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_set_camera(&mut self, camera: Camera) {
+        self.camera = camera;
+        self.fitted = true;
+        self.interacted = true;
+        self.stage = StageMachine::new(0.0);
+        self.last_stage_tick = None;
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_text_cache(&self) -> k10s_atlas::TextCacheCounts {
+        self.stats.borrow().text_cache
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_enable_text_cache(&mut self, enabled: bool) {
+        self.text_cache.borrow_mut().set_enabled(enabled);
     }
 
     fn viewport(window: &Window) -> (f32, f32) {
@@ -267,6 +291,7 @@ impl Render for MapView {
         let fg_buf = self.fg_buf.clone();
         let label_buf = self.label_buf.clone();
         let icon_buf = self.icon_buf.clone();
+        let text_cache = self.text_cache.clone();
         let edges_on = self.edges_on;
         let churn_on = self.churn_on;
         let hud_on = self.hud_on;
@@ -341,6 +366,7 @@ impl Render for MapView {
                             &fg_buf,
                             &label_buf,
                             &icon_buf,
+                            &text_cache,
                             edges_on,
                             churn_on,
                             hud_on,
@@ -398,6 +424,7 @@ fn paint_map(
     fg_buf: &Rc<RefCell<Vec<PaintQuad>>>,
     label_buf: &Rc<RefCell<Vec<LabelJob>>>,
     icon_buf: &Rc<RefCell<Vec<IconJob>>>,
+    text_cache: &Rc<RefCell<TextCache>>,
     edges_on: bool,
     churn_on: bool,
     hud_on: bool,
@@ -537,18 +564,16 @@ fn paint_map(
     let text_start = std::time::Instant::now();
     let font = gpui::font("Noto Sans");
     let mut label_counts = LabelCounts::default();
+    let mut cache = text_cache.borrow_mut();
+    let cache_before = cache.stats();
     for job in labels.iter() {
-        let run = TextRun {
-            len: job.text.len(),
-            font: font.clone(),
-            color: job.color.into(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let line = window
-            .text_system()
-            .shape_line(job.text.clone(), px(job.size_px), &[run], None);
+        let line = cache.shape_label(
+            job.text.clone(),
+            &font,
+            job.size_px,
+            job.color.into(),
+            window.text_system(),
+        );
         if line
             .paint(
                 point(px(job.x), px(job.y)),
@@ -563,6 +588,8 @@ fn paint_map(
             label_counts.count(&job.text);
         }
     }
+    let cache_delta = cache.stats().since(cache_before);
+    drop(cache);
     let text_end = std::time::Instant::now();
 
     {
@@ -583,6 +610,9 @@ fn paint_map(
         };
         st.labels_dropped = counts.labels_dropped;
         st.icons_dropped = counts.icons_dropped;
+        st.text_cache.hits = cache_delta.hits;
+        st.text_cache.misses = cache_delta.misses;
+        st.text_cache.evictions = cache_delta.evictions;
         st.end_cpu(frame_start);
     }
 
@@ -598,6 +628,7 @@ fn paint_map(
         animating,
         ox,
         oy,
+        text_cache,
         window,
         cx,
     );
@@ -629,6 +660,7 @@ fn paint_hud(
     animating: bool,
     ox: f32,
     oy: f32,
+    text_cache: &Rc<RefCell<TextCache>>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -640,64 +672,85 @@ fn paint_hud(
     let (fp50, fp95, fp99) = st.frame_percentiles();
     let (cp50, cp99) = st.cpu_percentiles();
     let t = scene.totals;
-    let lines = [
-        format!(
-            "k10s starmap [rev {}]  {} ns / {} wl / {} pods / {} sats / {} edges",
-            scene.rev,
-            group(t.regions),
-            group(t.blocks),
-            group(t.cells),
-            group(t.sats),
-            group(t.edges),
-        ),
-        format!(
-            "frame  p50 {fp50:.1}  p95 {fp95:.1}  p99 {fp99:.1} ms   (~{:.0} {})",
-            if fp50 > 0.0 { 1000.0 / fp50 } else { 0.0 },
-            if animating { "fps" } else { "paints/s" },
-        ),
-        format!("paint cpu  p50 {cp50:.2}  p99 {cp99:.2} ms"),
-        format!(
-            "zoom {zoom:.3}  stage {}  |  quads {}  lines {}  glyphs {}  icons {}  edges {}  dropped {}L/{}I",
-            if blend.is_settled() {
-                format!("Z{}", blend.to)
-            } else {
-                format!("Z{}>Z{}", blend.from, blend.to)
-            },
-            group(st.quads as u32),
-            st.lines,
-            group(st.glyphs as u32),
-            st.icons,
-            st.edges,
-            st.labels_dropped,
-            st.icons_dropped,
-        ),
-        format!(
-            "sats {}  curves {}{}  hex {}  |  drawn ns {} wl {} pods {}",
-            st.sats,
-            st.curves,
-            if st.curves_dropped > 0 {
-                format!(" (-{})", st.curves_dropped)
-            } else {
-                String::new()
-            },
-            st.bg_cells,
-            st.drawn.regions,
-            st.drawn.blocks,
-            group(st.drawn.cells as u32),
-        ),
-        format!(
-            "[c]hurn {}  [e]dges {}  [f]it  [h]ide",
-            if churn_on { "on" } else { "off" },
-            if edges_on { "on" } else { "off" },
-        ),
-    ];
+    let mut cache = text_cache.borrow_mut();
+    let lines = cache.hud_lines_mut();
+    for line in lines.iter_mut() {
+        line.clear();
+    }
+    write!(
+        lines[0],
+        "k10s starmap [rev {}]  {} ns / {} wl / {} pods / {} sats / {} edges",
+        scene.rev,
+        Grouped(t.regions),
+        Grouped(t.blocks),
+        Grouped(t.cells),
+        Grouped(t.sats),
+        Grouped(t.edges),
+    )
+    .expect("writing to a String is infallible");
+    write!(
+        lines[1],
+        "frame  p50 {fp50:.1}  p95 {fp95:.1}  p99 {fp99:.1} ms   (~{:.0} {})",
+        if fp50 > 0.0 { 1000.0 / fp50 } else { 0.0 },
+        if animating { "fps" } else { "paints/s" },
+    )
+    .expect("writing to a String is infallible");
+    write!(
+        lines[2],
+        "paint cpu  p50 {cp50:.2}  p99 {cp99:.2} ms  |  text cache {}H/{}M",
+        st.text_cache.hits, st.text_cache.misses,
+    )
+    .expect("writing to a String is infallible");
+    if blend.is_settled() {
+        write!(lines[3], "zoom {zoom:.3}  stage Z{}", blend.to)
+    } else {
+        write!(
+            lines[3],
+            "zoom {zoom:.3}  stage Z{}>Z{}",
+            blend.from, blend.to
+        )
+    }
+    .expect("writing to a String is infallible");
+    write!(
+        lines[3],
+        "  |  quads {}  lines {}  glyphs {}  icons {}  edges {}  dropped {}L/{}I",
+        Grouped(st.quads as u32),
+        st.lines,
+        Grouped(st.glyphs as u32),
+        st.icons,
+        st.edges,
+        st.labels_dropped,
+        st.icons_dropped,
+    )
+    .expect("writing to a String is infallible");
+    write!(lines[4], "sats {}  curves {}", st.sats, st.curves)
+        .expect("writing to a String is infallible");
+    if st.curves_dropped > 0 {
+        write!(lines[4], " (-{})", st.curves_dropped).expect("writing to a String is infallible");
+    }
+    write!(
+        lines[4],
+        "  hex {}  |  drawn ns {} wl {} pods {}",
+        st.bg_cells,
+        st.drawn.regions,
+        st.drawn.blocks,
+        Grouped(st.drawn.cells as u32),
+    )
+    .expect("writing to a String is infallible");
+    write!(
+        lines[5],
+        "[c]hurn {}  [e]dges {}  [f]it  [h]ide",
+        if churn_on { "on" } else { "off" },
+        if edges_on { "on" } else { "off" },
+    )
+    .expect("writing to a String is infallible");
     drop(st);
 
     let pad = 10.0;
     let line_h = 16.0;
     let hud_bounds = Bounds {
         origin: point(px(ox + 12.0), px(oy + 12.0)),
-        size: size(px(560.0), px(2.0 * pad + line_h * lines.len() as f32)),
+        size: size(px(600.0), px(2.0 * pad + line_h * lines.len() as f32)),
     };
     window.paint_quad(quad(
         hud_bounds,
@@ -710,16 +763,23 @@ fn paint_hud(
 
     let font = gpui::font("JetBrains Mono");
     for (i, text) in lines.iter().enumerate() {
-        let s = SharedString::from(text.as_str());
+        let hash = text::content_hash(text);
         let run = TextRun {
-            len: s.len(),
+            len: text.len(),
             font: font.clone(),
             color: rgb(HUD_TEXT).into(),
             background_color: None,
             underline: None,
             strikethrough: None,
         };
-        let line = window.text_system().shape_line(s, px(11.0), &[run], None);
+        let line = window.text_system().shape_line_by_hash(
+            hash,
+            text.len(),
+            px(11.0),
+            &[run],
+            None,
+            || SharedString::from(text.as_str()),
+        );
         let _ = line.paint(
             point(px(ox + 12.0 + pad), px(oy + 12.0 + pad + i as f32 * line_h)),
             px(line_h),
@@ -731,16 +791,20 @@ fn paint_hud(
     }
 }
 
-fn group(n: u32) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
+struct Grouped(u32);
+
+impl std::fmt::Display for Grouped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn write_grouped(value: u32, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if value < 1000 {
+                write!(f, "{value}")
+            } else {
+                write_grouped(value / 1000, f)?;
+                write!(f, ",{:03}", value % 1000)
+            }
         }
-        out.push(c);
+        write_grouped(self.0, f)
     }
-    out
 }
 
 #[cfg(test)]

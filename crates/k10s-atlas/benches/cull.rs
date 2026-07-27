@@ -1,8 +1,9 @@
 use std::hint::black_box;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use k10s_atlas::testing::{SceneSpec, lod_policy, scene};
 use k10s_atlas::{Camera, CullStats, LodPolicy, Scene, StageBlend, cull};
+use k10s_bench::{Config, measure as measure_samples};
 
 const VW: f32 = 1600.0;
 const VH: f32 = 1000.0;
@@ -19,24 +20,17 @@ struct Case {
     camera_name: &'static str,
     zoom: f32,
     iters: usize,
+    samples: usize,
+    batch_size: usize,
+    p50_rmad: f64,
     p50_ns: f64,
     p99_ns: f64,
     stats: CullStats,
 }
 
-fn percentile(sorted: &[u64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let i = (((sorted.len() - 1) as f64) * p).round() as usize;
-    sorted[i] as f64
-}
-
-fn measure(scene: &Scene, policy: &LodPolicy, camera: &Camera) -> (usize, f64, f64, CullStats) {
+fn measure(scene: &Scene, policy: &LodPolicy, camera: &Camera) -> k10s_bench::Samples {
     let blend = StageBlend::settled(policy.stage_for_zoom(camera.zoom));
-    let stats = cull(scene, camera, policy, blend, VW, VH, true, false);
-
-    for _ in 0..WARMUP {
+    measure_samples(Config::new(WARMUP, MIN_ITERS, MAX_ITERS, BUDGET), || {
         black_box(cull(
             black_box(scene),
             black_box(camera),
@@ -47,31 +41,7 @@ fn measure(scene: &Scene, policy: &LodPolicy, camera: &Camera) -> (usize, f64, f
             true,
             false,
         ));
-    }
-
-    let mut samples = Vec::with_capacity(MIN_ITERS);
-    let start = Instant::now();
-    while samples.len() < MAX_ITERS && (samples.len() < MIN_ITERS || start.elapsed() < BUDGET) {
-        let t = Instant::now();
-        black_box(cull(
-            black_box(scene),
-            black_box(camera),
-            policy,
-            blend,
-            VW,
-            VH,
-            true,
-            false,
-        ));
-        samples.push(t.elapsed().as_nanos() as u64);
-    }
-    samples.sort_unstable();
-    (
-        samples.len(),
-        percentile(&samples, 0.50),
-        percentile(&samples, 0.99),
-        stats,
-    )
+    })
 }
 
 fn cameras(scene: &Scene) -> Vec<(&'static str, Camera)> {
@@ -139,7 +109,9 @@ fn main() {
     for (name, spec) in specs() {
         let s = scene(spec);
         for (camera_name, camera) in cameras(&s) {
-            let (iters, p50, p99, stats) = measure(&s, &policy, &camera);
+            let blend = StageBlend::settled(policy.stage_for_zoom(camera.zoom));
+            let stats = cull(&s, &camera, &policy, blend, VW, VH, true, false);
+            let samples = measure(&s, &policy, &camera);
             cases.push(Case {
                 scene_name: name.clone(),
                 objects: spec.total_objects(),
@@ -147,9 +119,12 @@ fn main() {
                 blocks_per_region: spec.blocks_per_region,
                 camera_name,
                 zoom: camera.zoom,
-                iters,
-                p50_ns: p50,
-                p99_ns: p99,
+                iters: samples.iterations(),
+                samples: samples.sample_count(),
+                batch_size: samples.batch_size(),
+                p50_rmad: samples.p50_relative_mad(),
+                p50_ns: samples.percentile(0.50),
+                p99_ns: samples.percentile(0.99),
                 stats,
             });
         }
@@ -174,12 +149,14 @@ fn print_table(cases: &[Case]) {
             );
         }
         println!(
-            "    {:<12} zoom {:>6.2}  p50 {:>9.0} ns  p99 {:>9.0} ns  iters {:>6} | quads {:>6} labels {:>4} icons {:>4} sats {:>5} curves {:>5} edges {:>5} | drawn r/b/c {:>5}/{:>6}/{:>7}",
+            "    {:<12} zoom {:>6.2}  p50 {:>9.1} ns  p99 {:>9.1} ns  samples {:>6} x {:>5}  rMAD {:>5.1}% | quads {:>6} labels {:>4} icons {:>4} sats {:>5} curves {:>5} edges {:>5} | drawn r/b/c {:>5}/{:>6}/{:>7}",
             c.camera_name,
             c.zoom,
             c.p50_ns,
             c.p99_ns,
-            c.iters,
+            c.samples,
+            c.batch_size,
+            c.p50_rmad * 100.0,
             c.stats.quads,
             c.stats.labels,
             c.stats.icons,
@@ -195,7 +172,7 @@ fn print_table(cases: &[Case]) {
 
 fn print_json(cases: &[Case]) {
     println!("{{");
-    println!("  \"schema_version\": 2,");
+    println!("  \"schema_version\": 3,");
     println!("  \"viewport\": [{VW}, {VH}],");
     println!("  \"cases\": [");
     for (i, c) in cases.iter().enumerate() {
@@ -208,8 +185,11 @@ fn print_json(cases: &[Case]) {
         println!("      \"camera\": \"{}\",", c.camera_name);
         println!("      \"zoom\": {},", c.zoom);
         println!("      \"iters\": {},", c.iters);
-        println!("      \"p50_ns\": {:.0},", c.p50_ns);
-        println!("      \"p99_ns\": {:.0},", c.p99_ns);
+        println!("      \"samples\": {},", c.samples);
+        println!("      \"batch_size\": {},", c.batch_size);
+        println!("      \"p50_rmad\": {:.6},", c.p50_rmad);
+        println!("      \"p50_ns\": {:.3},", c.p50_ns);
+        println!("      \"p99_ns\": {:.3},", c.p99_ns);
         println!("      \"quads\": {},", c.stats.quads);
         println!("      \"labels\": {},", c.stats.labels);
         println!("      \"icons\": {},", c.stats.icons);

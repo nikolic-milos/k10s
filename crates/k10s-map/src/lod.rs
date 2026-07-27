@@ -26,6 +26,7 @@ pub const MAX_LABELS: usize = 400;
 pub const MAX_ICONS: usize = 1024;
 pub const MAX_EDGES: usize = 3000;
 pub const MAX_CURVES: usize = 1500;
+pub const MAX_CELLS_PER_BLOCK: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Knobs {
@@ -70,6 +71,7 @@ pub(crate) fn policy(knobs: Knobs) -> LodPolicy {
         max_icons: MAX_ICONS,
         max_edges: MAX_EDGES,
         max_curves: MAX_CURVES,
+        max_cells_per_block: MAX_CELLS_PER_BLOCK,
         sat_curves: !knobs.no_curves,
         stress: knobs.stress_quads,
         stress_curves: knobs.stress_curves && !knobs.stress_quads,
@@ -207,9 +209,16 @@ mod tests {
                     detail: Arc::from("16Gi"),
                 },
             }],
+            region_blocks: vec![],
+            block_cells: vec![],
+            block_sats: vec![],
+            spatial_index: Default::default(),
             edges: vec![],
+            edge_segments: vec![],
             region_edges: vec![],
+            region_edge_indexes: vec![],
             cross_edges: 0..0,
+            cross_edge_index: Default::default(),
             totals: Totals {
                 regions: 1,
                 blocks: 1,

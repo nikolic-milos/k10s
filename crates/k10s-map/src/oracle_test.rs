@@ -217,9 +217,16 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
                 },
             })
             .collect(),
+        region_blocks: base.region_blocks.clone(),
+        block_cells: base.block_cells.clone(),
+        block_sats: base.block_sats.clone(),
+        spatial_index: base.spatial_index.clone(),
         edges: base.edges.clone(),
+        edge_segments: base.edge_segments.clone(),
         region_edges: base.region_edges.clone(),
+        region_edge_indexes: base.region_edge_indexes.clone(),
         cross_edges: base.cross_edges.clone(),
+        cross_edge_index: base.cross_edge_index.clone(),
         totals: base.totals,
     }
 }
@@ -783,6 +790,8 @@ fn oracle_matches_painter_on_degenerate_scenes() {
     let flat_edges = flat.edges.len() as u32;
     flat.region_edges = vec![0..0; flat.regions.len()];
     flat.cross_edges = 0..flat_edges;
+    flat.rebuild_spatial_index();
+    flat.rebuild_edge_indexes();
 
     for (name, scene) in [
         ("empty", &empty),

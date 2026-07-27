@@ -4,7 +4,9 @@ use gpui::{
 use k10s_atlas::curves::{bow_jitter, curve_ctrl, dash_quadratic};
 use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 use k10s_core::layout::CARD_HEADER;
-use k10s_core::{KindId, Rect, SceneSnapshot, Severity, ToolId};
+use k10s_core::{
+    KindId, NsNode, PodNode, Rect, SatNode, SceneSnapshot, Severity, ToolId, WorkloadNode,
+};
 
 use crate::colors::*;
 use crate::hex;
@@ -94,6 +96,488 @@ fn push_icon<S: FrameSink>(
     }
 }
 
+struct FrameWalk<'a, S> {
+    camera: Camera,
+    visible: Rect,
+    viewport: (f32, f32),
+    origin: (f32, f32),
+    zoom: f32,
+    stage: u8,
+    z01_t: f32,
+    block_alpha: f32,
+    cell_alpha: f32,
+    cell_label_alpha: f32,
+    policy: &'a LodPolicy,
+    skip_blocks: bool,
+    hex_shown: bool,
+    edges_on: bool,
+    ns_border: gpui::Hsla,
+    ns_fill: gpui::Background,
+    ns_fill_rgba: gpui::Rgba,
+    ns_border_rgba: gpui::Rgba,
+    header_fill: gpui::Background,
+    workload_paint: [(gpui::Background, gpui::Hsla); 4],
+    pod_paint: [gpui::Background; 4],
+    strip_paint: [gpui::Background; 4],
+    sink: &'a mut S,
+    stats: CullStats,
+}
+
+impl<S: FrameSink> FrameWalk<'_, S> {
+    #[inline]
+    fn screen_bounds(&self, rect: &Rect) -> Bounds<Pixels> {
+        let (x, y) = self
+            .camera
+            .w2s(rect.x, rect.y, self.viewport.0, self.viewport.1);
+        Bounds {
+            origin: point(px(self.origin.0 + x), px(self.origin.1 + y)),
+            size: size(px(rect.w * self.zoom), px(rect.h * self.zoom)),
+        }
+    }
+
+    #[inline]
+    fn paint_region(&mut self, region: &NsNode) {
+        self.stats.drawn_regions += 1;
+        let bounds = self.screen_bounds(&region.rect);
+
+        if self.z01_t <= 0.0 {
+            self.sink.bg_quad(quad(
+                bounds,
+                px(6.0),
+                heat_color(region.ext.unhealthy_frac),
+                px(1.0),
+                self.ns_border,
+                Default::default(),
+            ));
+        } else if self.z01_t >= 1.0 {
+            self.sink.bg_quad(quad(
+                bounds,
+                px(8.0),
+                self.ns_fill,
+                px(1.0),
+                heat_border(region.ext.unhealthy_frac),
+                Default::default(),
+            ));
+        } else {
+            self.sink.bg_quad(quad(
+                bounds,
+                px(6.0 + 2.0 * self.z01_t),
+                mix(
+                    heat_color(region.ext.unhealthy_frac),
+                    self.ns_fill_rgba,
+                    self.z01_t,
+                ),
+                px(1.0),
+                mix(
+                    self.ns_border_rgba,
+                    heat_border(region.ext.unhealthy_frac),
+                    self.z01_t,
+                ),
+                Default::default(),
+            ));
+        }
+        self.stats.quads += 1;
+
+        if self.policy.region_label_shown(region.rect.w, self.zoom) {
+            let (x, y) = self.camera.w2s(
+                region.rect.x,
+                region.rect.y,
+                self.viewport.0,
+                self.viewport.1,
+            );
+            push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
+                text: SharedString::from(&region.label),
+                x: self.origin.0 + x + 10.0,
+                y: self.origin.1 + y + 6.0,
+                size_px: NS_LABEL_PX,
+                color: gpui::Rgba {
+                    r: 0.62,
+                    g: 0.58,
+                    b: 0.75,
+                    a: 1.0,
+                },
+            });
+        }
+    }
+
+    fn walk_region_children<const DIRECT: bool>(
+        &mut self,
+        scene: &SceneSnapshot,
+        region_index: usize,
+        region: &NsNode,
+    ) {
+        let region_inside = self.visible.contains(&region.rect);
+        if DIRECT {
+            let visible = self.visible;
+            if scene.region_block_index_is_selective(region_index, &visible) {
+                scene.for_each_region_block_candidate(region_index, &visible, |index, block| {
+                    self.block::<true>(scene, index, block, region_inside);
+                });
+            } else {
+                let start = region.children.start as usize;
+                for (offset, block) in scene.blocks[start..region.children.end as usize]
+                    .iter()
+                    .enumerate()
+                {
+                    self.block::<true>(scene, start + offset, block, region_inside);
+                }
+            }
+        } else {
+            let visible = self.visible;
+            scene.for_each_region_block_candidate(region_index, &visible, |index, block| {
+                self.block::<false>(scene, index, block, region_inside);
+            });
+        }
+    }
+
+    #[inline(always)]
+    fn block<const DIRECT: bool>(
+        &mut self,
+        scene: &SceneSnapshot,
+        block_index: usize,
+        block: &WorkloadNode,
+        region_inside: bool,
+    ) {
+        if !(region_inside || block.rect.intersects(&self.visible)) {
+            return;
+        }
+        let painted = self.policy.block_painted(block.inner.w, self.zoom) && !self.skip_blocks;
+        if painted {
+            self.stats.drawn_blocks += 1;
+            let severity = severity_index(block.ext.rollup);
+            let (fill_color, border) = self.workload_paint[severity];
+            self.sink.fg_quad(quad(
+                self.screen_bounds(&block.inner),
+                px(4.0),
+                fill_color,
+                px(1.0),
+                border,
+                Default::default(),
+            ));
+            self.stats.quads += 1;
+
+            if self.policy.block_chrome_shown(block.inner.w, self.zoom) {
+                let header_height = CARD_HEADER.min(block.inner.h * 0.32);
+                let header = Rect::new(block.inner.x, block.inner.y, block.inner.w, header_height);
+                self.sink.fg_quad(quad(
+                    self.screen_bounds(&header),
+                    px(4.0),
+                    self.header_fill,
+                    px(0.0),
+                    gpui::transparent_black(),
+                    Default::default(),
+                ));
+                let strip = Rect::new(
+                    block.inner.x + block.inner.w * 0.06,
+                    block.inner.y + header_height * 0.72,
+                    block.inner.w * 0.88,
+                    header_height * 0.14,
+                );
+                self.sink
+                    .fg_quad(fill(self.screen_bounds(&strip), self.strip_paint[severity]));
+                self.stats.quads += 2;
+            }
+
+            if self.policy.block_icon_shown(block.inner.w, self.zoom) {
+                let (x, y) = self.camera.w2s(
+                    block.inner.max_x(),
+                    block.inner.y,
+                    self.viewport.0,
+                    self.viewport.1,
+                );
+                let bounds = Bounds {
+                    origin: point(
+                        px(self.origin.0 + x - WL_ICON_PX - 3.0),
+                        px(self.origin.1 + y + 3.0),
+                    ),
+                    size: size(px(WL_ICON_PX), px(WL_ICON_PX)),
+                };
+                push_icon(&mut self.stats, self.policy, self.sink, || {
+                    if block.ext.tool != ToolId::NONE {
+                        IconJob::ToolId(block.ext.tool, bounds)
+                    } else {
+                        IconJob::Wl(block.ext.kind, bounds)
+                    }
+                });
+            }
+
+            if self.policy.block_label_shown(block.inner.w, self.zoom) {
+                let (x, y) = self.camera.w2s(
+                    block.inner.x,
+                    block.inner.y,
+                    self.viewport.0,
+                    self.viewport.1,
+                );
+                push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
+                    text: SharedString::from(&block.label),
+                    x: self.origin.0 + x + 4.0,
+                    y: self.origin.1 + y + 1.0,
+                    size_px: WL_LABEL_PX,
+                    color: gpui::Rgba {
+                        r: 0.72,
+                        g: 0.68,
+                        b: 0.85,
+                        a: self.block_alpha,
+                    },
+                });
+            }
+        }
+
+        if self.stage < 2 {
+            return;
+        }
+        let block_inside = region_inside || self.visible.contains(&block.rect);
+        if painted || self.policy.stress_curves {
+            let (hub_x, hub_y) = block.inner.center();
+            let (x, y) = self
+                .camera
+                .w2s(hub_x, hub_y, self.viewport.0, self.viewport.1);
+            let hub = (self.origin.0 + x, self.origin.1 + y);
+            if DIRECT {
+                let start = block.sats.start as usize;
+                for (offset, satellite) in scene.sats[start..block.sats.end as usize]
+                    .iter()
+                    .enumerate()
+                {
+                    self.satellite(start + offset, satellite, block_inside, hub);
+                }
+            } else {
+                scene.for_each_block_sat(block_index, |index, satellite| {
+                    self.satellite(index, satellite, block_inside, hub);
+                });
+            }
+        }
+
+        if !painted {
+            return;
+        }
+        let cells = block.children.len();
+        if cells > self.policy.max_cells_per_block
+            && self
+                .policy
+                .cells_aggregated(cells, block.inner.intersection_fraction(&self.visible))
+        {
+            let inset = (2.0 / self.zoom).clamp(0.5, 6.0);
+            let header = CARD_HEADER.min(block.inner.h * 0.32);
+            let aggregate = Rect::new(
+                block.inner.x + inset,
+                block.inner.y + header + inset,
+                (block.inner.w - inset * 2.0).max(1.0),
+                (block.inner.h - header - inset * 2.0).max(1.0),
+            );
+            self.sink.fg_quad(fill(
+                self.screen_bounds(&aggregate),
+                self.pod_paint[severity_index(block.ext.rollup)],
+            ));
+            self.stats.aggregated_blocks += 1;
+            self.stats.aggregated_cells += cells;
+            self.stats.quads += 1;
+            return;
+        }
+
+        if DIRECT {
+            let visible = self.visible;
+            if scene.block_cell_index_is_selective(block_index, &visible) {
+                scene.for_each_block_cell_candidate(block_index, &visible, |_, cell| {
+                    self.cell(cell, block_inside);
+                });
+            } else {
+                for cell in &scene.cells[block.children.start as usize..block.children.end as usize]
+                {
+                    self.cell(cell, block_inside);
+                }
+            }
+        } else {
+            let visible = self.visible;
+            scene.for_each_block_cell_candidate(block_index, &visible, |_, cell| {
+                self.cell(cell, block_inside);
+            });
+        }
+    }
+
+    fn satellite(
+        &mut self,
+        satellite_index: usize,
+        satellite: &SatNode,
+        block_inside: bool,
+        hub: (f32, f32),
+    ) {
+        if !(block_inside || satellite.rect.intersects(&self.visible))
+            || !self.policy.sat_painted(satellite.rect.w, self.zoom)
+        {
+            return;
+        }
+        self.stats.drawn_sats += 1;
+        let (world_x, world_y) = satellite.rect.center();
+        let (x, y) = self
+            .camera
+            .w2s(world_x, world_y, self.viewport.0, self.viewport.1);
+        let point = (self.origin.0 + x, self.origin.1 + y);
+
+        if self.policy.sat_icon_shown() {
+            push_icon(&mut self.stats, self.policy, self.sink, || {
+                IconJob::Sat(
+                    satellite.ext.kind,
+                    Bounds {
+                        origin: gpui::point(
+                            px(point.0 - SAT_ICON_PX * 0.5),
+                            px(point.1 - SAT_ICON_PX * 0.5),
+                        ),
+                        size: size(px(SAT_ICON_PX), px(SAT_ICON_PX)),
+                    },
+                )
+            });
+        }
+
+        if self.policy.sat_label_shown(satellite.rect.w, self.zoom) {
+            let (x, y) = self.camera.w2s(
+                satellite.rect.x,
+                satellite.rect.max_y(),
+                self.viewport.0,
+                self.viewport.1,
+            );
+            push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
+                text: SharedString::from(&satellite.label),
+                x: self.origin.0 + x - 8.0,
+                y: self.origin.1 + y + 2.0,
+                size_px: SAT_NAME_PX,
+                color: gpui::Rgba {
+                    r: 0.80,
+                    g: 0.75,
+                    b: 0.90,
+                    a: self.cell_alpha,
+                },
+            });
+            push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
+                text: SharedString::from(&satellite.ext.detail),
+                x: self.origin.0 + x - 8.0,
+                y: self.origin.1 + y + 2.0 + SAT_NAME_PX * 1.25,
+                size_px: SAT_DETAIL_PX,
+                color: gpui::Rgba {
+                    r: 0.62,
+                    g: 0.57,
+                    b: 0.74,
+                    a: self.cell_alpha,
+                },
+            });
+        }
+
+        if self.policy.sat_curves {
+            if self.stats.curves >= self.policy.curve_budget() {
+                self.stats.curves_dropped += 1;
+            } else {
+                self.stats.curves += 1;
+                let control = curve_ctrl(hub, point, bow_jitter(satellite_index as u64));
+                self.sink.curve(hub, control, point);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn cell(&mut self, cell: &PodNode, block_inside: bool) {
+        if !(block_inside || cell.rect.intersects(&self.visible)) {
+            return;
+        }
+        self.stats.drawn_cells += 1;
+        self.sink.fg_quad(fill(
+            self.screen_bounds(&cell.rect),
+            self.pod_paint[severity_index(cell.ext.state.severity)],
+        ));
+        self.stats.quads += 1;
+
+        if self.stage >= 3 && self.policy.cell_label_shown(cell.rect.w, self.zoom) {
+            let (x, y) = self.camera.w2s(
+                cell.rect.x,
+                cell.rect.y + cell.rect.h,
+                self.viewport.0,
+                self.viewport.1,
+            );
+            push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
+                text: SharedString::from(&cell.label),
+                x: self.origin.0 + x,
+                y: self.origin.1 + y + 2.0,
+                size_px: POD_LABEL_PX,
+                color: gpui::Rgba {
+                    r: 0.55,
+                    g: 0.51,
+                    b: 0.66,
+                    a: self.cell_label_alpha,
+                },
+            });
+        }
+    }
+
+    fn hierarchy<const DIRECT: bool>(&mut self, scene: &SceneSnapshot) {
+        if DIRECT && !scene.region_index_is_selective(&self.visible) {
+            for (index, region) in scene.regions.iter().enumerate() {
+                if region.rect.intersects(&self.visible) {
+                    self.paint_region(region);
+                    if self.stage != 0 {
+                        self.walk_region_children::<true>(scene, index, region);
+                    }
+                }
+            }
+        } else {
+            let visible = self.visible;
+            scene.for_each_region_candidate(&visible, |index, region| {
+                if region.rect.intersects(&visible) {
+                    self.paint_region(region);
+                    if self.stage != 0 {
+                        self.walk_region_children::<DIRECT>(scene, index, region);
+                    }
+                }
+            });
+        }
+    }
+
+    fn finish(mut self, scene: &SceneSnapshot) -> CullStats {
+        if self.hex_shown {
+            let (radius, _) = hex::level(self.zoom);
+            self.stats.bg_cells =
+                hex::for_each_center(&self.visible, radius, |center_x, center_y| {
+                    let mut ring = [(0.0f32, 0.0f32); 6];
+                    for (index, vertex) in ring.iter_mut().enumerate() {
+                        let angle = index as f32 * std::f32::consts::FRAC_PI_3;
+                        let world = (
+                            center_x + radius * angle.cos(),
+                            center_y + radius * angle.sin(),
+                        );
+                        let screen =
+                            self.camera
+                                .w2s(world.0, world.1, self.viewport.0, self.viewport.1);
+                        *vertex = (self.origin.0 + screen.0, self.origin.1 + screen.1);
+                    }
+                    self.sink.hex_ring(&ring);
+                });
+        }
+
+        if self.edges_on && self.stage >= 2 && !self.policy.stress && !self.policy.stress_curves {
+            self.stats.edges =
+                k10s_atlas::walk_edges(scene, &self.visible, self.policy.max_edges, |a, b| {
+                    let hash = ((a.0.to_bits() as u64) << 32 ^ a.1.to_bits() as u64)
+                        ^ ((b.0.to_bits() as u64) << 16 ^ b.1.to_bits() as u64);
+                    let a = self.camera.w2s(a.0, a.1, self.viewport.0, self.viewport.1);
+                    let b = self.camera.w2s(b.0, b.1, self.viewport.0, self.viewport.1);
+                    let start = (self.origin.0 + a.0, self.origin.1 + a.1);
+                    let end = (self.origin.0 + b.0, self.origin.1 + b.1);
+                    let control = curve_ctrl(start, end, bow_jitter(hash) * 0.6);
+                    self.sink.edge(start, control, end);
+                });
+        }
+        self.stats
+    }
+}
+
+#[inline(always)]
+const fn severity_index(severity: Severity) -> usize {
+    match severity {
+        Severity::Ok => 0,
+        Severity::Warn => 1,
+        Severity::Err => 2,
+        Severity::Unknown => 3,
+    }
+}
+
 pub fn walk<S: FrameSink>(
     bounds: Bounds<Pixels>,
     scene: &SceneSnapshot,
@@ -102,354 +586,69 @@ pub fn walk<S: FrameSink>(
     opts: FrameOpts<'_>,
     sink: &mut S,
 ) -> CullStats {
-    let vw = f32::from(bounds.size.width);
-    let vh = f32::from(bounds.size.height);
-    let ox = f32::from(bounds.origin.x);
-    let oy = f32::from(bounds.origin.y);
-    let zoom = camera.zoom;
-    let visible = camera.visible_world(vw, vh);
-
-    let w2b = |r: &Rect| -> Bounds<Pixels> {
-        let (sx, sy) = camera.w2s(r.x, r.y, vw, vh);
-        Bounds {
-            origin: point(px(ox + sx), px(oy + sy)),
-            size: size(px(r.w * zoom), px(r.h * zoom)),
-        }
-    };
-
-    let lod = opts.policy;
-    let stage = blend.walk_stage();
-    let skip_wl = opts.skip_blocks;
-
-    let block_alpha = blend.stage_alpha(1);
-    let cell_alpha = blend.stage_alpha(2);
-    let cell_label_alpha = blend.stage_alpha(3);
-
-    let z01_t = if stage == 0 {
-        0.0
-    } else if blend.from.min(blend.to) >= 1 {
-        1.0
-    } else {
-        blend.fade_alpha()
-    };
-
-    let ns_border_hsla: gpui::Hsla = rgb(NS_BORDER).into();
-    let ns_fill_bg: gpui::Background = rgb(NS_FILL).into();
-    let ns_fill_rgba = rgb(NS_FILL);
-    let ns_border_rgba = rgb(NS_BORDER);
-    let header_fill_bg: gpui::Background = scale_alpha(rgb(CARD_HEADER_FILL), block_alpha).into();
     const SEVERITIES: [Severity; 4] = [
         Severity::Ok,
         Severity::Warn,
         Severity::Err,
         Severity::Unknown,
     ];
-    let sev_ix = |h: Severity| -> usize {
-        match h {
-            Severity::Ok => 0,
-            Severity::Warn => 1,
-            Severity::Err => 2,
-            Severity::Unknown => 3,
-        }
-    };
-    let wl_paint: [(gpui::Background, gpui::Hsla); 4] = SEVERITIES.map(|h| {
-        let (fill_c, border_c) = workload_colors(h);
+    let viewport = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+    let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+    let stage = blend.walk_stage();
+    let block_alpha = blend.stage_alpha(1);
+    let cell_alpha = blend.stage_alpha(2);
+    let workload_paint = SEVERITIES.map(|severity| {
+        let (fill, border) = workload_colors(severity);
         (
-            scale_alpha(fill_c, block_alpha).into(),
-            scale_alpha(border_c, block_alpha).into(),
+            scale_alpha(fill, block_alpha).into(),
+            scale_alpha(border, block_alpha).into(),
         )
     });
-    let pod_paint: [gpui::Background; 4] =
-        SEVERITIES.map(|h| scale_alpha(pod_color(h), cell_alpha).into());
-    let strip_paint: [gpui::Background; 4] =
-        SEVERITIES.map(|h| scale_alpha(pod_color(h), block_alpha).into());
-
-    let mut st = CullStats {
-        stage,
-        ..CullStats::default()
-    };
 
     sink.bg_quad(fill(bounds, rgb(BG)));
-    st.quads += 1;
-
-    for ns in &scene.regions {
-        if !ns.rect.intersects(&visible) {
-            continue;
-        }
-        st.drawn_regions += 1;
-        let b = w2b(&ns.rect);
-
-        if z01_t <= 0.0 {
-            sink.bg_quad(quad(
-                b,
-                px(6.0),
-                heat_color(ns.ext.unhealthy_frac),
-                px(1.0),
-                ns_border_hsla,
-                Default::default(),
-            ));
-        } else if z01_t >= 1.0 {
-            sink.bg_quad(quad(
-                b,
-                px(8.0),
-                ns_fill_bg,
-                px(1.0),
-                heat_border(ns.ext.unhealthy_frac),
-                Default::default(),
-            ));
+    let mut walk = FrameWalk {
+        camera,
+        visible: camera.visible_world(viewport.0, viewport.1),
+        viewport,
+        origin,
+        zoom: camera.zoom,
+        stage,
+        z01_t: if stage == 0 {
+            0.0
+        } else if blend.from.min(blend.to) >= 1 {
+            1.0
         } else {
-            sink.bg_quad(quad(
-                b,
-                px(6.0 + 2.0 * z01_t),
-                mix(heat_color(ns.ext.unhealthy_frac), ns_fill_rgba, z01_t),
-                px(1.0),
-                mix(ns_border_rgba, heat_border(ns.ext.unhealthy_frac), z01_t),
-                Default::default(),
-            ));
-        }
-        st.quads += 1;
-
-        if lod.region_label_shown(ns.rect.w, zoom) {
-            push_label(&mut st, lod, sink, || {
-                let (sx, sy) = camera.w2s(ns.rect.x, ns.rect.y, vw, vh);
-                LabelJob {
-                    text: SharedString::from(&ns.label),
-                    x: ox + sx + 10.0,
-                    y: oy + sy + 6.0,
-                    size_px: NS_LABEL_PX,
-                    color: gpui::Rgba {
-                        r: 0.62,
-                        g: 0.58,
-                        b: 0.75,
-                        a: 1.0,
-                    },
-                }
-            });
-        }
-
-        if stage == 0 {
-            continue;
-        }
-
-        let region_inside = visible.contains(&ns.rect);
-        let ns_blocks = &scene.blocks[ns.children.start as usize..ns.children.end as usize];
-        for wl in ns_blocks {
-            if !(region_inside || wl.rect.intersects(&visible)) {
-                continue;
-            }
-            let painted = lod.block_painted(wl.inner.w, zoom) && !skip_wl;
-            if painted {
-                st.drawn_blocks += 1;
-                let (fill_bg, border_hsla) = wl_paint[sev_ix(wl.ext.rollup)];
-                sink.fg_quad(quad(
-                    w2b(&wl.inner),
-                    px(4.0),
-                    fill_bg,
-                    px(1.0),
-                    border_hsla,
-                    Default::default(),
-                ));
-                st.quads += 1;
-
-                if lod.block_chrome_shown(wl.inner.w, zoom) {
-                    let header_h = CARD_HEADER.min(wl.inner.h * 0.32);
-                    let header = Rect::new(wl.inner.x, wl.inner.y, wl.inner.w, header_h);
-                    sink.fg_quad(quad(
-                        w2b(&header),
-                        px(4.0),
-                        header_fill_bg,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        Default::default(),
-                    ));
-                    let strip = Rect::new(
-                        wl.inner.x + wl.inner.w * 0.06,
-                        wl.inner.y + header_h * 0.72,
-                        wl.inner.w * 0.88,
-                        header_h * 0.14,
-                    );
-                    sink.fg_quad(fill(w2b(&strip), strip_paint[sev_ix(wl.ext.rollup)]));
-                    st.quads += 2;
-                }
-
-                if lod.block_icon_shown(wl.inner.w, zoom) {
-                    push_icon(&mut st, lod, sink, || {
-                        let (sx, sy) = camera.w2s(wl.inner.max_x(), wl.inner.y, vw, vh);
-                        let b = Bounds {
-                            origin: point(px(ox + sx - WL_ICON_PX - 3.0), px(oy + sy + 3.0)),
-                            size: size(px(WL_ICON_PX), px(WL_ICON_PX)),
-                        };
-                        if wl.ext.tool != ToolId::NONE {
-                            IconJob::ToolId(wl.ext.tool, b)
-                        } else {
-                            IconJob::Wl(wl.ext.kind, b)
-                        }
-                    });
-                }
-
-                if lod.block_label_shown(wl.inner.w, zoom) {
-                    push_label(&mut st, lod, sink, || {
-                        let (sx, sy) = camera.w2s(wl.inner.x, wl.inner.y, vw, vh);
-                        LabelJob {
-                            text: SharedString::from(&wl.label),
-                            x: ox + sx + 4.0,
-                            y: oy + sy + 1.0,
-                            size_px: WL_LABEL_PX,
-                            color: gpui::Rgba {
-                                r: 0.72,
-                                g: 0.68,
-                                b: 0.85,
-                                a: block_alpha,
-                            },
-                        }
-                    });
-                }
-            }
-
-            if stage < 2 {
-                continue;
-            }
-            let block_inside = region_inside || visible.contains(&wl.rect);
-
-            if painted || lod.stress_curves {
-                let sat_base = wl.sats.start as usize;
-                let sats = &scene.sats[sat_base..wl.sats.end as usize];
-                let (hub_wx, hub_wy) = wl.inner.center();
-                let (hx, hy) = camera.w2s(hub_wx, hub_wy, vw, vh);
-                let hub_pt = (ox + hx, oy + hy);
-                for (j, sat) in sats.iter().enumerate() {
-                    if !(block_inside || sat.rect.intersects(&visible)) {
-                        continue;
-                    }
-                    if !lod.sat_painted(sat.rect.w, zoom) {
-                        continue;
-                    }
-                    st.drawn_sats += 1;
-                    let (sat_wx, sat_wy) = sat.rect.center();
-                    let (sx, sy) = camera.w2s(sat_wx, sat_wy, vw, vh);
-                    let sat_pt = (ox + sx, oy + sy);
-
-                    if lod.sat_icon_shown() {
-                        push_icon(&mut st, lod, sink, || {
-                            IconJob::Sat(
-                                sat.ext.kind,
-                                Bounds {
-                                    origin: point(
-                                        px(sat_pt.0 - SAT_ICON_PX * 0.5),
-                                        px(sat_pt.1 - SAT_ICON_PX * 0.5),
-                                    ),
-                                    size: size(px(SAT_ICON_PX), px(SAT_ICON_PX)),
-                                },
-                            )
-                        });
-                    }
-
-                    if lod.sat_label_shown(sat.rect.w, zoom) {
-                        let (lx, ly) = camera.w2s(sat.rect.x, sat.rect.max_y(), vw, vh);
-                        push_label(&mut st, lod, sink, || LabelJob {
-                            text: SharedString::from(&sat.label),
-                            x: ox + lx - 8.0,
-                            y: oy + ly + 2.0,
-                            size_px: SAT_NAME_PX,
-                            color: gpui::Rgba {
-                                r: 0.80,
-                                g: 0.75,
-                                b: 0.90,
-                                a: cell_alpha,
-                            },
-                        });
-                        push_label(&mut st, lod, sink, || LabelJob {
-                            text: SharedString::from(&sat.ext.detail),
-                            x: ox + lx - 8.0,
-                            y: oy + ly + 2.0 + SAT_NAME_PX * 1.25,
-                            size_px: SAT_DETAIL_PX,
-                            color: gpui::Rgba {
-                                r: 0.62,
-                                g: 0.57,
-                                b: 0.74,
-                                a: cell_alpha,
-                            },
-                        });
-                    }
-
-                    if lod.sat_curves {
-                        if st.curves >= lod.curve_budget() {
-                            st.curves_dropped += 1;
-                        } else {
-                            st.curves += 1;
-                            let bow = bow_jitter((sat_base + j) as u64);
-                            let ctrl = curve_ctrl(hub_pt, sat_pt, bow);
-                            sink.curve(hub_pt, ctrl, sat_pt);
-                        }
-                    }
-                }
-            }
-
-            if !painted {
-                continue;
-            }
-            let wl_cells = &scene.cells[wl.children.start as usize..wl.children.end as usize];
-            for pod in wl_cells {
-                if !(block_inside || pod.rect.intersects(&visible)) {
-                    continue;
-                }
-                st.drawn_cells += 1;
-                sink.fg_quad(fill(
-                    w2b(&pod.rect),
-                    pod_paint[sev_ix(pod.ext.state.severity)],
-                ));
-                st.quads += 1;
-
-                if stage >= 3 && lod.cell_label_shown(pod.rect.w, zoom) {
-                    push_label(&mut st, lod, sink, || {
-                        let (sx, sy) = camera.w2s(pod.rect.x, pod.rect.y + pod.rect.h, vw, vh);
-                        LabelJob {
-                            text: SharedString::from(&pod.label),
-                            x: ox + sx,
-                            y: oy + sy + 2.0,
-                            size_px: POD_LABEL_PX,
-                            color: gpui::Rgba {
-                                r: 0.55,
-                                g: 0.51,
-                                b: 0.66,
-                                a: cell_label_alpha,
-                            },
-                        }
-                    });
-                }
-            }
-        }
+            blend.fade_alpha()
+        },
+        block_alpha,
+        cell_alpha,
+        cell_label_alpha: blend.stage_alpha(3),
+        policy: opts.policy,
+        skip_blocks: opts.skip_blocks,
+        hex_shown: opts.hex_shown(),
+        edges_on: opts.edges_on,
+        ns_border: rgb(NS_BORDER).into(),
+        ns_fill: rgb(NS_FILL).into(),
+        ns_fill_rgba: rgb(NS_FILL),
+        ns_border_rgba: rgb(NS_BORDER),
+        header_fill: scale_alpha(rgb(CARD_HEADER_FILL), block_alpha).into(),
+        workload_paint,
+        pod_paint: SEVERITIES.map(|severity| scale_alpha(pod_color(severity), cell_alpha).into()),
+        strip_paint: SEVERITIES
+            .map(|severity| scale_alpha(pod_color(severity), block_alpha).into()),
+        sink,
+        stats: CullStats {
+            stage,
+            quads: 1,
+            ..CullStats::default()
+        },
+    };
+    if scene.child_ranges_are_direct() {
+        walk.hierarchy::<true>(scene);
+    } else {
+        walk.hierarchy::<false>(scene);
     }
-
-    if opts.hex_shown() {
-        let (hex_r, _) = hex::level(zoom);
-        st.bg_cells = hex::for_each_center(&visible, hex_r, |cx_, cy_| {
-            let mut ring = [(0.0f32, 0.0f32); 6];
-            for (i, vertex) in ring.iter_mut().enumerate() {
-                let ang = i as f32 * std::f32::consts::FRAC_PI_3;
-                let (wx, wy) = (cx_ + hex_r * ang.cos(), cy_ + hex_r * ang.sin());
-                let (sx, sy) = camera.w2s(wx, wy, vw, vh);
-                *vertex = (ox + sx, oy + sy);
-            }
-            sink.hex_ring(&ring);
-        });
-    }
-
-    if opts.edges_on && stage >= 2 && !opts.stress_any() {
-        st.edges = k10s_atlas::walk_edges(scene, &visible, lod.max_edges, |a, b| {
-            let (ax, ay) = camera.w2s(a.center().0, a.center().1, vw, vh);
-            let (bx, by) = camera.w2s(b.center().0, b.center().1, vw, vh);
-            let pa = (ox + ax, oy + ay);
-            let pb = (ox + bx, oy + by);
-
-            let h = ((a.x.to_bits() as u64) << 32 ^ a.y.to_bits() as u64)
-                ^ ((b.x.to_bits() as u64) << 16 ^ b.y.to_bits() as u64);
-            let ctrl = curve_ctrl(pa, pb, bow_jitter(h) * 0.6);
-            sink.edge(pa, ctrl, pb);
-        });
-    }
-
-    st
+    walk.finish(scene)
 }
 
 pub struct PaintSink<'a> {

@@ -28,7 +28,11 @@ impl Store {
     }
 
     pub fn apply(&mut self, staged: Staged) {
-        self.objects.insert(staged.uid.clone(), staged);
+        let _ = self.replace(staged);
+    }
+
+    pub(crate) fn replace(&mut self, staged: Staged) -> Option<Staged> {
+        self.objects.insert(staged.uid.clone(), staged)
     }
 
     pub fn remove(&mut self, uid: &str) -> Option<Staged> {
@@ -70,7 +74,7 @@ pub struct AssembleStats {
     pub owner_cycles: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Index {
     scope_of: HashMap<Arc<str>, Arc<str>>,
     attach_owner: HashMap<AttachKey, Arc<str>>,
