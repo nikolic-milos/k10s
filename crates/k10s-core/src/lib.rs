@@ -8,8 +8,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 pub use ingest::{
-    Capability, DEFAULT_INTAKE_CAPACITY, DesyncReason, IngestEvent, Intake, IntakeStats, Op,
-    Payload, ResourceEvent,
+    CONTROL_CAPACITY, Capability, DEFAULT_INTAKE_CAPACITY, DesyncReason, IngestEvent, Intake,
+    IntakeStats, Op, Payload, ResourceEvent,
 };
 pub use k10s_atlas::{BlockNode, CellNode, Edge, Endpoint, Level, Rect, RegionNode, Scene, Totals};
 pub use model::{

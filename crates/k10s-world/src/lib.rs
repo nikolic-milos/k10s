@@ -203,6 +203,7 @@ fn rollup(
     scratch.ns_stamp.resize(topo.ns_labels.len(), false);
     debug_assert!(scratch.wl_list.is_empty() && scratch.ns_list.is_empty());
 
+    let mut changed = false;
     for &(iu, new) in &dirty_pods.0 {
         let i = iu as usize;
         let old = agg.pod_state[i];
@@ -210,6 +211,7 @@ fn rollup(
             continue;
         }
         agg.pod_state[i] = new;
+        changed = true;
         for p in &mut pool.pending {
             if !p.all {
                 p.pods.push(iu);
@@ -241,6 +243,13 @@ fn rollup(
         }
     }
     dirty_pods.0.clear();
+    // Armed on any committed pod state, not only on one that moved a rollup: the
+    // reason-only path above has already written the new state into the aggregates
+    // and into every pool slot's pending list, and returning with the flag down
+    // strands it there until some unrelated severity change arms it.
+    if changed {
+        dirty.0 = true;
+    }
     if scratch.wl_list.is_empty() {
         return;
     }
@@ -273,7 +282,6 @@ fn rollup(
     }
     scratch.wl_list.clear();
     scratch.ns_list.clear();
-    dirty.0 = true;
 }
 
 fn materialize_into(snap: &mut SceneSnapshot, topo: &Topology, agg: &Aggregates, rev: u64) {
@@ -979,6 +987,49 @@ mod tests {
         assert_eq!(snap.cells[0].ext.state.severity, Severity::Err);
         assert_eq!(snap.cells[1].ext.state.severity, Severity::Warn);
         assert_eq!(snap.cells[2].ext.state.severity, Severity::Unknown);
+    }
+
+    #[test]
+    fn a_reason_only_change_publishes_instead_of_piling_up() {
+        // rollup used to commit the new state to the aggregates and to every pool
+        // slot's pending list and then return before arming Dirty, so a change that
+        // moved the reason without moving the severity was half-applied: no publish,
+        // no rev bump, and one u32 per event stranded in three lists until some
+        // unrelated severity change armed the flag.
+        let spec = platform(21, 2_000);
+        let scene = k10s_core::new_shared_scene();
+        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
+        schedule.run(&mut world);
+        assert_eq!(scene.load().rev, 1);
+
+        // Two Warn reasons, so no rollup anywhere above the pod can move.
+        let warn = [ReasonId::PENDING, ReasonId::NOT_READY];
+        set_pod_state(&mut world, 0, State::of(warn[0]));
+        schedule.run(&mut world);
+        let base = scene.load().rev;
+
+        for round in 0..8u64 {
+            let want = State::of(warn[(round as usize + 1) % 2]);
+            set_pod_state(&mut world, 0, want);
+            schedule.run(&mut world);
+
+            let snap = scene.load_full();
+            assert_eq!(
+                snap.rev,
+                base + round + 1,
+                "a reason-only change must publish"
+            );
+            assert_eq!(snap.cells[0].ext.state, want);
+            assert_published_matches_full(&world, &snap);
+            for (slot, p) in world.resource::<SnapshotPool>().pending.iter().enumerate() {
+                assert!(
+                    p.pods.len() <= SNAPSHOT_POOL_DEPTH,
+                    "pool slot {slot} holds {} pending pods after {} reason-only ticks",
+                    p.pods.len(),
+                    round + 1
+                );
+            }
+        }
     }
 
     #[test]
