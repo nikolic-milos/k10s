@@ -17,5 +17,8 @@ pub use flight::{
 };
 pub use lod::{LodPolicy, StageBlend, StageMachine};
 pub use pacing::FramePacer;
-pub use scene::{BlockNode, CellNode, Edge, Endpoint, Level, Rect, RegionNode, Scene, Totals};
-pub use stats::{DrawnCounts, FrameSpans, FrameStats};
+pub use scene::{
+    BlockNode, CellNode, Edge, EdgeIndex, EdgeSegment, Endpoint, Level, Rect, RegionNode, Scene,
+    Totals,
+};
+pub use stats::{DrawnCounts, FrameSpans, FrameStats, TextCacheCounts};

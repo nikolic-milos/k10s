@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::camera::Camera;
 use crate::scene::{Scene, Totals};
-use crate::stats::{DrawnCounts, FrameSpans, FrameStats};
+use crate::stats::{DrawnCounts, FrameSpans, FrameStats, TextCacheCounts};
 
 const VIEWPORT_STABLE_SECS: f32 = 0.75;
 const MAX_RESTARTS: u32 = 5;
@@ -55,6 +55,7 @@ pub struct SegmentResult {
     pub labels_dropped: usize,
     pub icons_dropped: usize,
     pub curves_dropped: usize,
+    pub text_cache: TextCacheCounts,
     pub spans: FrameSpans,
     pub cpu_ms: CpuPercentiles,
     pub frame_ms: Percentiles,
@@ -216,18 +217,26 @@ impl Flight {
 
         let mut fit = Camera::default();
         fit.fit(scene.bounds, vw, vh);
-        let Some(big) = scene
+        let Some((region_index, region)) = scene
             .regions
             .iter()
-            .filter(|r| !r.children.is_empty())
-            .max_by_key(|r| r.weight)
+            .enumerate()
+            .filter(|(_, region)| !region.children.is_empty())
+            .max_by_key(|(_, r)| r.weight)
         else {
             eprintln!(
                 "bench: no region in the scene has a block to fly to; aborting. Raise --objects until one does, then re-run."
             );
             return false;
         };
-        let block = &scene.blocks[big.children.start as usize];
+        let Some(block) = scene
+            .region_block_indices(region_index)
+            .next()
+            .map(|index| &scene.blocks[index])
+        else {
+            eprintln!("bench: the selected region has no addressable workload; aborting flight");
+            return false;
+        };
 
         let mut hub: Option<&crate::scene::BlockNode<B>> = None;
         for b in &scene.blocks {
@@ -238,7 +247,7 @@ impl Flight {
         }
         let anchors = FlightAnchors {
             fit,
-            region_center: big.rect.center(),
+            region_center: region.rect.center(),
             block_center: block.inner.center(),
             hub_center: hub.unwrap_or(block).inner.center(),
         };
@@ -300,6 +309,7 @@ impl Flight {
                     labels_dropped: stats.labels_dropped,
                     icons_dropped: stats.icons_dropped,
                     curves_dropped: stats.curves_dropped,
+                    text_cache: stats.text_cache,
                     spans: stats.span_p50(),
                     cpu_ms: CpuPercentiles { p50: c50, p99: c99 },
                     frame_ms: Percentiles { p50, p95, p99 },
@@ -335,22 +345,27 @@ impl Flight {
 fn proc_cpu_ms() -> f64 {
     #[cfg(target_os = "linux")]
     {
-        const TICK_MS: f64 = 1000.0 / 100.0;
-
-        if let Ok(stat) = std::fs::read_to_string("/proc/self/stat")
-            && let Some((_, rest)) = stat.rsplit_once(')')
-        {
-            let mut fields = rest.split_ascii_whitespace();
-            let utime: f64 = fields.nth(11).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let stime: f64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            return (utime + stime) * TICK_MS;
-        }
-        0.0
+        std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|stat| proc_stat_cpu_ms(&stat, rustix::param::clock_ticks_per_second()))
+            .unwrap_or(0.0)
     }
     #[cfg(not(target_os = "linux"))]
     {
         0.0
     }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_cpu_ms(stat: &str, ticks_per_second: u64) -> Option<f64> {
+    if ticks_per_second == 0 {
+        return None;
+    }
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_ascii_whitespace();
+    let user_ticks: u64 = fields.nth(11)?.parse().ok()?;
+    let system_ticks: u64 = fields.next()?.parse().ok()?;
+    Some((user_ticks + system_ticks) as f64 * 1000.0 / ticks_per_second as f64)
 }
 
 fn smoothstep(t: f32) -> f32 {
@@ -371,6 +386,15 @@ mod tests {
     use crate::scene::{BlockNode, CellNode, Rect, RegionNode};
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_uses_the_reported_clock_rate_and_the_last_name_delimiter() {
+        let stat = "42 (worker) with ) delimiters) R 1 2 3 4 5 6 7 8 9 10 250 125";
+        assert_eq!(proc_stat_cpu_ms(stat, 250), Some(1_500.0));
+        assert_eq!(proc_stat_cpu_ms(stat, 0), None);
+        assert_eq!(proc_stat_cpu_ms("malformed", 250), None);
+    }
 
     fn tiny_scene() -> Scene {
         let block_rect = Rect::new(10.0, 10.0, 50.0, 30.0);
@@ -398,9 +422,16 @@ mod tests {
                 ext: (),
             }],
             sats: vec![],
+            region_blocks: vec![],
+            block_cells: vec![],
+            block_sats: vec![],
+            spatial_index: Default::default(),
             edges: vec![],
+            edge_segments: vec![],
             region_edges: vec![],
+            region_edge_indexes: vec![],
             cross_edges: 0..0,
+            cross_edge_index: Default::default(),
             totals: Totals {
                 regions: 1,
                 blocks: 1,

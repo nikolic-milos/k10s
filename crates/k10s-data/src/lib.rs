@@ -2,6 +2,7 @@ pub mod assemble;
 pub mod connect;
 pub mod discover;
 pub mod mapping;
+mod projection;
 pub mod rbac;
 pub mod watch;
 
@@ -10,21 +11,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
-use k10s_core::{
-    Capability, Catalog, DesyncReason, IngestEvent, KindId, Op, Payload, ResourceEvent, State,
-};
+use crossbeam_channel::{Sender, TrySendError};
+use k10s_core::{Capability, Catalog, DesyncReason, IngestEvent, KindId, Op};
 
-use assemble::{AssembleStats, Index, Store};
+use assemble::{AssembleStats, Store};
 use connect::{ConnectError, Connector, Env};
 use discover::{Discovered, WatchTarget};
-use mapping::{AttachKinds, Detail, Staged};
+use mapping::AttachKinds;
+use projection::{Change, Projection};
 use rbac::Access;
 use watch::Message;
 
 pub type EventSink = Sender<IngestEvent>;
 
-const INTERNAL_QUEUE: usize = 8192;
+pub const DEFAULT_EVENT_SINK_CAPACITY: usize = 8_192;
+
+const INTERNAL_QUEUE: usize = DEFAULT_EVENT_SINK_CAPACITY;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -334,6 +336,7 @@ pub async fn sync_from(
     let assembled = assemble::assemble(&store, &mut catalog);
     report.assemble_ms = ms(at_assemble);
     report.assemble = assembled.stats;
+    let projection = Projection::from_assembled(&assembled);
 
     let mut events = assembled.events;
     for (kind, verdict) in verdicts(&discovered, &watch_set, &access) {
@@ -358,14 +361,7 @@ pub async fn sync_from(
     report.total_ms = ms(started);
 
     let snapshot = catalog.clone();
-    tokio::spawn(forward_live(
-        rx,
-        store,
-        catalog,
-        assembled.index,
-        sink,
-        metrics,
-    ));
+    tokio::spawn(forward_live(rx, store, catalog, projection, sink, metrics));
 
     Ok(Sync {
         events,
@@ -394,12 +390,6 @@ fn streams_settled(settled: &Settled, kind: KindId) -> usize {
     settled.get(&kind).map(|(n, _)| *n).unwrap_or(0)
 }
 
-struct Change {
-    op: Op,
-    uid: Arc<str>,
-    removed: Option<Box<Staged>>,
-}
-
 fn apply(
     message: Message,
     store: &mut Store,
@@ -411,25 +401,21 @@ fn apply(
         Message::Apply { staged, .. } => {
             metrics.applies.fetch_add(1, Ordering::Relaxed);
             let uid = staged.uid.clone();
-            let op = if store.get(&uid).is_some() {
+            let before = store.replace(*staged).map(Box::new);
+            let op = if before.is_some() {
                 Op::Modified
             } else {
                 Op::Added
             };
-            store.apply(*staged);
-            Some(Change {
-                op,
-                uid,
-                removed: None,
-            })
+            Some(Change { op, uid, before })
         }
         Message::Delete { uid, .. } => {
             metrics.deletes.fetch_add(1, Ordering::Relaxed);
-            let removed = store.remove(&uid).map(Box::new);
+            let before = store.remove(&uid).map(Box::new);
             Some(Change {
                 op: Op::Deleted,
                 uid,
-                removed,
+                before,
             })
         }
         Message::Settled { kind, listed } => {
@@ -452,7 +438,7 @@ async fn forward_live(
     mut rx: tokio::sync::mpsc::Receiver<Message>,
     mut store: Store,
     mut catalog: Catalog,
-    index: Index,
+    mut projection: Projection,
     sink: EventSink,
     metrics: Arc<IngestMetrics>,
 ) {
@@ -467,85 +453,34 @@ async fn forward_live(
             _ => None,
         };
         let changed = apply(message, &mut store, &mut settled, &mut desyncs, &metrics);
-        let event = match forward {
-            Some(e) => Some(e),
-            None => changed.and_then(|c| live_event(&store, &index, &mut catalog, &c)),
+        let events = match forward {
+            Some(event) => vec![event],
+            None => changed
+                .as_ref()
+                .map(|change| projection.project(&store, &mut catalog, change))
+                .unwrap_or_default(),
         };
-        let Some(event) = event else { continue };
-        if sink.send(event).is_err() {
-            return;
+        for event in events {
+            if !send_live(&sink, event).await {
+                return;
+            }
+            metrics.forwarded.fetch_add(1, Ordering::Relaxed);
         }
-        metrics.forwarded.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-fn live_event(
-    store: &Store,
-    index: &Index,
-    catalog: &mut Catalog,
-    change: &Change,
-) -> Option<IngestEvent> {
-    let staged: &Staged = match &change.removed {
-        Some(removed) => removed,
-        None => store.get(&change.uid)?,
-    };
-    let uid = &*change.uid;
-    let op = change.op;
-    let (parent, payload) = match &staged.detail {
-        Detail::Scope => (None, Payload::Scope),
-        Detail::Owner { tool } => {
-            if store.is_pass_through(staged.kind) && !index.emitted_owner(uid) {
-                return None;
-            }
-            (
-                Some(index.scope_uid(&staged.namespace)?.clone()),
-                Payload::Owner {
-                    kind: staged.kind,
-                    tool: *tool,
-                    depends_on: live_depends_on(index, staged),
-                },
+async fn send_live(sink: &EventSink, event: IngestEvent) -> bool {
+    match sink.try_send(event) {
+        Ok(()) => true,
+        Err(TrySendError::Disconnected(_)) => false,
+        Err(TrySendError::Full(event)) => {
+            let sink = sink.clone();
+            matches!(
+                tokio::task::spawn_blocking(move || sink.send(event)).await,
+                Ok(Ok(()))
             )
         }
-        Detail::Instance { reason, .. } => (
-            Some(index.parent_of(uid)?.clone()),
-            Payload::Instance {
-                state: State {
-                    severity: reason.severity,
-                    reason: catalog.intern_reason(&reason.display),
-                },
-            },
-        ),
-        Detail::Attached { detail, .. } => (
-            Some(
-                index
-                    .attachment_owner(staged.kind, &staged.namespace, &staged.name)?
-                    .clone(),
-            ),
-            Payload::Attached {
-                kind: staged.kind,
-                detail: detail.clone(),
-            },
-        ),
-    };
-    Some(IngestEvent::Resource(ResourceEvent {
-        kind: staged.kind,
-        uid: staged.uid.clone(),
-        namespace: staged.namespace.clone(),
-        name: staged.name.clone(),
-        resource_version: staged.resource_version,
-        parent,
-        op,
-        payload,
-    }))
-}
-
-fn live_depends_on(index: &Index, staged: &Staged) -> Vec<Arc<str>> {
-    staged
-        .controller
-        .as_ref()
-        .filter(|c| index.emitted_owner(&c.uid))
-        .map(|c| vec![c.uid.clone()])
-        .unwrap_or_default()
+    }
 }
 
 pub fn verdicts(
@@ -596,8 +531,8 @@ pub fn verdicts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::{Controller, Reason};
-    use k10s_core::{Intake, Role, Severity, ToolId, replay};
+    use crate::mapping::{Controller, Detail, Reason, Staged};
+    use k10s_core::{Intake, Payload, ResourceEvent, Role, Severity, ToolId, replay};
 
     #[test]
     fn the_sink_carries_contract_events_to_an_intake() {
@@ -621,6 +556,27 @@ mod tests {
             4
         );
         assert_eq!(plane.metrics(), MetricsSnapshot::default());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_bounded_sink_backpressures_without_dropping() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let first = IngestEvent::Synced { kind: KindId::POD };
+        let second = IngestEvent::Synced {
+            kind: KindId::NAMESPACE,
+        };
+        tx.send(first.clone()).expect("the sink is connected");
+
+        let mut blocked = Box::pin(send_live(&tx, second.clone()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut blocked)
+                .await
+                .is_err(),
+            "a full sink must apply backpressure"
+        );
+        assert_eq!(rx.recv().expect("the first event remained queued"), first);
+        assert!(blocked.await);
+        assert_eq!(rx.recv().expect("the second event was forwarded"), second);
     }
 
     const RS: KindId = KindId(9_500);
@@ -674,11 +630,11 @@ mod tests {
         (store, catalog, assembled)
     }
 
-    fn modified(uid: &str) -> Change {
+    fn modified(store: &Store, uid: &str) -> Change {
         Change {
             op: Op::Modified,
             uid: uid.into(),
-            removed: None,
+            before: store.get(uid).cloned().map(Box::new),
         }
     }
 
@@ -708,30 +664,140 @@ mod tests {
                 ctrl("rs-2", "ReplicaSet", "hand-rolled", "apps/v1"),
             ),
         ]);
-        let index = &assembled.index;
+        let mut projection = Projection::from_assembled(&assembled);
 
         assert!(
-            live_event(&store, index, &mut catalog, &modified("rs-1")).is_none(),
+            projection
+                .project(&store, &mut catalog, &modified(&store, "rs-1"))
+                .is_empty(),
             "a ReplicaSet under a Deployment has no card to update"
         );
-        let promoted = resource_event(live_event(&store, index, &mut catalog, &modified("rs-2")));
+        let promoted = resource_event(
+            projection
+                .project(&store, &mut catalog, &modified(&store, "rs-2"))
+                .into_iter()
+                .next(),
+        );
         assert_eq!(promoted.parent.as_deref(), Some("ns-1"));
         assert!(matches!(promoted.payload, Payload::Owner { kind, .. } if kind == RS));
-        let dep = resource_event(live_event(&store, index, &mut catalog, &modified("dep-1")));
+        let dep = resource_event(
+            projection
+                .project(&store, &mut catalog, &modified(&store, "dep-1"))
+                .into_iter()
+                .next(),
+        );
         assert_eq!(&*dep.uid, "dep-1");
         for (pod, parent) in [("pod-1", "dep-1"), ("pod-2", "rs-2")] {
-            let event = resource_event(live_event(&store, index, &mut catalog, &modified(pod)));
+            let event = resource_event(
+                projection
+                    .project(&store, &mut catalog, &modified(&store, pod))
+                    .into_iter()
+                    .next(),
+            );
             assert_eq!(event.parent.as_deref(), Some(parent), "{pod}");
         }
 
-        let removed = store.remove("rs-1").map(Box::new);
-        assert!(removed.is_some(), "the store held it");
+        let before = store.remove("rs-1").map(Box::new);
+        assert!(before.is_some(), "the store held it");
         let vanished = Change {
             op: Op::Deleted,
             uid: "rs-1".into(),
-            removed,
+            before,
         };
-        assert!(live_event(&store, index, &mut catalog, &vanished).is_none());
+        let reparented = projection.project(&store, &mut catalog, &vanished);
+        assert!(
+            reparented.iter().any(|event| matches!(
+                event,
+                IngestEvent::Resource(resource)
+                    if resource.uid.as_ref() == "rs-1" && resource.op == Op::Added
+            )),
+            "the still-running pod keeps a synthetic card for its now-unwatched controller"
+        );
+        assert!(
+            reparented.iter().any(|event| matches!(
+                event,
+                IngestEvent::Resource(resource)
+                    if resource.uid.as_ref() == "pod-1"
+                        && resource.op == Op::Modified
+                        && resource.parent.as_deref() == Some("rs-1")
+            )),
+            "the dependent pod follows the rebuilt index"
+        );
+    }
+
+    #[test]
+    fn a_live_namespace_makes_its_waiting_topology_visible_parent_first() {
+        let (mut store, mut catalog, assembled) = after_sync(vec![
+            object(KindId::DEPLOYMENT, Role::Owner, "dep-1", "api"),
+            under(
+                object(KindId::POD, Role::Instance, "pod-1", "api-1"),
+                ctrl("dep-1", "Deployment", "api", "apps/v1"),
+            ),
+        ]);
+        assert!(assembled.events.is_empty(), "the scope is not visible yet");
+        let mut projection = Projection::from_assembled(&assembled);
+
+        let namespace = object(KindId::NAMESPACE, Role::Scope, "ns-1", "prod");
+        store.apply(namespace.clone());
+        let events = projection.project(
+            &store,
+            &mut catalog,
+            &Change {
+                op: Op::Added,
+                uid: namespace.uid,
+                before: None,
+            },
+        );
+        let resources: Vec<&ResourceEvent> = events
+            .iter()
+            .filter_map(|event| match event {
+                IngestEvent::Resource(resource) => Some(resource),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.uid.as_ref())
+                .collect::<Vec<_>>(),
+            ["ns-1", "dep-1", "pod-1"]
+        );
+        assert_eq!(resources[1].parent.as_deref(), Some("ns-1"));
+        assert_eq!(resources[2].parent.as_deref(), Some("dep-1"));
+        assert!(resources.iter().all(|resource| resource.op == Op::Added));
+    }
+
+    #[test]
+    fn deleting_a_scope_retracts_children_before_their_parents() {
+        let (mut store, mut catalog, assembled) = after_sync(vec![
+            object(KindId::NAMESPACE, Role::Scope, "ns-1", "prod"),
+            object(KindId::DEPLOYMENT, Role::Owner, "dep-1", "api"),
+            under(
+                object(KindId::POD, Role::Instance, "pod-1", "api-1"),
+                ctrl("dep-1", "Deployment", "api", "apps/v1"),
+            ),
+        ]);
+        let mut projection = Projection::from_assembled(&assembled);
+        let before = store.remove("ns-1").map(Box::new);
+        let events = projection.project(
+            &store,
+            &mut catalog,
+            &Change {
+                op: Op::Deleted,
+                uid: "ns-1".into(),
+                before,
+            },
+        );
+        let deleted: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                IngestEvent::Resource(resource) if resource.op == Op::Deleted => {
+                    Some(resource.uid.as_ref())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted, ["pod-1", "dep-1", "ns-1"]);
     }
 
     #[test]
@@ -748,7 +814,7 @@ mod tests {
                 ctrl("ro-1", "Rollout", "web", "argoproj.io/v1alpha1"),
             ),
         ]);
-        let index = &assembled.index;
+        let mut projection = Projection::from_assembled(&assembled);
         let from_sync = |uid: &str| {
             assembled
                 .events
@@ -762,21 +828,27 @@ mod tests {
                 })
                 .expect("the sync emitted this owner")
         };
-        let live = |uid: &str, catalog: &mut Catalog| {
-            let event = live_event(&store, index, catalog, &modified(uid));
+        let live = |uid: &str, catalog: &mut Catalog, projection: &mut Projection| {
+            let event = projection
+                .project(&store, catalog, &modified(&store, uid))
+                .into_iter()
+                .next();
             match resource_event(event).payload {
                 Payload::Owner { depends_on, .. } => depends_on,
                 other => panic!("expected an owner payload, got {other:?}"),
             }
         };
 
-        assert_eq!(live("job-1", &mut catalog), vec![Arc::<str>::from("cj-1")]);
         assert_eq!(
-            live("job-1", &mut catalog),
+            live("job-1", &mut catalog, &mut projection),
+            vec![Arc::<str>::from("cj-1")]
+        );
+        assert_eq!(
+            live("job-1", &mut catalog, &mut projection),
             from_sync("job-1"),
             "one producer, one answer"
         );
-        assert!(live("job-2", &mut catalog).is_empty());
+        assert!(live("job-2", &mut catalog, &mut projection).is_empty());
         assert!(from_sync("job-2").is_empty());
     }
 

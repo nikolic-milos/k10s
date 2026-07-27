@@ -133,7 +133,7 @@ impl Intake {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_uid.is_empty() && self.control.is_empty()
+        self.by_uid.is_empty() && self.control.is_empty() && self.overflowed.is_empty()
     }
 
     pub fn push(&mut self, event: IngestEvent) {
@@ -158,12 +158,8 @@ impl Intake {
     }
 
     fn signal_overflow(&mut self, kind: KindId) {
-        if self.overflowed.insert(kind) {
+        if self.overflowed.len() < CONTROL_CAPACITY && self.overflowed.insert(kind) {
             self.stats.desyncs += 1;
-            self.control.push(IngestEvent::Desync {
-                kind,
-                reason: DesyncReason::Overflow,
-            });
         }
     }
 
@@ -231,14 +227,19 @@ impl Intake {
     }
 
     pub fn drain_into(&mut self, out: &mut Vec<IngestEvent>) {
-        out.reserve(self.pending.len() + self.control.len());
+        out.reserve(self.pending.len() + self.control.len() + self.overflowed.len());
         for ev in self.pending.drain(..).flatten() {
             out.push(IngestEvent::Resource(ev));
         }
         out.append(&mut self.control);
+        let mut overflowed: Vec<KindId> = self.overflowed.drain().collect();
+        overflowed.sort_unstable_by_key(|kind| kind.0);
+        out.extend(overflowed.into_iter().map(|kind| IngestEvent::Desync {
+            kind,
+            reason: DesyncReason::Overflow,
+        }));
         self.first_added.clear();
         self.by_uid.clear();
-        self.overflowed.clear();
     }
 
     pub fn drain(&mut self) -> Vec<IngestEvent> {
@@ -473,7 +474,7 @@ mod tests {
             i.push(IngestEvent::Synced { kind: KindId::POD });
         }
         assert!(
-            i.control.len() <= CONTROL_CAPACITY + 1,
+            i.control.len() <= CONTROL_CAPACITY,
             "control grew to {}",
             i.control.len()
         );
@@ -490,6 +491,36 @@ mod tests {
             )),
             "a bound nobody is told about is a stall"
         );
+    }
+
+    #[test]
+    fn distinct_overflows_are_bounded_and_drain_deterministically() {
+        let mut i = Intake::with_capacity(0);
+        for n in (0..CONTROL_CAPACITY * 3).rev() {
+            let mut event = match res("full", Op::Added, n as u64) {
+                IngestEvent::Resource(event) => event,
+                _ => unreachable!(),
+            };
+            event.kind = KindId(n as u32);
+            i.push(IngestEvent::Resource(event));
+        }
+        assert_eq!(i.overflowed.len(), CONTROL_CAPACITY);
+        assert!(i.control.is_empty());
+
+        let drained = i.drain();
+        assert_eq!(drained.len(), CONTROL_CAPACITY);
+        let kinds: Vec<u32> = drained
+            .into_iter()
+            .map(|event| match event {
+                IngestEvent::Desync {
+                    kind,
+                    reason: DesyncReason::Overflow,
+                } => kind.0,
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert!(kinds.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(i.is_empty());
     }
 
     #[test]

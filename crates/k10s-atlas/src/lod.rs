@@ -18,6 +18,7 @@ pub struct LodPolicy {
     pub max_icons: usize,
     pub max_edges: usize,
     pub max_curves: usize,
+    pub max_cells_per_block: usize,
     pub sat_curves: bool,
 
     pub stress: bool,
@@ -26,6 +27,8 @@ pub struct LodPolicy {
 }
 
 impl LodPolicy {
+    const MIN_AGGREGATE_VISIBLE_FRACTION: f32 = 0.125;
+
     pub fn stage_for_zoom(&self, zoom: f32) -> u8 {
         let stage = if zoom >= self.stage_cell {
             2 + (zoom >= self.stage_cell_label) as u8
@@ -112,6 +115,14 @@ impl LodPolicy {
         } else {
             self.max_curves
         }
+    }
+
+    #[inline]
+    pub fn cells_aggregated(&self, cells: usize, visible_fraction: f32) -> bool {
+        cells > self.max_cells_per_block
+            && visible_fraction >= Self::MIN_AGGREGATE_VISIBLE_FRACTION
+            && !self.stress
+            && !self.stress_curves
     }
 }
 
@@ -236,6 +247,7 @@ mod tests {
             max_icons: 512,
             max_edges: 3000,
             max_curves: 1500,
+            max_cells_per_block: 1024,
             sat_curves: true,
             stress: false,
             stress_curves: false,
@@ -263,6 +275,20 @@ mod tests {
         pol.stress = true;
         assert_eq!(pol.stage_target(0, 0.01), 2);
         assert_eq!(pol.stage_target(3, 0.01), 2);
+    }
+
+    #[test]
+    fn aggregate_lod_requires_both_fan_out_and_visible_area() {
+        let mut pol = policy();
+        assert!(!pol.cells_aggregated(pol.max_cells_per_block, 1.0));
+        assert!(!pol.cells_aggregated(pol.max_cells_per_block + 1, 0.124));
+        assert!(pol.cells_aggregated(pol.max_cells_per_block + 1, 0.125));
+
+        pol.stress = true;
+        assert!(!pol.cells_aggregated(usize::MAX, 1.0));
+        pol.stress = false;
+        pol.stress_curves = true;
+        assert!(!pol.cells_aggregated(usize::MAX, 1.0));
     }
 
     #[test]
