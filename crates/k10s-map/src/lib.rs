@@ -25,6 +25,18 @@ pub use frame::FrameOpts;
 pub use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 pub use lod::{cull, stage_for_zoom};
 
+/// The painter's traversal seam, opened for `benches/walk.rs`.
+///
+/// `frame::walk` and its sink are crate-private because `paint_map` is their only caller and
+/// this crate's public surface is already wider than its one consumer uses. A bench target is a
+/// separate crate, so it can see nothing else; this feature -- and only this feature -- lifts the
+/// seam out, the same way `k10s-atlas` opens its scene generator. Timing anything narrower than
+/// `walk` would time the cull oracle again, which is the whole reason the bench exists.
+#[cfg(feature = "testing")]
+pub mod testing {
+    pub use crate::frame::{FramePaths, FrameSink, IconJob, LabelJob, PaintSink, walk};
+}
+
 use bench::{Bench, BenchFrame};
 use colors::*;
 use frame::{IconJob, LabelJob, PaintSink};
@@ -146,6 +158,7 @@ pub struct MapView {
     drag: Option<Point<Pixels>>,
     churn_on: bool,
     edges_on: bool,
+    hud_on: bool,
     fitted: bool,
 
     interacted: bool,
@@ -189,6 +202,7 @@ impl MapView {
             drag: None,
             churn_on: true,
             edges_on: true,
+            hud_on: true,
             fitted: false,
             interacted: false,
             last_vp: (0.0, 0.0),
@@ -272,10 +286,13 @@ impl Render for MapView {
         let icon_buf = self.icon_buf.clone();
         let edges_on = self.edges_on;
         let churn_on = self.churn_on;
+        let hud_on = self.hud_on;
 
         div()
             .size_full()
-            .bg(rgb(BG))
+            // No `.bg()` here: the canvas below fills this element exactly, and `frame::walk`
+            // opens every frame with a full-bounds quad in the same colour. Two fills of one
+            // viewport-sized rect per frame, and the second one is the one the cull oracle counts.
             .track_focus(&self.focus_handle)
             .on_mouse_down(
                 MouseButton::Left,
@@ -320,6 +337,7 @@ impl Render for MapView {
                         let _ = this.ctrl.send(WorldCtrl::SetChurn(this.churn_on));
                     }
                     "e" => this.edges_on = !this.edges_on,
+                    "h" => this.hud_on = !this.hud_on,
                     "f" => {
                         let scene = this.scene.load();
                         let (vw, vh) = Self::viewport(window);
@@ -345,6 +363,7 @@ impl Render for MapView {
                             &icon_buf,
                             edges_on,
                             churn_on,
+                            hud_on,
                             was_continuous,
                             animating,
                             window,
@@ -401,6 +420,7 @@ fn paint_map(
     icon_buf: &Rc<RefCell<Vec<IconJob>>>,
     edges_on: bool,
     churn_on: bool,
+    hud_on: bool,
     was_continuous: bool,
     animating: bool,
     window: &mut Window,
@@ -456,25 +476,38 @@ fn paint_map(
     window.paint_quads(&bg);
 
     let paths_start = std::time::Instant::now();
-    if counts.bg_cells > 0
-        && let Ok(path) = paths.hex.build()
-    {
-        window.paint_path(path, rgb(HEX_LINE).alpha(hex::level(zoom).1));
+    // Tessellation is the one step that can reject the geometry the walk produced: a layer too big
+    // for the `u16` index buffer gpui builds a path into fails whole, and dropping the `Err` costs
+    // the frame that entire layer -- which reads as "the hex grid is off", not as an error. Release
+    // still degrades rather than dying; a debug build names the layer. The oracle test makes the
+    // same four assertions headless, but only over pinned viewports and cameras.
+    if counts.bg_cells > 0 {
+        let hex = paths.hex.build();
+        debug_assert!(hex.is_ok(), "hex layer failed to tessellate");
+        if let Ok(path) = hex {
+            window.paint_path(path, rgb(HEX_LINE).alpha(hex::level(zoom).1));
+        }
     }
 
-    if counts.edges > 0
-        && let Ok(path) = paths.edges.build()
-    {
-        window.paint_path(path, rgb(EDGE).alpha(0.30 * cell_alpha));
+    if counts.edges > 0 {
+        let edges = paths.edges.build();
+        debug_assert!(edges.is_ok(), "edge layer failed to tessellate");
+        if let Ok(path) = edges {
+            window.paint_path(path, rgb(EDGE).alpha(0.30 * cell_alpha));
+        }
     }
 
     if counts.curves > 0 {
-        if paths.glow
-            && let Ok(path) = paths.curve_glow.build()
-        {
-            window.paint_path(path, rgb(CURVE_GLOW).alpha(CURVE_GLOW_ALPHA * cell_alpha));
+        if paths.glow {
+            let glow = paths.curve_glow.build();
+            debug_assert!(glow.is_ok(), "curve glow layer failed to tessellate");
+            if let Ok(path) = glow {
+                window.paint_path(path, rgb(CURVE_GLOW).alpha(CURVE_GLOW_ALPHA * cell_alpha));
+            }
         }
-        if let Ok(path) = paths.curve_core.build() {
+        let core = paths.curve_core.build();
+        debug_assert!(core.is_ok(), "curve core layer failed to tessellate");
+        if let Ok(path) = core {
             window.paint_path(path, rgb(CURVE_CORE).alpha(CURVE_CORE_ALPHA * cell_alpha));
         }
     }
@@ -589,6 +622,7 @@ fn paint_map(
         blend,
         edges_on,
         churn_on,
+        hud_on,
         animating,
         ox,
         oy,
@@ -613,6 +647,10 @@ fn span_us(from: std::time::Instant, to: std::time::Instant) -> f32 {
     (to - from).as_secs_f32() * 1_000_000.0
 }
 
+/// The `[h]` toggle gates everything below, not just the drawing: `frame_percentiles` and
+/// `cpu_percentiles` each sort up to 240 samples, and both run after `end_cpu`, so no §6.7 gate
+/// metric sees them. `spans.hud_us` is the only span that does, which is what makes the toggle the
+/// way to find out what they cost.
 #[expect(clippy::too_many_arguments)]
 fn paint_hud(
     scene: &SceneSnapshot,
@@ -621,12 +659,17 @@ fn paint_hud(
     blend: StageBlend,
     edges_on: bool,
     churn_on: bool,
+    hud_on: bool,
     animating: bool,
     ox: f32,
     oy: f32,
     window: &mut Window,
     cx: &mut App,
 ) {
+    if !hud_on {
+        return;
+    }
+
     let st = stats.borrow();
     let (fp50, fp95, fp99) = st.frame_percentiles();
     let (cp50, cp99) = st.cpu_percentiles();
@@ -677,7 +720,7 @@ fn paint_hud(
             group(st.drawn.cells as u32),
         ),
         format!(
-            "[c]hurn {}  [e]dges {}  [f]it",
+            "[c]hurn {}  [e]dges {}  [f]it  [h]ide",
             if churn_on { "on" } else { "off" },
             if edges_on { "on" } else { "off" },
         ),
@@ -701,7 +744,9 @@ fn paint_hud(
 
     let font = gpui::font("JetBrains Mono");
     for (i, text) in lines.iter().enumerate() {
-        let s = SharedString::from(text.clone());
+        // `from(&str)` and not `from(text.clone())`: `SmolStr` copies either way at these lengths,
+        // and cloning the `String` first is the copy that buys nothing.
+        let s = SharedString::from(text.as_str());
         let run = TextRun {
             len: s.len(),
             font: font.clone(),
