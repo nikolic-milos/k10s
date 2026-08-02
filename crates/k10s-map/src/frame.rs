@@ -532,7 +532,9 @@ impl<S: FrameSink> FrameWalk<'_, S> {
 
     fn finish(mut self, scene: &SceneSnapshot) -> CullStats {
         if self.hex_shown {
-            let (radius, _) = hex::level(self.zoom);
+            // The clamp can grow the grid pitch; ring vertices must use the
+            // same radius as the centers or clamped frames draw gapped hexes.
+            let radius = hex::effective_radius(&self.visible, hex::level(self.zoom).0);
             self.stats.bg_cells =
                 hex::for_each_center(&self.visible, radius, |center_x, center_y| {
                     let mut ring = [(0.0f32, 0.0f32); 6];
@@ -781,6 +783,7 @@ mod tests {
 
     use super::*;
     use crate::lod::{Knobs, policy};
+    use k10s_core::SceneData;
 
     const INLINE_CAP: usize = 23;
 
@@ -802,47 +805,50 @@ mod tests {
 
     fn scene(cell_label: &str) -> SceneSnapshot {
         SceneSnapshot {
-            rev: 1,
-            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
-            regions: vec![NsNode {
-                rect: Rect::new(0.0, 0.0, 100.0, 100.0),
-                label: Arc::from("payments-production-eu-west"),
-                weight: 1,
-                children: 0..1,
-                ext: NsExt {
-                    unhealthy_frac: 0.25,
-                    rollup: Severity::Warn,
-                },
-            }],
-            blocks: vec![WorkloadNode {
-                rect: Rect::new(10.0, 10.0, 60.0, 60.0),
-                inner: Rect::new(10.0, 10.0, 60.0, 60.0),
-                label: Arc::from("checkout-api-canary-rollout"),
-                children: 0..1,
-                sats: 0..1,
-                ext: WlExt {
-                    kind: KindId::DEPLOYMENT,
-                    tool: ToolId::NONE,
-                    rollup: Severity::Ok,
-                    ns: 0,
-                },
-            }],
-            cells: vec![PodNode {
-                rect: Rect::new(12.0, 12.0, 20.0, 20.0),
-                label: Arc::from(cell_label),
-                ext: PodExt {
-                    state: State::of(ReasonId::RUNNING),
-                },
-            }],
-            sats: vec![SatNode {
-                rect: Rect::new(75.0, 20.0, 10.0, 10.0),
-                label: Arc::from("checkout-api-primary-service"),
-                ext: SatExt {
-                    kind: KindId::SERVICE,
-                    detail: Arc::from("ClusterIP 10.96.0.1:8443/tcp"),
-                },
-            }],
-            ..SceneSnapshot::default()
+            ids: Default::default(),
+            scene: SceneData {
+                rev: 1,
+                bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+                regions: vec![NsNode {
+                    rect: Rect::new(0.0, 0.0, 100.0, 100.0),
+                    label: Arc::from("payments-production-eu-west"),
+                    weight: 1,
+                    children: 0..1,
+                    ext: NsExt {
+                        unhealthy_frac: 0.25,
+                        rollup: Severity::Warn,
+                    },
+                }],
+                blocks: vec![WorkloadNode {
+                    rect: Rect::new(10.0, 10.0, 60.0, 60.0),
+                    inner: Rect::new(10.0, 10.0, 60.0, 60.0),
+                    label: Arc::from("checkout-api-canary-rollout"),
+                    children: 0..1,
+                    sats: 0..1,
+                    ext: WlExt {
+                        kind: KindId::DEPLOYMENT,
+                        tool: ToolId::NONE,
+                        rollup: Severity::Ok,
+                        ns: 0,
+                    },
+                }],
+                cells: vec![PodNode {
+                    rect: Rect::new(12.0, 12.0, 20.0, 20.0),
+                    label: Arc::from(cell_label),
+                    ext: PodExt {
+                        state: State::of(ReasonId::RUNNING),
+                    },
+                }],
+                sats: vec![SatNode {
+                    rect: Rect::new(75.0, 20.0, 10.0, 10.0),
+                    label: Arc::from("checkout-api-primary-service"),
+                    ext: SatExt {
+                        kind: KindId::SERVICE,
+                        detail: Arc::from("ClusterIP 10.96.0.1:8443/tcp"),
+                    },
+                }],
+                ..SceneData::default()
+            },
         }
     }
 

@@ -152,6 +152,7 @@ fn reference_edges(scene: &SceneSnapshot, visible: &Rect, max_edges: usize) -> u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k10s_core::SceneData;
     use k10s_core::{
         KindId, NsExt, NsNode, PodExt, PodNode, Rect, SatExt, SatNode, Severity, State, ToolId,
         Totals, WlExt, WorkloadNode,
@@ -171,62 +172,76 @@ mod tests {
         let halo = Rect::new(10.0, 20.0, 110.0, 60.0);
         let card = Rect::new(10.0, 20.0, 80.0, 60.0);
         SceneSnapshot {
-            rev: 1,
-            bounds: Rect::new(0.0, 0.0, 400.0, 200.0),
-            regions: vec![NsNode {
-                rect: Rect::new(0.0, 0.0, 200.0, 100.0),
-                label: Arc::from("ns"),
-                weight: 1,
-                children: 0..1,
-                ext: NsExt {
-                    unhealthy_frac: 0.0,
-                    rollup: Severity::Ok,
+            ids: Default::default(),
+            scene: SceneData {
+                rev: 1,
+                bounds: Rect::new(0.0, 0.0, 400.0, 200.0),
+                regions: vec![NsNode {
+                    rect: Rect::new(0.0, 0.0, 200.0, 100.0),
+                    label: Arc::from("ns"),
+                    weight: 1,
+                    children: 0..1,
+                    ext: NsExt {
+                        unhealthy_frac: 0.0,
+                        rollup: Severity::Ok,
+                    },
+                }],
+                blocks: vec![WorkloadNode {
+                    rect: halo,
+                    inner: card,
+                    label: Arc::from("wl"),
+                    children: 0..1,
+                    sats: 0..1,
+                    ext: WlExt {
+                        kind: KindId::DEPLOYMENT,
+                        tool: ToolId::NONE,
+                        rollup: Severity::Ok,
+                        ns: 0,
+                    },
+                }],
+                cells: vec![PodNode {
+                    rect: Rect::new(20.0, 40.0, 12.0, 12.0),
+                    label: Arc::from("pod"),
+                    ext: PodExt { state: State::OK },
+                }],
+                sats: vec![SatNode {
+                    rect: Rect::new(94.0, 30.0, 18.0, 18.0),
+                    label: Arc::from("pvc/data-wl-0"),
+                    ext: SatExt {
+                        kind: KindId::VOLUME,
+                        detail: Arc::from("16Gi"),
+                    },
+                }],
+                region_blocks: vec![],
+                block_cells: vec![],
+                block_sats: vec![],
+                spatial_index: Default::default(),
+                edges: vec![],
+                edge_segments: vec![],
+                region_edges: vec![],
+                region_edge_indexes: vec![],
+                cross_edges: 0..0,
+                cross_edge_index: Default::default(),
+                totals: Totals {
+                    regions: 1,
+                    blocks: 1,
+                    cells: 1,
+                    sats: 1,
+                    edges: 0,
                 },
-            }],
-            blocks: vec![WorkloadNode {
-                rect: halo,
-                inner: card,
-                label: Arc::from("wl"),
-                children: 0..1,
-                sats: 0..1,
-                ext: WlExt {
-                    kind: KindId::DEPLOYMENT,
-                    tool: ToolId::NONE,
-                    rollup: Severity::Ok,
-                    ns: 0,
-                },
-            }],
-            cells: vec![PodNode {
-                rect: Rect::new(20.0, 40.0, 12.0, 12.0),
-                label: Arc::from("pod"),
-                ext: PodExt { state: State::OK },
-            }],
-            sats: vec![SatNode {
-                rect: Rect::new(94.0, 30.0, 18.0, 18.0),
-                label: Arc::from("pvc/data-wl-0"),
-                ext: SatExt {
-                    kind: KindId::VOLUME,
-                    detail: Arc::from("16Gi"),
-                },
-            }],
-            region_blocks: vec![],
-            block_cells: vec![],
-            block_sats: vec![],
-            spatial_index: Default::default(),
-            edges: vec![],
-            edge_segments: vec![],
-            region_edges: vec![],
-            region_edge_indexes: vec![],
-            cross_edges: 0..0,
-            cross_edge_index: Default::default(),
-            totals: Totals {
-                regions: 1,
-                blocks: 1,
-                cells: 1,
-                sats: 1,
-                edges: 0,
             },
         }
+    }
+
+    #[test]
+    fn the_bench_fixture_policy_is_the_shipping_policy() {
+        assert_eq!(
+            policy(Knobs::default()),
+            k10s_atlas::testing::lod_policy(),
+            "k10s_atlas::testing::lod_policy() is a hand-maintained copy of \
+             lod::policy(Knobs::default()); four gated bench suites measure the \
+             copy, so a drift here silently benchmarks a non-shipping policy"
+        );
     }
 
     #[test]

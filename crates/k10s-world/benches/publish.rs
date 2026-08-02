@@ -12,7 +12,7 @@ const MODE: LayoutMode = LayoutMode::Spread;
 const OBJECT_COUNTS: [u32; 2] = [25_000, 50_000];
 const CHANGED_PODS: [usize; 5] = [1, 16, 256, 4096, 16_384];
 const WARMUP: usize = 8;
-const MIN_ITERS: usize = 40;
+const MIN_ITERS: usize = P99_MIN_ITERS;
 const MAX_ITERS: usize = 20_000;
 const BUDGET: Duration = Duration::from_millis(250);
 
@@ -26,7 +26,7 @@ fn tail_value(sorted: &[u64]) -> f64 {
     if sorted.len() >= P99_MIN_ITERS {
         percentile(sorted, 0.99)
     } else {
-        sorted.last().copied().unwrap_or(0) as f64
+        sorted.last().copied().unwrap_or(0) as f64 / 1000.0
     }
 }
 
@@ -69,6 +69,7 @@ fn delta(before: PublishStats, after: PublishStats) -> PublishStats {
     PublishStats {
         publishes: after.publishes - before.publishes,
         full_materializes: after.full_materializes - before.full_materializes,
+        structural_patches: after.structural_patches - before.structural_patches,
         deep_clones: after.deep_clones - before.deep_clones,
     }
 }
@@ -273,10 +274,15 @@ fn topology_update(spec: &ClusterSpec, objects: u32, timed_op: Op) -> Case {
         let stats = apply_and_publish(&mut bench, timed);
         samples.push(sample_start.elapsed().as_nanos() as u64);
         assert_eq!(stats.publishes, 1);
-        assert_eq!(stats.full_materializes, 1);
+        assert_eq!(
+            stats.full_materializes + stats.structural_patches,
+            1,
+            "one structural publish is one patch or one full materialize"
+        );
         assert_eq!(stats.deep_clones, 0);
         measured_stats.publishes += stats.publishes;
         measured_stats.full_materializes += stats.full_materializes;
+        measured_stats.structural_patches += stats.structural_patches;
         if let Some(event) = restore {
             apply_and_publish(&mut bench, event);
         }
@@ -379,7 +385,7 @@ fn print_table(cases: &[Case]) {
             println!("\n  {} objects, {} pods", c.objects, c.pods);
         }
         println!(
-            "    {:<17} {:>6} changed  p50 {:>9.3} us  {} {:>9.3} us | samples {:>5} x {:>2} rMAD {:>5.1}% publishes {:>5} full {:>5} deep clones {:>5}",
+            "    {:<17} {:>6} changed  p50 {:>9.3} us  {} {:>9.3} us | samples {:>5} x {:>2} rMAD {:>5.1}% publishes {:>5} full {:>5} patches {:>5} deep clones {:>5}",
             c.op,
             c.changed,
             c.p50_us,
@@ -390,6 +396,7 @@ fn print_table(cases: &[Case]) {
             c.p50_rmad * 100.0,
             c.stats.publishes,
             c.stats.full_materializes,
+            c.stats.structural_patches,
             c.stats.deep_clones,
         );
     }
@@ -418,6 +425,10 @@ fn print_json(cases: &[Case]) {
         println!(
             "      \"full_materializes\": {},",
             c.stats.full_materializes
+        );
+        println!(
+            "      \"structural_patches\": {},",
+            c.stats.structural_patches
         );
         println!("      \"deep_clones\": {}", c.stats.deep_clones);
         println!("    }}{comma}");

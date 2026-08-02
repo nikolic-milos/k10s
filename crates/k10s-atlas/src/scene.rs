@@ -55,7 +55,7 @@ impl Rect {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegionNode<X = ()> {
     pub rect: Rect,
     pub label: Arc<str>,
@@ -64,7 +64,7 @@ pub struct RegionNode<X = ()> {
     pub ext: X,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BlockNode<X = ()> {
     pub rect: Rect,
 
@@ -75,7 +75,7 @@ pub struct BlockNode<X = ()> {
     pub ext: X,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CellNode<X = ()> {
     pub rect: Rect,
     pub label: Arc<str>,
@@ -580,7 +580,7 @@ fn build_spatial_node(
     slot
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Totals {
     pub regions: u32,
     pub blocks: u32,

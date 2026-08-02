@@ -34,7 +34,7 @@ fn ring_count((c0, c1, r0, r1): (i64, i64, i64, i64)) -> usize {
     (c1 - c0 + 1).max(0) as usize * (r1 - r0 + 1).max(0) as usize
 }
 
-pub fn for_each_center(visible: &Rect, r: f32, mut emit: impl FnMut(f32, f32)) -> usize {
+pub fn effective_radius(visible: &Rect, r: f32) -> f32 {
     let mut r = r;
     let mut band = ring_band(visible, r);
     while ring_count(band) > MAX_RINGS {
@@ -42,7 +42,12 @@ pub fn for_each_center(visible: &Rect, r: f32, mut emit: impl FnMut(f32, f32)) -
         r *= overshoot.sqrt().max(1.01);
         band = ring_band(visible, r);
     }
-    let (c0, c1, r0, r1) = band;
+    r
+}
+
+pub fn for_each_center(visible: &Rect, r: f32, mut emit: impl FnMut(f32, f32)) -> usize {
+    let r = effective_radius(visible, r);
+    let (c0, c1, r0, r1) = ring_band(visible, r);
     let col_pitch = 1.5 * r;
     let row_pitch = 3.0f32.sqrt() * r;
     let mut n = 0usize;
@@ -84,6 +89,24 @@ mod tests {
             );
             assert!(alpha > 0.0 && alpha < 0.3);
         }
+    }
+
+    #[test]
+    fn a_clamped_grid_is_stable_under_its_own_effective_radius() {
+        let visible = Rect::new(0.0, 0.0, 1.0e6, 1.0e6);
+        let r = 100.0;
+        let clamped = effective_radius(&visible, r);
+        assert!(clamped > r, "this viewport must engage the clamp");
+        assert_eq!(
+            clamped,
+            effective_radius(&visible, clamped),
+            "effective_radius must be idempotent so centers and vertices agree"
+        );
+        let mut original = Vec::new();
+        let mut reclamped = Vec::new();
+        for_each_center(&visible, r, |x, y| original.push((x, y)));
+        for_each_center(&visible, clamped, |x, y| reclamped.push((x, y)));
+        assert_eq!(original, reclamped, "pre-clamping must not move any center");
     }
 
     #[test]

@@ -1,3 +1,14 @@
+//! The open model and the ingestion contract every other crate meets at.
+//!
+//! Kinds, tools, and reasons are interned dense ids (`KindId`, `ToolId`,
+//! `ReasonId`) resolved through a `Catalog`, never strings in hot paths. The
+//! scene is four levels of role (scope, owner, instance, satellite) held in
+//! flat vectors inside `SceneSnapshot`; a published snapshot is immutable, so
+//! a reader holding one must never observe a mutation. Ingestion is an event
+//! stream (`IngestEvent`), not a snapshot type, and `Intake` bounds it on both
+//! axes -- it coalesces by object uid and degrades to a labelled `Desync`
+//! resync instead of blocking or growing.
+
 pub mod ingest;
 pub mod layout;
 pub mod model;
@@ -21,13 +32,13 @@ pub use model::{
 };
 pub use replay::RecordedStream;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NsExt {
     pub unhealthy_frac: f32,
     pub rollup: Severity,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WlExt {
     pub kind: KindId,
     pub tool: ToolId,
@@ -35,12 +46,12 @@ pub struct WlExt {
     pub ns: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PodExt {
     pub state: State,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SatExt {
     pub kind: KindId,
     pub detail: Arc<str>,
@@ -53,7 +64,44 @@ pub type SatNode = CellNode<SatExt>;
 
 pub type EdgeInst = Edge;
 
-pub type SceneSnapshot = Scene<NsExt, WlExt, PodExt, SatExt>;
+pub type SceneData = Scene<NsExt, WlExt, PodExt, SatExt>;
+
+// Opaque per-slot identities, parallel to the scene's node vectors. The
+// engine below never reads them: they exist so a consumer holding a snapshot
+// can say what a slot *is* -- selection, data requests -- across publishes,
+// where slot reuse would otherwise let a bare index silently change meaning.
+// Tombstoned slots hold the empty string.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SceneIds {
+    pub regions: Vec<Arc<str>>,
+    pub blocks: Vec<Arc<str>>,
+    pub cells: Vec<Arc<str>>,
+    pub sats: Vec<Arc<str>>,
+}
+
+// The scene the engine draws plus the identity the model layer needs, one
+// value so both swap atomically under the same Arc. Identity lives here and
+// not on `Scene` deliberately: the engine's hot type stays engine-only, and
+// the ids cost one reference bump per snapshot clone.
+#[derive(Debug, Clone, Default)]
+pub struct SceneSnapshot {
+    pub scene: SceneData,
+    pub ids: Arc<SceneIds>,
+}
+
+impl std::ops::Deref for SceneSnapshot {
+    type Target = SceneData;
+
+    fn deref(&self) -> &SceneData {
+        &self.scene
+    }
+}
+
+impl std::ops::DerefMut for SceneSnapshot {
+    fn deref_mut(&mut self) -> &mut SceneData {
+        &mut self.scene
+    }
+}
 
 pub type SharedScene = Arc<ArcSwap<SceneSnapshot>>;
 
