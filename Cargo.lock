@@ -3464,6 +3464,7 @@ dependencies = [
  "k10s-core",
  "k10s-data",
  "k10s-map",
+ "k10s-shell",
  "k10s-world",
 ]
 
@@ -3533,6 +3534,19 @@ dependencies = [
  "serde",
  "serde_json",
  "stats_alloc",
+]
+
+[[package]]
+name = "k10s-shell"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "futures",
+ "gpui",
+ "k10s-atlas",
+ "k10s-core",
+ "k10s-map",
+ "k10s-world",
 ]
 
 [[package]]

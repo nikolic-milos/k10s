@@ -130,15 +130,21 @@ impl Default for TextCache {
 }
 
 impl TextCache {
+    // A label's color carries the LOD cross-fade alpha, and the alpha is part
+    // of the cache key. Caching mid-fade frames would insert a new entry per
+    // label per frame and churn the warm settled set out of the FIFO, so an
+    // unsettled frame shapes uncached and the cache serves the frames where
+    // zero per-frame allocation actually matters.
     pub(crate) fn shape_label(
         &mut self,
         text: SharedString,
         font: &Font,
         size_px: f32,
         color: Hsla,
+        settled: bool,
         text_system: &WindowTextSystem,
     ) -> ShapedLine {
-        if self.enabled {
+        if self.enabled && settled {
             self.labels.shape(text, font, size_px, color, text_system)
         } else {
             self.labels
@@ -154,6 +160,7 @@ impl TextCache {
         &mut self.hud_lines
     }
 
+    #[cfg_attr(not(any(test, feature = "testing")), expect(dead_code))]
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
@@ -209,5 +216,51 @@ mod tests {
     fn content_hash_is_stable_and_content_sensitive() {
         assert_eq!(content_hash("pod-1"), content_hash("pod-1"));
         assert_ne!(content_hash("pod-1"), content_hash("pod-2"));
+    }
+
+    #[test]
+    fn an_unsettled_frame_never_evicts_the_warm_settled_set() {
+        let system = text_system();
+        let font = gpui::font("Noto Sans");
+        let opaque: Hsla = gpui::rgb(0xffffff).into();
+        let mut cache = TextCache {
+            labels: BoundedCache::new(2),
+            ..TextCache::default()
+        };
+
+        cache.shape_label("a".into(), &font, 12.0, opaque, true, &system);
+        cache.shape_label("b".into(), &font, 12.0, opaque, true, &system);
+
+        let mut faded = opaque;
+        for step in 1..=50 {
+            faded.a = step as f32 / 51.0;
+            cache.shape_label("a".into(), &font, 12.0, faded, false, &system);
+            cache.shape_label("b".into(), &font, 12.0, faded, false, &system);
+        }
+        assert_eq!(
+            cache.stats().evictions,
+            0,
+            "a fade must not churn the cache"
+        );
+
+        let before = cache.stats();
+        cache.shape_label("a".into(), &font, 12.0, opaque, true, &system);
+        cache.shape_label("b".into(), &font, 12.0, opaque, true, &system);
+        let after = cache.stats().since(before);
+        assert_eq!(
+            (after.hits, after.misses),
+            (2, 0),
+            "the settled set must still be warm after the fade"
+        );
+
+        cache.set_enabled(false);
+        let before = cache.stats();
+        cache.shape_label("a".into(), &font, 12.0, opaque, true, &system);
+        let after = cache.stats().since(before);
+        assert_eq!(
+            (after.hits, after.misses),
+            (0, 1),
+            "a disabled cache must shape uncached even on a settled frame"
+        );
     }
 }

@@ -45,6 +45,117 @@ impl Ring {
         out.sort_unstable_by(f32::total_cmp);
         out
     }
+
+    fn envelope(&self, scratch: &mut [f32; WINDOW]) -> CounterStats {
+        let s = self.sorted_into(scratch);
+        CounterStats {
+            min: s.first().copied().unwrap_or(0.0) as u32,
+            max: s.last().copied().unwrap_or(0.0) as u32,
+            p99: pct(s, 0.99) as u32,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CounterStats {
+    pub min: u32,
+    pub max: u32,
+    pub p99: u32,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SegmentCounters {
+    pub quads: CounterStats,
+    pub lines: CounterStats,
+    pub glyphs: CounterStats,
+    pub icons: CounterStats,
+    pub sats: CounterStats,
+    pub curves: CounterStats,
+    pub edges: CounterStats,
+    pub bg_cells: CounterStats,
+    pub drawn_regions: CounterStats,
+    pub drawn_blocks: CounterStats,
+    pub drawn_cells: CounterStats,
+    pub labels_dropped: CounterStats,
+    pub icons_dropped: CounterStats,
+    pub curves_dropped: CounterStats,
+}
+
+impl SegmentCounters {
+    pub fn is_steady(&self) -> bool {
+        let flat = |c: &CounterStats| c.min == c.max;
+        flat(&self.quads)
+            && flat(&self.lines)
+            && flat(&self.glyphs)
+            && flat(&self.icons)
+            && flat(&self.sats)
+            && flat(&self.curves)
+            && flat(&self.edges)
+            && flat(&self.bg_cells)
+            && flat(&self.drawn_regions)
+            && flat(&self.drawn_blocks)
+            && flat(&self.drawn_cells)
+            && flat(&self.labels_dropped)
+            && flat(&self.icons_dropped)
+            && flat(&self.curves_dropped)
+    }
+}
+
+#[derive(Default)]
+struct CounterRings {
+    quads: Ring,
+    lines: Ring,
+    glyphs: Ring,
+    icons: Ring,
+    sats: Ring,
+    curves: Ring,
+    edges: Ring,
+    bg_cells: Ring,
+    drawn_regions: Ring,
+    drawn_blocks: Ring,
+    drawn_cells: Ring,
+    labels_dropped: Ring,
+    icons_dropped: Ring,
+    curves_dropped: Ring,
+}
+
+impl CounterRings {
+    fn clear(&mut self) {
+        self.quads.clear();
+        self.lines.clear();
+        self.glyphs.clear();
+        self.icons.clear();
+        self.sats.clear();
+        self.curves.clear();
+        self.edges.clear();
+        self.bg_cells.clear();
+        self.drawn_regions.clear();
+        self.drawn_blocks.clear();
+        self.drawn_cells.clear();
+        self.labels_dropped.clear();
+        self.icons_dropped.clear();
+        self.curves_dropped.clear();
+    }
+
+    fn envelopes(&self) -> SegmentCounters {
+        let mut scratch = [0.0f32; WINDOW];
+        SegmentCounters {
+            quads: self.quads.envelope(&mut scratch),
+            lines: self.lines.envelope(&mut scratch),
+            glyphs: self.glyphs.envelope(&mut scratch),
+            icons: self.icons.envelope(&mut scratch),
+            sats: self.sats.envelope(&mut scratch),
+            curves: self.curves.envelope(&mut scratch),
+            edges: self.edges.envelope(&mut scratch),
+            bg_cells: self.bg_cells.envelope(&mut scratch),
+            drawn_regions: self.drawn_regions.envelope(&mut scratch),
+            drawn_blocks: self.drawn_blocks.envelope(&mut scratch),
+            drawn_cells: self.drawn_cells.envelope(&mut scratch),
+            labels_dropped: self.labels_dropped.envelope(&mut scratch),
+            icons_dropped: self.icons_dropped.envelope(&mut scratch),
+            curves_dropped: self.curves_dropped.envelope(&mut scratch),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -126,6 +237,7 @@ pub struct FrameStats {
     intervals: Ring,
     cpu: Ring,
     spans: SpanRings,
+    counters: CounterRings,
     frames: u64,
     pub quads: usize,
     pub lines: usize,
@@ -147,6 +259,35 @@ impl FrameStats {
         self.intervals.clear();
         self.cpu.clear();
         self.spans.clear();
+        self.counters.clear();
+    }
+
+    // Called once per painted frame after the counter fields are written, so a
+    // segment reports the envelope every frame traced out rather than whatever
+    // one frame happened to be current when the segment ended.
+    pub fn commit_counters(&mut self) {
+        self.counters.quads.push(self.quads as f32);
+        self.counters.lines.push(self.lines as f32);
+        self.counters.glyphs.push(self.glyphs as f32);
+        self.counters.icons.push(self.icons as f32);
+        self.counters.sats.push(self.sats as f32);
+        self.counters.curves.push(self.curves as f32);
+        self.counters.edges.push(self.edges as f32);
+        self.counters.bg_cells.push(self.bg_cells as f32);
+        self.counters.drawn_regions.push(self.drawn.regions as f32);
+        self.counters.drawn_blocks.push(self.drawn.blocks as f32);
+        self.counters.drawn_cells.push(self.drawn.cells as f32);
+        self.counters
+            .labels_dropped
+            .push(self.labels_dropped as f32);
+        self.counters.icons_dropped.push(self.icons_dropped as f32);
+        self.counters
+            .curves_dropped
+            .push(self.curves_dropped as f32);
+    }
+
+    pub fn segment_counters(&self) -> SegmentCounters {
+        self.counters.envelopes()
     }
 
     pub fn begin_frame(&mut self, now: Instant, continuous: bool) {
@@ -317,6 +458,39 @@ mod tests {
             spans.paint_total_us(),
             spans.walk_us + spans.quads_us + spans.paths_us + spans.icons_us + spans.text_us
         );
+    }
+
+    #[test]
+    fn counter_envelopes_trace_the_segment_not_the_last_frame() {
+        let mut st = FrameStats::default();
+        for quads in [200usize, 350, 500, 350, 205] {
+            st.quads = quads;
+            st.glyphs = quads * 10;
+            st.commit_counters();
+        }
+        let counters = st.segment_counters();
+        assert_eq!((counters.quads.min, counters.quads.max), (200, 500));
+        assert_eq!(counters.quads.p99, 500);
+        assert_eq!((counters.glyphs.min, counters.glyphs.max), (2000, 5000));
+        assert!(
+            !counters.is_steady(),
+            "a pan that moved the counters is not steady"
+        );
+
+        st.reset();
+        assert_eq!(st.segment_counters(), SegmentCounters::default());
+
+        for _ in 0..3 {
+            st.quads = 205;
+            st.commit_counters();
+        }
+        let steady = st.segment_counters();
+        assert_eq!(
+            (steady.quads.min, steady.quads.max, steady.quads.p99),
+            (205, 205, 205),
+            "a static segment's envelope collapses to the sample"
+        );
+        assert!(steady.is_steady());
     }
 
     #[test]
