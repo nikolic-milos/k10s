@@ -13,7 +13,7 @@ cluster options:
   --list-contexts                         print the kubeconfig's contexts and exit
 
 generator options:
-  --objects N                             objects to generate (default 25000)
+  --objects N                             objects to generate (default 25000, max 1000000)
   --seed S                                generator seed (default 55)
   --churn EVENTS_PER_SEC                  churn events per second (default 120, max 100000)
   --scenario NAME                         platform|observability|data|ns-fanout|wl-fanout
@@ -21,17 +21,20 @@ generator options:
 
 shared options:
   --layout spread|dense                   layout mode (default spread)
-  --machine LABEL                         machine label recorded in bench reports
-  --bench                                 run the scripted flight bench
-  --json                                  bench report as JSON on stdout (needs --bench and --machine)
+  --machine LABEL                         hardware label required by --bench
+                                          (e.g. linux-x86_64-i5-12600k)
+  --bench                                 run the scripted flight bench (needs --machine)
+  --json                                  bench report as JSON on stdout (needs --bench)
   -h, --help                              print this message
 
 unrecognized arguments are reported on stderr and ignored";
 
-const DEFAULT_MACHINE: &str = "unlabeled";
 const DEFAULT_SYNC_TIMEOUT_SECS: f32 = 30.0;
 const MAX_SYNC_TIMEOUT_SECS: f32 = 3600.0;
 const MAX_CHURN_PER_SEC: f32 = 100_000.0;
+const MAX_OBJECTS: u32 = 1_000_000;
+
+const PLACEHOLDER_MACHINES: &[&str] = &["my-box", "unlabeled", "todo", "test", "placeholder"];
 
 const VALUE_FLAGS: [&str; 9] = [
     "--objects",
@@ -108,9 +111,8 @@ impl Default for Args {
 impl Args {
     pub fn machine_label(&self) -> String {
         self.machine
-            .as_deref()
-            .unwrap_or(DEFAULT_MACHINE)
-            .to_string()
+            .clone()
+            .expect("parse rejects --bench without a usable --machine")
     }
 
     pub fn effective_churn(&self) -> f32 {
@@ -176,6 +178,9 @@ pub enum ArgError {
     },
     JsonWithoutBench,
     MissingMachineLabel,
+    BadMachineLabel {
+        got: String,
+    },
     BenchWithCluster,
 }
 
@@ -190,8 +195,13 @@ impl std::fmt::Display for ArgError {
             } => write!(f, "{flag} expects {expected}, got {got}"),
             ArgError::JsonWithoutBench => write!(f, "--json requires --bench"),
             ArgError::MissingMachineLabel => {
-                write!(f, "--bench --json requires --machine LABEL")
+                write!(f, "--bench requires --machine LABEL")
             }
+            ArgError::BadMachineLabel { got } => write!(
+                f,
+                "--machine rejects placeholder {got:?}; pass a hardware-labelled name \
+                 (e.g. linux-x86_64-i5-12600k)"
+            ),
             ArgError::BenchWithCluster => write!(
                 f,
                 "--bench needs the generator: its baselines are for a fixed scene, \
@@ -213,7 +223,15 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
         };
         match flag {
             "--objects" => {
-                args.objects = number("--objects", "a u32", inline, &mut rest)?;
+                let objects: u32 = number("--objects", "a u32", inline, &mut rest)?;
+                if objects > MAX_OBJECTS {
+                    return Err(ArgError::BadValue {
+                        flag: "--objects",
+                        expected: format!("a count up to {MAX_OBJECTS}"),
+                        got: objects.to_string(),
+                    });
+                }
+                args.objects = objects;
                 args.objects_explicit = true;
             }
             "--seed" => {
@@ -274,10 +292,33 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
     if args.json && !args.bench {
         return Err(ArgError::JsonWithoutBench);
     }
-    if args.bench && args.json && args.machine.is_none() {
-        return Err(ArgError::MissingMachineLabel);
+    if args.bench {
+        match args.machine.as_deref() {
+            None => return Err(ArgError::MissingMachineLabel),
+            Some(label) if !is_usable_machine_label(label) => {
+                return Err(ArgError::BadMachineLabel {
+                    got: label.to_string(),
+                });
+            }
+            Some(_) => {}
+        }
     }
     Ok(args)
+}
+
+fn is_usable_machine_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed
+        .chars()
+        .all(|c| c.is_whitespace() || c.is_ascii_punctuation())
+    {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    !PLACEHOLDER_MACHINES.contains(&lower.as_str())
 }
 
 fn value(
@@ -368,7 +409,7 @@ mod tests {
             (&["--machine", "m2-air"], |a| {
                 a.machine.as_deref() == Some("m2-air")
             }),
-            (&["--bench"], |a| a.bench),
+            (&["--bench", "--machine", "m2-air"], |a| a.bench),
             (&["--bench", "--json", "--machine", "m"], |a| a.json),
             (&["--help"], |a| a.help),
             (&["-h"], |a| a.help),
@@ -697,23 +738,81 @@ mod tests {
     }
 
     #[test]
-    fn json_bench_without_machine_is_an_error() {
+    fn bench_without_machine_is_an_error() {
+        assert_eq!(parse_argv(&["--bench"]), Err(ArgError::MissingMachineLabel));
         assert_eq!(
             parse_argv(&["--bench", "--json"]),
             Err(ArgError::MissingMachineLabel)
         );
+        assert!(
+            ArgError::MissingMachineLabel
+                .to_string()
+                .contains("--machine")
+        );
     }
 
     #[test]
-    fn bench_without_json_needs_no_machine() {
-        let args = ok(&["--bench"]);
-        assert!(args.bench);
-        assert_eq!(args.machine_label(), DEFAULT_MACHINE);
+    fn placeholder_machine_labels_are_rejected_with_bench() {
+        let placeholders: &[&str] = &[
+            "my-box",
+            "MY-BOX",
+            " unlabeled ",
+            "TODO",
+            "todo",
+            "test",
+            "placeholder",
+            "",
+            "   ",
+            "---",
+            "...",
+            "!!!",
+        ];
+        for &label in placeholders {
+            let argv = ["--bench", "--machine", label];
+            assert!(
+                matches!(parse_argv(&argv), Err(ArgError::BadMachineLabel { .. })),
+                "placeholder {label:?} was accepted"
+            );
+        }
+        let err = parse_argv(&["--bench", "--machine", "my-box"]).unwrap_err();
+        assert!(
+            err.to_string().contains("hardware-labelled"),
+            "bad label message should guide the user: {err}"
+        );
     }
 
     #[test]
-    fn machine_label_prefers_the_explicit_label() {
-        assert_eq!(ok(&["--machine", "m4-max"]).machine_label(), "m4-max");
+    fn usable_machine_labels_are_accepted_with_bench() {
+        for label in [
+            "m2-air",
+            "ci-runner",
+            "macos-aarch64-macbook-pro-m1",
+            "linux-x86_64-i5-12600k",
+            "m",
+        ] {
+            let args = ok(&["--bench", "--machine", label]);
+            assert_eq!(args.machine.as_deref(), Some(label));
+        }
+    }
+
+    #[test]
+    fn objects_above_the_cap_are_rejected() {
+        assert_eq!(ok(&["--objects", "1000000"]).objects, 1_000_000);
+        assert!(matches!(
+            parse_argv(&["--objects", "1000001"]),
+            Err(ArgError::BadValue {
+                flag: "--objects",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn machine_label_carries_the_validated_label() {
+        assert_eq!(
+            ok(&["--bench", "--machine", "m4-max"]).machine_label(),
+            "m4-max"
+        );
     }
 
     #[test]

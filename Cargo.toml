@@ -6,6 +6,7 @@ members = [
     "crates/k10s-clustergen",
     "crates/k10s-world",
     "crates/k10s-map",
+    "crates/k10s-shell",
     "crates/k10s-app",
     "crates/k10s-data",
     "crates/k10s-bench",
@@ -30,6 +31,7 @@ k10s-core = { path = "crates/k10s-core" }
 k10s-clustergen = { path = "crates/k10s-clustergen" }
 k10s-world = { path = "crates/k10s-world" }
 k10s-map = { path = "crates/k10s-map" }
+k10s-shell = { path = "crates/k10s-shell" }
 k10s-app = { path = "crates/k10s-app" }
 k10s-data = { path = "crates/k10s-data" }
 k10s-bench = { path = "crates/k10s-bench" }
@@ -79,10 +81,16 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# One codegen unit, deliberately: the hot loops are generic and monomorphize
+# in their calling crates, so with multiple units any consumer-crate change
+# reshuffles partitioning and swings nanosecond benchmarks 15-380% with zero
+# semantic change (measured three times before this was pinned). Determinism
+# of the performance argument is worth the link time.
 [profile.release]
 debug = "line-tables-only"
 split-debuginfo = "packed"
 lto = "thin"
+codegen-units = 1
 
 [profile.profiling]
 inherits = "release"

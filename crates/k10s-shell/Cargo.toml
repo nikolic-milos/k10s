@@ -1,0 +1,21 @@
+[package]
+name = "k10s-shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+k10s-atlas.workspace = true
+k10s-core.workspace = true
+k10s-map.workspace = true
+gpui.workspace = true
+crossbeam-channel.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+k10s-world.workspace = true

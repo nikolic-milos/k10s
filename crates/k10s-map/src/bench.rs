@@ -20,11 +20,14 @@ pub struct BenchTotals {
 pub struct BenchReport {
     pub schema_version: u32,
     pub machine: String,
+    pub churn: f32,
     pub arch: String,
     pub objects: u32,
     pub seed: u64,
     pub layout: String,
     pub viewport: [f32; 2],
+    pub window: [f32; 2],
+    pub resizes: u32,
     pub totals: BenchTotals,
     pub segments: Vec<SegmentResult>,
 }
@@ -32,6 +35,7 @@ pub struct BenchReport {
 #[derive(Clone)]
 pub struct BenchMeta {
     pub machine: String,
+    pub churn: f32,
     pub arch: String,
     pub objects: u32,
     pub seed: u64,
@@ -147,13 +151,16 @@ impl Bench {
 
     fn report(&self, r: &FlightResult) -> BenchReport {
         BenchReport {
-            schema_version: 3,
+            schema_version: 5,
             machine: self.meta.machine.clone(),
+            churn: self.meta.churn,
             arch: self.meta.arch.clone(),
             objects: self.meta.objects,
             seed: self.meta.seed,
             layout: self.meta.layout.clone(),
             viewport: r.viewport,
+            window: r.window,
+            resizes: r.resizes,
             totals: BenchTotals {
                 namespaces: r.totals.regions,
                 workloads: r.totals.blocks,
@@ -185,8 +192,10 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "k10s bench [{}] - {} ns / {} wl / {} pods / {} sats / {} edges - viewport {:.0}x{:.0}{}",
+        "k10s bench [{}] machine={} churn={} - {} ns / {} wl / {} pods / {} sats / {} edges - viewport {:.0}x{:.0}{}",
         report.layout,
+        report.machine,
+        report.churn,
         report.totals.namespaces,
         report.totals.workloads,
         report.totals.pods,
@@ -195,17 +204,29 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
         report.viewport[0],
         report.viewport[1],
         if restarts > 0 {
-            format!(" ({restarts} restart(s) after resize)")
+            format!(" ({restarts} restart(s) after focus loss)")
         } else {
             String::new()
         },
     );
+    if report.resizes > 0 {
+        let _ = writeln!(
+            out,
+            "  window resized {} time(s) mid-flight (last {:.0}x{:.0}); the letterboxed \
+             counters hold, wall-clock timings may not",
+            report.resizes, report.window[0], report.window[1],
+        );
+    }
     for r in &report.segments {
         if let Some(idle) = &r.idle {
+            let cpu = match idle.proc_cpu_ms {
+                Some(ms) => format!("{ms:.1} ms process cpu"),
+                None => "n/a process cpu".to_string(),
+            };
             let _ = writeln!(
                 out,
-                "  {:<28} idle {:.0} s: {} paints, {:.1} ms process cpu",
-                r.name, idle.dur_s, idle.paints, idle.proc_cpu_ms,
+                "  {:<28} idle {:.0} s @ churn {}: {} paints, {cpu}",
+                r.name, idle.dur_s, report.churn, idle.paints,
             );
             continue;
         }
@@ -231,6 +252,22 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
             r.text_cache.misses,
             r.text_cache.evictions,
         );
+        if !r.counters.is_steady() {
+            let range = |c: &k10s_atlas::CounterStats| format!("{}..{}~{}", c.min, c.max, c.p99);
+            let _ = writeln!(
+                out,
+                "  {:<28} envelope (min..max~p99)  quads {}  lines {}  glyphs {}  icons {}  sats {}  curves {}  edges {}  hex {}",
+                "",
+                range(&r.counters.quads),
+                range(&r.counters.lines),
+                range(&r.counters.glyphs),
+                range(&r.counters.icons),
+                range(&r.counters.sats),
+                range(&r.counters.curves),
+                range(&r.counters.edges),
+                range(&r.counters.bg_cells),
+            );
+        }
         let _ = writeln!(
             out,
             "  {:<28} spans us  walk {:>6.0}  quads {:>5.0}  paths {:>6.0}  icons {:>5.0}  text {:>6.0}  hud {:>5.0}",
@@ -254,15 +291,15 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k10s_atlas::flight::{CpuPercentiles, IdleResult, Percentiles};
-    use k10s_atlas::{DrawnCounts, FrameSpans, TextCacheCounts};
+    use k10s_atlas::flight::{CpuPercentiles, FLIGHT_VIEWPORT, IdleResult, Percentiles};
+    use k10s_atlas::{CounterStats, DrawnCounts, FrameSpans, SegmentCounters, TextCacheCounts};
 
     fn anchors() -> FlightAnchors {
         let mut fit = Camera::default();
         fit.fit(
             k10s_core::Rect::new(0.0, 0.0, 10_000.0, 6_000.0),
-            1600.0,
-            1000.0,
+            FLIGHT_VIEWPORT[0],
+            FLIGHT_VIEWPORT[1],
         );
         FlightAnchors {
             fit,
@@ -275,7 +312,7 @@ mod tests {
     #[test]
     fn plan_keeps_its_shape_and_zoom_targets() {
         let a = anchors();
-        let segs = plan(&a, 1600.0, 1000.0);
+        let segs = plan(&a, FLIGHT_VIEWPORT[0], FLIGHT_VIEWPORT[1]);
 
         let first_measured = segs
             .iter()
@@ -343,9 +380,10 @@ mod tests {
     }
 
     #[test]
-    fn report_json_keeps_schema_v3_keys() {
+    fn report_json_keeps_schema_v5_keys() {
         let meta = BenchMeta {
-            machine: "m".into(),
+            machine: "linux-x86_64-i5-12600k".into(),
+            churn: 120.0,
             arch: "x".into(),
             objects: 1,
             seed: 42,
@@ -371,6 +409,19 @@ mod tests {
             labels_dropped: 7,
             icons_dropped: 8,
             curves_dropped: 9,
+            counters: SegmentCounters {
+                quads: CounterStats {
+                    min: 10,
+                    max: 480,
+                    p99: 460,
+                },
+                glyphs: CounterStats {
+                    min: 41,
+                    max: 3316,
+                    p99: 3300,
+                },
+                ..SegmentCounters::default()
+            },
             text_cache: TextCacheCounts {
                 hits: 11,
                 misses: 12,
@@ -396,7 +447,9 @@ mod tests {
             idle,
         };
         let result = FlightResult {
-            viewport: [1600.0, 1000.0],
+            viewport: FLIGHT_VIEWPORT,
+            window: [1512.0, 837.0],
+            resizes: 0,
             totals: k10s_atlas::Totals {
                 regions: 3,
                 blocks: 20,
@@ -409,15 +462,25 @@ mod tests {
                 seg(Some(IdleResult {
                     dur_s: 5.0,
                     paints: 0,
-                    proc_cpu_ms: 1.5,
+                    proc_cpu_ms: Some(1.5),
                 })),
             ],
             restarts: 0,
         };
-        let v = serde_json::to_value(bench.report(&result)).unwrap();
+        let report = bench.report(&result);
+        let v = serde_json::to_value(&report).unwrap();
 
-        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["schema_version"], 5);
+        assert_eq!(v["machine"], "linux-x86_64-i5-12600k");
+        assert_eq!(v["churn"], 120.0);
         assert_eq!(v["layout"], "spread");
+        assert_eq!(v["viewport"], serde_json::json!([1600.0, 1000.0]));
+        assert_eq!(
+            v["window"],
+            serde_json::json!([1512.0, 837.0]),
+            "the real window must survive as provenance next to the pinned viewport"
+        );
+        assert_eq!(v["resizes"], 0);
         let totals = v["totals"].as_object().unwrap();
         let mut keys: Vec<_> = totals.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -441,6 +504,7 @@ mod tests {
             "labels_dropped",
             "icons_dropped",
             "curves_dropped",
+            "counters",
             "text_cache",
             "spans",
             "cpu_ms",
@@ -448,6 +512,10 @@ mod tests {
         ] {
             assert!(s0.contains_key(key), "segment missing {key}");
         }
+        assert_eq!(v["segments"][0]["counters"]["quads"]["min"], 10);
+        assert_eq!(v["segments"][0]["counters"]["quads"]["max"], 480);
+        assert_eq!(v["segments"][0]["counters"]["quads"]["p99"], 460);
+        assert_eq!(v["segments"][0]["counters"]["glyphs"]["max"], 3316);
         assert!(
             !s0.contains_key("gate_frame"),
             "no code gates frames, so the report must not advertise it"
@@ -477,5 +545,95 @@ mod tests {
         let mut keys: Vec<_> = idle.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["dur_s", "paints", "proc_cpu_ms"]);
+
+        let table = render_table(&report, 0);
+        assert!(
+            table.contains("machine=linux-x86_64-i5-12600k"),
+            "header must stamp machine: {table}"
+        );
+        assert!(
+            table.contains("churn=120"),
+            "header must stamp churn: {table}"
+        );
+        assert!(
+            table.contains("idle 5 s @ churn 120: 0 paints, 1.5 ms process cpu"),
+            "idle line must name churn: {table}"
+        );
+        assert!(
+            table.contains("envelope (min..max~p99)  quads 10..480~460"),
+            "an animated segment must print its counter envelope: {table}"
+        );
+    }
+
+    #[test]
+    fn table_names_churn_zero_when_asked() {
+        let report = BenchReport {
+            schema_version: 5,
+            machine: "ci-runner".into(),
+            churn: 0.0,
+            arch: "x".into(),
+            objects: 1,
+            seed: 1,
+            layout: "dense".into(),
+            viewport: [800.0, 600.0],
+            window: [800.0, 600.0],
+            resizes: 0,
+            totals: BenchTotals {
+                namespaces: 1,
+                workloads: 2,
+                pods: 3,
+                sats: 4,
+                edges: 5,
+            },
+            segments: vec![SegmentResult {
+                name: "Z0 idle (no damage)".into(),
+                quads: 0,
+                lines: 0,
+                glyphs: 0,
+                icons: 0,
+                sats: 0,
+                curves: 0,
+                edges: 0,
+                bg_cells: 0,
+                drawn: DrawnCounts {
+                    regions: 0,
+                    blocks: 0,
+                    cells: 0,
+                },
+                labels_dropped: 0,
+                icons_dropped: 0,
+                curves_dropped: 0,
+                counters: SegmentCounters::default(),
+                text_cache: TextCacheCounts {
+                    hits: 0,
+                    misses: 0,
+                    evictions: 0,
+                },
+                spans: FrameSpans {
+                    walk_us: 0.0,
+                    quads_us: 0.0,
+                    paths_us: 0.0,
+                    icons_us: 0.0,
+                    text_us: 0.0,
+                    hud_us: 0.0,
+                },
+                cpu_ms: CpuPercentiles { p50: 0.0, p99: 0.0 },
+                frame_ms: Percentiles {
+                    p50: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
+                },
+                idle: Some(IdleResult {
+                    dur_s: 5.0,
+                    paints: 0,
+                    proc_cpu_ms: None,
+                }),
+            }],
+        };
+        let table = render_table(&report, 0);
+        assert!(table.starts_with(
+            "k10s bench [dense] machine=ci-runner churn=0 - 1 ns / 2 wl / 3 pods / 4 sats / 5 edges - viewport 800x600\n"
+        ));
+        assert!(table.contains("@ churn 0: 0 paints, n/a process cpu"));
     }
 }

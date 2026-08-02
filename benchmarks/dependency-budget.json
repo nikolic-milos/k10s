@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "maximum_packages": 797,
+  "maximum_packages": 798,
   "maximum_external_packages": 788,
   "maximum_git_packages": 28,
   "allowed_git_sources": [

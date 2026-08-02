@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use gpui::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use k10s_clustergen::GenConfig;
 use k10s_core::{Capability, IngestEvent, WorldCtrl, new_shared_scene};
+use k10s_data::read::Fetched;
 use k10s_data::{DEFAULT_EVENT_SINK_CAPACITY, DataPlane};
 use k10s_map::{BenchMeta, MapView};
+use k10s_shell::Workspace;
 
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
@@ -23,8 +25,190 @@ fn install_panic_hook() {
 }
 
 struct Live {
-    _plane: DataPlane,
+    // Field order is load-bearing: the receiver must drop before the plane, so
+    // a watch task blocked on a full bounded sink gets a disconnect error
+    // instead of deadlocking the runtime shutdown that plane's drop waits on.
     events: crossbeam_channel::Receiver<IngestEvent>,
+    inspector: k10s_data::inspect::Inspector,
+    reader: k10s_data::read::Reader,
+    _plane: DataPlane,
+}
+
+// The shell's provider seam, adapted to the data plane. The shell never sees
+// kube; it sees labelled outcomes. Every reply callback runs on the data
+// plane's runtime and the shell bridges onto its own executor, so no thread
+// is parked waiting for an answer.
+struct PlaneProvider {
+    inspector: k10s_data::inspect::Inspector,
+    reader: k10s_data::read::Reader,
+}
+
+impl k10s_shell::ReadProvider for PlaneProvider {
+    fn fetch_events(
+        &self,
+        namespace: &str,
+        name: &str,
+        reply: k10s_shell::Reply<k10s_shell::Detail>,
+    ) {
+        self.inspector
+            .fetch_events(namespace, name, move |detail| reply(adapt(detail)));
+    }
+
+    fn fetch_log_tail(
+        &self,
+        namespace: &str,
+        pod: &str,
+        reply: k10s_shell::Reply<k10s_shell::Detail>,
+    ) {
+        self.inspector
+            .fetch_log_tail(namespace, &Arc::from(pod), move |detail| {
+                reply(adapt(detail))
+            });
+    }
+
+    fn kinds(&self) -> Vec<k10s_shell::KindRow> {
+        self.reader
+            .kinds()
+            .into_iter()
+            .map(|row| k10s_shell::KindRow {
+                id: row.id,
+                display: row.display,
+                kind: row.kind,
+                namespaced: row.namespaced,
+                forbidden: row.verdict == Some(Capability::Forbidden),
+            })
+            .collect()
+    }
+
+    fn fetch_table(
+        &self,
+        kind: k10s_core::KindId,
+        reply: k10s_shell::Reply<k10s_shell::TableOutcome>,
+    ) {
+        self.reader
+            .fetch_table(kind, move |fetched| reply(table_outcome(fetched)));
+    }
+
+    fn fetch_node_table(&self, reply: k10s_shell::Reply<k10s_shell::TableOutcome>) {
+        self.reader
+            .fetch_node_table(move |fetched| reply(table_outcome(fetched)));
+    }
+
+    fn fetch_describe(
+        &self,
+        request: &k10s_shell::DescribeRequest,
+        reply: k10s_shell::Reply<k10s_shell::DocOutcome>,
+    ) {
+        let request = k10s_data::describe::DescribeRequest {
+            kind: request.kind,
+            namespace: request.namespace.clone(),
+            name: request.name.clone(),
+            uid: request.uid.clone(),
+        };
+        self.reader.fetch_describe(request, move |fetched| {
+            reply(match fetched {
+                Fetched::Ok(described) => k10s_shell::DocOutcome::Doc {
+                    title: described.title,
+                    lines: described.lines,
+                },
+                Fetched::Denied { what } => k10s_shell::DocOutcome::Denied(what),
+                Fetched::Failed { why, .. } => k10s_shell::DocOutcome::Failed(why),
+            })
+        });
+    }
+
+    fn fetch_containers(
+        &self,
+        namespace: &str,
+        pod: &str,
+        reply: k10s_shell::Reply<k10s_shell::ContainersOutcome>,
+    ) {
+        self.reader
+            .fetch_containers(namespace, pod, move |fetched| {
+                reply(match fetched {
+                    Fetched::Ok(containers) => {
+                        k10s_shell::ContainersOutcome::Containers(containers)
+                    }
+                    Fetched::Denied { what } => k10s_shell::ContainersOutcome::Denied(what),
+                    Fetched::Failed { why, .. } => k10s_shell::ContainersOutcome::Failed(why),
+                })
+            });
+    }
+
+    fn follow_log(
+        &self,
+        request: &k10s_shell::LogRequest,
+        on_chunk: Box<dyn Fn(k10s_shell::LogChunk) + Send + Sync>,
+    ) -> k10s_shell::LogStop {
+        use k10s_data::logs::LogChunk;
+        let request = k10s_data::logs::LogRequest {
+            namespace: request.namespace.clone(),
+            pod: request.pod.clone(),
+            container: request.container.clone(),
+            previous: request.previous,
+        };
+        let stop = self.reader.follow_log(
+            request,
+            Box::new(move |chunk| {
+                on_chunk(match chunk {
+                    LogChunk::Lines(lines) => k10s_shell::LogChunk::Lines(lines),
+                    LogChunk::Ended { why } => k10s_shell::LogChunk::Ended(why.to_string()),
+                    LogChunk::Denied { what } => k10s_shell::LogChunk::Denied(what),
+                    LogChunk::Failed { why, .. } => k10s_shell::LogChunk::Failed(why),
+                })
+            }),
+        );
+        k10s_shell::LogStop::new(move || drop(stop))
+    }
+}
+
+fn table_outcome(fetched: Fetched<k10s_data::browse::TablePage>) -> k10s_shell::TableOutcome {
+    match fetched {
+        Fetched::Ok(page) => k10s_shell::TableOutcome::Table(k10s_shell::TablePage {
+            columns: page
+                .columns
+                .into_iter()
+                .map(|column| k10s_shell::TableColumn {
+                    name: column.name,
+                    wide: column.wide,
+                })
+                .collect(),
+            rows: page
+                .rows
+                .into_iter()
+                .map(|row| k10s_shell::TableRow {
+                    cells: row.cells,
+                    name: row.name,
+                    namespace: row.namespace,
+                    uid: row.uid,
+                })
+                .collect(),
+            truncated: page.truncated,
+        }),
+        Fetched::Denied { what } => k10s_shell::TableOutcome::Denied(what),
+        Fetched::Failed { why, .. } => k10s_shell::TableOutcome::Failed(why),
+    }
+}
+
+fn adapt(detail: k10s_data::inspect::InspectDetail) -> k10s_shell::Detail {
+    use k10s_data::inspect::InspectDetail;
+    match detail {
+        InspectDetail::Events(lines) => k10s_shell::Detail::Events(
+            lines
+                .into_iter()
+                .map(|line| k10s_shell::EventRow {
+                    when: line.last_seen,
+                    kind: line.kind,
+                    reason: line.reason,
+                    message: line.message,
+                    count: line.count,
+                })
+                .collect(),
+        ),
+        InspectDetail::Log(tail) => k10s_shell::Detail::Log(tail.lines),
+        InspectDetail::Denied { what } => k10s_shell::Detail::Denied(what),
+        InspectDetail::Failed { why, .. } => k10s_shell::Detail::Failed(why),
+    }
 }
 
 const WORLD_CONTROL_CAPACITY: usize = 64;
@@ -54,6 +238,9 @@ fn main() {
     }
     if args.churn_was_overridden() {
         eprintln!("k10s: --churn is ignored with --cluster; the cluster supplies the churn");
+    }
+    if args.machine.is_some() && !args.bench {
+        eprintln!("k10s: --machine does nothing without --bench");
     }
 
     if args.list_contexts {
@@ -98,6 +285,7 @@ fn main() {
     let shutdown_tx = ctrl_tx.clone();
     let bench_meta = args.bench.then(|| BenchMeta {
         machine: args.machine_label(),
+        churn: args.effective_churn(),
         arch: cli::platform(),
         objects: args.objects,
         seed: args.seed,
@@ -106,7 +294,11 @@ fn main() {
     });
     let window_failed = Arc::new(AtomicBool::new(false));
     let window_status = window_failed.clone();
+    let plane = live
+        .as_ref()
+        .map(|live| (live.inspector.clone(), live.reader.clone()));
     gpui_platform::application().run(move |cx| {
+        cx.bind_keys(k10s_shell::keybindings());
         let bounds = Bounds::centered(None, size(px(1600.0), px(1000.0)), cx);
         let opened = cx.open_window(
             WindowOptions {
@@ -119,12 +311,18 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|cx| {
+                let is_bench = bench_meta.is_some();
+                let map = cx.new(|cx| {
                     MapView::new(scene.clone(), ctrl_tx.clone(), bench_meta, damage_rx, cx)
                 });
-                let focus = view.read(cx).focus_handle();
+                let provider = plane.clone().map(|(inspector, reader)| {
+                    std::rc::Rc::new(PlaneProvider { inspector, reader })
+                        as std::rc::Rc<dyn k10s_shell::ReadProvider>
+                });
+                let workspace = cx.new(|cx| Workspace::new(map, is_bench, provider, cx));
+                let focus = workspace.read(cx).map_focus_handle(cx);
                 window.focus(&focus, cx);
-                view
+                workspace
             },
         );
         if let Err(err) = opened {
@@ -213,8 +411,10 @@ fn connect_cluster(args: &cli::Args) -> Result<(Vec<IngestEvent>, Option<Live>),
     Ok((
         sync.events,
         Some(Live {
-            _plane: plane,
             events: rx,
+            inspector: sync.inspector,
+            reader: sync.reader,
+            _plane: plane,
         }),
     ))
 }

@@ -1,3 +1,14 @@
+//! The GPUI painter for the Starmap.
+//!
+//! `frame::walk` is the one traversal, shared by the window painter and every
+//! headless sink through `FrameSink`; in debug builds each painted frame is
+//! re-derived by the `k10s-atlas` cull oracle and must agree counter for
+//! counter. Painting is damage-driven -- zero paints at idle under
+//! `--churn 0` is a gated invariant -- and the paint path must not allocate
+//! per frame at steady state: labels come from a bounded shaped-text cache
+//! that only serves settled frames, and the `bench-alloc` ratchet holds the
+//! walk at zero allocations.
+
 mod bench;
 mod colors;
 mod frame;
@@ -5,9 +16,10 @@ mod hex;
 mod lod;
 #[cfg(test)]
 mod oracle_test;
+mod pick;
 mod text;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
@@ -17,15 +29,27 @@ use futures::channel::mpsc::Receiver;
 use gpui::{
     App, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString, TextAlign,
-    TextRun, TransformationMatrix, Window, canvas, div, point, prelude::*, px, quad, rgb, size,
+    TextRun, TransformationMatrix, Window, canvas, div, fill, point, prelude::*, px, quad, rgb,
+    size,
 };
-use k10s_atlas::{DrawnCounts, FramePacer, FrameSpans, FrameStats, StageMachine};
+use k10s_atlas::{DrawnCounts, FLIGHT_VIEWPORT, FramePacer, FrameSpans, FrameStats, StageMachine};
 use k10s_core::{KindId, SceneSnapshot, SharedScene, ToolId, WorldCtrl};
 
 pub use bench::{BenchMeta, BenchReport};
+
+// A click resolved against the snapshot that was on screen when it landed.
+// The snapshot rides along so the consumer names slots from the exact scene
+// the user saw, immune to a publish racing the mouse.
+pub struct Picked {
+    pub snapshot: std::sync::Arc<SceneSnapshot>,
+    pub path: PickPath,
+}
+
+impl gpui::EventEmitter<Picked> for MapView {}
 pub use frame::FrameOpts;
 pub use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 pub use lod::{cull, stage_for_zoom};
+pub use pick::{PickPath, pick};
 
 #[cfg(feature = "testing")]
 pub mod testing {
@@ -142,6 +166,8 @@ pub struct MapView {
     ctrl: Sender<WorldCtrl>,
     camera: Camera,
     drag: Option<Point<Pixels>>,
+    drag_total: f32,
+    map_bounds: Rc<Cell<k10s_core::Rect>>,
     churn_on: bool,
     edges_on: bool,
     hud_on: bool,
@@ -187,6 +213,8 @@ impl MapView {
             ctrl,
             camera: Camera::default(),
             drag: None,
+            drag_total: 0.0,
+            map_bounds: Rc::new(Cell::new(k10s_core::Rect::ZERO)),
             churn_on: true,
             edges_on: true,
             hud_on: true,
@@ -228,6 +256,48 @@ impl MapView {
     #[cfg(feature = "testing")]
     pub fn testing_enable_text_cache(&mut self, enabled: bool) {
         self.text_cache.borrow_mut().set_enabled(enabled);
+    }
+
+    // The painted element's rect, falling back to the window before the
+    // first paint. Camera math and picking are element-relative; the window
+    // is only the map when nothing else is docked beside it.
+    fn map_viewport(&self, window: &Window) -> ((f32, f32), f32, f32) {
+        let rect = self.map_bounds.get();
+        if rect.w > 0.0 && rect.h > 0.0 {
+            ((rect.x, rect.y), rect.w, rect.h)
+        } else {
+            let (vw, vh) = Self::viewport(window);
+            ((0.0, 0.0), vw, vh)
+        }
+    }
+
+    fn emit_pick(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let rect = self.map_bounds.get();
+        if rect.w <= 0.0 || rect.h <= 0.0 {
+            return;
+        }
+        let snapshot = self.scene.load_full();
+        if snapshot.rev == 0 {
+            return;
+        }
+        // A click resolves at the stage the zoom is settling toward; a fade
+        // lasts 180 ms and picking mid-fade should answer for where the user
+        // is going, not where the crossfade happens to be.
+        let policy = lod();
+        let blend = StageBlend::settled(policy.stage_for_zoom(self.camera.zoom));
+        let Some(path) = pick(
+            &snapshot,
+            &self.camera,
+            policy,
+            blend,
+            rect.w,
+            rect.h,
+            f32::from(position.x) - rect.x,
+            f32::from(position.y) - rect.y,
+        ) else {
+            return;
+        };
+        cx.emit(Picked { snapshot, path });
     }
 
     fn viewport(window: &Window) -> (f32, f32) {
@@ -295,6 +365,8 @@ impl Render for MapView {
         let edges_on = self.edges_on;
         let churn_on = self.churn_on;
         let hud_on = self.hud_on;
+        let bench_letterbox = self.bench.is_some();
+        let map_bounds = self.map_bounds.clone();
 
         div()
             .size_full()
@@ -303,18 +375,23 @@ impl Render for MapView {
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, _| {
                     this.drag = Some(ev.position);
+                    this.drag_total = 0.0;
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, _| {
-                    this.drag = None;
+                cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                    let clicked = this.drag.take().is_some() && this.drag_total < 4.0;
+                    if clicked {
+                        this.emit_pick(ev.position, cx);
+                    }
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 if let Some(last) = this.drag {
                     let dx = f32::from(ev.position.x - last.x);
                     let dy = f32::from(ev.position.y - last.y);
+                    this.drag_total += dx.abs() + dy.abs();
                     this.camera.pan_px(dx, dy);
                     this.drag = Some(ev.position);
                     this.interacted = true;
@@ -324,11 +401,11 @@ impl Render for MapView {
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
                 let dy = f32::from(ev.delta.pixel_delta(px(24.0)).y);
                 let factor = (dy * 0.0035).exp();
-                let (vw, vh) = Self::viewport(window);
+                let (origin, vw, vh) = this.map_viewport(window);
                 this.camera.zoom_around(
                     factor,
-                    f32::from(ev.position.x),
-                    f32::from(ev.position.y),
+                    f32::from(ev.position.x) - origin.0,
+                    f32::from(ev.position.y) - origin.1,
                     vw,
                     vh,
                 );
@@ -345,7 +422,7 @@ impl Render for MapView {
                     "h" => this.hud_on = !this.hud_on,
                     "f" => {
                         let scene = this.scene.load();
-                        let (vw, vh) = Self::viewport(window);
+                        let (_, vw, vh) = this.map_viewport(window);
                         this.camera.fit(scene.bounds, vw, vh);
                     }
                     _ => return,
@@ -356,6 +433,12 @@ impl Render for MapView {
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
+                        map_bounds.set(k10s_core::Rect::new(
+                            f32::from(bounds.origin.x),
+                            f32::from(bounds.origin.y),
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                        ));
                         paint_map(
                             bounds,
                             &scene,
@@ -372,6 +455,7 @@ impl Render for MapView {
                             hud_on,
                             was_continuous,
                             animating,
+                            bench_letterbox,
                             window,
                             cx,
                         );
@@ -387,12 +471,55 @@ impl Render for MapView {
 
 fn skip_workloads() -> bool {
     static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SKIP.get_or_init(|| std::env::var_os("K10S_SKIP_WL").is_some())
+    *SKIP.get_or_init(|| std::env::var_os("K10S_SKIP_WL").is_some_and(|v| v != "0"))
+}
+
+fn letterbox_bounds(canvas: Bounds<Pixels>) -> Bounds<Pixels> {
+    let [lw, lh] = FLIGHT_VIEWPORT;
+    let cw = f32::from(canvas.size.width);
+    let ch = f32::from(canvas.size.height);
+    let ox = f32::from(canvas.origin.x) + (cw - lw) * 0.5;
+    let oy = f32::from(canvas.origin.y) + (ch - lh) * 0.5;
+    Bounds {
+        origin: point(px(ox), px(oy)),
+        size: size(px(lw), px(lh)),
+    }
+}
+
+#[cfg(test)]
+mod letterbox_tests {
+    use super::*;
+
+    #[test]
+    fn letterbox_keeps_logical_size_and_centers() {
+        let canvas = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(1920.0), px(1200.0)),
+        };
+        let box_ = letterbox_bounds(canvas);
+        assert_eq!(f32::from(box_.size.width), FLIGHT_VIEWPORT[0]);
+        assert_eq!(f32::from(box_.size.height), FLIGHT_VIEWPORT[1]);
+        assert!((f32::from(box_.origin.x) - 160.0).abs() < 1e-3);
+        assert!((f32::from(box_.origin.y) - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn letterbox_origin_may_go_negative_on_a_smaller_window() {
+        let canvas = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(1512.0), px(837.0)),
+        };
+        let box_ = letterbox_bounds(canvas);
+        assert_eq!(f32::from(box_.size.width), FLIGHT_VIEWPORT[0]);
+        assert_eq!(f32::from(box_.size.height), FLIGHT_VIEWPORT[1]);
+        assert!(f32::from(box_.origin.x) < 0.0);
+        assert!(f32::from(box_.origin.y) < 0.0);
+    }
 }
 
 fn repaint_always() -> bool {
     static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ALWAYS.get_or_init(|| std::env::var_os("K10S_REPAINT_ALWAYS").is_some())
+    *ALWAYS.get_or_init(|| std::env::var_os("K10S_REPAINT_ALWAYS").is_some_and(|v| v != "0"))
 }
 
 fn glow_on() -> bool {
@@ -415,7 +542,7 @@ impl LabelCounts {
 
 #[expect(clippy::too_many_arguments)]
 fn paint_map(
-    bounds: Bounds<Pixels>,
+    canvas_bounds: Bounds<Pixels>,
     scene: &SceneSnapshot,
     camera: Camera,
     blend: StageBlend,
@@ -430,6 +557,7 @@ fn paint_map(
     hud_on: bool,
     was_continuous: bool,
     animating: bool,
+    bench_letterbox: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -439,6 +567,13 @@ fn paint_map(
     let mut fg = fg_buf.borrow_mut();
     let mut labels = label_buf.borrow_mut();
     let mut icons = icon_buf.borrow_mut();
+
+    let bounds = if bench_letterbox {
+        window.paint_quad(fill(canvas_bounds, rgb(BG)));
+        letterbox_bounds(canvas_bounds)
+    } else {
+        canvas_bounds
+    };
 
     let ox = f32::from(bounds.origin.x);
     let oy = f32::from(bounds.origin.y);
@@ -572,6 +707,7 @@ fn paint_map(
             &font,
             job.size_px,
             job.color.into(),
+            blend.is_settled(),
             window.text_system(),
         );
         if line
@@ -614,6 +750,7 @@ fn paint_map(
         st.text_cache.misses = cache_delta.misses;
         st.text_cache.evictions = cache_delta.evictions;
         st.end_cpu(frame_start);
+        st.commit_counters();
     }
 
     let hud_start = std::time::Instant::now();
