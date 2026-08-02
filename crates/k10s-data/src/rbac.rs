@@ -32,6 +32,7 @@ fn matches(patterns: &[String], value: &str) -> bool {
 pub struct RuleSet {
     rules: Vec<Rule>,
     incomplete: bool,
+    unanswered: bool,
 }
 
 impl RuleSet {
@@ -48,11 +49,28 @@ impl RuleSet {
                 })
                 .collect(),
             incomplete: status.incomplete,
+            unanswered: false,
+        }
+    }
+
+    // A rules review that got no answer must behave like an incomplete one:
+    // the namespace stays in every fallback so its kinds are attempted, and a
+    // real denial then surfaces as a labelled stream error instead of the
+    // namespace silently vanishing from the map.
+    pub fn unanswered() -> RuleSet {
+        RuleSet {
+            rules: Vec::new(),
+            incomplete: true,
+            unanswered: true,
         }
     }
 
     pub fn is_incomplete(&self) -> bool {
         self.incomplete
+    }
+
+    pub fn is_unanswered(&self) -> bool {
+        self.unanswered
     }
 
     pub fn is_empty(&self) -> bool {
@@ -117,6 +135,13 @@ impl Access {
         self.per_namespace.iter().map(|(ns, _)| ns.as_str())
     }
 
+    pub fn unanswered_namespaces(&self) -> impl Iterator<Item = &str> {
+        self.per_namespace
+            .iter()
+            .filter(|(_, rules)| rules.is_unanswered())
+            .map(|(ns, _)| ns.as_str())
+    }
+
     pub fn unanswered(&self) -> usize {
         self.cluster_wide
             .values()
@@ -176,44 +201,57 @@ impl Access {
 pub async fn probe(client: &Client, targets: &[WatchTarget], namespaces: &[String]) -> Access {
     let mut access = Access::default();
 
+    // Every review is independent, so the whole probe is one round trip deep
+    // instead of namespaces + 2 x kinds serial ones on the cold-start path.
     let rules_api: Api<SelfSubjectRulesReview> = Api::all(client.clone());
-    let mut rules_failed = 0u32;
-    for ns in namespaces {
-        access.requests += 1;
-        match rules_api
-            .create(&PostParams::default(), &rules_review(ns))
-            .await
-        {
-            Ok(review) => {
-                let status = review.status.unwrap_or_default();
-                access
-                    .per_namespace
-                    .push((ns.clone(), RuleSet::from_status(&status)));
+    access.requests += namespaces.len() as u32;
+    let rule_sets = futures::future::join_all(namespaces.iter().map(|ns| {
+        let api = rules_api.clone();
+        async move { api.create(&PostParams::default(), &rules_review(ns)).await }
+    }))
+    .await;
+    let mut rules_failed = 0usize;
+    for (ns, outcome) in namespaces.iter().zip(rule_sets) {
+        let rules = match outcome {
+            Ok(review) => RuleSet::from_status(&review.status.unwrap_or_default()),
+            Err(_) => {
+                rules_failed += 1;
+                RuleSet::unanswered()
             }
-            Err(_) => rules_failed += 1,
-        }
+        };
+        access.per_namespace.push((ns.clone(), rules));
     }
 
     let access_api: Api<SelfSubjectAccessReview> = Api::all(client.clone());
-    let mut reviews_failed = 0u32;
-    for want in targets {
-        let mut answer = Answer::Allowed;
-        for verb in ["list", "watch"] {
-            access.requests += 1;
-            let verdict = match access_api
-                .create(&PostParams::default(), &access_review(&want.target, verb))
-                .await
-            {
-                Ok(review) if review.status.as_ref().is_some_and(|s| s.allowed) => Answer::Allowed,
-                Ok(_) => Answer::Denied,
-                Err(_) => {
-                    reviews_failed += 1;
-                    Answer::Unanswered
+    access.requests += 2 * targets.len() as u32;
+    let answers = futures::future::join_all(targets.iter().map(|want| {
+        let api = access_api.clone();
+        async move {
+            let ask = |verb: &'static str| {
+                let api = api.clone();
+                async move {
+                    match api
+                        .create(&PostParams::default(), &access_review(&want.target, verb))
+                        .await
+                    {
+                        Ok(review) if review.status.as_ref().is_some_and(|s| s.allowed) => {
+                            (Answer::Allowed, 0u32)
+                        }
+                        Ok(_) => (Answer::Denied, 0),
+                        Err(_) => (Answer::Unanswered, 1),
+                    }
                 }
             };
-            answer = answer.and(verdict);
+            let ((list, list_failed), (watch, watch_failed)) =
+                futures::join!(ask("list"), ask("watch"));
+            (want.target.id, list.and(watch), list_failed + watch_failed)
         }
-        access.cluster_wide.insert(want.target.id, answer);
+    }))
+    .await;
+    let mut reviews_failed = 0u32;
+    for (kind, answer, failed) in answers {
+        reviews_failed += failed;
+        access.cluster_wide.insert(kind, answer);
     }
 
     let answered = access
@@ -224,7 +262,7 @@ pub async fn probe(client: &Client, targets: &[WatchTarget], namespaces: &[Strin
     if reviews_failed > 0 && answered == 0 {
         access.degraded = true;
     }
-    if rules_failed > 0 && access.per_namespace.is_empty() && !namespaces.is_empty() {
+    if rules_failed > 0 && rules_failed == namespaces.len() {
         access.degraded = true;
     }
     access
@@ -325,6 +363,35 @@ mod tests {
             fidelity: crate::discover::Fidelity::Metadata,
             pass_through: false,
         }
+    }
+
+    #[test]
+    fn an_unanswered_namespace_keeps_its_fallback_on_a_denied_kind() {
+        let mut access = Access::default();
+        access.cluster_wide.insert(KindId::POD, Answer::Denied);
+        access
+            .per_namespace
+            .push(("answered-and-denied".into(), ruleset(vec![], false)));
+        access
+            .per_namespace
+            .push(("transiently-failed".into(), RuleSet::unanswered()));
+
+        let scope = access.scope_for(&pods());
+        assert_eq!(
+            scope,
+            WatchScope::Namespaces(vec!["transiently-failed".into()]),
+            "a namespace whose rules review failed must be attempted, not silently dropped"
+        );
+        assert_eq!(
+            access.verdict(&pods()),
+            Capability::Watchable,
+            "the kind stays watchable through the attempted namespace"
+        );
+        assert_eq!(
+            access.unanswered_namespaces().collect::<Vec<_>>(),
+            vec!["transiently-failed"],
+            "the report must be able to name what it is guessing about"
+        );
     }
 
     #[test]

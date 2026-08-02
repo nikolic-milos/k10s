@@ -754,6 +754,52 @@ contexts:
     }
 
     #[test]
+    fn the_production_error_shape_reaches_the_auth_leaf_through_the_chain() {
+        // kube-client 4.x never constructs kube::Error::Auth on the request
+        // path: the auth layer is a tower middleware, so a failed credential
+        // arrives as kube::Error::Service(BoxError) with the AuthError buried
+        // behind however many layers the stack added. The redaction must be
+        // reached through source(), not through the enum variant.
+        #[derive(Debug)]
+        struct MiddlewareWrap {
+            source: AuthError,
+        }
+        impl std::fmt::Display for MiddlewareWrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "request dispatch failed: {}", self.source)
+            }
+        }
+        impl std::error::Error for MiddlewareWrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+
+        for err in [
+            kube::Error::Service(Box::new(failed_exec_plugin())),
+            kube::Error::Service(Box::new(MiddlewareWrap {
+                source: failed_exec_plugin(),
+            })),
+        ] {
+            let raw = &err as &dyn std::error::Error;
+            assert!(
+                raw.to_string().contains(SENTINEL)
+                    || raw
+                        .source()
+                        .is_some_and(|s| s.to_string().contains(SENTINEL)),
+                "the raw chain must be the thing that leaks, or this proves nothing: {err}"
+            );
+            let said = describe(&err as &dyn std::error::Error);
+            assert!(!said.contains(SENTINEL), "credential survived: {said}");
+            assert!(
+                !said.contains("KUBERNETES_EXEC_INFO"),
+                "injected environment survived: {said}"
+            );
+            assert!(said.contains("gke-gcloud-auth-plugin"), "{said}");
+        }
+    }
+
+    #[test]
     fn the_plugin_name_is_found_behind_anything_std_puts_in_front_of_it() {
         for (rendered, want) in [
             (r#""kubelogin""#, Some("kubelogin")),
