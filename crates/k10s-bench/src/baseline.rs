@@ -129,6 +129,14 @@ fn compare_suite(
 
     for field in &suite.top_exact {
         report.checks += 1;
+        if baseline.get(field).is_none() && current.get(field).is_none() {
+            return Err(format!(
+                "{}: top-level field '{field}' exists in neither document; \
+                 a misspelled manifest field gates nothing",
+                suite.name
+            )
+            .into());
+        }
         if baseline.get(field) != current.get(field) {
             report.regressions.push(format!(
                 "{}: top-level field '{}' changed from {} to {}",
@@ -162,6 +170,14 @@ fn compare_suite(
         let current_case = current_cases[key];
         for field in &suite.exact {
             report.checks += 1;
+            if baseline_case.get(field).is_none() && current_case.get(field).is_none() {
+                return Err(format!(
+                    "{} {key}: structural field '{field}' exists in neither document; \
+                     a misspelled manifest field gates nothing",
+                    suite.name
+                )
+                .into());
+            }
             if baseline_case.get(field) != current_case.get(field) {
                 report.regressions.push(format!(
                     "{} {key}: structural field '{}' changed from {} to {}",
@@ -186,8 +202,18 @@ fn compare_suite(
             if let Some(minimum) = metric.minimum_samples {
                 let baseline_samples = integer(baseline_case, "samples", &suite.name, key)?;
                 let current_samples = integer(current_case, "samples", &suite.name, key)?;
-                if baseline_samples < minimum || current_samples < minimum {
+                if baseline_samples < minimum {
                     report.skipped += 1;
+                    continue;
+                }
+                if current_samples < minimum {
+                    report.checks += 1;
+                    report.regressions.push(format!(
+                        "{} {key}: sample count collapsed from {baseline_samples} to \
+                         {current_samples}, below the {minimum} needed to gate '{}'; \
+                         a tail regression must not disable its own gate",
+                        suite.name, metric.field
+                    ));
                     continue;
                 }
             }
@@ -375,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_tails_without_enough_independent_samples() {
+    fn skips_tails_the_baseline_never_had_enough_samples_for() {
         let mut suite = suite();
         suite.metrics[0].minimum_samples = Some(100);
         let baseline = json!({
@@ -392,5 +418,59 @@ mod tests {
         compare_suite(&suite, &baseline, &current, &mut report).unwrap();
         assert!(report.passed());
         assert_eq!(report.skipped, 1);
+    }
+
+    #[test]
+    fn a_sample_count_collapse_is_a_regression_not_a_skip() {
+        let mut suite = suite();
+        suite.metrics[0].minimum_samples = Some(100);
+        let baseline = json!({
+            "schema_version": 1,
+            "mode": "timing",
+            "cases": [{"name": "a", "drawn": 3, "samples": 150, "p50_rmad": 0.01, "p50_ns": 100.0}]
+        });
+        let current = json!({
+            "schema_version": 1,
+            "mode": "timing",
+            "cases": [{"name": "a", "drawn": 3, "samples": 90, "p50_rmad": 0.01, "p50_ns": 100.0}]
+        });
+        let mut report = Report::default();
+        compare_suite(&suite, &baseline, &current, &mut report).unwrap();
+        assert_eq!(report.regressions.len(), 1, "{:?}", report.regressions);
+        assert!(report.regressions[0].contains("sample count collapsed"));
+        assert_eq!(report.skipped, 0);
+    }
+
+    #[test]
+    fn an_exact_field_absent_from_both_documents_is_an_error() {
+        let mut suite = suite();
+        suite.exact = vec!["drwan".to_owned()];
+        let doc = json!({
+            "schema_version": 1,
+            "mode": "timing",
+            "cases": [{"name": "a", "drawn": 3, "p50_rmad": 0.01, "p50_ns": 100.0}]
+        });
+        let mut report = Report::default();
+        let error = compare_suite(&suite, &doc, &doc, &mut report).unwrap_err();
+        assert!(error.to_string().contains("gates nothing"), "{error}");
+
+        suite.exact = vec![];
+        suite.top_exact = vec!["mdoe".to_owned()];
+        let error = compare_suite(&suite, &doc, &doc, &mut report).unwrap_err();
+        assert!(error.to_string().contains("gates nothing"), "{error}");
+    }
+
+    #[test]
+    fn a_null_exact_field_is_present_and_comparable() {
+        let mut suite = suite();
+        suite.exact = vec!["drawn".to_owned()];
+        let baseline = json!({
+            "schema_version": 1,
+            "mode": "timing",
+            "cases": [{"name": "a", "drawn": null, "p50_rmad": 0.01, "p50_ns": 100.0}]
+        });
+        let mut report = Report::default();
+        compare_suite(&suite, &baseline, &baseline, &mut report).unwrap();
+        assert!(report.passed());
     }
 }

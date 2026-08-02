@@ -8,18 +8,18 @@
   "cases": [
     {
       "cache": "cached",
-      "allocations_per_paint": 68.168,
-      "reallocations_per_paint": 94.734,
-      "bytes_per_paint": 1819827,
+      "allocations_per_paint": 67.270,
+      "reallocations_per_paint": 94.016,
+      "bytes_per_paint": 1819489,
       "text_cache_hits": 11,
       "text_cache_misses": 0,
       "text_cache_evictions": 0
     },
     {
       "cache": "uncached-control",
-      "allocations_per_paint": 70.777,
-      "reallocations_per_paint": 94.422,
-      "bytes_per_paint": 1819824,
+      "allocations_per_paint": 70.172,
+      "reallocations_per_paint": 93.938,
+      "bytes_per_paint": 1819597,
       "text_cache_hits": 0,
       "text_cache_misses": 11,
       "text_cache_evictions": 0

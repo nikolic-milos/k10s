@@ -1,0 +1,1275 @@
+{
+  "schema_version": 5,
+  "machine": "linux-x86_64-i5-12600k",
+  "churn": 0.0,
+  "arch": "x86_64-linux",
+  "objects": 25000,
+  "seed": 55,
+  "layout": "spread",
+  "viewport": [
+    1600.0,
+    1000.0
+  ],
+  "window": [
+    1251.0,
+    1350.0
+  ],
+  "resizes": 0,
+  "totals": {
+    "namespaces": 197,
+    "workloads": 2964,
+    "pods": 14952,
+    "sats": 7023,
+    "edges": 1763
+  },
+  "segments": [
+    {
+      "name": "Z0 static (island overview)",
+      "quads": 198,
+      "lines": 0,
+      "glyphs": 0,
+      "icons": 0,
+      "sats": 0,
+      "curves": 0,
+      "edges": 0,
+      "bg_cells": 504,
+      "drawn": {
+        "regions": 197,
+        "blocks": 0,
+        "cells": 0
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 198,
+          "max": 198,
+          "p99": 198
+        },
+        "lines": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "glyphs": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "sats": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "edges": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "bg_cells": {
+          "min": 504,
+          "max": 504,
+          "p99": 504
+        },
+        "drawn_regions": {
+          "min": 197,
+          "max": 197,
+          "p99": 197
+        },
+        "drawn_blocks": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "drawn_cells": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 13.328,
+        "quads_us": 6.2060003,
+        "paths_us": 280.961,
+        "icons_us": 0.05,
+        "text_us": 0.074,
+        "hud_us": 26.151
+      },
+      "cpu_ms": {
+        "p50": 0.300563,
+        "p99": 0.483785
+      },
+      "frame_ms": {
+        "p50": 6.06374,
+        "p95": 6.153034,
+        "p99": 6.365657
+      }
+    },
+    {
+      "name": "Z0->Z1 fly-in",
+      "quads": 69,
+      "lines": 4,
+      "glyphs": 66,
+      "icons": 3,
+      "sats": 0,
+      "curves": 0,
+      "edges": 0,
+      "bg_cells": 459,
+      "drawn": {
+        "regions": 4,
+        "blocks": 64,
+        "cells": 0
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 8,
+          "max": 134,
+          "p99": 132
+        },
+        "lines": {
+          "min": 4,
+          "max": 27,
+          "p99": 27
+        },
+        "glyphs": {
+          "min": 66,
+          "max": 388,
+          "p99": 388
+        },
+        "icons": {
+          "min": 0,
+          "max": 4,
+          "p99": 4
+        },
+        "sats": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "edges": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "bg_cells": {
+          "min": 216,
+          "max": 680,
+          "p99": 660
+        },
+        "drawn_regions": {
+          "min": 4,
+          "max": 27,
+          "p99": 27
+        },
+        "drawn_blocks": {
+          "min": 0,
+          "max": 126,
+          "p99": 124
+        },
+        "drawn_cells": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 4,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 13.415,
+        "quads_us": 1.758,
+        "paths_us": 257.92,
+        "icons_us": 0.103,
+        "text_us": 11.426001,
+        "hud_us": 86.875
+      },
+      "cpu_ms": {
+        "p50": 0.287748,
+        "p99": 0.493197
+      },
+      "frame_ms": {
+        "p50": 6.059661,
+        "p95": 6.17597,
+        "p99": 6.378752
+      }
+    },
+    {
+      "name": "Z1 static (workload cards)",
+      "quads": 69,
+      "lines": 4,
+      "glyphs": 66,
+      "icons": 3,
+      "sats": 0,
+      "curves": 0,
+      "edges": 0,
+      "bg_cells": 459,
+      "drawn": {
+        "regions": 4,
+        "blocks": 64,
+        "cells": 0
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 69,
+          "max": 69,
+          "p99": 69
+        },
+        "lines": {
+          "min": 4,
+          "max": 4,
+          "p99": 4
+        },
+        "glyphs": {
+          "min": 66,
+          "max": 66,
+          "p99": 66
+        },
+        "icons": {
+          "min": 3,
+          "max": 3,
+          "p99": 3
+        },
+        "sats": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "edges": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "bg_cells": {
+          "min": 459,
+          "max": 459,
+          "p99": 459
+        },
+        "drawn_regions": {
+          "min": 4,
+          "max": 4,
+          "p99": 4
+        },
+        "drawn_blocks": {
+          "min": 64,
+          "max": 64,
+          "p99": 64
+        },
+        "drawn_cells": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 4,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 13.2300005,
+        "quads_us": 3.2810001,
+        "paths_us": 262.249,
+        "icons_us": 1.049,
+        "text_us": 6.068,
+        "hud_us": 29.794
+      },
+      "cpu_ms": {
+        "p50": 0.286515,
+        "p99": 0.35796398
+      },
+      "frame_ms": {
+        "p50": 6.062671,
+        "p95": 6.168323,
+        "p99": 6.199882
+      }
+    },
+    {
+      "name": "Z1 cross-map pan",
+      "quads": 33,
+      "lines": 6,
+      "glyphs": 72,
+      "icons": 0,
+      "sats": 0,
+      "curves": 0,
+      "edges": 0,
+      "bg_cells": 459,
+      "drawn": {
+        "regions": 8,
+        "blocks": 24,
+        "cells": 0
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 33,
+          "max": 96,
+          "p99": 93
+        },
+        "lines": {
+          "min": 2,
+          "max": 9,
+          "p99": 9
+        },
+        "glyphs": {
+          "min": 31,
+          "max": 128,
+          "p99": 128
+        },
+        "icons": {
+          "min": 0,
+          "max": 4,
+          "p99": 4
+        },
+        "sats": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "edges": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "bg_cells": {
+          "min": 442,
+          "max": 459,
+          "p99": 459
+        },
+        "drawn_regions": {
+          "min": 2,
+          "max": 11,
+          "p99": 11
+        },
+        "drawn_blocks": {
+          "min": 24,
+          "max": 91,
+          "p99": 88
+        },
+        "drawn_cells": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 6,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 13.805,
+        "quads_us": 3.658,
+        "paths_us": 266.423,
+        "icons_us": 0.82600003,
+        "text_us": 11.462,
+        "hud_us": 96.52599
+      },
+      "cpu_ms": {
+        "p50": 0.293887,
+        "p99": 0.50647104
+      },
+      "frame_ms": {
+        "p50": 6.060672,
+        "p95": 6.210452,
+        "p99": 6.344358
+      }
+    },
+    {
+      "name": "Z1->Z2 fly-in (hub)",
+      "quads": 205,
+      "lines": 162,
+      "glyphs": 2269,
+      "icons": 81,
+      "sats": 80,
+      "curves": 80,
+      "edges": 23,
+      "bg_cells": 360,
+      "drawn": {
+        "regions": 1,
+        "blocks": 1,
+        "cells": 200
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 1,
+          "max": 205,
+          "p99": 205
+        },
+        "lines": {
+          "min": 0,
+          "max": 172,
+          "p99": 170
+        },
+        "glyphs": {
+          "min": 0,
+          "max": 2415,
+          "p99": 2386
+        },
+        "icons": {
+          "min": 0,
+          "max": 86,
+          "p99": 85
+        },
+        "sats": {
+          "min": 0,
+          "max": 85,
+          "p99": 84
+        },
+        "curves": {
+          "min": 0,
+          "max": 85,
+          "p99": 84
+        },
+        "edges": {
+          "min": 14,
+          "max": 41,
+          "p99": 40
+        },
+        "bg_cells": {
+          "min": 216,
+          "max": 693,
+          "p99": 660
+        },
+        "drawn_regions": {
+          "min": 0,
+          "max": 2,
+          "p99": 2
+        },
+        "drawn_blocks": {
+          "min": 0,
+          "max": 16,
+          "p99": 15
+        },
+        "drawn_cells": {
+          "min": 0,
+          "max": 200,
+          "p99": 200
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 162,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 16.967001,
+        "quads_us": 1.997,
+        "paths_us": 488.355,
+        "icons_us": 2.152,
+        "text_us": 4.302,
+        "hud_us": 120.896
+      },
+      "cpu_ms": {
+        "p50": 0.529354,
+        "p99": 1.6951649
+      },
+      "frame_ms": {
+        "p50": 6.065227,
+        "p95": 6.1513443,
+        "p99": 6.184207
+      }
+    },
+    {
+      "name": "Z2 static (hub + satellites)",
+      "quads": 205,
+      "lines": 162,
+      "glyphs": 2269,
+      "icons": 81,
+      "sats": 80,
+      "curves": 80,
+      "edges": 23,
+      "bg_cells": 360,
+      "drawn": {
+        "regions": 1,
+        "blocks": 1,
+        "cells": 200
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 205,
+          "max": 205,
+          "p99": 205
+        },
+        "lines": {
+          "min": 162,
+          "max": 162,
+          "p99": 162
+        },
+        "glyphs": {
+          "min": 2269,
+          "max": 2269,
+          "p99": 2269
+        },
+        "icons": {
+          "min": 81,
+          "max": 81,
+          "p99": 81
+        },
+        "sats": {
+          "min": 80,
+          "max": 80,
+          "p99": 80
+        },
+        "curves": {
+          "min": 80,
+          "max": 80,
+          "p99": 80
+        },
+        "edges": {
+          "min": 23,
+          "max": 23,
+          "p99": 23
+        },
+        "bg_cells": {
+          "min": 360,
+          "max": 360,
+          "p99": 360
+        },
+        "drawn_regions": {
+          "min": 1,
+          "max": 1,
+          "p99": 1
+        },
+        "drawn_blocks": {
+          "min": 1,
+          "max": 1,
+          "p99": 1
+        },
+        "drawn_cells": {
+          "min": 200,
+          "max": 200,
+          "p99": 200
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 162,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 77.117004,
+        "quads_us": 7.682,
+        "paths_us": 1230.124,
+        "icons_us": 7.0420003,
+        "text_us": 170.657,
+        "hud_us": 33.342
+      },
+      "cpu_ms": {
+        "p50": 1.4983231,
+        "p99": 2.359621
+      },
+      "frame_ms": {
+        "p50": 6.060403,
+        "p95": 6.1738153,
+        "p99": 6.2389917
+      }
+    },
+    {
+      "name": "Z2 hub pan",
+      "quads": 112,
+      "lines": 113,
+      "glyphs": 1588,
+      "icons": 57,
+      "sats": 55,
+      "curves": 55,
+      "edges": 21,
+      "bg_cells": 360,
+      "drawn": {
+        "regions": 1,
+        "blocks": 2,
+        "cells": 104
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 112,
+          "max": 205,
+          "p99": 205
+        },
+        "lines": {
+          "min": 111,
+          "max": 170,
+          "p99": 170
+        },
+        "glyphs": {
+          "min": 1562,
+          "max": 2387,
+          "p99": 2385
+        },
+        "icons": {
+          "min": 56,
+          "max": 85,
+          "p99": 85
+        },
+        "sats": {
+          "min": 54,
+          "max": 84,
+          "p99": 84
+        },
+        "curves": {
+          "min": 54,
+          "max": 84,
+          "p99": 84
+        },
+        "edges": {
+          "min": 21,
+          "max": 23,
+          "p99": 23
+        },
+        "bg_cells": {
+          "min": 345,
+          "max": 360,
+          "p99": 360
+        },
+        "drawn_regions": {
+          "min": 1,
+          "max": 1,
+          "p99": 1
+        },
+        "drawn_blocks": {
+          "min": 1,
+          "max": 2,
+          "p99": 2
+        },
+        "drawn_cells": {
+          "min": 104,
+          "max": 200,
+          "p99": 200
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 113,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 64.246,
+        "quads_us": 6.914,
+        "paths_us": 1080.0381,
+        "icons_us": 6.186,
+        "text_us": 169.634,
+        "hud_us": 35.197002
+      },
+      "cpu_ms": {
+        "p50": 1.329045,
+        "p99": 2.016812
+      },
+      "frame_ms": {
+        "p50": 6.059558,
+        "p95": 6.189464,
+        "p99": 6.2335076
+      }
+    },
+    {
+      "name": "Z2->Z3 fly-in",
+      "quads": 205,
+      "lines": 202,
+      "glyphs": 3316,
+      "icons": 1,
+      "sats": 0,
+      "curves": 0,
+      "edges": 21,
+      "bg_cells": 345,
+      "drawn": {
+        "regions": 1,
+        "blocks": 1,
+        "cells": 200
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 205,
+          "max": 205,
+          "p99": 205
+        },
+        "lines": {
+          "min": 26,
+          "max": 226,
+          "p99": 226
+        },
+        "glyphs": {
+          "min": 357,
+          "max": 3647,
+          "p99": 3647
+        },
+        "icons": {
+          "min": 1,
+          "max": 23,
+          "p99": 22
+        },
+        "sats": {
+          "min": 0,
+          "max": 22,
+          "p99": 21
+        },
+        "curves": {
+          "min": 0,
+          "max": 22,
+          "p99": 21
+        },
+        "edges": {
+          "min": 21,
+          "max": 21,
+          "p99": 21
+        },
+        "bg_cells": {
+          "min": 345,
+          "max": 589,
+          "p99": 589
+        },
+        "drawn_regions": {
+          "min": 1,
+          "max": 1,
+          "p99": 1
+        },
+        "drawn_blocks": {
+          "min": 1,
+          "max": 1,
+          "p99": 1
+        },
+        "drawn_cells": {
+          "min": 200,
+          "max": 200,
+          "p99": 200
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 202,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 29.925999,
+        "quads_us": 7.1150002,
+        "paths_us": 671.085,
+        "icons_us": 1.8560001,
+        "text_us": 309.58398,
+        "hud_us": 101.14
+      },
+      "cpu_ms": {
+        "p50": 0.99833906,
+        "p99": 1.821407
+      },
+      "frame_ms": {
+        "p50": 6.062971,
+        "p95": 6.237689,
+        "p99": 6.403536
+      }
+    },
+    {
+      "name": "Z3 static (pod detail)",
+      "quads": 205,
+      "lines": 202,
+      "glyphs": 3316,
+      "icons": 1,
+      "sats": 0,
+      "curves": 0,
+      "edges": 21,
+      "bg_cells": 345,
+      "drawn": {
+        "regions": 1,
+        "blocks": 1,
+        "cells": 200
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 205,
+          "max": 205,
+          "p99": 205
+        },
+        "lines": {
+          "min": 202,
+          "max": 202,
+          "p99": 202
+        },
+        "glyphs": {
+          "min": 3316,
+          "max": 3316,
+          "p99": 3316
+        },
+        "icons": {
+          "min": 1,
+          "max": 1,
+          "p99": 1
+        },
+        "sats": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "edges": {
+          "min": 21,
+          "max": 21,
+          "p99": 21
+        },
+        "bg_cells": {
+          "min": 345,
+          "max": 345,
+          "p99": 345
+        },
+        "drawn_regions": {
+          "min": 1,
+          "max": 1,
+          "p99": 1
+        },
+        "drawn_blocks": {
+          "min": 1,
+          "max": 1,
+          "p99": 1
+        },
+        "drawn_cells": {
+          "min": 200,
+          "max": 200,
+          "p99": 200
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 202,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 20.251,
+        "quads_us": 7.041,
+        "paths_us": 592.231,
+        "icons_us": 1.0500001,
+        "text_us": 293.999,
+        "hud_us": 34.416
+      },
+      "cpu_ms": {
+        "p50": 0.913247,
+        "p99": 1.545694
+      },
+      "frame_ms": {
+        "p50": 6.0627723,
+        "p95": 6.15932,
+        "p99": 6.2306824
+      }
+    },
+    {
+      "name": "Z3->Z0 fly-out",
+      "quads": 198,
+      "lines": 0,
+      "glyphs": 0,
+      "icons": 0,
+      "sats": 0,
+      "curves": 0,
+      "edges": 0,
+      "bg_cells": 504,
+      "drawn": {
+        "regions": 197,
+        "blocks": 0,
+        "cells": 0
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 24,
+          "max": 198,
+          "p99": 198
+        },
+        "lines": {
+          "min": 0,
+          "max": 47,
+          "p99": 47
+        },
+        "glyphs": {
+          "min": 0,
+          "max": 670,
+          "p99": 670
+        },
+        "icons": {
+          "min": 0,
+          "max": 9,
+          "p99": 5
+        },
+        "sats": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "edges": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "bg_cells": {
+          "min": 216,
+          "max": 693,
+          "p99": 660
+        },
+        "drawn_regions": {
+          "min": 2,
+          "max": 197,
+          "p99": 197
+        },
+        "drawn_blocks": {
+          "min": 0,
+          "max": 155,
+          "p99": 138
+        },
+        "drawn_cells": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 13.568,
+        "quads_us": 4.425,
+        "paths_us": 229.476,
+        "icons_us": 0.058000002,
+        "text_us": 17.25,
+        "hud_us": 113.362
+      },
+      "cpu_ms": {
+        "p50": 0.27145,
+        "p99": 0.481186
+      },
+      "frame_ms": {
+        "p50": 6.062714,
+        "p95": 6.1579256,
+        "p99": 6.282136
+      }
+    },
+    {
+      "name": "Z0 idle (no damage)",
+      "quads": 198,
+      "lines": 0,
+      "glyphs": 0,
+      "icons": 0,
+      "sats": 0,
+      "curves": 0,
+      "edges": 0,
+      "bg_cells": 504,
+      "drawn": {
+        "regions": 197,
+        "blocks": 0,
+        "cells": 0
+      },
+      "labels_dropped": 0,
+      "icons_dropped": 0,
+      "curves_dropped": 0,
+      "counters": {
+        "quads": {
+          "min": 198,
+          "max": 198,
+          "p99": 198
+        },
+        "lines": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "glyphs": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "sats": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "edges": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "bg_cells": {
+          "min": 504,
+          "max": 504,
+          "p99": 504
+        },
+        "drawn_regions": {
+          "min": 197,
+          "max": 197,
+          "p99": 197
+        },
+        "drawn_blocks": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "drawn_cells": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "labels_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "icons_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        },
+        "curves_dropped": {
+          "min": 0,
+          "max": 0,
+          "p99": 0
+        }
+      },
+      "text_cache": {
+        "hits": 0,
+        "misses": 0,
+        "evictions": 0
+      },
+      "spans": {
+        "walk_us": 14.403,
+        "quads_us": 6.2730002,
+        "paths_us": 303.046,
+        "icons_us": 0.057,
+        "text_us": 0.09,
+        "hud_us": 98.878
+      },
+      "cpu_ms": {
+        "p50": 0.324099,
+        "p99": 0.324099
+      },
+      "frame_ms": {
+        "p50": 6.134566,
+        "p95": 6.134566,
+        "p99": 6.134566
+      },
+      "idle": {
+        "dur_s": 5.0,
+        "paints": 0,
+        "proc_cpu_ms": 20.0
+      }
+    }
+  ]
+}
