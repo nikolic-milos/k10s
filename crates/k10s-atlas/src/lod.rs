@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LodPolicy {
     pub stage_block: f32,
     pub stage_cell: f32,

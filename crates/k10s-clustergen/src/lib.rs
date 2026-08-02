@@ -1,3 +1,13 @@
+//! Deterministic synthetic cluster generation for benchmarks and tests.
+//!
+//! Same seed, same cluster, on every platform: generation draws from a seeded
+//! ChaCha8 stream and nothing here may consult a clock, a HashMap iteration
+//! order, or a thread. Scenes stay shaped like clusters people actually run
+//! -- names are unique within a namespace, statefulsets use ordinals, fan-out
+//! scenarios exist to stress exactly the axis their name says. This crate is
+//! a producer of the ingestion contract, so `k10s-world` needs it only as a
+//! dev-dependency.
+
 pub mod stream;
 
 use k10s_core::{KindId, ReasonId, State, ToolId};
@@ -843,10 +853,18 @@ pub fn generate(cfg: &GenConfig) -> ClusterSpec {
 
         let wl_count = 2 + (rng.random::<f32>().powi(3) * 60.0) as usize;
         let mut workloads = Vec::with_capacity(wl_count);
+        let mut names = std::collections::HashSet::with_capacity(wl_count);
         for _ in 0..wl_count {
             let role = ROLE_WORDS[rng.random_range(0..ROLE_WORDS.len())];
             let svc = NS_WORDS[rng.random_range(0..NS_WORDS.len())];
-            let name = format!("{svc}-{role}");
+            // A namespace cannot hold two workloads of one name; disambiguate
+            // collisions with an ordinal the way people actually do.
+            let mut name = format!("{svc}-{role}");
+            let mut ordinal = 1usize;
+            while !names.insert(name.clone()) {
+                ordinal += 1;
+                name = format!("{svc}-{role}-{ordinal}");
+            }
             let kind = sample_kind(&mut rng);
             let replicas = match kind {
                 KindId::JOB => 1,
@@ -1189,17 +1207,31 @@ mod tests {
     }
 
     #[test]
-    fn fan_out_workload_names_stay_unique_inside_the_hot_namespace() {
-        for scenario in [Scenario::NsFanOut, Scenario::WlFanOut] {
-            let spec = generate(&fan_cfg(scenario, 25_000));
+    fn workload_names_are_unique_inside_every_namespace() {
+        for scenario in [
+            Scenario::Platform,
+            Scenario::Observability,
+            Scenario::Data,
+            Scenario::NsFanOut,
+            Scenario::WlFanOut,
+        ] {
+            let spec = generate(&GenConfig {
+                seed: 55,
+                target_objects: 25_000,
+                scenario,
+            });
             for ns in &spec.namespaces {
                 let mut names: Vec<&str> = ns.workloads.iter().map(|w| &*w.name).collect();
                 let count = names.len();
                 names.sort_unstable();
                 names.dedup();
-                if ns.name == "monorepo-prod" || ns.name == "shard-prod" {
-                    assert_eq!(names.len(), count, "{} has duplicate names", ns.name);
-                }
+                assert_eq!(
+                    names.len(),
+                    count,
+                    "{:?}/{} holds two workloads of one name, which no cluster can",
+                    scenario,
+                    ns.name
+                );
             }
         }
     }

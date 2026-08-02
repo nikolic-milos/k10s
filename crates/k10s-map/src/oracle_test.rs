@@ -2,8 +2,8 @@ use gpui::{Bounds, PaintQuad, Pixels, point, px, size};
 use k10s_atlas::testing::{SceneSpec, scene as base_scene};
 use k10s_atlas::{Camera, CullStats, LodPolicy, MAX_ZOOM, MIN_ZOOM, StageBlend};
 use k10s_core::{
-    KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, SatExt, SatNode, SceneSnapshot, Severity,
-    State, ToolId, WlExt, WorkloadNode,
+    KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, SatExt, SatNode, SceneData, SceneSnapshot,
+    Severity, State, ToolId, WlExt, WorkloadNode,
 };
 use std::sync::Arc;
 
@@ -157,77 +157,80 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
     ];
 
     SceneSnapshot {
-        rev: base.rev,
-        bounds: base.bounds,
-        regions: base
-            .regions
-            .iter()
-            .enumerate()
-            .map(|(i, r)| NsNode {
-                rect: r.rect,
-                label: r.label.clone(),
-                weight: r.weight,
-                children: r.children.clone(),
-                ext: NsExt {
-                    unhealthy_frac: (i % 5) as f32 * 0.15,
-                    rollup: SEVERITIES[i % SEVERITIES.len()],
-                },
-            })
-            .collect(),
-        blocks: base
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(i, b)| WorkloadNode {
-                rect: b.rect,
-                inner: b.inner,
-                label: b.label.clone(),
-                children: b.children.clone(),
-                sats: b.sats.clone(),
-                ext: WlExt {
-                    kind: KINDS[i % KINDS.len()],
-                    tool: TOOLS[i % TOOLS.len()],
-                    rollup: SEVERITIES[i % SEVERITIES.len()],
-                    ns: 0,
-                },
-            })
-            .collect(),
-        cells: base
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| PodNode {
-                rect: c.rect,
-                label: c.label.clone(),
-                ext: PodExt {
-                    state: State::of(REASONS[i % REASONS.len()]),
-                },
-            })
-            .collect(),
-        sats: base
-            .sats
-            .iter()
-            .enumerate()
-            .map(|(i, s)| SatNode {
-                rect: s.rect,
-                label: s.label.clone(),
-                ext: SatExt {
-                    kind: SATS[i % SATS.len()],
-                    detail: Arc::from(format!("{i}Gi").as_str()),
-                },
-            })
-            .collect(),
-        region_blocks: base.region_blocks.clone(),
-        block_cells: base.block_cells.clone(),
-        block_sats: base.block_sats.clone(),
-        spatial_index: base.spatial_index.clone(),
-        edges: base.edges.clone(),
-        edge_segments: base.edge_segments.clone(),
-        region_edges: base.region_edges.clone(),
-        region_edge_indexes: base.region_edge_indexes.clone(),
-        cross_edges: base.cross_edges.clone(),
-        cross_edge_index: base.cross_edge_index.clone(),
-        totals: base.totals,
+        ids: Default::default(),
+        scene: SceneData {
+            rev: base.rev,
+            bounds: base.bounds,
+            regions: base
+                .regions
+                .iter()
+                .enumerate()
+                .map(|(i, r)| NsNode {
+                    rect: r.rect,
+                    label: r.label.clone(),
+                    weight: r.weight,
+                    children: r.children.clone(),
+                    ext: NsExt {
+                        unhealthy_frac: (i % 5) as f32 * 0.15,
+                        rollup: SEVERITIES[i % SEVERITIES.len()],
+                    },
+                })
+                .collect(),
+            blocks: base
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| WorkloadNode {
+                    rect: b.rect,
+                    inner: b.inner,
+                    label: b.label.clone(),
+                    children: b.children.clone(),
+                    sats: b.sats.clone(),
+                    ext: WlExt {
+                        kind: KINDS[i % KINDS.len()],
+                        tool: TOOLS[i % TOOLS.len()],
+                        rollup: SEVERITIES[i % SEVERITIES.len()],
+                        ns: 0,
+                    },
+                })
+                .collect(),
+            cells: base
+                .cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| PodNode {
+                    rect: c.rect,
+                    label: c.label.clone(),
+                    ext: PodExt {
+                        state: State::of(REASONS[i % REASONS.len()]),
+                    },
+                })
+                .collect(),
+            sats: base
+                .sats
+                .iter()
+                .enumerate()
+                .map(|(i, s)| SatNode {
+                    rect: s.rect,
+                    label: s.label.clone(),
+                    ext: SatExt {
+                        kind: SATS[i % SATS.len()],
+                        detail: Arc::from(format!("{i}Gi").as_str()),
+                    },
+                })
+                .collect(),
+            region_blocks: base.region_blocks.clone(),
+            block_cells: base.block_cells.clone(),
+            block_sats: base.block_sats.clone(),
+            spatial_index: base.spatial_index.clone(),
+            edges: base.edges.clone(),
+            edge_segments: base.edge_segments.clone(),
+            region_edges: base.region_edges.clone(),
+            region_edge_indexes: base.region_edge_indexes.clone(),
+            cross_edges: base.cross_edges.clone(),
+            cross_edge_index: base.cross_edge_index.clone(),
+            totals: base.totals,
+        },
     }
 }
 

@@ -1,3 +1,13 @@
+//! The simulation world: ingest in, immutable scene snapshots out.
+//!
+//! A bevy_ecs world drains a bounded `Intake` once per tick, lays out scopes
+//! and owners deterministically (same seed, same scene), and publishes
+//! `Arc<SceneSnapshot>` through an `ArcSwap` from a fixed-depth pool.
+//! Isolation is the invariant to protect: extraction never mutates through a
+//! shared `Arc`, so a reader keeps a coherent scene for as long as it holds
+//! one, whatever the pool depth. Layout non-overlap, containment, and
+//! determinism are tested properties, not intentions.
+
 pub mod input;
 pub mod layout;
 mod topology;
@@ -66,6 +76,7 @@ fn update_pod_states(world: &mut World, indices: &[u32], mut f: impl FnMut(State
 #[derive(Resource)]
 struct Topology {
     spatial_revision: u64,
+    identity_revision: u64,
     ns_slots: topology::SlotMap,
     ns_labels: Vec<Arc<str>>,
     ns_rects: Vec<Rect>,
@@ -101,7 +112,7 @@ struct Topology {
     bounds: Rect,
 }
 
-#[derive(Resource)]
+#[derive(Resource, Debug, Clone, PartialEq)]
 struct Aggregates {
     pod_state: Vec<State>,
     wl_rollup: Vec<Severity>,
@@ -139,6 +150,37 @@ struct Pending {
     pods: Vec<u32>,
     wls: Vec<u32>,
     nss: Vec<u32>,
+    structural: Structural,
+}
+
+// A structural batch's footprint on one pooled snapshot: which slots need
+// their node rewritten from the topology, and which derived vectors changed
+// wholesale. It accumulates across batches until that buffer publishes.
+#[derive(Default)]
+struct Structural {
+    active: bool,
+    nss: Vec<u32>,
+    wls: Vec<u32>,
+    pods: Vec<u32>,
+    sats: Vec<u32>,
+    ranges_ns_wl: bool,
+    ranges_wl_pod: bool,
+    ranges_wl_sat: bool,
+    edges: bool,
+}
+
+impl Structural {
+    fn clear(&mut self) {
+        self.active = false;
+        self.nss.clear();
+        self.wls.clear();
+        self.pods.clear();
+        self.sats.clear();
+        self.ranges_ns_wl = false;
+        self.ranges_wl_pod = false;
+        self.ranges_wl_sat = false;
+        self.edges = false;
+    }
 }
 
 impl Pending {
@@ -154,6 +196,7 @@ impl Pending {
         self.pods.clear();
         self.wls.clear();
         self.nss.clear();
+        self.structural.clear();
     }
 }
 
@@ -164,6 +207,7 @@ struct SnapshotPool {
     bufs: [Arc<SceneSnapshot>; SNAPSHOT_POOL_DEPTH],
     pending: [Pending; SNAPSHOT_POOL_DEPTH],
     spatial_revisions: [u64; SNAPSHOT_POOL_DEPTH],
+    identity_revisions: [u64; SNAPSHOT_POOL_DEPTH],
     next: usize,
 }
 
@@ -173,6 +217,7 @@ impl SnapshotPool {
             bufs: std::array::from_fn(|_| Arc::new(SceneSnapshot::default())),
             pending: std::array::from_fn(|_| Pending::full()),
             spatial_revisions: [0; SNAPSHOT_POOL_DEPTH],
+            identity_revisions: [0; SNAPSHOT_POOL_DEPTH],
             next: 0,
         }
     }
@@ -182,6 +227,7 @@ impl SnapshotPool {
 pub struct PublishStats {
     pub publishes: u64,
     pub full_materializes: u64,
+    pub structural_patches: u64,
     pub deep_clones: u64,
 }
 
@@ -290,6 +336,7 @@ fn materialize_into(
     agg: &Aggregates,
     rev: u64,
     rebuild_spatial_index: bool,
+    rebuild_ids: bool,
 ) {
     snap.rev = rev;
     snap.bounds = topo.bounds;
@@ -386,6 +433,34 @@ fn materialize_into(
             }),
     );
 
+    // Identity only moves when a slot table does, and the revision says so;
+    // skipping the rebuild spares two atomic operations per object on the
+    // repeated-materialize paths. The ids are Arc-shared so a snapshot clone
+    // costs one reference bump; make_mut pays copy-on-write only when a
+    // reader still holds the previous identity.
+    if rebuild_ids {
+        let tombstone: Arc<str> = Arc::from("");
+        let uid_of = |slots: &topology::SlotMap, slot: usize| {
+            slots
+                .uid(slot as u32)
+                .cloned()
+                .unwrap_or_else(|| tombstone.clone())
+        };
+        let ids = Arc::make_mut(&mut snap.ids);
+        ids.regions.clear();
+        ids.regions
+            .extend((0..topo.ns_slots.slots()).map(|slot| uid_of(&topo.ns_slots, slot)));
+        ids.blocks.clear();
+        ids.blocks
+            .extend((0..topo.wl_slots.slots()).map(|slot| uid_of(&topo.wl_slots, slot)));
+        ids.cells.clear();
+        ids.cells
+            .extend((0..topo.pod_slots.slots()).map(|slot| uid_of(&topo.pod_slots, slot)));
+        ids.sats.clear();
+        ids.sats
+            .extend((0..topo.sat_slots.slots()).map(|slot| uid_of(&topo.sat_slots, slot)));
+    }
+
     snap.region_blocks.clear();
     snap.region_blocks.extend_from_slice(&topo.region_blocks);
     snap.block_cells.clear();
@@ -407,8 +482,160 @@ fn materialize_into(
 
 fn materialize_snapshot(topo: &Topology, agg: &Aggregates, rev: u64) -> SceneSnapshot {
     let mut snap = SceneSnapshot::default();
-    materialize_into(&mut snap, topo, agg, rev, true);
+    materialize_into(&mut snap, topo, agg, rev, true, true);
     snap
+}
+
+fn ns_node(topo: &Topology, agg: &Aggregates, i: usize) -> NsNode {
+    NsNode {
+        rect: topo.ns_rects[i],
+        label: topo.ns_labels[i].clone(),
+        weight: topo.ns_pod_count[i],
+        children: topo.ns_wl_range[i].clone(),
+        ext: NsExt {
+            unhealthy_frac: agg.ns_unhealthy[i],
+            rollup: agg.ns_rollup[i],
+        },
+    }
+}
+
+fn wl_node(topo: &Topology, agg: &Aggregates, i: usize) -> WorkloadNode {
+    WorkloadNode {
+        rect: topo.wl_rects[i],
+        inner: topo.wl_card_rects[i],
+        label: topo.wl_labels[i].clone(),
+        children: topo.wl_pod_range[i].clone(),
+        sats: topo.wl_sat_range[i].clone(),
+        ext: WlExt {
+            kind: topo.wl_kinds[i],
+            tool: topo.wl_tools[i],
+            rollup: agg.wl_rollup[i],
+            ns: topo.wl_ns[i],
+        },
+    }
+}
+
+fn pod_node(topo: &Topology, agg: &Aggregates, i: usize) -> PodNode {
+    PodNode {
+        rect: topo.pod_rects[i],
+        label: topo.pod_labels[i].clone(),
+        ext: PodExt {
+            state: agg.pod_state[i],
+        },
+    }
+}
+
+fn sat_node(topo: &Topology, i: usize) -> SatNode {
+    SatNode {
+        rect: topo.sat_rects[i],
+        label: topo.sat_labels[i].clone(),
+        ext: SatExt {
+            kind: topo.sat_kinds[i],
+            detail: topo.sat_details[i].clone(),
+        },
+    }
+}
+
+// The structural sibling of the pods/wls/nss patch loops: the snapshot
+// mirrors the topology slot arrays one to one, so a structural batch patches
+// the slots it touched and the derived vectors it invalidated instead of
+// rebuilding fifty thousand nodes to move one pod. Isolation is untouched --
+// this runs on a uniquely owned buffer exactly like the state patch.
+fn patch_structural_into(
+    snap: &mut SceneSnapshot,
+    topo: &Topology,
+    agg: &Aggregates,
+    structural: &Structural,
+) {
+    snap.bounds = topo.bounds;
+    snap.totals = Totals {
+        regions: topo.ns_slots.active() as u32,
+        blocks: topo.wl_slots.active() as u32,
+        cells: topo.pod_slots.active() as u32,
+        sats: topo.sat_slots.active() as u32,
+        edges: topo.edges.len() as u32,
+    };
+
+    let tombstone: Arc<str> = Arc::from("");
+    let uid_of = |slots: &topology::SlotMap, slot: usize| {
+        slots
+            .uid(slot as u32)
+            .cloned()
+            .unwrap_or_else(|| tombstone.clone())
+    };
+    // Deref hides the field split from the borrow checker; name both halves.
+    let SceneSnapshot { scene, ids } = snap;
+    let ids = Arc::make_mut(ids);
+    for i in scene.regions.len()..topo.ns_rects.len() {
+        scene.regions.push(ns_node(topo, agg, i));
+        ids.regions.push(uid_of(&topo.ns_slots, i));
+    }
+    for &i in &structural.nss {
+        scene.regions[i as usize] = ns_node(topo, agg, i as usize);
+        ids.regions[i as usize] = uid_of(&topo.ns_slots, i as usize);
+    }
+    for i in scene.blocks.len()..topo.wl_rects.len() {
+        scene.blocks.push(wl_node(topo, agg, i));
+        ids.blocks.push(uid_of(&topo.wl_slots, i));
+    }
+    for &i in &structural.wls {
+        scene.blocks[i as usize] = wl_node(topo, agg, i as usize);
+        ids.blocks[i as usize] = uid_of(&topo.wl_slots, i as usize);
+    }
+    for i in scene.cells.len()..topo.pod_rects.len() {
+        scene.cells.push(pod_node(topo, agg, i));
+        ids.cells.push(uid_of(&topo.pod_slots, i));
+    }
+    for &i in &structural.pods {
+        scene.cells[i as usize] = pod_node(topo, agg, i as usize);
+        ids.cells[i as usize] = uid_of(&topo.pod_slots, i as usize);
+    }
+    for i in scene.sats.len()..topo.sat_rects.len() {
+        scene.sats.push(sat_node(topo, i));
+        ids.sats.push(uid_of(&topo.sat_slots, i));
+    }
+    for &i in &structural.sats {
+        scene.sats[i as usize] = sat_node(topo, i as usize);
+        ids.sats[i as usize] = uid_of(&topo.sat_slots, i as usize);
+    }
+
+    // A rebuilt adjacency renumbers every parent's range, so the ranges are
+    // refreshed level-wide; that is a plain field write per parent, with no
+    // label traffic behind it.
+    if structural.ranges_ns_wl {
+        for (node, range) in scene.regions.iter_mut().zip(&topo.ns_wl_range) {
+            node.children = range.clone();
+        }
+        scene.region_blocks.clear();
+        scene.region_blocks.extend_from_slice(&topo.region_blocks);
+    }
+    if structural.ranges_wl_pod {
+        for (node, range) in scene.blocks.iter_mut().zip(&topo.wl_pod_range) {
+            node.children = range.clone();
+        }
+        scene.block_cells.clear();
+        scene.block_cells.extend_from_slice(&topo.block_cells);
+    }
+    if structural.ranges_wl_sat {
+        for (node, range) in scene.blocks.iter_mut().zip(&topo.wl_sat_range) {
+            node.sats = range.clone();
+        }
+        scene.block_sats.clear();
+        scene.block_sats.extend_from_slice(&topo.block_sats);
+    }
+
+    if structural.edges {
+        scene.edges.clear();
+        scene.edges.extend_from_slice(&topo.edges);
+        scene.region_edges.clear();
+        scene
+            .region_edges
+            .extend(topo.ns_edge_range.iter().cloned());
+        scene.cross_edges = topo.cross_edge_range.clone();
+        scene.rebuild_edge_indexes();
+    }
+
+    scene.rebuild_spatial_index();
 }
 
 #[inline(never)]
@@ -432,26 +659,38 @@ fn extract(
         bufs,
         pending,
         spatial_revisions,
+        identity_revisions,
         next,
     } = &mut *pool;
-    let (buf, pending, spatial_revision) = (
+    let (buf, pending, spatial_revision, identity_revision) = (
         &mut bufs[*next],
         &mut pending[*next],
         &mut spatial_revisions[*next],
+        &mut identity_revisions[*next],
     );
     if pending.all {
         stats.full_materializes += 1;
         let rebuild_spatial_index = *spatial_revision != topo.spatial_revision;
+        let rebuild_ids = *identity_revision != topo.identity_revision;
         match Arc::get_mut(buf) {
-            Some(snap) => materialize_into(snap, &topo, &agg, rev.0, rebuild_spatial_index),
+            Some(snap) => {
+                materialize_into(snap, &topo, &agg, rev.0, rebuild_spatial_index, rebuild_ids)
+            }
             None => *buf = Arc::new(materialize_snapshot(&topo, &agg, rev.0)),
         }
         *spatial_revision = topo.spatial_revision;
+        *identity_revision = topo.identity_revision;
     } else {
         if Arc::get_mut(buf).is_none() {
             stats.deep_clones += 1;
         }
         let snap = Arc::make_mut(buf);
+        if pending.structural.active {
+            stats.structural_patches += 1;
+            patch_structural_into(snap, &topo, &agg, &pending.structural);
+            *spatial_revision = topo.spatial_revision;
+            *identity_revision = topo.identity_revision;
+        }
         for &i in &pending.pods {
             snap.cells[i as usize].ext.state = agg.pod_state[i as usize];
         }
@@ -695,6 +934,7 @@ fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (Wo
 
     world.insert_resource(Topology {
         spatial_revision: 1,
+        identity_revision: 1,
         ns_slots,
         ns_labels,
         ns_rects: lay.ns_rects,
@@ -930,35 +1170,62 @@ mod tests {
         set_pod_state(world, pod as u32, new);
     }
 
+    // A published snapshot -- state-patched, structurally patched, or fully
+    // materialized -- must be indistinguishable from a fresh materialize:
+    // node for node, range for range, and through the spatial index as the
+    // cull actually consumes it.
     fn assert_published_matches_full(world: &World, snap: &SceneSnapshot) {
         let topo = world.resource::<Topology>();
         let agg = world.resource::<Aggregates>();
         let full = materialize_snapshot(topo, agg, snap.rev);
-        assert_eq!(snap.cells.len(), full.cells.len());
-        assert_eq!(snap.blocks.len(), full.blocks.len());
-        assert_eq!(snap.regions.len(), full.regions.len());
-        for (i, (a, b)) in snap.cells.iter().zip(&full.cells).enumerate() {
-            assert_eq!(a.ext.state, b.ext.state, "cell {i} at rev {}", snap.rev);
-            assert_eq!(a.rect, b.rect, "cell {i} rect at rev {}", snap.rev);
-        }
-        for (i, (a, b)) in snap.blocks.iter().zip(&full.blocks).enumerate() {
-            assert_eq!(a.ext.rollup, b.ext.rollup, "block {i} at rev {}", snap.rev);
-            assert_eq!(a.children, b.children, "block {i} children");
-        }
-        for (i, (a, b)) in snap.regions.iter().zip(&full.regions).enumerate() {
+        assert_eq!(
+            snap.regions, full.regions,
+            "regions diverged at rev {}",
+            snap.rev
+        );
+        assert_eq!(
+            snap.blocks, full.blocks,
+            "blocks diverged at rev {}",
+            snap.rev
+        );
+        assert_eq!(snap.cells, full.cells, "cells diverged at rev {}", snap.rev);
+        assert_eq!(snap.sats, full.sats, "sats diverged at rev {}", snap.rev);
+        assert_eq!(
+            snap.region_blocks, full.region_blocks,
+            "region_blocks diverged"
+        );
+        assert_eq!(snap.block_cells, full.block_cells, "block_cells diverged");
+        assert_eq!(snap.block_sats, full.block_sats, "block_sats diverged");
+        assert_eq!(snap.edges, full.edges, "edges diverged");
+        assert_eq!(
+            snap.region_edges, full.region_edges,
+            "region_edges diverged"
+        );
+        assert_eq!(snap.cross_edges, full.cross_edges, "cross_edges diverged");
+        assert_eq!(snap.ids, full.ids, "identity vectors diverged");
+        assert_eq!(snap.totals, full.totals, "totals diverged");
+        assert_eq!(snap.bounds, full.bounds, "bounds diverged");
+
+        let policy = k10s_atlas::testing::lod_policy();
+        let mut fit = k10s_atlas::Camera::default();
+        fit.fit(snap.bounds, 1600.0, 1000.0);
+        let cameras = [fit.zoom, 0.12, 1.0, 4.5].map(|zoom| k10s_atlas::Camera {
+            cx: snap.bounds.center().0,
+            cy: snap.bounds.center().1,
+            zoom,
+        });
+        for camera in cameras {
+            let blend = k10s_atlas::StageBlend::settled(policy.stage_for_zoom(camera.zoom));
+            let through_patched =
+                k10s_atlas::cull(snap, &camera, &policy, blend, 1600.0, 1000.0, true, false);
+            let through_full =
+                k10s_atlas::cull(&full, &camera, &policy, blend, 1600.0, 1000.0, true, false);
             assert_eq!(
-                a.ext.unhealthy_frac, b.ext.unhealthy_frac,
-                "region {i} at rev {}",
-                snap.rev
-            );
-            assert_eq!(
-                a.ext.rollup, b.ext.rollup,
-                "region {i} rollup at rev {}",
-                snap.rev
+                through_patched, through_full,
+                "the cull sees different scenes at zoom {}",
+                camera.zoom
             );
         }
-        assert_eq!(snap.totals.cells, full.totals.cells);
-        assert_eq!(snap.bounds, full.bounds);
     }
 
     fn assert_rollup_arithmetic(world: &World) {
@@ -1481,6 +1748,275 @@ mod tests {
                 cross.len()
             );
         }
+    }
+
+    #[test]
+    fn selective_rebuilds_match_a_full_rebuild_after_every_batch_shape() {
+        use k10s_core::{Payload, ResourceEvent};
+        let sat = |uid: &str, parent: &str, op: Op| {
+            IngestEvent::Resource(ResourceEvent {
+                kind: KindId::SERVICE,
+                uid: uid.into(),
+                namespace: "prod".into(),
+                name: uid.into(),
+                resource_version: 0,
+                parent: Some(parent.into()),
+                op,
+                payload: Payload::Attached {
+                    kind: KindId::SERVICE,
+                    detail: Arc::from("80/TCP"),
+                },
+            })
+        };
+        let owner_with_deps = |uid: &str, name: &str, deps: &[&str], op: Op| {
+            IngestEvent::Resource(ResourceEvent {
+                kind: KindId::DEPLOYMENT,
+                uid: uid.into(),
+                namespace: "prod".into(),
+                name: name.into(),
+                resource_version: 0,
+                parent: Some("ns-prod".into()),
+                op,
+                payload: Payload::Owner {
+                    kind: KindId::DEPLOYMENT,
+                    tool: ToolId::NONE,
+                    depends_on: deps.iter().map(|dep| Arc::from(*dep)).collect(),
+                },
+            })
+        };
+        let renamed_pod = |uid: &str, name: &str, state: State| {
+            IngestEvent::Resource(ResourceEvent {
+                kind: KindId::POD,
+                uid: uid.into(),
+                namespace: "prod".into(),
+                name: name.into(),
+                resource_version: 0,
+                parent: Some("wl-api".into()),
+                op: Op::Modified,
+                payload: Payload::Instance { state },
+            })
+        };
+
+        let batches: Vec<Vec<IngestEvent>> = vec![
+            // The rolling-update hot path: pods only.
+            vec![replay::instance(
+                "pod-3",
+                "prod",
+                "wl-api",
+                State::of(ReasonId::CRASH_LOOP_BACK_OFF),
+                Op::Added,
+            )],
+            // A rename forces a pod state change through the structural path.
+            vec![renamed_pod(
+                "pod-3",
+                "pod-3-renamed",
+                State::of(ReasonId::NOT_READY),
+            )],
+            vec![replay::instance(
+                "pod-2",
+                "prod",
+                "wl-api",
+                State::OK,
+                Op::Deleted,
+            )],
+            // A new workload with edges, then its pod, parent-first.
+            vec![
+                owner_with_deps("wl-edge", "edge", &["wl-api"], Op::Added),
+                replay::instance("pod-e1", "prod", "wl-edge", State::OK, Op::Added),
+            ],
+            // Dependency change on an existing workload without a move.
+            vec![owner_with_deps("wl-edge", "edge", &[], Op::Modified)],
+            vec![sat("svc-api", "wl-api", Op::Added)],
+            vec![sat("svc-api", "wl-api", Op::Deleted)],
+            // A whole new namespace, then its content.
+            vec![
+                replay::scope("ns-canary", "canary", Op::Added),
+                replay::owner("wl-canary", "canary", "canary", KindId::JOB, Op::Added),
+                replay::instance(
+                    "pod-c1",
+                    "canary",
+                    "wl-canary",
+                    State::of(ReasonId::PENDING),
+                    Op::Added,
+                ),
+            ],
+            // A workload delete cascades its pod before the slot clears.
+            vec![replay::owner(
+                "wl-canary",
+                "canary",
+                "canary",
+                KindId::JOB,
+                Op::Deleted,
+            )],
+            vec![replay::scope("ns-canary", "canary", Op::Deleted)],
+            // Slot reuse after the tombstones above: the reused slot's
+            // identity vector entry must change with it, which is the whole
+            // reason the snapshot carries ids.
+            vec![replay::instance(
+                "pod-4",
+                "prod",
+                "wl-api",
+                State::OK,
+                Op::Added,
+            )],
+        ];
+
+        let initial = replay::initial_sync();
+        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
+        topology::verify_derived_state(&mut bench.world);
+
+        let held = bench.snapshot();
+        let held_before = (*held).clone();
+
+        for (index, batch) in batches.iter().enumerate() {
+            bench.apply_events(batch);
+            bench.run_publish();
+            topology::verify_derived_state(&mut bench.world);
+            assert_published_matches_full(&bench.world, &bench.snapshot());
+            let snapshot = bench.snapshot();
+            assert!(
+                snapshot.rev > index as u64,
+                "each structural batch must publish"
+            );
+        }
+
+        let stats = bench.stats();
+        assert!(
+            stats.structural_patches > 0,
+            "the small batches must exercise the patch path: {stats:?}"
+        );
+        assert!(
+            stats.full_materializes > 0,
+            "batches touching most of a tiny scene must fall back to full: {stats:?}"
+        );
+        assert_eq!(
+            held.regions, held_before.regions,
+            "a held snapshot must never change under its reader"
+        );
+        assert_eq!(held.cells, held_before.cells);
+        assert_eq!(held.totals, held_before.totals);
+        assert_eq!(held.rev, held_before.rev);
+    }
+
+    #[test]
+    fn snapshot_ids_name_slots_and_survive_reuse() {
+        let initial = replay::initial_sync();
+        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
+
+        let snap = bench.snapshot();
+        let slot = snap
+            .cells
+            .iter()
+            .position(|cell| cell.label.as_ref() == "pod-1")
+            .expect("pod-1 is in the initial sync");
+        assert_eq!(
+            snap.ids.cells[slot].as_ref(),
+            "pod-1",
+            "a slot's identity entry names the object living in it"
+        );
+        drop(snap);
+
+        bench.apply_events(&[replay::instance(
+            "pod-1",
+            "prod",
+            "wl-api",
+            State::OK,
+            Op::Deleted,
+        )]);
+        bench.run_publish();
+        let snap = bench.snapshot();
+        assert_eq!(
+            snap.ids.cells[slot].as_ref(),
+            "",
+            "a tombstoned slot's identity must empty, not linger"
+        );
+        drop(snap);
+
+        bench.apply_events(&[replay::instance(
+            "pod-replacement",
+            "prod",
+            "wl-api",
+            State::OK,
+            Op::Added,
+        )]);
+        bench.run_publish();
+        let snap = bench.snapshot();
+        assert_eq!(
+            snap.ids.cells[slot].as_ref(),
+            "pod-replacement",
+            "a reused slot must carry the new identity; a selection keyed by \
+             uid sees the swap where one keyed by slot would silently follow it"
+        );
+    }
+
+    #[test]
+    fn a_structural_patch_deep_clones_around_a_held_reader_at_scale() {
+        let spec = generate(&GenConfig {
+            seed: 55,
+            target_objects: 12_000,
+            scenario: Scenario::Platform,
+        });
+        let events =
+            k10s_clustergen::stream::snapshot(&spec, LayoutMode::Spread.emits_attachments());
+        let parent = events
+            .iter()
+            .find_map(|event| match event {
+                IngestEvent::Resource(r)
+                    if matches!(r.payload, k10s_core::Payload::Owner { .. }) =>
+                {
+                    Some((r.uid.clone(), r.namespace.clone()))
+                }
+                _ => None,
+            })
+            .expect("the generated stream has an owner");
+        let mut bench = PublishBench::new(&events, LayoutMode::Spread);
+        // The pool is three deep and each buffer's first publish is a full
+        // materialize by construction; warm the last one so the measured
+        // rounds prove the steady state.
+        let warmup = [replay::instance(
+            "pod-live-warmup",
+            &parent.1,
+            &parent.0,
+            State::OK,
+            Op::Added,
+        )];
+        bench.apply_events(&warmup);
+        bench.run_publish();
+        let before = bench.stats();
+
+        let held = bench.snapshot();
+        let held_rev = held.rev;
+        let held_cells = held.cells.len();
+
+        for round in 0..4 {
+            let uid = format!("pod-live-{round}");
+            let batch = [replay::instance(
+                &uid,
+                &parent.1,
+                &parent.0,
+                State::of(ReasonId::NOT_READY),
+                Op::Added,
+            )];
+            bench.apply_events(&batch);
+            bench.run_publish();
+            assert_published_matches_full(&bench.world, &bench.snapshot());
+        }
+        topology::verify_derived_state(&mut bench.world);
+
+        let stats = bench.stats();
+        let delta_patches = stats.structural_patches - before.structural_patches;
+        let delta_fulls = stats.full_materializes - before.full_materializes;
+        assert_eq!(
+            (delta_patches, delta_fulls),
+            (4, 0),
+            "a one-pod change at scale must patch, never fall back: {stats:?}"
+        );
+        assert!(
+            stats.deep_clones > before.deep_clones,
+            "the held reader's buffer must be cloned around, not mutated: {stats:?}"
+        );
+        assert_eq!(held.rev, held_rev, "the held snapshot must not move");
+        assert_eq!(held.cells.len(), held_cells);
     }
 
     #[test]

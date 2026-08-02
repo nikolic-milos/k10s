@@ -8,7 +8,9 @@ use k10s_core::layout::{
     CARD_HEADER, CARD_PAD, NS_GAP, NS_HEADER, NS_PAD, POD_GAP, POD_PITCH, POD_SIZE, SAT_RING_GAP,
     SAT_RING0_GAP, SAT_SIZE, WL_GAP, WL_HEADER, WL_PAD,
 };
-use k10s_core::{EdgeInst, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent, State, ToolId};
+use k10s_core::{
+    EdgeInst, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent, Severity, State, ToolId,
+};
 
 use crate::{
     Aggregates, Dirty, DirtyPods, Pending, PodH, SnapshotPool, Topology, layout::LayoutMode,
@@ -162,26 +164,159 @@ pub(super) fn apply_events(world: &mut World, events: &[IngestEvent], mode: Layo
     let mut topology = world
         .remove_resource::<Topology>()
         .expect("the world owns its topology while applying live events");
+    let mut aggregates = world
+        .remove_resource::<Aggregates>()
+        .expect("the world owns its aggregates while applying live events");
+    let mut dirt = BatchDirt::default();
+    // Pod-state deltas queued for rollup() but not yet folded would be lost to
+    // the incremental path, whose "old state" is what aggregates already hold.
+    if !world.resource::<DirtyPods>().0.is_empty() {
+        dirt.aggregates_full = true;
+    }
     for event in events {
         let IngestEvent::Resource(resource) = event else {
             continue;
         };
-        apply_resource(world, &mut topology, resource, mode);
+        apply_resource(
+            world,
+            &mut topology,
+            &mut aggregates,
+            &mut dirt,
+            resource,
+            mode,
+        );
     }
-    rebuild_structure(&mut topology);
+    rebuild_selective(&mut topology, &dirt);
     topology.spatial_revision += 1;
-    let aggregates = rebuild_aggregates(world, &topology);
+    if dirt.identity {
+        topology.identity_revision += 1;
+    }
+    let aggregates = if dirt.aggregates_full {
+        rebuild_aggregates(world, &topology)
+    } else {
+        aggregates
+    };
+    // A patch must win by construction: when the batch invalidated the
+    // aggregates or counts wholesale, or touched a large share of the scene,
+    // the full materialize is both simpler and cheaper.
+    let total_slots = topology.ns_slots.slots()
+        + topology.wl_slots.slots()
+        + topology.pod_slots.slots()
+        + topology.sat_slots.slots();
+    let full = dirt.aggregates_full || dirt.counts_full || dirt.touched() * 2 > total_slots;
     world.insert_resource(topology);
     world.insert_resource(aggregates);
     world.resource_mut::<DirtyPods>().0.clear();
     {
         let mut pool = world.resource_mut::<SnapshotPool>();
         for pending in &mut pool.pending {
-            *pending = Pending::full();
+            if full {
+                *pending = Pending::full();
+            } else if !pending.all {
+                let structural = &mut pending.structural;
+                structural.active = true;
+                structural.nss.extend_from_slice(&dirt.nss);
+                structural.wls.extend_from_slice(&dirt.wls);
+                structural.pods.extend_from_slice(&dirt.pods);
+                structural.sats.extend_from_slice(&dirt.sats);
+                structural.ranges_ns_wl |= dirt.ns_wl;
+                structural.ranges_wl_pod |= dirt.wl_pod;
+                structural.ranges_wl_sat |= dirt.wl_sat;
+                structural.edges |= dirt.edges;
+            }
         }
     }
     world.resource_mut::<Dirty>().0 = true;
     true
+}
+
+// Which derived structures a live batch invalidated, and which slots it
+// touched. Everything defaults to clean, and each upsert or removal marks
+// exactly what it changed, so a batch pays to rebuild the relations it
+// invalidated and the snapshots patch only the nodes that moved.
+#[derive(Default)]
+struct BatchDirt {
+    identity: bool,
+    ns_wl: bool,
+    wl_pod: bool,
+    wl_sat: bool,
+    edges: bool,
+    counts_full: bool,
+    aggregates_full: bool,
+    nss: Vec<u32>,
+    wls: Vec<u32>,
+    pods: Vec<u32>,
+    sats: Vec<u32>,
+}
+
+impl BatchDirt {
+    fn touched(&self) -> usize {
+        self.nss.len() + self.wls.len() + self.pods.len() + self.sats.len()
+    }
+}
+
+fn rebuild_selective(topology: &mut Topology, dirt: &BatchDirt) {
+    if dirt.ns_wl {
+        let region_blocks = Adjacency::build(
+            &topology.wl_ns,
+            &topology.wl_slots,
+            topology.ns_slots.slots(),
+        );
+        let direct = region_blocks.is_direct();
+        topology.ns_wl_range = region_blocks.ranges;
+        topology.region_blocks = if direct {
+            Vec::new()
+        } else {
+            region_blocks.indices
+        };
+    }
+    if dirt.wl_pod {
+        let block_cells = Adjacency::build(
+            &topology.pod_wl,
+            &topology.pod_slots,
+            topology.wl_slots.slots(),
+        );
+        let direct = block_cells.is_direct();
+        topology.wl_pod_range = block_cells.ranges;
+        topology.block_cells = if direct {
+            Vec::new()
+        } else {
+            block_cells.indices
+        };
+    }
+    if dirt.wl_sat {
+        let block_sats = Adjacency::build(
+            &topology.sat_wl,
+            &topology.sat_slots,
+            topology.wl_slots.slots(),
+        );
+        let direct = block_sats.is_direct();
+        topology.wl_sat_range = block_sats.ranges;
+        topology.block_sats = if direct {
+            Vec::new()
+        } else {
+            block_sats.indices
+        };
+    }
+    if dirt.counts_full {
+        topology.ns_pod_count.fill(0);
+        for pod in 0..topology.pod_slots.slots() {
+            if !topology.pod_slots.is_active(pod) {
+                continue;
+            }
+            let workload = topology.pod_wl[pod] as usize;
+            if !topology.wl_slots.is_active(workload) {
+                continue;
+            }
+            let namespace = topology.wl_ns[workload] as usize;
+            if topology.ns_slots.is_active(namespace) {
+                topology.ns_pod_count[namespace] += 1;
+            }
+        }
+    }
+    if dirt.edges {
+        rebuild_edges(topology);
+    }
 }
 
 impl Topology {
@@ -210,36 +345,96 @@ impl Topology {
 fn apply_resource(
     world: &mut World,
     topology: &mut Topology,
+    aggregates: &mut Aggregates,
+    dirt: &mut BatchDirt,
     resource: &ResourceEvent,
     mode: LayoutMode,
 ) {
     if resource.op == Op::Deleted {
-        remove_resource(topology, resource);
+        remove_resource(topology, aggregates, dirt, resource);
         return;
     }
     match &resource.payload {
-        Payload::Scope => upsert_namespace(topology, resource),
+        Payload::Scope => upsert_namespace(topology, aggregates, dirt, resource),
         Payload::Owner {
             kind,
             tool,
             depends_on,
-        } => upsert_workload(topology, resource, *kind, *tool, depends_on, mode),
-        Payload::Instance { state } => upsert_pod(world, topology, resource, *state, mode),
+        } => upsert_workload(
+            topology, aggregates, dirt, resource, *kind, *tool, depends_on, mode,
+        ),
+        Payload::Instance { state } => {
+            upsert_pod(world, topology, aggregates, dirt, resource, *state, mode)
+        }
         Payload::Attached { kind, detail } if mode.emits_attachments() => {
-            upsert_satellite(topology, resource, *kind, detail)
+            upsert_satellite(topology, dirt, resource, *kind, detail)
         }
         Payload::Attached { .. } => {}
     }
 }
 
-fn upsert_namespace(topology: &mut Topology, resource: &ResourceEvent) {
+// One pod's severity moves between (workload, namespace) buckets. `from` and
+// `to` of None mean the pod is entering or leaving the world; the rollups of
+// every touched bucket are refreshed immediately, which per event is O(1).
+fn shift_pod_severity(
+    topology: &Topology,
+    aggregates: &mut Aggregates,
+    from: Option<(u32, State)>,
+    to: Option<(u32, State)>,
+) {
+    let mut touched = [None::<u32>; 2];
+    if let Some((workload, state)) = from {
+        let namespace = topology.wl_ns[workload as usize] as usize;
+        let rank = state.severity.rank() as usize;
+        aggregates.wl_sev_counts[workload as usize][rank] -= 1;
+        aggregates.ns_sev_counts[namespace][rank] -= 1;
+        if state.severity.is_unhealthy() {
+            aggregates.ns_unhealthy_count[namespace] -= 1;
+        }
+        touched[0] = Some(workload);
+    }
+    if let Some((workload, state)) = to {
+        let namespace = topology.wl_ns[workload as usize] as usize;
+        let rank = state.severity.rank() as usize;
+        aggregates.wl_sev_counts[workload as usize][rank] += 1;
+        aggregates.ns_sev_counts[namespace][rank] += 1;
+        if state.severity.is_unhealthy() {
+            aggregates.ns_unhealthy_count[namespace] += 1;
+        }
+        touched[1] = Some(workload);
+    }
+    for workload in touched.into_iter().flatten() {
+        let namespace = topology.wl_ns[workload as usize] as usize;
+        aggregates.wl_rollup[workload as usize] =
+            rollup_of(&aggregates.wl_sev_counts[workload as usize]);
+        aggregates.ns_rollup[namespace] = rollup_of(&aggregates.ns_sev_counts[namespace]);
+        let total = topology.ns_pod_count[namespace].max(1) as f32;
+        aggregates.ns_unhealthy[namespace] =
+            aggregates.ns_unhealthy_count[namespace] as f32 / total;
+    }
+}
+
+fn upsert_namespace(
+    topology: &mut Topology,
+    aggregates: &mut Aggregates,
+    dirt: &mut BatchDirt,
+    resource: &ResourceEvent,
+) {
     let (slot, inserted) = topology.ns_slots.insert(resource.uid.clone());
     let index = slot as usize;
     ensure_namespace(topology, index + 1);
     topology.ns_labels[index] = resource.name.clone();
+    dirt.nss.push(slot);
     if !inserted {
         return;
     }
+    dirt.identity = true;
+    dirt.ns_wl = true;
+    ensure_namespace_aggregates(aggregates, index + 1);
+    aggregates.ns_sev_counts[index] = [0; 4];
+    aggregates.ns_unhealthy_count[index] = 0;
+    aggregates.ns_unhealthy[index] = 0.0;
+    aggregates.ns_rollup[index] = Severity::Ok;
 
     let width = NS_PAD * 2.0 + POD_SIZE + CARD_PAD * 2.0;
     let height = NS_PAD * 2.0 + NS_HEADER + POD_SIZE + CARD_HEADER + CARD_PAD * 2.0;
@@ -252,8 +447,11 @@ fn upsert_namespace(topology: &mut Topology, resource: &ResourceEvent) {
     grow_world(topology, topology.ns_rects[index]);
 }
 
+#[expect(clippy::too_many_arguments)]
 fn upsert_workload(
     topology: &mut Topology,
+    aggregates: &mut Aggregates,
+    dirt: &mut BatchDirt,
     resource: &ResourceEvent,
     kind: KindId,
     tool: ToolId,
@@ -267,10 +465,42 @@ fn upsert_workload(
     else {
         return;
     };
+    let slots_before = topology.wl_slots.slots();
     let (slot, inserted) = topology.wl_slots.insert(resource.uid.clone());
     let index = slot as usize;
     ensure_workload(topology, index + 1);
     let moved = !inserted && topology.wl_ns[index] != namespace;
+    dirt.wls.push(slot);
+    if inserted || moved {
+        dirt.nss.push(namespace);
+    }
+    if inserted {
+        dirt.identity = true;
+        dirt.ns_wl = true;
+        dirt.edges = true;
+        if topology.wl_slots.slots() > slots_before {
+            // The pod and satellite adjacencies key their ranges by workload
+            // slot, so a grown slot table must regrow them even though no
+            // child moved.
+            dirt.wl_pod = true;
+            dirt.wl_sat = true;
+        }
+        ensure_workload_aggregates(aggregates, index + 1);
+        aggregates.wl_sev_counts[index] = [0; 4];
+        aggregates.wl_rollup[index] = Severity::Ok;
+    }
+    if moved {
+        // A workload changing namespace would need its pods' severity buckets
+        // transferred wholesale; it cannot happen on a real cluster, so it
+        // pays the full rebuild instead of carrying transfer code.
+        dirt.ns_wl = true;
+        dirt.edges = true;
+        dirt.counts_full = true;
+        dirt.aggregates_full = true;
+    }
+    if !inserted && !moved && topology.wl_depends_on[index].as_slice() != depends_on {
+        dirt.edges = true;
+    }
     topology.wl_labels[index] = resource.name.clone();
     topology.wl_kinds[index] = kind;
     topology.wl_tools[index] = tool;
@@ -285,6 +515,8 @@ fn upsert_workload(
 fn upsert_pod(
     world: &mut World,
     topology: &mut Topology,
+    aggregates: &mut Aggregates,
+    dirt: &mut BatchDirt,
     resource: &ResourceEvent,
     state: State,
     mode: LayoutMode,
@@ -299,12 +531,50 @@ fn upsert_pod(
     let (slot, inserted) = topology.pod_slots.insert(resource.uid.clone());
     let index = slot as usize;
     ensure_pod(world, topology, index + 1);
+    ensure_pod_aggregates(aggregates, index + 1);
     let moved = !inserted && topology.pod_wl[index] != workload;
+    let previous = (!inserted).then(|| (topology.pod_wl[index], aggregates.pod_state[index]));
     topology.pod_labels[index] = resource.name.clone();
     topology.pod_wl[index] = workload;
+    dirt.pods.push(slot);
+    dirt.wls.push(workload);
+    dirt.nss.push(topology.wl_ns[workload as usize]);
+    if let Some((old_workload, _)) = previous
+        && moved
+        && topology.wl_slots.is_active(old_workload as usize)
+    {
+        dirt.wls.push(old_workload);
+        dirt.nss.push(topology.wl_ns[old_workload as usize]);
+    }
     if inserted || moved {
+        dirt.wl_pod = true;
         topology.pod_rects[index] = place_pod(topology, slot, workload, mode);
     }
+    if inserted {
+        dirt.identity = true;
+    }
+    match previous {
+        None => {
+            topology.ns_pod_count[topology.wl_ns[workload as usize] as usize] += 1;
+            shift_pod_severity(topology, aggregates, None, Some((workload, state)));
+        }
+        Some((old_workload, old_state)) => {
+            if moved {
+                let old_ns = topology.wl_ns[old_workload as usize] as usize;
+                topology.ns_pod_count[old_ns] -= 1;
+                topology.ns_pod_count[topology.wl_ns[workload as usize] as usize] += 1;
+            }
+            if moved || old_state != state {
+                shift_pod_severity(
+                    topology,
+                    aggregates,
+                    Some((old_workload, old_state)),
+                    Some((workload, state)),
+                );
+            }
+        }
+    }
+    aggregates.pod_state[index] = state;
     let entity = topology.pod_entities[index];
     if let Some(mut health) = world.get_mut::<PodH>(entity) {
         health.0 = state;
@@ -313,6 +583,7 @@ fn upsert_pod(
 
 fn upsert_satellite(
     topology: &mut Topology,
+    dirt: &mut BatchDirt,
     resource: &ResourceEvent,
     kind: KindId,
     detail: &Arc<str>,
@@ -332,12 +603,24 @@ fn upsert_satellite(
     topology.sat_kinds[index] = kind;
     topology.sat_details[index] = detail.clone();
     topology.sat_wl[index] = workload;
+    dirt.sats.push(slot);
+    if inserted {
+        dirt.identity = true;
+    }
     if inserted || moved {
+        dirt.wl_sat = true;
+        dirt.wls.push(workload);
+        dirt.nss.push(topology.wl_ns[workload as usize]);
         topology.sat_rects[index] = place_satellite(topology, slot, workload);
     }
 }
 
-fn remove_resource(topology: &mut Topology, resource: &ResourceEvent) {
+fn remove_resource(
+    topology: &mut Topology,
+    aggregates: &mut Aggregates,
+    dirt: &mut BatchDirt,
+    resource: &ResourceEvent,
+) {
     match resource.payload {
         Payload::Scope => {
             let Some(namespace) = topology.ns_slots.get(&resource.uid) else {
@@ -350,22 +633,34 @@ fn remove_resource(topology: &mut Topology, resource: &ResourceEvent) {
                 .filter_map(|index| topology.wl_slots.uid(index as u32).cloned())
                 .collect();
             for uid in workloads {
-                remove_workload(topology, &uid);
+                remove_workload(topology, aggregates, dirt, &uid);
             }
             if let Some(slot) = topology.ns_slots.remove(&resource.uid) {
+                dirt.identity = true;
+                dirt.ns_wl = true;
+                dirt.nss.push(slot);
                 let index = slot as usize;
                 topology.ns_labels[index] = Arc::from("");
                 topology.ns_rects[index] = DEAD_RECT;
                 topology.ns_pod_count[index] = 0;
+                aggregates.ns_sev_counts[index] = [0; 4];
+                aggregates.ns_unhealthy_count[index] = 0;
+                aggregates.ns_unhealthy[index] = 0.0;
+                aggregates.ns_rollup[index] = Severity::Ok;
             }
         }
-        Payload::Owner { .. } => remove_workload(topology, &resource.uid),
-        Payload::Instance { .. } => remove_pod(topology, &resource.uid),
-        Payload::Attached { .. } => remove_satellite(topology, &resource.uid),
+        Payload::Owner { .. } => remove_workload(topology, aggregates, dirt, &resource.uid),
+        Payload::Instance { .. } => remove_pod(topology, aggregates, dirt, &resource.uid),
+        Payload::Attached { .. } => remove_satellite(topology, dirt, &resource.uid),
     }
 }
 
-fn remove_workload(topology: &mut Topology, uid: &str) {
+fn remove_workload(
+    topology: &mut Topology,
+    aggregates: &mut Aggregates,
+    dirt: &mut BatchDirt,
+    uid: &str,
+) {
     let Some(workload) = topology.wl_slots.get(uid) else {
         return;
     };
@@ -374,36 +669,70 @@ fn remove_workload(topology: &mut Topology, uid: &str) {
         .filter_map(|index| topology.pod_slots.uid(index as u32).cloned())
         .collect();
     for uid in pods {
-        remove_pod(topology, &uid);
+        remove_pod(topology, aggregates, dirt, &uid);
     }
     let satellites: Vec<Arc<str>> = (0..topology.sat_slots.slots())
         .filter(|&index| topology.sat_slots.is_active(index) && topology.sat_wl[index] == workload)
         .filter_map(|index| topology.sat_slots.uid(index as u32).cloned())
         .collect();
     for uid in satellites {
-        remove_satellite(topology, &uid);
+        remove_satellite(topology, dirt, &uid);
     }
     if let Some(slot) = topology.wl_slots.remove(uid) {
+        dirt.identity = true;
+        dirt.ns_wl = true;
+        dirt.edges = true;
+        dirt.wls.push(slot);
         let index = slot as usize;
+        if topology.ns_slots.is_active(topology.wl_ns[index] as usize) {
+            dirt.nss.push(topology.wl_ns[index]);
+        }
+        debug_assert_eq!(
+            aggregates.wl_sev_counts[index], [0; 4],
+            "a workload's pods must all be removed before the workload"
+        );
         topology.wl_labels[index] = Arc::from("");
         topology.wl_rects[index] = DEAD_RECT;
         topology.wl_card_rects[index] = DEAD_RECT;
         topology.wl_ns[index] = NO_SLOT;
         topology.wl_depends_on[index].clear();
+        aggregates.wl_sev_counts[index] = [0; 4];
+        aggregates.wl_rollup[index] = Severity::Ok;
     }
 }
 
-fn remove_pod(topology: &mut Topology, uid: &str) {
+fn remove_pod(
+    topology: &mut Topology,
+    aggregates: &mut Aggregates,
+    dirt: &mut BatchDirt,
+    uid: &str,
+) {
     if let Some(slot) = topology.pod_slots.remove(uid) {
+        dirt.identity = true;
+        dirt.wl_pod = true;
+        dirt.pods.push(slot);
         let index = slot as usize;
+        let workload = topology.pod_wl[index];
+        let state = aggregates.pod_state[index];
+        if topology.wl_slots.is_active(workload as usize) {
+            let namespace = topology.wl_ns[workload as usize] as usize;
+            topology.ns_pod_count[namespace] -= 1;
+            shift_pod_severity(topology, aggregates, Some((workload, state)), None);
+            dirt.wls.push(workload);
+            dirt.nss.push(namespace as u32);
+        }
+        aggregates.pod_state[index] = State::OK;
         topology.pod_labels[index] = Arc::from("");
         topology.pod_rects[index] = DEAD_RECT;
         topology.pod_wl[index] = NO_SLOT;
     }
 }
 
-fn remove_satellite(topology: &mut Topology, uid: &str) {
+fn remove_satellite(topology: &mut Topology, dirt: &mut BatchDirt, uid: &str) {
     if let Some(slot) = topology.sat_slots.remove(uid) {
+        dirt.identity = true;
+        dirt.wl_sat = true;
+        dirt.sats.push(slot);
         let index = slot as usize;
         topology.sat_labels[index] = Arc::from("");
         topology.sat_details[index] = Arc::from("");
@@ -412,62 +741,26 @@ fn remove_satellite(topology: &mut Topology, uid: &str) {
     }
 }
 
-fn rebuild_structure(topology: &mut Topology) {
-    let region_blocks = Adjacency::build(
-        &topology.wl_ns,
-        &topology.wl_slots,
-        topology.ns_slots.slots(),
-    );
-    let direct = region_blocks.is_direct();
-    topology.ns_wl_range = region_blocks.ranges;
-    topology.region_blocks = if direct {
-        Vec::new()
-    } else {
-        region_blocks.indices
-    };
-
-    let block_cells = Adjacency::build(
-        &topology.pod_wl,
-        &topology.pod_slots,
-        topology.wl_slots.slots(),
-    );
-    let direct = block_cells.is_direct();
-    topology.wl_pod_range = block_cells.ranges;
-    topology.block_cells = if direct {
-        Vec::new()
-    } else {
-        block_cells.indices
-    };
-
-    let block_sats = Adjacency::build(
-        &topology.sat_wl,
-        &topology.sat_slots,
-        topology.wl_slots.slots(),
-    );
-    let direct = block_sats.is_direct();
-    topology.wl_sat_range = block_sats.ranges;
-    topology.block_sats = if direct {
-        Vec::new()
-    } else {
-        block_sats.indices
-    };
-
-    topology.ns_pod_count.fill(0);
-    for pod in 0..topology.pod_slots.slots() {
-        if !topology.pod_slots.is_active(pod) {
-            continue;
-        }
-        let workload = topology.pod_wl[pod] as usize;
-        if !topology.wl_slots.is_active(workload) {
-            continue;
-        }
-        let namespace = topology.wl_ns[workload] as usize;
-        if topology.ns_slots.is_active(namespace) {
-            topology.ns_pod_count[namespace] += 1;
-        }
+fn ensure_namespace_aggregates(aggregates: &mut Aggregates, len: usize) {
+    if aggregates.ns_sev_counts.len() < len {
+        aggregates.ns_sev_counts.resize(len, [0; 4]);
+        aggregates.ns_unhealthy_count.resize(len, 0);
+        aggregates.ns_unhealthy.resize(len, 0.0);
+        aggregates.ns_rollup.resize(len, Severity::Ok);
     }
+}
 
-    rebuild_edges(topology);
+fn ensure_workload_aggregates(aggregates: &mut Aggregates, len: usize) {
+    if aggregates.wl_sev_counts.len() < len {
+        aggregates.wl_sev_counts.resize(len, [0; 4]);
+        aggregates.wl_rollup.resize(len, Severity::Ok);
+    }
+}
+
+fn ensure_pod_aggregates(aggregates: &mut Aggregates, len: usize) {
+    if aggregates.pod_state.len() < len {
+        aggregates.pod_state.resize(len, State::OK);
+    }
 }
 
 fn rebuild_edges(topology: &mut Topology) {
@@ -546,29 +839,38 @@ fn rebuild_aggregates(world: &World, topology: &Topology) -> Aggregates {
     }
 }
 
+// Every ensure_* grows and never shrinks: a reused tombstone slot arrives
+// with a length below the high-water mark, and a plain resize would truncate
+// every live entry above it.
 fn ensure_namespace(topology: &mut Topology, len: usize) {
-    topology.ns_labels.resize_with(len, || Arc::from(""));
-    topology.ns_rects.resize(len, DEAD_RECT);
-    topology.ns_wl_range.resize(len, 0..0);
-    topology.ns_pod_count.resize(len, 0);
+    if topology.ns_labels.len() < len {
+        topology.ns_labels.resize_with(len, || Arc::from(""));
+        topology.ns_rects.resize(len, DEAD_RECT);
+        topology.ns_wl_range.resize(len, 0..0);
+        topology.ns_pod_count.resize(len, 0);
+    }
 }
 
 fn ensure_workload(topology: &mut Topology, len: usize) {
-    topology.wl_labels.resize_with(len, || Arc::from(""));
-    topology.wl_rects.resize(len, DEAD_RECT);
-    topology.wl_card_rects.resize(len, DEAD_RECT);
-    topology.wl_kinds.resize(len, KindId::DEPLOYMENT);
-    topology.wl_tools.resize(len, ToolId::NONE);
-    topology.wl_ns.resize(len, NO_SLOT);
-    topology.wl_depends_on.resize_with(len, Vec::new);
-    topology.wl_pod_range.resize(len, 0..0);
-    topology.wl_sat_range.resize(len, 0..0);
+    if topology.wl_labels.len() < len {
+        topology.wl_labels.resize_with(len, || Arc::from(""));
+        topology.wl_rects.resize(len, DEAD_RECT);
+        topology.wl_card_rects.resize(len, DEAD_RECT);
+        topology.wl_kinds.resize(len, KindId::DEPLOYMENT);
+        topology.wl_tools.resize(len, ToolId::NONE);
+        topology.wl_ns.resize(len, NO_SLOT);
+        topology.wl_depends_on.resize_with(len, Vec::new);
+        topology.wl_pod_range.resize(len, 0..0);
+        topology.wl_sat_range.resize(len, 0..0);
+    }
 }
 
 fn ensure_pod(world: &mut World, topology: &mut Topology, len: usize) {
-    topology.pod_labels.resize_with(len, || Arc::from(""));
-    topology.pod_rects.resize(len, DEAD_RECT);
-    topology.pod_wl.resize(len, NO_SLOT);
+    if topology.pod_labels.len() < len {
+        topology.pod_labels.resize_with(len, || Arc::from(""));
+        topology.pod_rects.resize(len, DEAD_RECT);
+        topology.pod_wl.resize(len, NO_SLOT);
+    }
     while topology.pod_entities.len() < len {
         topology
             .pod_entities
@@ -577,11 +879,13 @@ fn ensure_pod(world: &mut World, topology: &mut Topology, len: usize) {
 }
 
 fn ensure_satellite(topology: &mut Topology, len: usize) {
-    topology.sat_labels.resize_with(len, || Arc::from(""));
-    topology.sat_details.resize_with(len, || Arc::from(""));
-    topology.sat_kinds.resize(len, KindId::SERVICE);
-    topology.sat_rects.resize(len, DEAD_RECT);
-    topology.sat_wl.resize(len, NO_SLOT);
+    if topology.sat_labels.len() < len {
+        topology.sat_labels.resize_with(len, || Arc::from(""));
+        topology.sat_details.resize_with(len, || Arc::from(""));
+        topology.sat_kinds.resize(len, KindId::SERVICE);
+        topology.sat_rects.resize(len, DEAD_RECT);
+        topology.sat_wl.resize(len, NO_SLOT);
+    }
 }
 
 fn place_workload(topology: &mut Topology, slot: u32, namespace: u32, mode: LayoutMode) {
@@ -612,6 +916,21 @@ fn place_pod(topology: &mut Topology, slot: u32, workload: u32, mode: LayoutMode
         LayoutMode::Dense => (WL_PAD, WL_HEADER),
     };
     let columns = (((card.w - pad * 2.0 + POD_GAP) / POD_PITCH).floor() as usize).max(1);
+    // One pass over the pod slots collects this workload's occupied corners;
+    // probing then costs the candidate count, not candidates x every pod in
+    // the world. Positions compare exactly because every pod rect comes from
+    // the same formula below.
+    let occupied: std::collections::HashSet<(u32, u32)> = (0..topology.pod_slots.slots())
+        .filter(|&index| {
+            topology.pod_slots.is_active(index)
+                && index != slot as usize
+                && topology.pod_wl[index] == workload
+        })
+        .map(|index| {
+            let rect = topology.pod_rects[index];
+            (rect.x.to_bits(), rect.y.to_bits())
+        })
+        .collect();
     let mut position = 0usize;
     loop {
         let column = position % columns;
@@ -622,13 +941,7 @@ fn place_pod(topology: &mut Topology, slot: u32, workload: u32, mode: LayoutMode
             POD_SIZE,
             POD_SIZE,
         );
-        let occupied = (0..topology.pod_slots.slots()).any(|index| {
-            topology.pod_slots.is_active(index)
-                && index != slot as usize
-                && topology.pod_wl[index] == workload
-                && topology.pod_rects[index] == candidate
-        });
-        if !occupied {
+        if !occupied.contains(&(candidate.x.to_bits(), candidate.y.to_bits())) {
             grow_workload(topology, workload, candidate, pad);
             return candidate;
         }
@@ -640,6 +953,14 @@ fn place_satellite(topology: &mut Topology, slot: u32, workload: u32) -> Rect {
     let card = topology.wl_card_rects[workload as usize];
     let (center_x, center_y) = card.center();
     let base_radius = 0.5 * (card.w * card.w + card.h * card.h).sqrt() + SAT_RING0_GAP;
+    let siblings: Vec<Rect> = (0..topology.sat_slots.slots())
+        .filter(|&index| {
+            topology.sat_slots.is_active(index)
+                && index != slot as usize
+                && topology.sat_wl[index] == workload
+        })
+        .map(|index| topology.sat_rects[index])
+        .collect();
     let mut position = 0usize;
     loop {
         const RING_SLOTS: usize = 12;
@@ -652,13 +973,7 @@ fn place_satellite(topology: &mut Topology, slot: u32, workload: u32) -> Rect {
             SAT_SIZE,
             SAT_SIZE,
         );
-        let occupied = (0..topology.sat_slots.slots()).any(|index| {
-            topology.sat_slots.is_active(index)
-                && index != slot as usize
-                && topology.sat_wl[index] == workload
-                && topology.sat_rects[index].intersects(&candidate)
-        });
-        if !occupied {
+        if !siblings.iter().any(|rect| rect.intersects(&candidate)) {
             let workload_index = workload as usize;
             topology.wl_rects[workload_index] =
                 rect_union(topology.wl_rects[workload_index], candidate);
@@ -704,6 +1019,97 @@ fn rect_union(a: Rect, b: Rect) -> Rect {
         a.max_x().max(b.max_x()) - x,
         a.max_y().max(b.max_y()) - y,
     )
+}
+
+// The selective rebuild and the incremental aggregates are only safe if they
+// are indistinguishable from recomputing everything. This recomputes
+// everything and says so when they are not.
+#[cfg(test)]
+pub(super) fn verify_derived_state(world: &mut World) {
+    let mut topology = world
+        .remove_resource::<Topology>()
+        .expect("topology present");
+
+    fn child_lists(ranges: &[Range<u32>], indices: &[u32]) -> Vec<Vec<u32>> {
+        ranges
+            .iter()
+            .map(|range| {
+                if indices.is_empty() {
+                    (range.start..range.end).collect()
+                } else {
+                    indices[range.start as usize..range.end as usize].to_vec()
+                }
+            })
+            .collect()
+    }
+    let fresh = Adjacency::build(
+        &topology.wl_ns,
+        &topology.wl_slots,
+        topology.ns_slots.slots(),
+    );
+    assert_eq!(
+        child_lists(&topology.ns_wl_range, &topology.region_blocks),
+        child_lists(&fresh.ranges, &fresh.indices),
+        "the ns->wl adjacency drifted from a full rebuild"
+    );
+    let fresh = Adjacency::build(
+        &topology.pod_wl,
+        &topology.pod_slots,
+        topology.wl_slots.slots(),
+    );
+    assert_eq!(
+        child_lists(&topology.wl_pod_range, &topology.block_cells),
+        child_lists(&fresh.ranges, &fresh.indices),
+        "the wl->pod adjacency drifted from a full rebuild"
+    );
+    let fresh = Adjacency::build(
+        &topology.sat_wl,
+        &topology.sat_slots,
+        topology.wl_slots.slots(),
+    );
+    assert_eq!(
+        child_lists(&topology.wl_sat_range, &topology.block_sats),
+        child_lists(&fresh.ranges, &fresh.indices),
+        "the wl->sat adjacency drifted from a full rebuild"
+    );
+
+    let mut fresh_counts = vec![0u32; topology.ns_pod_count.len()];
+    for pod in 0..topology.pod_slots.slots() {
+        if !topology.pod_slots.is_active(pod) {
+            continue;
+        }
+        let workload = topology.pod_wl[pod] as usize;
+        if !topology.wl_slots.is_active(workload) {
+            continue;
+        }
+        let namespace = topology.wl_ns[workload] as usize;
+        if topology.ns_slots.is_active(namespace) {
+            fresh_counts[namespace] += 1;
+        }
+    }
+    assert_eq!(
+        topology.ns_pod_count, fresh_counts,
+        "ns_pod_count drifted from a full recount"
+    );
+
+    let stored_edges = topology.edges.clone();
+    let stored_ranges = topology.ns_edge_range.clone();
+    let stored_cross = topology.cross_edge_range.clone();
+    rebuild_edges(&mut topology);
+    assert_eq!(stored_edges, topology.edges, "edges drifted");
+    assert_eq!(stored_ranges, topology.ns_edge_range, "edge ranges drifted");
+    assert_eq!(
+        stored_cross, topology.cross_edge_range,
+        "cross range drifted"
+    );
+
+    let fresh_aggregates = rebuild_aggregates(world, &topology);
+    assert_eq!(
+        world.resource::<Aggregates>(),
+        &fresh_aggregates,
+        "aggregates drifted from a full rebuild"
+    );
+    world.insert_resource(topology);
 }
 
 #[cfg(test)]
