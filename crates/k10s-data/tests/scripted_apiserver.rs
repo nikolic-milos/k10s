@@ -20,6 +20,7 @@ struct Route {
     accept_contains: Option<&'static str>,
     status: u16,
     body: String,
+    hang: bool,
     used: bool,
 }
 
@@ -48,6 +49,7 @@ impl Script {
             accept_contains: None,
             status,
             body: body.into(),
+            hang: false,
             used: false,
         });
         self
@@ -67,6 +69,23 @@ impl Script {
             accept_contains: Some(accept_contains),
             status,
             body: body.into(),
+            hang: false,
+            used: false,
+        });
+        self
+    }
+
+    // A route that never answers: the connection stays open, like a real
+    // API server holding a follow. What a caller can prove against it is
+    // that cancellation works while a request is in flight.
+    fn route_hanging(&self, method: &'static str, matches: &str) -> &Self {
+        self.state.lock().expect("script lock").routes.push(Route {
+            method,
+            matches: matches.to_string(),
+            accept_contains: None,
+            status: 0,
+            body: String::new(),
+            hang: true,
             used: false,
         });
         self
@@ -128,6 +147,10 @@ impl Service<http::Request<Body>> for Script {
                 && r.accept_contains.is_none_or(|want| accept.contains(want))
         });
         let (status, body) = match hit {
+            Some(route) if route.hang => {
+                route.used = true;
+                return Box::pin(std::future::pending());
+            }
             Some(route) => {
                 route.used = true;
                 (route.status, route.body.clone())
@@ -431,6 +454,125 @@ fn run_live(
 
 fn run(script: &Script, options: Options) -> Sync {
     run_live(script, options, |_| true).0
+}
+
+#[test]
+fn the_inspector_reads_events_and_logs_and_labels_a_denial() {
+    use k10s_data::inspect::InspectDetail;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/events?",
+        200,
+        r#"{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[
+            {"metadata":{"name":"e1","namespace":"prod"},"type":"Warning","reason":"BackOff",
+             "message":"Back-off restarting failed container","count":7,
+             "lastTimestamp":"2026-08-02T04:00:00Z",
+             "involvedObject":{"kind":"Pod","name":"api-1","namespace":"prod"}},
+            {"metadata":{"name":"e2","namespace":"prod"},"type":"Normal","reason":"Pulled",
+             "message":"Container image pulled","count":1,
+             "lastTimestamp":"2026-08-02T05:00:00Z",
+             "involvedObject":{"kind":"Pod","name":"api-1","namespace":"prod"}}
+        ]}"#,
+    );
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/pods/api-1/log?",
+        200,
+        "2026-08-02T05:00:00Z listening on :8080\n2026-08-02T05:00:01Z ready\n",
+    );
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/events?",
+        403,
+        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"events is forbidden"}"#,
+    );
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let sync = runtime
+        .block_on(async {
+            sync_from(
+                script.client(),
+                "prod",
+                &options(),
+                tx,
+                Arc::new(IngestMetrics::default()),
+            )
+            .await
+        })
+        .expect("the scripted cluster syncs");
+
+    let recv = |rx: futures::channel::oneshot::Receiver<InspectDetail>| {
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), rx).await })
+            .expect("a reply within the budget")
+            .expect("the fetch task replies")
+    };
+
+    let (reply, rx) = futures::channel::oneshot::channel();
+    sync.inspector.fetch_events("prod", "api-1", move |detail| {
+        let _ = reply.send(detail);
+    });
+    let InspectDetail::Events(events) = recv(rx) else {
+        panic!("events must resolve");
+    };
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        (events[0].reason.as_str(), events[0].kind.as_str()),
+        ("Pulled", "Normal"),
+        "newest first: {events:?}"
+    );
+    assert_eq!(events[1].count, 7);
+    let sent = script.requests_for("/events");
+    assert!(
+        sent[0]
+            .path
+            .contains("fieldSelector=involvedObject.name%3Dapi-1")
+            || sent[0]
+                .path
+                .contains("fieldSelector=involvedObject.name=api-1"),
+        "the query must scope to the object: {}",
+        sent[0].path
+    );
+
+    let (reply, rx) = futures::channel::oneshot::channel();
+    sync.inspector
+        .fetch_log_tail("prod", &Arc::from("api-1"), move |detail| {
+            let _ = reply.send(detail);
+        });
+    let InspectDetail::Log(tail) = recv(rx) else {
+        panic!("logs must resolve");
+    };
+    assert_eq!(tail.lines.len(), 2);
+    assert!(tail.lines[1].ends_with("ready"));
+    let log_request = &script.requests_for("/pods/api-1/log")[0];
+    assert!(
+        log_request.path.contains("tailLines=200"),
+        "the tail must be bounded: {}",
+        log_request.path
+    );
+
+    let (reply, rx) = futures::channel::oneshot::channel();
+    sync.inspector.fetch_events("prod", "api-1", move |detail| {
+        let _ = reply.send(detail);
+    });
+    assert_eq!(
+        recv(rx),
+        InspectDetail::Denied { what: "events" },
+        "a 403 is a labelled state, not an error string"
+    );
+
+    drop(runtime);
 }
 
 fn options() -> Options {
@@ -776,6 +918,94 @@ fn a_kind_the_probe_denies_is_forbidden_and_never_requested() {
 }
 
 #[test]
+fn a_failed_rules_review_keeps_its_namespace_attempted_rather_than_invisible() {
+    let script = Script::default();
+    script_discovery(&script);
+    script.route(
+        "POST",
+        "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+        201,
+        r#"{"kind":"SelfSubjectRulesReview","apiVersion":"authorization.k8s.io/v1","spec":{},
+            "status":{"incomplete":false,"nonResourceRules":[],
+                      "resourceRules":[{"apiGroups":[""],"resources":["pods"],"verbs":["list","watch"]}]}}"#,
+    );
+    script.route(
+        "POST",
+        "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+        503,
+        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":503,"reason":"ServiceUnavailable","message":"etcdserver: request timed out"}"#,
+    );
+    script_access_reviews(&script, false, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/team-a/pods?",
+        200,
+        list(&[POD_IN_PROD_JSON.to_string()], "Pod"),
+    );
+    script.route(
+        "GET",
+        "/api/v1/namespaces/team-b/pods?",
+        200,
+        list(&[], "Pod"),
+    );
+    for (path, kind) in [
+        ("/apis/apps/v1/namespaces/team-b/deployments?", "Deployment"),
+        ("/apis/apps/v1/namespaces/team-b/replicasets?", "ReplicaSet"),
+        ("/apis/batch/v1/namespaces/team-b/jobs?", "Job"),
+        ("/apis/batch/v1/namespaces/team-b/cronjobs?", "CronJob"),
+        ("/api/v1/namespaces/team-b/services?", "Service"),
+        ("/api/v1/namespaces/team-b/configmaps?", "ConfigMap"),
+        ("/api/v1/namespaces/team-b/secrets?", "Secret"),
+        (
+            "/api/v1/namespaces/team-b/persistentvolumeclaims?",
+            "PersistentVolumeClaim",
+        ),
+    ] {
+        script.route("GET", path, 200, list(&[], kind));
+    }
+
+    let mut opts = options();
+    opts.probe_namespaces = vec!["team-a".into(), "team-b".into()];
+    let sync = run(&script, opts);
+    let report = &sync.report;
+
+    assert_eq!(report.probed_namespaces, vec!["team-a", "team-b"]);
+    assert_eq!(
+        report.namespaces_unanswered,
+        vec!["team-b"],
+        "the report must name the namespace it is guessing about"
+    );
+    assert!(
+        !report.probe_degraded,
+        "one failed rules review out of two is a gap, not a dead probe"
+    );
+
+    assert_eq!(capability(&sync, KindId::POD), Some(Capability::Watchable));
+    assert!(
+        !script.requests_for("/namespaces/team-a/pods").is_empty(),
+        "the granted namespace lists pods"
+    );
+    assert!(
+        !script.requests_for("/namespaces/team-b/pods").is_empty(),
+        "the unanswered namespace must be attempted, not silently dropped"
+    );
+
+    assert!(
+        !script
+            .requests_for("/namespaces/team-b/deployments")
+            .is_empty(),
+        "a kind the answered namespace denies is still attempted where no answer exists"
+    );
+    assert!(
+        script
+            .requests_for("/namespaces/team-a/deployments")
+            .is_empty(),
+        "the answered namespace's denial still gates"
+    );
+}
+
+#[test]
 fn a_kind_the_probe_could_not_answer_for_is_attempted_rather_than_denied() {
     let script = Script::default();
     script_discovery(&script);
@@ -961,4 +1191,595 @@ fn a_server_that_does_not_serve_a_kind_makes_it_absent_rather_than_broken() {
     assert_eq!(stats, k10s_world::input::FoldStats::default());
     assert_eq!(input.namespaces.len(), 1);
     assert_eq!(input.total_pods, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Phase F: the read path. Tables, describe, log follow, containers, nodes --
+// all driven against the same scripted API server, no cluster, no sockets.
+// ---------------------------------------------------------------------------
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime")
+}
+
+fn sync_on(runtime: &tokio::runtime::Runtime, script: &Script) -> (Sync, EventReceiver) {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let sync = runtime
+        .block_on(async {
+            sync_from(
+                script.client(),
+                "prod",
+                &options(),
+                tx,
+                Arc::new(IngestMetrics::default()),
+            )
+            .await
+        })
+        .expect("the scripted cluster syncs");
+    (sync, rx)
+}
+
+type EventReceiver = crossbeam_channel::Receiver<IngestEvent>;
+
+fn wait<T: Send + 'static>(rx: &std::sync::mpsc::Receiver<T>) -> T {
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("a reply within the budget")
+}
+
+const DEPLOYMENT_TABLE_JSON: &str = r#"{"kind":"Table","apiVersion":"meta.k8s.io/v1",
+    "metadata":{"resourceVersion":"1000","continue":"page-2"},
+    "columnDefinitions":[
+        {"name":"Name","type":"string","format":"name","priority":0},
+        {"name":"Ready","type":"string","priority":0},
+        {"name":"Replicas","type":"integer","priority":0},
+        {"name":"Containers","type":"string","priority":1}],
+    "rows":[{"cells":["api","1/1",1,"app"],
+             "object":{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",
+                       "metadata":{"name":"api","namespace":"prod","uid":"uid-dep"}}}]}"#;
+
+#[test]
+fn any_discovered_kind_lists_as_a_server_side_table_with_bounded_pages() {
+    use k10s_core::KindId;
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route_accepting(
+        "GET",
+        "/apis/apps/v1/deployments?",
+        "as=Table",
+        200,
+        DEPLOYMENT_TABLE_JSON,
+    );
+    script.route_accepting(
+        "GET",
+        "/api/v1/pods?",
+        "as=Table",
+        403,
+        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"pods is forbidden"}"#,
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let kinds = sync.reader.kinds();
+    assert_eq!(kinds.len(), 10, "every discovered listable kind is offered");
+    let displays: Vec<&str> = kinds.iter().map(|k| k.display.as_str()).collect();
+    let mut sorted = displays.clone();
+    sorted.sort_unstable();
+    assert_eq!(displays, sorted, "kinds arrive sorted for a picker");
+    let deployments = kinds
+        .iter()
+        .find(|k| k.display == "deployments.apps")
+        .expect("the group is part of the name");
+    assert_eq!(deployments.kind, "Deployment");
+    assert!(deployments.namespaced);
+    assert_eq!(deployments.verdict, Some(Capability::Watchable));
+    assert!(kinds.iter().any(|k| k.display == "pods"));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_table(KindId::DEPLOYMENT, move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    let Fetched::Ok(page) = wait(&rx) else {
+        panic!("the table must resolve");
+    };
+    assert_eq!(
+        page.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Namespace", "Name", "Ready", "Replicas", "Containers"],
+        "a cluster-wide list of a namespaced kind gains the namespace column"
+    );
+    assert!(page.columns[4].wide, "priority > 0 is a wide column");
+    assert_eq!(page.rows[0].cells, ["prod", "api", "1/1", "1", "app"]);
+    assert_eq!(page.rows[0].name, "api");
+    assert_eq!(page.rows[0].namespace.as_deref(), Some("prod"));
+    assert_eq!(page.rows[0].uid, "uid-dep");
+    assert!(
+        page.truncated,
+        "a continue token surfaces, it is not chased"
+    );
+
+    let table_requests: Vec<Seen> = script
+        .requests_for("/apis/apps/v1/deployments")
+        .into_iter()
+        .filter(|r| r.accept.contains("as=Table"))
+        .collect();
+    assert_eq!(table_requests.len(), 1, "{table_requests:?}");
+    assert!(
+        table_requests[0]
+            .accept
+            .contains("as=Table;v=v1;g=meta.k8s.io"),
+        "the server renders the columns: {}",
+        table_requests[0].accept
+    );
+    assert!(
+        table_requests[0].path.contains("limit=500"),
+        "a table page is bounded: {}",
+        table_requests[0].path
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_table(KindId::POD, move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    assert_eq!(
+        wait(&rx),
+        Fetched::Denied { what: "table" },
+        "a 403 is a labelled state, not an error string"
+    );
+
+    drop(runtime);
+}
+
+#[test]
+fn describe_renders_fields_walks_owners_and_joins_events_by_uid() {
+    use k10s_core::KindId;
+    use k10s_data::describe::DescribeRequest;
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/pods/api-1",
+        200,
+        pod_json("api-1", "uid-pod-1", true),
+    );
+    script.route_accepting(
+        "GET",
+        "/apis/apps/v1/namespaces/prod/replicasets/api-7f9",
+        "as=PartialObjectMetadata",
+        200,
+        r#"{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",
+            "metadata":{"name":"api-7f9","namespace":"prod","uid":"uid-rs",
+              "ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"api","uid":"uid-dep","controller":true}]}}"#,
+    );
+    script.route_accepting(
+        "GET",
+        "/apis/apps/v1/namespaces/prod/deployments/api",
+        "as=PartialObjectMetadata",
+        200,
+        r#"{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",
+            "metadata":{"name":"api","namespace":"prod","uid":"uid-dep"}}"#,
+    );
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/events?",
+        200,
+        r#"{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[
+            {"metadata":{"name":"e1","namespace":"prod"},"type":"Warning","reason":"BackOff",
+             "message":"Back-off restarting failed container","count":7,
+             "lastTimestamp":"2026-08-02T04:00:00Z",
+             "involvedObject":{"kind":"Pod","name":"api-1","namespace":"prod","uid":"uid-pod-1"}}
+        ]}"#,
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_describe(
+        DescribeRequest {
+            kind: KindId::POD,
+            namespace: Some("prod".to_string()),
+            name: "api-1".to_string(),
+            uid: "uid-pod-1".to_string(),
+        },
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    );
+    let Fetched::Ok(described) = wait(&rx) else {
+        panic!("describe must resolve");
+    };
+    assert_eq!(described.title, "Pod api-1");
+    let text = described.lines.join("\n");
+    assert!(text.contains("kind: Pod"), "{text}");
+    assert!(
+        text.contains("reason: CrashLoopBackOff"),
+        "field-level rendering reaches into status: {text}"
+    );
+    let rs_at = described
+        .lines
+        .iter()
+        .position(|l| l.trim() == "ReplicaSet api-7f9")
+        .unwrap_or_else(|| panic!("the direct owner is walked: {text}"));
+    let dep_at = described
+        .lines
+        .iter()
+        .position(|l| l.trim() == "Deployment api")
+        .unwrap_or_else(|| panic!("the chain reaches the root: {text}"));
+    assert!(rs_at < dep_at, "the chain reads upward");
+    assert!(text.contains("BackOff x7"), "{text}");
+
+    for request in script.requests_for("/replicasets/api-7f9") {
+        assert!(
+            request.accept.contains("as=PartialObjectMetadata"),
+            "an owner hop needs metadata only: {request:?}"
+        );
+    }
+    let events = script.requests_for("/namespaces/prod/events");
+    assert!(
+        events[0].path.contains("involvedObject.uid%3Duid-pod-1"),
+        "events join by uid, not by name collision: {}",
+        events[0].path
+    );
+
+    drop(runtime);
+}
+
+#[test]
+fn a_secret_describe_is_metadata_only_by_construction() {
+    use k10s_core::KindId;
+    use k10s_data::describe::DescribeRequest;
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route_accepting(
+        "GET",
+        "/api/v1/namespaces/prod/secrets/api-token",
+        "as=PartialObjectMetadata",
+        200,
+        r#"{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",
+            "metadata":{"name":"api-token","namespace":"prod","uid":"uid-sec",
+                        "annotations":{"kubernetes.io/service-account.name":"api"}}}"#,
+    );
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/events?",
+        200,
+        r#"{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}"#,
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_describe(
+        DescribeRequest {
+            kind: KindId::SECRET,
+            namespace: Some("prod".to_string()),
+            name: "api-token".to_string(),
+            uid: "uid-sec".to_string(),
+        },
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    );
+    let Fetched::Ok(described) = wait(&rx) else {
+        panic!("describe must resolve");
+    };
+    let text = described.lines.join("\n");
+    assert!(
+        described.lines[0].contains("values withheld"),
+        "the document says what is missing: {text}"
+    );
+    assert!(text.contains("kind: Secret"), "{text}");
+    assert!(
+        !text.contains("PartialObjectMetadata"),
+        "the wire shape is not the story: {text}"
+    );
+    assert!(text.contains("(none recorded)"), "{text}");
+
+    let secret_requests = script.requests_for("/secrets/api-token");
+    assert!(!secret_requests.is_empty());
+    for request in &secret_requests {
+        assert!(
+            request.accept.contains("as=PartialObjectMetadata"),
+            "a Secret describe must be structurally metadata-only: {request:?}"
+        );
+    }
+
+    drop(runtime);
+}
+
+#[test]
+fn a_log_follow_streams_lines_ends_labelled_and_cancels_mid_open() {
+    use k10s_data::logs::{LogChunk, LogRequest};
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/pods/api-1/log?",
+        200,
+        "2026-08-02T05:00:00Z listening on :8080\n2026-08-02T05:00:01Z ready\n2026-08-02T05:00:02Z serving\n",
+    );
+    script.route_hanging("GET", "/api/v1/namespaces/prod/pods/api-2/log?");
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/pods/api-3/log?",
+        403,
+        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"pods/log is forbidden"}"#,
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let request = |pod: &str| LogRequest {
+        namespace: "prod".to_string(),
+        pod: pod.to_string(),
+        container: None,
+        previous: false,
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = sync.reader.follow_log(
+        request("api-1"),
+        Box::new(move |chunk| {
+            let _ = tx.send(chunk);
+        }),
+    );
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        match wait(&rx) {
+            LogChunk::Lines(batch) => lines.extend(batch),
+            LogChunk::Ended { why } => {
+                assert_eq!(why, "the stream ended");
+                break;
+            }
+            other => panic!("unexpected chunk {other:?}"),
+        }
+    }
+    assert_eq!(lines.len(), 3);
+    assert!(lines[1].ends_with("ready"), "{lines:?}");
+    drop(stop);
+    let follow = &script.requests_for("/pods/api-1/log")[0];
+    assert!(follow.path.contains("follow=true"), "{}", follow.path);
+    assert!(follow.path.contains("tailLines=500"), "{}", follow.path);
+    assert!(follow.path.contains("timestamps=true"), "{}", follow.path);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = sync.reader.follow_log(
+        request("api-2"),
+        Box::new(move |chunk| {
+            let _ = tx.send(chunk);
+        }),
+    );
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "the held connection produces nothing"
+    );
+    drop(stop);
+    assert_eq!(
+        wait(&rx),
+        LogChunk::Ended { why: "stopped" },
+        "dropping the guard cancels a follow that is still opening"
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _stop = sync.reader.follow_log(
+        request("api-3"),
+        Box::new(move |chunk| {
+            let _ = tx.send(chunk);
+        }),
+    );
+    assert_eq!(wait(&rx), LogChunk::Denied { what: "logs" });
+
+    drop(runtime);
+}
+
+#[test]
+fn containers_come_from_the_pod_spec_in_run_order() {
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/pods/api-1",
+        200,
+        r#"{"metadata":{"name":"api-1","namespace":"prod","uid":"uid-pod-1","resourceVersion":"900"},
+            "spec":{"containers":[{"name":"app","image":"nginx"},{"name":"proxy","image":"envoy"}],
+                    "initContainers":[{"name":"init-db","image":"flyway"}],
+                    "ephemeralContainers":[{"name":"debug","image":"busybox"}]},
+            "status":{"phase":"Running"}}"#,
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader
+        .fetch_containers("prod", "api-1", move |outcome| {
+            let _ = tx.send(outcome);
+        });
+    assert_eq!(
+        wait(&rx),
+        Fetched::Ok(vec![
+            "app".to_string(),
+            "proxy".to_string(),
+            "init-db".to_string(),
+            "debug".to_string(),
+        ])
+    );
+
+    drop(runtime);
+}
+
+const NODE_LIST_JSON: &str = r#"{"kind":"NodeList","apiVersion":"v1","metadata":{},"items":[
+    {"metadata":{"name":"n1","uid":"uid-n1",
+                 "labels":{"node-role.kubernetes.io/control-plane":"","kubernetes.io/hostname":"n1"}},
+     "spec":{"taints":[{"key":"dedicated","value":"infra","effect":"NoSchedule"}]},
+     "status":{"allocatable":{"cpu":"4","memory":"16Gi","pods":"110"},
+               "conditions":[{"type":"Ready","status":"True"},
+                             {"type":"MemoryPressure","status":"False"}],
+               "nodeInfo":{"kubeletVersion":"v1.32.3"}}}
+]}"#;
+
+const NODE_PODS_JSON: &str = r#"{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[
+    {"metadata":{"name":"api-1","uid":"uid-pod-1","namespace":"prod"},
+     "spec":{"nodeName":"n1",
+             "containers":[{"name":"app","resources":{"requests":{"cpu":"500m","memory":"64Mi"}}}],
+             "initContainers":[{"name":"sidecar-log","restartPolicy":"Always",
+                                "resources":{"requests":{"cpu":"100m"}}}]},
+     "status":{"phase":"Running"}},
+    {"metadata":{"name":"api-2","uid":"uid-pod-2","namespace":"prod"},
+     "spec":{"nodeName":"n1",
+             "containers":[{"name":"app","resources":{"requests":{"cpu":"1","memory":"0"}}}]},
+     "status":{"phase":"Running"}}
+]}"#;
+
+#[test]
+fn the_node_table_measures_allocatable_requests_and_usage() {
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route("GET", "/api/v1/nodes?", 200, NODE_LIST_JSON);
+    script.route(
+        "GET",
+        "/api/v1/pods?fieldSelector=spec.nodeName%3Dn1",
+        200,
+        NODE_PODS_JSON,
+    );
+    script.route(
+        "GET",
+        "/apis/metrics.k8s.io/v1beta1/nodes?",
+        200,
+        r#"{"kind":"NodeMetricsList","apiVersion":"metrics.k8s.io/v1beta1","items":[
+            {"metadata":{"name":"n1"},"usage":{"cpu":"250m","memory":"8Gi"}}]}"#,
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_node_table(move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    let Fetched::Ok(page) = wait(&rx) else {
+        panic!("the node table must resolve");
+    };
+    assert_eq!(
+        page.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Name",
+            "Status",
+            "Roles",
+            "Version",
+            "Pods",
+            "CPU req",
+            "Memory req",
+            "CPU use",
+            "Memory use",
+            "Taints",
+        ]
+    );
+    assert_eq!(page.rows.len(), 1);
+    let row = &page.rows[0];
+    assert_eq!(row.name, "n1");
+    assert_eq!(row.uid, "uid-n1");
+    assert_eq!(
+        row.cells,
+        [
+            "n1",
+            "Ready",
+            "control-plane",
+            "v1.32.3",
+            "2/110 (2%)",
+            "1600m/4 (40%)",
+            "64Mi/16.0Gi (0%)",
+            "250m/4 (6%)",
+            "8.0Gi/16.0Gi (50%)",
+            "1",
+        ],
+        "the sidecar accumulates and the init floor is honoured"
+    );
+    assert!(!page.truncated);
+
+    let pod_scan = &script.requests_for("fieldSelector=spec.nodeName")[0];
+    assert!(
+        pod_scan.path.contains("status.phase%21%3DSucceeded"),
+        "terminated pods do not hold requests: {}",
+        pod_scan.path
+    );
+
+    drop(runtime);
+}
+
+#[test]
+fn a_cluster_without_metrics_server_hides_usage_rather_than_breaking() {
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route("GET", "/api/v1/nodes?", 200, NODE_LIST_JSON);
+    script.route(
+        "GET",
+        "/api/v1/pods?fieldSelector=spec.nodeName%3Dn1",
+        200,
+        r#"{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[]}"#,
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_node_table(move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    let Fetched::Ok(page) = wait(&rx) else {
+        panic!("the node table must resolve");
+    };
+    assert!(
+        page.columns.iter().all(|c| !c.name.contains("use")),
+        "absent metrics-server means invisible, not broken: {:?}",
+        page.columns
+    );
+    assert_eq!(page.rows[0].cells[4], "0/110 (0%)");
+
+    drop(runtime);
 }

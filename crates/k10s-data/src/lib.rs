@@ -1,9 +1,28 @@
+//! The read-only Kubernetes data plane.
+//!
+//! Everything here reaches the cluster through the API server with an
+//! ordinary kubeconfig: no operator, agent, CRD, or in-cluster footprint of
+//! any kind, ever. Watches recover from 410 by relisting and reaping, RBAC is
+//! probed upfront into a tri-state capability verdict so denial degrades into
+//! a label rather than an empty map, and Secrets are projected to metadata
+//! structurally -- a secret value must never reach a snapshot, a log line, or
+//! an error message. Error text shown to a person is redaction-filtered
+//! because exec credential plugins leak their environment through `Debug`.
+//! The `kube::Client` seam is a `tower` service, which is what lets
+//! `tests/scripted_apiserver.rs` be the API server.
+
 pub mod assemble;
+pub mod browse;
 pub mod connect;
+pub mod describe;
 pub mod discover;
+pub mod inspect;
+pub mod logs;
 pub mod mapping;
+pub mod nodes;
 mod projection;
 pub mod rbac;
+pub mod read;
 pub mod watch;
 
 use std::collections::HashMap;
@@ -59,6 +78,7 @@ pub struct ClusterReport {
     pub probe_degraded: bool,
     pub kinds_unanswered: usize,
     pub probed_namespaces: Vec<String>,
+    pub namespaces_unanswered: Vec<String>,
     pub objects_held: usize,
     pub assemble: AssembleStats,
     pub desyncs: Vec<(KindId, DesyncReason)>,
@@ -96,6 +116,8 @@ pub struct Sync {
     pub events: Vec<IngestEvent>,
     pub catalog: Catalog,
     pub report: ClusterReport,
+    pub inspector: inspect::Inspector,
+    pub reader: read::Reader,
 }
 
 #[derive(Debug, Default)]
@@ -265,6 +287,7 @@ pub async fn sync_from(
     report.probe_degraded = access.degraded;
     report.kinds_unanswered = access.unanswered();
     report.probed_namespaces = access.namespaces().map(str::to_string).collect();
+    report.namespaces_unanswered = access.unanswered_namespaces().map(str::to_string).collect();
 
     let attach = attach_kinds(&discovered);
     let pass_through: Vec<KindId> = watch_set
@@ -339,8 +362,12 @@ pub async fn sync_from(
     let projection = Projection::from_assembled(&assembled);
 
     let mut events = assembled.events;
-    for (kind, verdict) in verdicts(&discovered, &watch_set, &access) {
-        events.push(IngestEvent::Capability { kind, verdict });
+    let verdict_list = verdicts(&discovered, &watch_set, &access);
+    for (kind, verdict) in &verdict_list {
+        events.push(IngestEvent::Capability {
+            kind: *kind,
+            verdict: *verdict,
+        });
     }
     for (kind, reason) in &report.desyncs {
         events.push(IngestEvent::Desync {
@@ -361,12 +388,16 @@ pub async fn sync_from(
     report.total_ms = ms(started);
 
     let snapshot = catalog.clone();
+    let inspector = inspect::Inspector::new(client.clone());
+    let reader = read::Reader::new(client.clone(), discovered.targets.clone(), &verdict_list);
     tokio::spawn(forward_live(rx, store, catalog, projection, sink, metrics));
 
     Ok(Sync {
         events,
         catalog: snapshot,
         report,
+        inspector,
+        reader,
     })
 }
 

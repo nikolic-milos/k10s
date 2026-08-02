@@ -18,8 +18,8 @@ crossbeam-channel.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+http.workspace = true
 
 [dev-dependencies]
 k10s-world.workspace = true
-http = "1"
 tower = { version = "0.5", features = ["util"] }
