@@ -1,3 +1,13 @@
+//! The benchmark harness and the baseline comparator.
+//!
+//! Timing batches short operations until one independent sample spans at
+//! least 20 us and reports sample count, batch size, and median relative
+//! absolute deviation alongside every number. The comparator in `baseline` is
+//! fail-closed: a missing suite, a schema drift, a vanished case, a structural
+//! counter change, a noisy median, or a sample-count collapse is a rejection,
+//! not a warning -- a gate that can be disabled by the regression it guards
+//! against is not a gate.
+
 use std::time::{Duration, Instant};
 
 pub mod baseline;
