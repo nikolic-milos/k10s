@@ -220,15 +220,18 @@ fn connect_cluster(args: &cli::Args) -> Result<(Vec<IngestEvent>, Option<Live>),
 }
 
 fn report_degradation(sync: &k10s_data::Sync) {
-    for note in degradation_notes(sync) {
+    for note in degradation_notes(&sync.report, &sync.catalog, &sync.events) {
         eprintln!("k10s: {note}");
     }
 }
 
-fn degradation_notes(sync: &k10s_data::Sync) -> Vec<String> {
-    let report = &sync.report;
+fn degradation_notes(
+    report: &k10s_data::ClusterReport,
+    catalog: &k10s_core::Catalog,
+    events: &[IngestEvent],
+) -> Vec<String> {
     let name = |kind: k10s_core::KindId| {
-        sync.catalog
+        catalog
             .kind(kind)
             .map(|e| e.slug.to_string())
             .unwrap_or_else(|| format!("kind {}", kind.0))
@@ -249,6 +252,13 @@ fn degradation_notes(sync: &k10s_data::Sync) -> Vec<String> {
             report.kinds_unanswered
         ));
     }
+    if !report.namespaces_unanswered.is_empty() {
+        notes.push(format!(
+            "the rules review for {} got no answer, so denied kinds are still attempted \
+             there and a real denial will show up as a stream error instead of an empty map",
+            report.namespaces_unanswered.join(", ")
+        ));
+    }
     if !report.aggregated_discovery {
         notes.push(
             "this server has no aggregated discovery, so discovery cost one request per API group"
@@ -256,8 +266,7 @@ fn degradation_notes(sync: &k10s_data::Sync) -> Vec<String> {
         );
     }
 
-    let forbidden: Vec<String> = sync
-        .events
+    let forbidden: Vec<String> = events
         .iter()
         .filter_map(|e| match e {
             IngestEvent::Capability {
@@ -362,11 +371,7 @@ mod tests {
     }
 
     fn notes_for(report: ClusterReport, events: Vec<IngestEvent>) -> Vec<String> {
-        degradation_notes(&k10s_data::Sync {
-            events,
-            catalog: Catalog::new(),
-            report,
-        })
+        degradation_notes(&report, &Catalog::new(), &events)
     }
 
     fn forbidden(kind: KindId) -> IngestEvent {
