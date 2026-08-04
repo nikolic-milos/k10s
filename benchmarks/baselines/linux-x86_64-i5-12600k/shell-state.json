@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "mode": "shell",
+  "cases": [
+    {
+      "scenario": "tree-5k",
+      "op": "read",
+      "entries": 5001,
+      "result": 111,
+      "iters": 314,
+      "samples": 314,
+      "batch_size": 1,
+      "p50_rmad": 0.009732,
+      "p50_ns": 955958.000,
+      "p99_ns": 1021836.000
+    },
+    {
+      "scenario": "tree-5k",
+      "op": "read-and-apply",
+      "entries": 5001,
+      "result": 111,
+      "iters": 126,
+      "samples": 126,
+      "batch_size": 1,
+      "p50_rmad": 0.007612,
+      "p50_ns": 958559.000,
+      "p99_ns": 982518.000
+    },
+    {
+      "scenario": "dir-2k",
+      "op": "keystroke",
+      "entries": 2000,
+      "result": 299,
+      "iters": 378,
+      "samples": 378,
+      "batch_size": 1,
+      "p50_rmad": 0.007556,
+      "p50_ns": 317781.000,
+      "p99_ns": 333946.000
+    },
+    {
+      "scenario": "scan-5k",
+      "op": "scan",
+      "entries": 5001,
+      "result": 1576,
+      "iters": 20,
+      "samples": 20,
+      "batch_size": 1,
+      "p50_rmad": 0.001276,
+      "p50_ns": 41320991.000,
+      "p99_ns": 41484998.000
+    },
+    {
+      "scenario": "scan-5k",
+      "op": "keystroke",
+      "entries": 1576,
+      "result": 256,
+      "iters": 362,
+      "samples": 362,
+      "batch_size": 1,
+      "p50_rmad": 0.004140,
+      "p50_ns": 329943.000,
+      "p99_ns": 350540.000
+    },
+    {
+      "scenario": "viewport-60",
+      "op": "layers",
+      "entries": 4518,
+      "result": 200,
+      "iters": 1901,
+      "samples": 1901,
+      "batch_size": 1,
+      "p50_rmad": 0.006027,
+      "p50_ns": 60398.000,
+      "p99_ns": 73087.000
+    },
+    {
+      "scenario": "viewport-60",
+      "op": "query-and-compose",
+      "entries": 30,
+      "result": 585,
+      "iters": 590,
+      "samples": 590,
+      "batch_size": 1,
+      "p50_rmad": 0.032668,
+      "p50_ns": 200532.000,
+      "p99_ns": 224048.000
+    },
+    {
+      "scenario": "diff-256k",
+      "op": "diff-paint",
+      "entries": 6787,
+      "result": 2260,
+      "iters": 40222,
+      "samples": 5746,
+      "batch_size": 7,
+      "p50_rmad": 0.005140,
+      "p50_ns": 2974.000,
+      "p99_ns": 3178.429
+    },
+    {
+      "scenario": "diff-256k",
+      "op": "diff-fold",
+      "entries": 6787,
+      "result": 6787,
+      "iters": 116864,
+      "samples": 1826,
+      "batch_size": 64,
+      "p50_rmad": 0.007243,
+      "p50_ns": 1024.750,
+      "p99_ns": 1062.500
+    }
+  ]
+}

@@ -84,6 +84,18 @@ jobs:
           cargo bench --locked -p k10s-world --bench publish
           -- --json > "$RESULT_DIR/world-publish.json"
 
+      - name: Benchmark editor engine
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-edit --bench edit
+          -- --json > "$RESULT_DIR/editor-edit.json"
+
+      - name: Benchmark shell state machines
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-shell --bench shell --features test-support
+          -- --json > "$RESULT_DIR/shell-state.json"
+
       - name: Benchmark map walk
         run: >-
           taskset --cpu-list "$PERF_CPU"

@@ -61,10 +61,12 @@ run atlas-cull.json cargo bench --locked -p k10s-atlas --bench cull --features t
 run atlas-fanout.json cargo bench --locked -p k10s-atlas --bench fanout --features testing
 run world-fanout-cull.json cargo bench --locked -p k10s-world --bench fanout_cull
 run world-publish.json cargo bench --locked -p k10s-world --bench publish
+run editor-edit.json cargo bench --locked -p k10s-edit --bench edit
 
 if [ "$SKIP_GPUI" = "1" ]; then
-    echo "skipping the three suites that need gpui system libraries"
+    echo "skipping the suites that need gpui system libraries"
 else
+    run shell-state.json cargo bench --locked -p k10s-shell --bench shell --features test-support
     run map-walk.json cargo bench --locked -p k10s-map --bench walk --features testing
     run map-alloc.json cargo bench --locked -p k10s-map --bench walk --features testing,bench-alloc
     echo "==> map-paint.json"
