@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "maximum_packages": 798,
-  "maximum_external_packages": 788,
-  "maximum_git_packages": 28,
+  "maximum_packages": 830,
+  "maximum_external_packages": 817,
+  "maximum_git_packages": 29,
   "allowed_git_sources": [
     "git+https://github.com/nikolic-milos/zed?rev=1997311daedbd90333b6710634d2cfbd81b33306#1997311daedbd90333b6710634d2cfbd81b33306",
     "git+https://github.com/rust-x-bindings/rust-xcb?rev=ae3b2cd080e78173223038ccbebdc644eaf4a9ad#ae3b2cd080e78173223038ccbebdc644eaf4a9ad",

@@ -5,11 +5,14 @@ members = [
     "crates/k10s-core",
     "crates/k10s-clustergen",
     "crates/k10s-world",
+    "crates/k10s-theme",
     "crates/k10s-map",
     "crates/k10s-shell",
     "crates/k10s-app",
     "crates/k10s-data",
     "crates/k10s-bench",
+    "crates/k10s-edit",
+    "crates/k10s-assets",
 ]
 exclude = [
     "third-party/stacksafe-macro",
@@ -30,24 +33,56 @@ k10s-atlas = { path = "crates/k10s-atlas" }
 k10s-core = { path = "crates/k10s-core" }
 k10s-clustergen = { path = "crates/k10s-clustergen" }
 k10s-world = { path = "crates/k10s-world" }
+k10s-theme = { path = "crates/k10s-theme" }
 k10s-map = { path = "crates/k10s-map" }
 k10s-shell = { path = "crates/k10s-shell" }
 k10s-app = { path = "crates/k10s-app" }
 k10s-data = { path = "crates/k10s-data" }
 k10s-bench = { path = "crates/k10s-bench" }
+k10s-edit = { path = "crates/k10s-edit" }
+k10s-assets = { path = "crates/k10s-assets" }
 
 gpui = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
 gpui_platform = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
+# Typography is k10s-assets' own now; what is still borrowed from here is the
+# eight window-control and panel SVGs the shell draws, so the revision stays
+# pinned to the same one gpui is built from and k10s-assets chains to it.
+zed_assets = { package = "assets", git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
+
+# Already in the lock via gpui, and only the decoder the X11 window icon needs
+# is turned on: enabling defaults here would pull rayon and friends in behind it.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 bevy_ecs = "0.19"
 arc-swap = "1.9"
 crossbeam-channel = "0.5"
 futures = "0.3"
+regex = "1"
+# The embedded terminal: grid, parser, and escape handling, plus the tty
+# module for the local shell -- kube exec arrives over the same byte-stream
+# seam without touching a PTY.
+alacritty_terminal = { version = "0.26", default-features = false }
 rand = "0.10"
 rand_chacha = "0.10"
 serde = "1"
 serde_json = "1"
-rustix = { version = "1.1", features = ["param"] }
+# param serves the atlas; fs carries the one fcntl the local terminal needs
+# to hand a blocking PTY fd to its reader thread.
+rustix = { version = "1.1", features = ["param", "fs"] }
+
+# The editor's structure layer, §5.2's one deliberate packages bump: the
+# grammars link as C with no runtime and no LSP. Measured before adding --
+# tree-sitter, tree-sitter-yaml, tree-sitter-language and streaming-iterator
+# were four new packages, tree-sitter-json exactly one more; everything else
+# in their closure (cc, regex, serde) was already in the lock. JSON carries
+# the settings and keymap files the editor now owns.
+tree-sitter = "0.26"
+tree-sitter-yaml = "0.7"
+tree-sitter-json = "0.24"
+streaming-iterator = "0.1"
+# Cursor motion moves by grapheme cluster, not by scalar: gpui already links
+# this, so the editor's correctness here costs zero packages.
+unicode-segmentation = "1"
 
 http = "1"
 kube = { version = "4.0", features = [
@@ -56,9 +91,14 @@ kube = { version = "4.0", features = [
     "http-proxy",
     "socks5",
     "gzip",
+    # ws carries port-forward and exec: both are SPDY-replacing WebSocket
+    # upgrades on the API server connection.
+    "ws",
 ] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
-tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macros"] }
+# net exists for the port-forward listener on 127.0.0.1; nothing else in the
+# data plane opens a socket directly.
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
