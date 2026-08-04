@@ -7,51 +7,97 @@
 //! `Selection` is derived from it by a pure function, so a panel can never
 //! disagree with the frame that was on screen. The center is a row of items
 //! -- the map, the kind browser, the node capacity table, describe documents,
-//! live log follows -- switched by tabs and keyed actions; every read goes
+//! live log follows -- switched by tabs and keyed actions; anything hosted
+//! implements [`Item`] and the workspace holds it as a boxed [`ItemHandle`],
+//! so a new panel kind never touches workspace internals. Every read goes
 //! through the [`ReadProvider`] seam, so the shell never sees kube, and every
-//! denial arrives as a labelled state. Keybindings are scoped by context
-//! (`Workspace`, `Browse`, `Doc`, `Typing`), with the plain-letter commands
-//! suppressed while an input mode is capturing text. Panels and items render
-//! on notify only: zero paints at idle is a gated invariant and the shell
-//! must never be the reason it fails.
+//! denial arrives as a labelled state; the local terminal is the same
+//! [`TerminalView`] on a PTY transport instead of an exec. The chrome is
+//! Zed's: a title bar with the application menu, drag-to-move, and
+//! client-side window controls when the compositor asks for them, and a
+//! status bar whose panel buttons dispatch the same actions the keys do.
+//! Keybindings are scoped by context (`Workspace`, `Browse`, `Doc`,
+//! `Typing`), with text-typing keystrokes -- plain and shifted -- suppressed
+//! while an input mode is capturing. Panels and items render on notify only:
+//! zero paints at idle is a gated invariant and the shell must never be the
+//! reason it fails.
 
 pub mod browse;
+pub mod config_schema;
+pub mod diff;
+pub mod dock;
+pub mod editor;
+pub mod files;
+pub mod finder;
+pub mod forwards;
+pub mod fs;
+pub mod item;
+pub mod keymap;
+pub mod palette;
 pub mod provider;
+pub mod pty;
+pub mod settings;
 pub mod table;
+pub mod term;
 pub mod text;
+pub mod ui;
 
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
-    NoAction, ParentElement, Render, SharedString, Styled, Subscription, Window, actions, div,
-    prelude::*, px, rgb,
+    App, ClickEvent, Context, Decorations, DragMoveEvent, Entity, FocusHandle, IntoElement,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoAction, ParentElement,
+    Render, Role, SharedString, Styled, Subscription, Window, actions, canvas, div, prelude::*, px,
+    rgb, svg,
 };
 
 use k10s_core::{KindId, Level, SceneSnapshot, kind_short};
 use k10s_map::{MapView, PickPath, Picked};
+use k10s_theme::{Theme, Typography};
 
 use browse::{BrowseEvent, BrowseView};
+use dock::Dock;
+use editor::{EditorEvent, EditorView};
+use files::{FilesEvent, FilesView};
+use finder::{FileFinderView, FinderEvent, PathPickerView, PickerEvent, PickerMode};
+use forwards::ForwardsView;
+pub use item::{Item, ItemHandle};
+use palette::{PaletteEvent, PaletteView};
 pub use provider::{
-    ContainersOutcome, DescribeRequest, Detail, DocOutcome, EventRow, KindRow, LogChunk,
-    LogRequest, LogStop, NullProvider, ReadProvider, Reply, TableColumn, TableOutcome, TablePage,
-    TableRow,
+    ApplyOutcome, ApplyRequest, Conflicted, ContainersOutcome, DescribeRequest, Detail, DocOutcome,
+    EventRow, ExecEvent, ExecRequest, ExecSession, ForwardOutcome, ForwardRequest, ForwardRow,
+    ForwardState, KindRow, LogChunk, LogRequest, LogStop, ManifestOutcome, NullExecSession,
+    NullProvider, ReadProvider, Reply, SchemaCatalogOutcome, SchemaSource, SchemaTextOutcome,
+    TableColumn, TableOutcome, TablePage, TableRow, WorkloadLogRequest,
 };
+use term::TerminalView;
 use text::TextView;
+use ui::{
+    DockSizes, MAX_DOCK_SIZE, MIN_DOCK_SIZE, MODAL_TOP, RESIZE_HANDLE_SIZE, STATUS_BAR_HEIGHT,
+    TAB_HEIGHT, Viewport, icon_button, key_hint, panel_header, title_bar_height,
+};
 
 actions!(
     k10s_shell,
     [
         ToggleInspector,
         ClearSelection,
+        OpenPalette,
         OpenBrowser,
         OpenNodes,
+        OpenForwards,
+        ToggleTerminal,
+        Quit,
         DescribeSelection,
         LogsSelection,
+        ExecSelection,
         NextItem,
         PrevItem,
         CloseItem,
+        ToggleLeftDock,
+        ToggleRightDock,
+        ToggleBottomDock,
         RowUp,
         RowDown,
         RowPageUp,
@@ -60,7 +106,11 @@ actions!(
         RowEnd,
         OpenRow,
         LogsRow,
+        ExecRow,
         Refresh,
+        LoadMore,
+        StartForward,
+        StopForward,
         EnterFilter,
         Back,
         DocScrollUp,
@@ -81,21 +131,107 @@ actions!(
         CommitInput,
         CancelInput,
         DeleteInputChar,
+        EditSelection,
+        EditRow,
+        EditorUp,
+        EditorDown,
+        EditorLeft,
+        EditorRight,
+        EditorWordLeft,
+        EditorWordRight,
+        EditorHome,
+        EditorEnd,
+        EditorPageUp,
+        EditorPageDown,
+        EditorDocStart,
+        EditorDocEnd,
+        EditorSelectUp,
+        EditorSelectDown,
+        EditorSelectLeft,
+        EditorSelectRight,
+        EditorSelectWordLeft,
+        EditorSelectWordRight,
+        EditorSelectHome,
+        EditorSelectEnd,
+        EditorSelectAll,
+        EditorBackspace,
+        EditorDelete,
+        EditorNewline,
+        EditorTab,
+        EditorShiftTab,
+        EditorUndo,
+        EditorRedo,
+        EditorDeleteLine,
+        EditorToggleComment,
+        EditorCursorAbove,
+        EditorCursorBelow,
+        EditorSelectNext,
+        EditorComplete,
+        EditorFind,
+        EditorReplace,
+        EditorReplaceAll,
+        EditorToggleRegex,
+        EditorCancel,
+        EditorSave,
+        EditorSaveAs,
+        OpenFile,
+        OpenFolder,
+        NewFile,
+        FindFile,
+        OpenSettings,
+        OpenKeymap,
+        PickParent,
+        DiffAgainstLive,
+        ApplyDryRun,
+        ApplyToCluster,
+        ForceApply,
+        NextChange,
+        PrevChange,
+        ToggleFolded,
     ]
 );
+
+/// Every key context the shell sets. One list: the binding-scope invariant
+/// test reads it, and the keymap file's schema offers it as an enum, so a
+/// new context cannot be added to one without the other.
+pub const KEY_CONTEXTS: [&str; 9] = [
+    "Workspace",
+    "Browse",
+    "Doc",
+    "Diff",
+    "Editor",
+    "Typing",
+    "Terminal",
+    "Palette",
+    "Map",
+];
 
 pub fn keybindings() -> Vec<KeyBinding> {
     let workspace = Some("Workspace");
     let browse = Some("Browse");
     let doc = Some("Doc");
     let typing = Some("Typing");
+    let editor = Some("Editor");
+    let diff = Some("Diff");
     let mut bindings = vec![
+        KeyBinding::new("ctrl-shift-p", OpenPalette, workspace),
         KeyBinding::new("i", ToggleInspector, workspace),
         KeyBinding::new("escape", ClearSelection, workspace),
         KeyBinding::new("b", OpenBrowser, workspace),
         KeyBinding::new("n", OpenNodes, workspace),
+        // shift-f, not f: the map holds default focus and binds f to FitView,
+        // so a plain-f workspace command would be unreachable. Capital F is
+        // also the browser's row-forward mnemonic, so F means forwards
+        // everywhere.
+        KeyBinding::new("shift-f", OpenForwards, workspace),
         KeyBinding::new("d", DescribeSelection, workspace),
         KeyBinding::new("l", LogsSelection, workspace),
+        KeyBinding::new("s", ExecSelection, workspace),
+        KeyBinding::new("ctrl-b", ToggleLeftDock, workspace),
+        KeyBinding::new("ctrl-alt-b", ToggleRightDock, workspace),
+        KeyBinding::new("ctrl-j", ToggleBottomDock, workspace),
+        KeyBinding::new("ctrl-`", ToggleTerminal, workspace),
+        KeyBinding::new("ctrl-q", Quit, workspace),
         KeyBinding::new("ctrl-tab", NextItem, workspace),
         KeyBinding::new("ctrl-shift-tab", PrevItem, workspace),
         KeyBinding::new("ctrl-w", CloseItem, workspace),
@@ -107,7 +243,11 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("end", RowEnd, browse),
         KeyBinding::new("enter", OpenRow, browse),
         KeyBinding::new("l", LogsRow, browse),
+        KeyBinding::new("s", ExecRow, browse),
         KeyBinding::new("r", Refresh, browse),
+        KeyBinding::new("m", LoadMore, browse),
+        KeyBinding::new("shift-f", StartForward, browse),
+        KeyBinding::new("x", StopForward, browse),
         KeyBinding::new("/", EnterFilter, browse),
         KeyBinding::new("escape", Back, browse),
         KeyBinding::new("up", DocScrollUp, doc),
@@ -128,15 +268,152 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", CommitInput, typing),
         KeyBinding::new("escape", CancelInput, typing),
         KeyBinding::new("backspace", DeleteInputChar, typing),
+        KeyBinding::new("shift-enter", PrevMatch, typing),
+        KeyBinding::new("ctrl-enter", EditorReplaceAll, typing),
+        KeyBinding::new("alt-r", EditorToggleRegex, typing),
+        KeyBinding::new("y", EditSelection, workspace),
+        KeyBinding::new("y", EditRow, browse),
+        KeyBinding::new("up", EditorUp, editor),
+        KeyBinding::new("down", EditorDown, editor),
+        KeyBinding::new("left", EditorLeft, editor),
+        KeyBinding::new("right", EditorRight, editor),
+        KeyBinding::new("ctrl-left", EditorWordLeft, editor),
+        KeyBinding::new("ctrl-right", EditorWordRight, editor),
+        KeyBinding::new("home", EditorHome, editor),
+        KeyBinding::new("end", EditorEnd, editor),
+        KeyBinding::new("pageup", EditorPageUp, editor),
+        KeyBinding::new("pagedown", EditorPageDown, editor),
+        KeyBinding::new("ctrl-home", EditorDocStart, editor),
+        KeyBinding::new("ctrl-end", EditorDocEnd, editor),
+        KeyBinding::new("shift-up", EditorSelectUp, editor),
+        KeyBinding::new("shift-down", EditorSelectDown, editor),
+        KeyBinding::new("shift-left", EditorSelectLeft, editor),
+        KeyBinding::new("shift-right", EditorSelectRight, editor),
+        KeyBinding::new("ctrl-shift-left", EditorSelectWordLeft, editor),
+        KeyBinding::new("ctrl-shift-right", EditorSelectWordRight, editor),
+        KeyBinding::new("shift-home", EditorSelectHome, editor),
+        KeyBinding::new("shift-end", EditorSelectEnd, editor),
+        KeyBinding::new("ctrl-a", EditorSelectAll, editor),
+        KeyBinding::new("backspace", EditorBackspace, editor),
+        KeyBinding::new("shift-backspace", EditorBackspace, editor),
+        KeyBinding::new("delete", EditorDelete, editor),
+        KeyBinding::new("enter", EditorNewline, editor),
+        KeyBinding::new("shift-enter", EditorNewline, editor),
+        KeyBinding::new("tab", EditorTab, editor),
+        KeyBinding::new("shift-tab", EditorShiftTab, editor),
+        KeyBinding::new("ctrl-z", EditorUndo, editor),
+        KeyBinding::new("ctrl-shift-z", EditorRedo, editor),
+        KeyBinding::new("ctrl-shift-k", EditorDeleteLine, editor),
+        KeyBinding::new("ctrl-/", EditorToggleComment, editor),
+        KeyBinding::new("ctrl-alt-up", EditorCursorAbove, editor),
+        KeyBinding::new("ctrl-alt-down", EditorCursorBelow, editor),
+        KeyBinding::new("ctrl-d", EditorSelectNext, editor),
+        KeyBinding::new("ctrl-space", EditorComplete, editor),
+        KeyBinding::new("ctrl-f", EditorFind, editor),
+        KeyBinding::new("ctrl-h", EditorReplace, editor),
+        KeyBinding::new("f3", NextMatch, editor),
+        KeyBinding::new("shift-f3", PrevMatch, editor),
+        KeyBinding::new("escape", EditorCancel, editor),
+        KeyBinding::new("ctrl-s", EditorSave, editor),
+        KeyBinding::new("ctrl-shift-s", EditorSaveAs, editor),
+        KeyBinding::new("ctrl-alt-d", DiffAgainstLive, editor),
+        // The diff surface reuses the document scrolling actions rather than
+        // declaring six of its own: the keys a reader already knows move a
+        // diff the same way they move a describe document.
+        KeyBinding::new("up", DocScrollUp, diff),
+        KeyBinding::new("down", DocScrollDown, diff),
+        KeyBinding::new("pageup", DocPageUp, diff),
+        KeyBinding::new("pagedown", DocPageDown, diff),
+        KeyBinding::new("home", DocHome, diff),
+        KeyBinding::new("end", DocEnd, diff),
+        KeyBinding::new("n", NextChange, diff),
+        KeyBinding::new("shift-n", PrevChange, diff),
+        KeyBinding::new("c", ToggleFolded, diff),
+        KeyBinding::new("r", Refresh, diff),
+        KeyBinding::new("ctrl-alt-d", DiffAgainstLive, diff),
+        KeyBinding::new("ctrl-alt-r", ApplyDryRun, diff),
+        // The write, and the one that takes a field from another manager. Both
+        // need a second press; neither can answer the other's question.
+        KeyBinding::new("ctrl-s", ApplyToCluster, diff),
+        KeyBinding::new("ctrl-shift-s", ForceApply, diff),
+        KeyBinding::new("ctrl-o", OpenFile, workspace),
+        KeyBinding::new("ctrl-shift-o", OpenFolder, workspace),
+        KeyBinding::new("ctrl-alt-n", NewFile, workspace),
+        KeyBinding::new("ctrl-p", FindFile, workspace),
+        KeyBinding::new("ctrl-,", OpenSettings, workspace),
+        KeyBinding::new("ctrl-k ctrl-s", OpenKeymap, workspace),
+        KeyBinding::new("up", RowUp, Some("Palette")),
+        KeyBinding::new("down", RowDown, Some("Palette")),
+        KeyBinding::new("enter", CommitInput, Some("Palette")),
+        KeyBinding::new("escape", CancelInput, Some("Palette")),
+        KeyBinding::new("backspace", DeleteInputChar, Some("Palette")),
+        KeyBinding::new("ctrl-up", PickParent, Some("Palette")),
     ];
-    // While an input mode is capturing text, the workspace's plain-letter
-    // commands must type, not dispatch: a NoAction binding in the deeper
-    // context stops the ancestor match, and the character falls through to
-    // the view's key handler.
-    for key in ["i", "b", "n", "d", "l"] {
-        bindings.push(KeyBinding::new(key, NoAction, typing));
-    }
+    bindings.extend(k10s_map::keybindings());
+    let suppressors = input_suppressors(bindings.iter());
+    bindings.extend(suppressors);
     bindings
+}
+
+/// Produce the deeper-context guards that keep an ancestor workspace command
+/// from stealing keystrokes that type text (plain and shifted alike). This is
+/// derived rather than listed by hand so newly added default and user
+/// bindings are safe automatically. Explicit bindings in an input context win
+/// and are never replaced.
+pub fn input_suppressors<'a>(
+    bindings: impl IntoIterator<Item = &'a KeyBinding>,
+) -> Vec<KeyBinding> {
+    let bindings: Vec<&KeyBinding> = bindings.into_iter().collect();
+    let input_contexts = ["Typing", "Palette", "Terminal", "Editor"];
+
+    // A binding whose single keystroke would otherwise type text: no chording
+    // modifier, but shift stays -- shift-f is how an F is typed, so a
+    // shift-letter workspace command must be guarded exactly like a plain one.
+    let typing_key = |binding: &KeyBinding| {
+        let [stroke] = binding.keystrokes() else {
+            return None;
+        };
+        let modifiers = stroke.modifiers();
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            return None;
+        }
+        Some(if modifiers.shift {
+            format!("shift-{}", stroke.key())
+        } else {
+            stroke.key().to_string()
+        })
+    };
+    let context_of =
+        |binding: &KeyBinding| binding.predicate().map(|predicate| predicate.to_string());
+
+    let protected: std::collections::BTreeSet<(String, String)> = bindings
+        .iter()
+        .filter_map(|binding| {
+            let context = context_of(binding)?;
+            if !input_contexts.contains(&context.as_str()) {
+                return None;
+            }
+            Some((context, typing_key(binding)?))
+        })
+        .collect();
+    let captured: std::collections::BTreeSet<String> = bindings
+        .iter()
+        .filter(|binding| matches!(context_of(binding).as_deref(), None | Some("Workspace")))
+        .filter_map(|binding| typing_key(binding))
+        .collect();
+
+    captured
+        .into_iter()
+        .flat_map(|key| {
+            input_contexts.into_iter().filter_map({
+                let protected = &protected;
+                move |context| {
+                    (!protected.contains(&(context.to_string(), key.clone())))
+                        .then(|| KeyBinding::new(&key, NoAction, Some(context)))
+                }
+            })
+        })
+        .collect()
 }
 
 // What the user has selected, named well enough to ask the cluster about it:
@@ -232,48 +509,121 @@ impl Selection {
     }
 }
 
-const PANEL_BG: u32 = 0x14121f;
-const PANEL_BORDER: u32 = 0x2c2842;
-const PANEL_HEADING: u32 = 0xb8b2d9;
-const PANEL_LABEL: u32 = 0x6e6890;
-const PANEL_VALUE: u32 = 0xcfcae6;
-const TAB_BAR_BG: u32 = 0x0b0a12;
-const TAB_ACTIVE_BG: u32 = 0x2c2842;
-const TAB_TEXT: u32 = 0xb8b2d9;
-const TAB_DIM: u32 = 0x6e6890;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ItemTag {
     Map,
     Browse,
     Nodes,
+    Forwards,
+    Files,
     Doc(String),
+    Edit(String),
+    Diff(String),
     Logs(String),
+    Term(String),
+    LocalTerm,
 }
 
-enum ItemView {
-    Map,
-    Browse(Entity<BrowseView>, #[allow(dead_code)] Subscription),
-    Text(Entity<TextView>),
+// Where the user's config files live; the app resolves the platform paths
+// and the workspace only opens what it is handed.
+#[derive(Debug, Clone)]
+pub struct ConfigPaths {
+    pub settings: std::path::PathBuf,
+    pub keymap: std::path::PathBuf,
 }
 
-struct Item {
+// The map is an item like any other hosted view: erasing it behind the same
+// handle is what lets the center row treat "the starmap" and "a describe
+// document" identically.
+impl Item for MapView {
+    fn title(&self) -> SharedString {
+        "map".into()
+    }
+
+    fn focus_handle(&self) -> FocusHandle {
+        MapView::focus_handle(self)
+    }
+}
+
+// One hosted view: the dedup tag the workspace finds it by, the type-erased
+// handle it renders and focuses through, and whatever subscription keeps its
+// events flowing. New panel kinds cost an `Item` impl and nothing here.
+struct Tab {
     tag: ItemTag,
-    view: ItemView,
+    view: Box<dyn ItemHandle>,
+    _subscription: Option<Subscription>,
+}
+
+impl Tab {
+    fn new(tag: ItemTag, view: impl ItemHandle + 'static) -> Tab {
+        Tab {
+            tag,
+            view: Box::new(view),
+            _subscription: None,
+        }
+    }
+
+    fn with_subscription(
+        tag: ItemTag,
+        view: impl ItemHandle + 'static,
+        subscription: Subscription,
+    ) -> Tab {
+        Tab {
+            tag,
+            view: Box::new(view),
+            _subscription: Some(subscription),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DockEdge {
+    Left,
+    Right,
+    Bottom,
+}
+
+#[derive(Clone)]
+struct DraggedDockResize(DockEdge);
+
+impl Render for DraggedDockResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
 }
 
 pub struct Workspace {
     map: Entity<MapView>,
-    items: Vec<Item>,
-    active: usize,
+    palette: Option<(Entity<PaletteView>, Subscription)>,
+    palette_previous_focus: Option<FocusHandle>,
+    center: Vec<Tab>,
+    center_active: usize,
+    left: Dock<Tab>,
+    bottom: Dock<Tab>,
     selection: Option<Selection>,
     inspector_open: bool,
+    app_menu_open: bool,
+    // Zed's title bar drag state machine: armed on mouse down, fires the
+    // compositor move on the first movement, disarmed everywhere else.
+    should_move: bool,
     bench: bool,
     provider: Rc<dyn ReadProvider>,
+    schema: Rc<std::cell::RefCell<editor::SchemaStore>>,
+    fs: std::sync::Arc<dyn fs::Fs>,
+    config: Option<ConfigPaths>,
+    files_root: Option<std::path::PathBuf>,
+    picker: Option<(Entity<PathPickerView>, Subscription)>,
+    picker_save_target: Option<gpui::WeakEntity<EditorView>>,
+    picker_previous_focus: Option<FocusHandle>,
+    finder: Option<(Entity<FileFinderView>, Subscription)>,
+    scratch_counter: usize,
+    status_note: Option<String>,
     connected: bool,
     events: Option<Detail>,
     log: Option<Detail>,
     fetch_generation: u64,
+    viewport: Viewport,
+    dock_size_override: Option<DockSizes>,
     _pick_subscription: Subscription,
 }
 
@@ -282,6 +632,7 @@ impl Workspace {
         map: Entity<MapView>,
         bench: bool,
         provider: Option<Rc<dyn ReadProvider>>,
+        config: Option<ConfigPaths>,
         cx: &mut Context<Self>,
     ) -> Self {
         let pick_subscription = cx.subscribe(&map, |this: &mut Self, _, picked: &Picked, cx| {
@@ -292,20 +643,38 @@ impl Workspace {
         });
         let connected = provider.is_some();
         Workspace {
-            map,
-            items: vec![Item {
-                tag: ItemTag::Map,
-                view: ItemView::Map,
-            }],
-            active: 0,
+            map: map.clone(),
+            palette: None,
+            palette_previous_focus: None,
+            center: vec![Tab::new(ItemTag::Map, map)],
+            center_active: 0,
+            left: Dock::default(),
+            bottom: Dock::default(),
             selection: None,
             inspector_open: false,
+            app_menu_open: false,
+            should_move: false,
             bench,
             provider: provider.unwrap_or_else(|| Rc::new(NullProvider)),
+            schema: Rc::new(std::cell::RefCell::new(editor::SchemaStore::new())),
+            fs: std::sync::Arc::new(fs::RealFs),
+            config,
+            files_root: None,
+            picker: None,
+            picker_save_target: None,
+            picker_previous_focus: None,
+            finder: None,
+            scratch_counter: 0,
+            status_note: None,
             connected,
             events: None,
             log: None,
             fetch_generation: 0,
+            viewport: Viewport {
+                width: 1600.0,
+                height: 1000.0,
+            },
+            dock_size_override: None,
             _pick_subscription: pick_subscription,
         }
     }
@@ -374,41 +743,73 @@ impl Workspace {
         self.map.read(cx).focus_handle()
     }
 
-    fn item_focus_handle(&self, index: usize, cx: &App) -> Option<FocusHandle> {
-        match &self.items.get(index)?.view {
-            ItemView::Map => Some(self.map.read(cx).focus_handle()),
-            ItemView::Browse(view, _) => Some(view.read(cx).focus_handle()),
-            ItemView::Text(view) => Some(view.read(cx).focus_handle()),
-        }
+    fn focus_item(&self, tab: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&tab.view.focus_handle(cx), cx);
     }
 
-    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.items.len() {
+    fn activate_center(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.center.len() {
             return;
         }
-        self.active = index;
-        if let Some(focus) = self.item_focus_handle(index, cx) {
-            window.focus(&focus, cx);
+        self.center_active = index;
+        if let Some(tab) = self.center.get(index) {
+            window.focus(&tab.view.focus_handle(cx), cx);
         }
         cx.notify();
     }
 
+    fn activate_left(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.left.activate(index);
+        if let Some(tab) = self.left.active() {
+            window.focus(&tab.view.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    fn activate_bottom(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.bottom.activate(index);
+        if let Some(tab) = self.bottom.active() {
+            window.focus(&tab.view.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    // An item lives where its shape belongs: documents in the center pane,
+    // navigation on the left, panel-shaped feeds and sessions on the bottom.
     fn activate_existing(
         &mut self,
         tag: &ItemTag,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if let Some(index) = self.items.iter().position(|item| &item.tag == tag) {
-            self.activate(index, window, cx);
+        if let Some(index) = self.center.iter().position(|tab| &tab.tag == tag) {
+            self.activate_center(index, window, cx);
+            return true;
+        }
+        if let Some(index) = self.left.find(|tab| &tab.tag == tag) {
+            self.activate_left(index, window, cx);
+            return true;
+        }
+        if let Some(index) = self.bottom.find(|tab| &tab.tag == tag) {
+            self.activate_bottom(index, window, cx);
             return true;
         }
         false
     }
 
-    fn push_item(&mut self, item: Item, window: &mut Window, cx: &mut Context<Self>) {
-        self.items.push(item);
-        self.activate(self.items.len() - 1, window, cx);
+    fn open_center(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        self.center.push(tab);
+        self.activate_center(self.center.len() - 1, window, cx);
+    }
+
+    fn open_left(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.left.push(tab);
+        self.activate_left(index, window, cx);
+    }
+
+    fn open_bottom(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.bottom.push(tab);
+        self.activate_bottom(index, window, cx);
     }
 
     fn subscribe_browse(
@@ -422,8 +823,28 @@ impl Workspace {
             window,
             |this, _, event: &BrowseEvent, window, cx| match event {
                 BrowseEvent::OpenDoc(request) => this.open_doc(request.clone(), window, cx),
+                BrowseEvent::OpenEdit(request) => this.open_editor(request.clone(), window, cx),
                 BrowseEvent::OpenLogs { namespace, pod } => {
                     this.open_logs(namespace.clone(), pod.clone(), window, cx)
+                }
+                BrowseEvent::OpenWorkloadLogs {
+                    namespace,
+                    kind,
+                    name,
+                } => this.open_workload_logs(
+                    WorkloadLogRequest {
+                        namespace: namespace.clone(),
+                        kind: *kind,
+                        name: name.clone(),
+                    },
+                    window,
+                    cx,
+                ),
+                BrowseEvent::StartForward(request) => {
+                    this.open_forwards(Some(request.clone()), window, cx)
+                }
+                BrowseEvent::OpenExec { namespace, pod } => {
+                    this.open_terminal(namespace.clone(), pod.clone(), window, cx)
                 }
             },
         )
@@ -436,11 +857,8 @@ impl Workspace {
         let provider = self.provider.clone();
         let view = cx.new(|cx| BrowseView::kinds(provider, cx));
         let subscription = self.subscribe_browse(&view, window, cx);
-        self.push_item(
-            Item {
-                tag: ItemTag::Browse,
-                view: ItemView::Browse(view, subscription),
-            },
+        self.open_left(
+            Tab::with_subscription(ItemTag::Browse, view, subscription),
             window,
             cx,
         );
@@ -453,11 +871,8 @@ impl Workspace {
         let provider = self.provider.clone();
         let view = cx.new(|cx| BrowseView::nodes(provider, cx));
         let subscription = self.subscribe_browse(&view, window, cx);
-        self.push_item(
-            Item {
-                tag: ItemTag::Nodes,
-                view: ItemView::Browse(view, subscription),
-            },
+        self.open_left(
+            Tab::with_subscription(ItemTag::Nodes, view, subscription),
             window,
             cx,
         );
@@ -470,14 +885,377 @@ impl Workspace {
         }
         let provider = self.provider.clone();
         let view = cx.new(|cx| TextView::doc(provider, request, cx));
-        self.push_item(
-            Item {
-                tag,
-                view: ItemView::Text(view),
+        self.open_center(Tab::new(tag, view), window, cx);
+    }
+
+    // Every editor tab routes its events the same way: a save-as request
+    // opens the picker aimed back at this editor, and a state change (dirty,
+    // saved, renamed) repaints the tab strip so the dot is honest.
+    fn subscribe_editor(
+        &mut self,
+        view: &Entity<EditorView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            view,
+            window,
+            |this, editor, event: &EditorEvent, window, cx| match event {
+                EditorEvent::SaveAsRequested => {
+                    let seed = this.picker_seed(editor.read(cx).source());
+                    this.picker_save_target = Some(editor.downgrade());
+                    this.open_picker(seed, PickerMode::Save, window, cx);
+                }
+                EditorEvent::DiffRequested { dry_run } => {
+                    this.open_diff(editor, *dry_run, window, cx);
+                }
+                EditorEvent::StateChanged => {
+                    let tag = Self::editor_tag(editor.read(cx).source());
+                    let tag = if tag == ItemTag::Edit(String::new()) {
+                        None
+                    } else {
+                        Some(tag)
+                    };
+                    let id = editor.entity_id();
+                    if let Some(tag) = tag
+                        && let Some(tab) =
+                            this.center.iter_mut().find(|tab| tab.view.item_id() == id)
+                    {
+                        tab.tag = tag;
+                    }
+                    cx.notify();
+                }
             },
+        )
+    }
+
+    // A diff belongs to the buffer that asked for it: asking twice re-compares
+    // in the tab that is already open rather than stacking copies of the same
+    // question, and re-asking with a dry run upgrades that comparison in place.
+    fn open_diff(
+        &mut self,
+        editor: &Entity<EditorView>,
+        dry_run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sources) = editor.read(cx).diff_sources() else {
+            self.status_note = Some("this buffer has no live version to compare with".to_string());
+            cx.notify();
+            return;
+        };
+        if self.bench {
+            return;
+        }
+        let tag = ItemTag::Diff(format!("{}/{}", sources.request.uid, sources.request.name));
+        if let Some(index) = self.center.iter().position(|tab| tab.tag == tag) {
+            let existing = self.center[index]
+                .view
+                .to_any()
+                .downcast::<diff::DiffView>()
+                .ok();
+            if let Some(existing) = existing {
+                existing.update(cx, |view, cx| view.refresh(sources, dry_run, cx));
+                self.activate_center(index, window, cx);
+                return;
+            }
+        }
+        let provider = self.provider.clone();
+        let weak = editor.downgrade();
+        let view = cx.new(|cx| diff::DiffView::new(provider, weak, sources, dry_run, cx));
+        self.open_center(Tab::new(tag, view), window, cx);
+    }
+
+    // One tag per document identity, so a scratch buffer saved to disk stops
+    // being a scratch buffer and cannot be opened again beside itself.
+    fn editor_tag(source: &editor::EditorSource) -> ItemTag {
+        match source {
+            editor::EditorSource::Cluster(request) => {
+                ItemTag::Edit(format!("cluster:{}/{}", request.uid, request.name))
+            }
+            editor::EditorSource::File(path) => ItemTag::Edit(format!("file:{}", path.display())),
+            // A scratch buffer has no identity to collide with, so it keeps
+            // the tag it opened with until a save gives it a path.
+            editor::EditorSource::Scratch => ItemTag::Edit(String::new()),
+        }
+    }
+
+    fn picker_seed(&self, source: &editor::EditorSource) -> std::path::PathBuf {
+        match source {
+            editor::EditorSource::File(path) => path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("/")),
+            _ => self
+                .files_root
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| std::path::PathBuf::from("/")),
+        }
+    }
+
+    fn open_editor(
+        &mut self,
+        request: DescribeRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = Self::editor_tag(&editor::EditorSource::Cluster(request.clone()));
+        if self.bench || self.activate_existing(&tag, window, cx) {
+            return;
+        }
+        let provider = self.provider.clone();
+        let schema = self.schema.clone();
+        let fs = self.fs.clone();
+        let view = cx.new(|cx| EditorView::cluster(provider, fs, schema, request, cx));
+        let subscription = self.subscribe_editor(&view, window, cx);
+        self.open_center(Tab::with_subscription(tag, view, subscription), window, cx);
+    }
+
+    // A path is whatever it is on disk: a folder opens the files panel, a
+    // file opens an editor. One entry point so the picker, the finder, the
+    // panel, and the command line all agree.
+    fn open_path(&mut self, path: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        // Asking what the path is costs a stat, and a stat on a dead network
+        // mount costs seconds, so the question is asked off this thread and the
+        // answer opens the item one turn later.
+        let fs = self.fs.clone();
+        let probe = path.clone();
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                let folder = cx
+                    .background_executor()
+                    .spawn(async move { fs.is_dir(&probe) })
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if folder {
+                        this.open_folder(path, window, cx);
+                    } else {
+                        this.open_file(path, window, cx);
+                    }
+                });
+            })
+            .detach();
+    }
+
+    fn open_file(&mut self, path: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let tag = Self::editor_tag(&editor::EditorSource::File(path.clone()));
+        if self.bench || self.activate_existing(&tag, window, cx) {
+            return;
+        }
+        let provider = self.provider.clone();
+        let schema = self.schema.clone();
+        let fs = self.fs.clone();
+        let view = cx.new(|cx| EditorView::file(provider, fs, schema, path, cx));
+        let subscription = self.subscribe_editor(&view, window, cx);
+        self.open_center(Tab::with_subscription(tag, view, subscription), window, cx);
+    }
+
+    fn open_folder(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bench {
+            return;
+        }
+        self.files_root = Some(path.clone());
+        let existing = self
+            .left
+            .panels()
+            .find(|(_, tab)| tab.tag == ItemTag::Files)
+            .and_then(|(_, tab)| tab.view.to_any().downcast::<FilesView>().ok());
+        if let Some(existing) = existing {
+            existing.update(cx, |view, cx| view.set_root(path, cx));
+            self.activate_existing(&ItemTag::Files, window, cx);
+            cx.notify();
+            return;
+        }
+        let fs = self.fs.clone();
+        let view = cx.new(|cx| FilesView::new(fs, path, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &FilesEvent, window, cx| match event {
+                FilesEvent::OpenFile(path) => this.open_file(path.clone(), window, cx),
+            },
+        );
+        self.open_left(
+            Tab::with_subscription(ItemTag::Files, view, subscription),
             window,
             cx,
         );
+    }
+
+    fn new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench {
+            return;
+        }
+        self.scratch_counter += 1;
+        let title = format!("untitled-{}.yaml", self.scratch_counter);
+        let tag = ItemTag::Edit(format!("scratch:{title}"));
+        let provider = self.provider.clone();
+        let schema = self.schema.clone();
+        let fs = self.fs.clone();
+        let view = cx.new(|cx| EditorView::scratch(provider, fs, schema, title, cx));
+        let subscription = self.subscribe_editor(&view, window, cx);
+        self.open_center(Tab::with_subscription(tag, view, subscription), window, cx);
+    }
+
+    // Settings and keymap are ordinary editor tabs over the real files, with
+    // the schema this binary defines. Saving them is what applies them: the
+    // config poller notices the write and reloads, so there is no separate
+    // settings UI to drift from the file.
+    fn open_config(&mut self, keymap: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.config.clone() else {
+            if !self.bench {
+                self.status_note = Some(
+                    "no config directory on this platform, so there is no file to edit".to_string(),
+                );
+                cx.notify();
+            }
+            return;
+        };
+        let (path, template, root) = if keymap {
+            (
+                config.keymap,
+                config_schema::KEYMAP_TEMPLATE,
+                config_schema::keymap_root(cx),
+            )
+        } else {
+            (
+                config.settings,
+                config_schema::SETTINGS_TEMPLATE,
+                config_schema::settings_root(
+                    k10s_theme::registry(cx),
+                    &cx.text_system().all_font_names(),
+                ),
+            )
+        };
+        let tag = Self::editor_tag(&editor::EditorSource::File(path.clone()));
+        if self.bench || self.activate_existing(&tag, window, cx) {
+            return;
+        }
+        let provider = self.provider.clone();
+        let schema = self.schema.clone();
+        let fs = self.fs.clone();
+        let view = cx.new(|cx| {
+            EditorView::file_or_template(provider, fs, schema, path, template, cx)
+                .with_schema_root(root)
+        });
+        let subscription = self.subscribe_editor(&view, window, cx);
+        self.open_center(Tab::with_subscription(tag, view, subscription), window, cx);
+    }
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.take().is_some() {
+            self.picker_save_target = None;
+            if let Some(previous) = self.picker_previous_focus.take() {
+                window.focus(&previous, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn open_picker(
+        &mut self,
+        seed: std::path::PathBuf,
+        mode: PickerMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bench {
+            return;
+        }
+        self.close_palette(window, cx);
+        self.close_finder(window, cx);
+        if self.picker.is_some() {
+            self.close_picker(window, cx);
+        }
+        self.picker_previous_focus = window.focused(cx);
+        let fs = self.fs.clone();
+        let view = cx.new(|cx| PathPickerView::new(fs, seed, mode, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &PickerEvent, window, cx| match event {
+                PickerEvent::Dismissed => this.close_picker(window, cx),
+                PickerEvent::Confirmed(path) => {
+                    let path = path.clone();
+                    let target = this.picker_save_target.take();
+                    this.close_picker(window, cx);
+                    match target {
+                        Some(editor) => match editor.upgrade() {
+                            Some(editor) => editor.update(cx, |editor, cx| {
+                                editor.assign_path_and_save(path, cx);
+                            }),
+                            None => {
+                                this.status_note = Some(
+                                    "that editor closed before the save; nothing was written"
+                                        .to_string(),
+                                );
+                                cx.notify();
+                            }
+                        },
+                        None => this.open_path(path, window, cx),
+                    }
+                }
+            },
+        );
+        let focus = view.read(cx).focus_handle();
+        self.picker = Some((view, subscription));
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn close_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.finder.take().is_some() {
+            if let Some(previous) = self.picker_previous_focus.take() {
+                window.focus(&previous, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn open_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench {
+            return;
+        }
+        let Some(root) = self.files_root.clone() else {
+            // No folder open, so there is nothing to search: say which key
+            // opens one rather than showing an empty list.
+            self.status_note = Some("no folder open; ctrl-shift-o opens one".to_string());
+            cx.notify();
+            return;
+        };
+        self.close_palette(window, cx);
+        if self.picker.is_some() {
+            self.close_picker(window, cx);
+        }
+        if self.finder.is_some() {
+            self.close_finder(window, cx);
+        }
+        self.picker_previous_focus = window.focused(cx);
+        let fs = self.fs.clone();
+        let view = cx.new(|cx| FileFinderView::new(fs, root, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &FinderEvent, window, cx| match event {
+                FinderEvent::Dismissed => this.close_finder(window, cx),
+                FinderEvent::Confirmed(path) => {
+                    let path = path.clone();
+                    this.close_finder(window, cx);
+                    this.open_path(path, window, cx);
+                }
+            },
+        );
+        let focus = view.read(cx).focus_handle();
+        self.finder = Some((view, subscription));
+        window.focus(&focus, cx);
+        cx.notify();
     }
 
     fn open_logs(
@@ -499,152 +1277,377 @@ impl Workspace {
             previous: false,
         };
         let view = cx.new(|cx| TextView::logs(provider, request, cx));
-        self.push_item(
-            Item {
-                tag,
-                view: ItemView::Text(view),
-            },
-            window,
-            cx,
-        );
+        self.open_bottom(Tab::new(tag, view), window, cx);
     }
 
-    fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active == 0 || self.items.len() <= 1 {
+    // One forwards item; a start request lands on the existing view rather
+    // than opening a second registry window.
+    fn open_forwards(
+        &mut self,
+        start: Option<ForwardRequest>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bench {
             return;
         }
-        // Dropping the item drops its entity: a log follow's stop guard goes
-        // with it, and the stream is cancelled.
-        self.items.remove(self.active);
-        let index = self.active.min(self.items.len() - 1);
-        self.activate(index, window, cx);
+        if let Some(index) = self.bottom.find(|tab| tab.tag == ItemTag::Forwards) {
+            if let Some(request) = start
+                && let Some(view) = self
+                    .bottom
+                    .panels()
+                    .nth(index)
+                    .and_then(|(_, tab)| tab.view.to_any().downcast::<ForwardsView>().ok())
+            {
+                view.update(cx, |view, cx| view.start(request, cx));
+            }
+            self.activate_bottom(index, window, cx);
+            return;
+        }
+        let provider = self.provider.clone();
+        let view = cx.new(|cx| ForwardsView::new(provider, start, cx));
+        self.open_bottom(Tab::new(ItemTag::Forwards, view), window, cx);
     }
 
-    fn item_title(&self, item: &Item, cx: &App) -> SharedString {
-        match &item.view {
-            ItemView::Map => "map".into(),
-            ItemView::Browse(view, _) => view.read(cx).title(),
-            ItemView::Text(view) => view.read(cx).title(),
+    // The shell we ask a container for: bash when the image has one, else
+    // sh. A container with neither answers inside the terminal itself.
+    fn shell_command() -> Vec<String> {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "command -v bash >/dev/null 2>&1 && exec bash || exec sh".to_string(),
+        ]
+    }
+
+    fn open_terminal(
+        &mut self,
+        namespace: String,
+        pod: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = ItemTag::Term(format!("{namespace}/{pod}"));
+        if self.bench || self.activate_existing(&tag, window, cx) {
+            return;
+        }
+        let provider = self.provider.clone();
+        let request = ExecRequest {
+            namespace,
+            pod,
+            container: None,
+            command: Self::shell_command(),
+        };
+        let view = cx.new(|cx| TerminalView::exec(provider, request, cx));
+        self.open_bottom(Tab::new(tag, view), window, cx);
+    }
+
+    // Zed's terminal toggle semantics: create lazily on first use, focus it
+    // when it is visible but unfocused, hide the dock when it already holds
+    // focus. Lazy on purpose -- a shell nobody asked for yet must not spend
+    // a process, an fd, or a paint at startup.
+    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench {
+            return;
+        }
+        if let Some(index) = self.bottom.find(|tab| tab.tag == ItemTag::LocalTerm) {
+            let focused = self.bottom.is_open()
+                && self.bottom.active_index() == index
+                && self
+                    .bottom
+                    .active()
+                    .is_some_and(|tab| tab.view.focus_handle(cx).contains_focused(window, cx));
+            if focused {
+                self.bottom.set_open(false);
+                self.activate_center(self.center_active, window, cx);
+            } else {
+                self.activate_bottom(index, window, cx);
+            }
+            return;
+        }
+        let view = cx.new(TerminalView::local);
+        self.open_bottom(Tab::new(ItemTag::LocalTerm, view), window, cx);
+    }
+
+    fn open_workload_logs(
+        &mut self,
+        request: WorkloadLogRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = ItemTag::Logs(format!(
+            "{}/{}/{}",
+            request.namespace,
+            kind_short(request.kind),
+            request.name
+        ));
+        if self.bench || self.activate_existing(&tag, window, cx) {
+            return;
+        }
+        let provider = self.provider.clone();
+        let view = cx.new(|cx| TextView::workload_logs(provider, request, cx));
+        self.open_bottom(Tab::new(tag, view), window, cx);
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            if let Some(previous) = self.palette_previous_focus.take() {
+                window.focus(&previous, cx);
+            }
+            cx.notify();
         }
     }
 
-    fn row(label: &'static str, value: impl Into<SharedString>) -> impl IntoElement {
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench {
+            return;
+        }
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+            return;
+        }
+        self.palette_previous_focus = window.focused(cx);
+        let view = cx.new(PaletteView::new);
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &PaletteEvent, window, cx| match event {
+                PaletteEvent::Dismissed => this.close_palette(window, cx),
+                PaletteEvent::Confirmed(name) => {
+                    let name = *name;
+                    // Zed's order: whoever had focus gets it back, then the
+                    // command lands exactly where the keystroke would have.
+                    this.close_palette(window, cx);
+                    match cx.build_action(name, None) {
+                        Ok(action) => window.dispatch_action(action, cx),
+                        Err(error) => {
+                            eprintln!("k10s: the palette cannot build {name:?}: {error}")
+                        }
+                    }
+                }
+            },
+        );
+        let focus = view.read(cx).focus_handle();
+        self.palette = Some((view, subscription));
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    // ctrl-w closes whatever has focus, if it is closable: a bottom panel, a
+    // left panel, or a center tab that is not the map. Dropping the item
+    // drops its entity: a log follow's stop guard or an exec session goes
+    // with it.
+    fn close_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused_in =
+            |tab: &Tab, cx: &Context<Self>| tab.view.focus_handle(cx).contains_focused(window, cx);
+        if let Some(tab) = self.bottom.active()
+            && focused_in(tab, cx)
+        {
+            self.bottom.remove(self.bottom.active_index());
+            match self.bottom.active() {
+                Some(next) => self.focus_item(next, window, cx),
+                None => self.activate_center(self.center_active, window, cx),
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(tab) = self.left.active()
+            && focused_in(tab, cx)
+        {
+            self.left.remove(self.left.active_index());
+            match self.left.active() {
+                Some(next) => self.focus_item(next, window, cx),
+                None => self.activate_center(self.center_active, window, cx),
+            }
+            cx.notify();
+            return;
+        }
+        if self.center_active > 0 && self.center.len() > 1 {
+            // An item holding unsaved work is never closed by a keystroke
+            // aimed somewhere else: focus it instead, so the next ctrl-w
+            // reaches its own guard and the user sees what they are discarding.
+            if self.center[self.center_active].view.is_dirty(cx) {
+                let tab = &self.center[self.center_active];
+                let focused = tab.view.focus_handle(cx).contains_focused(window, cx);
+                if !focused {
+                    let handle = tab.view.focus_handle(cx);
+                    window.focus(&handle, cx);
+                    self.status_note =
+                        Some("unsaved changes; ctrl-w again to discard them".to_string());
+                    cx.notify();
+                    return;
+                }
+            }
+            self.center.remove(self.center_active);
+            let index = self.center_active.min(self.center.len() - 1);
+            self.activate_center(index, window, cx);
+        }
+    }
+
+    fn row(
+        theme: &Theme,
+        fonts: &Typography,
+        label: &'static str,
+        value: impl Into<SharedString>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
             .gap(px(2.0))
             .child(
                 div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(PANEL_LABEL))
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text_muted))
                     .child(label),
             )
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(PANEL_VALUE))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_size(px(fonts.ui_size))
+                    .text_color(rgb(theme.shell.text))
                     .child(value.into()),
             )
     }
 
-    fn inspector(&self, selection: Selection) -> impl IntoElement {
-        let mut panel = div()
-            .w(px(320.0))
+    fn inspector(
+        &self,
+        theme: &Theme,
+        fonts: &Typography,
+        width: f32,
+        selection: Option<Selection>,
+    ) -> impl IntoElement {
+        let body = match selection {
+            None => div()
+                .flex_1()
+                .min_h(px(0.0))
+                .p(px(12.0))
+                .text_size(px(fonts.ui_size))
+                .text_color(rgb(theme.shell.text_muted))
+                .child("Nothing selected. Select a resource on the map.")
+                .into_any_element(),
+            Some(selection) => {
+                let mut body = div()
+                    .id("inspector-body")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .p(px(12.0))
+                    .child(
+                        div()
+                            .text_size(px(fonts.ui_size))
+                            .text_color(rgb(theme.shell.text))
+                            .child(format!("{} {}", selection.kind, selection.name)),
+                    )
+                    .child(Self::row(theme, &fonts, "Name", selection.name.to_string()))
+                    .child(Self::row(theme, &fonts, "Kind", selection.kind));
+                if let Some(namespace) = selection.namespace.as_deref() {
+                    body = body.child(Self::row(theme, &fonts, "Namespace", namespace.to_string()));
+                }
+                if let Some(owner) = selection.owner.as_deref() {
+                    body = body.child(Self::row(theme, &fonts, "Owner", owner.to_string()));
+                }
+                if !selection.uid.is_empty() {
+                    body = body.child(Self::row(theme, &fonts, "UID", selection.uid.to_string()));
+                }
+                body = body.child(Self::detail_section(
+                    theme,
+                    &fonts,
+                    "Events",
+                    self.events.as_ref(),
+                    |detail| {
+                        let Detail::Events(rows) = detail else {
+                            return Vec::new();
+                        };
+                        rows.iter()
+                            .map(|row| {
+                                format!(
+                                    "{} x{} {} — {}",
+                                    row.kind, row.count, row.reason, row.message
+                                )
+                            })
+                            .collect()
+                    },
+                ));
+                if selection.level == Level::Cell {
+                    body = body.child(Self::detail_section(
+                        theme,
+                        &fonts,
+                        "Log tail",
+                        self.log.as_ref(),
+                        |detail| {
+                            let Detail::Log(lines) = detail else {
+                                return Vec::new();
+                            };
+                            lines.iter().rev().take(12).rev().cloned().collect()
+                        },
+                    ));
+                }
+                body.child(
+                    div()
+                        .text_size(px(fonts.small()))
+                        .text_color(rgb(theme.shell.text_muted))
+                        .child(if self.connected {
+                            "d describe · l logs · s shell"
+                        } else {
+                            "Events and logs require a cluster connection."
+                        }),
+                )
+                .into_any_element()
+            }
+        };
+
+        div()
+            .id("inspector")
+            .w(px(width))
             .h_full()
+            .relative()
+            .flex_none()
             .flex()
             .flex_col()
-            .gap(px(12.0))
-            .p(px(14.0))
-            .bg(rgb(PANEL_BG))
+            .overflow_hidden()
+            .bg(rgb(theme.shell.panel_background))
             .border_l_1()
-            .border_color(rgb(PANEL_BORDER))
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .text_color(rgb(PANEL_HEADING))
-                    .child(format!("{} {}", selection.kind, selection.name)),
-            )
-            .child(Self::row("name", selection.name.to_string()))
-            .child(Self::row("kind", selection.kind));
-        if let Some(namespace) = selection.namespace.as_deref() {
-            panel = panel.child(Self::row("namespace", namespace.to_string()));
-        }
-        if let Some(owner) = selection.owner.as_deref() {
-            panel = panel.child(Self::row("owner", owner.to_string()));
-        }
-        if !selection.uid.is_empty() {
-            panel = panel.child(Self::row("uid", selection.uid.to_string()));
-        }
-        panel = panel.child(Self::detail_section(
-            "events",
-            self.events.as_ref(),
-            |detail| {
-                let Detail::Events(rows) = detail else {
-                    return Vec::new();
-                };
-                rows.iter()
-                    .map(|row| {
-                        format!(
-                            "{} x{} {} - {}",
-                            row.kind, row.count, row.reason, row.message
-                        )
-                    })
-                    .collect()
-            },
-        ));
-        if selection.level == Level::Cell {
-            panel = panel.child(Self::detail_section(
-                "log tail",
-                self.log.as_ref(),
-                |detail| {
-                    let Detail::Log(lines) = detail else {
-                        return Vec::new();
-                    };
-                    lines.iter().rev().take(12).rev().cloned().collect()
-                },
-            ));
-        }
-        panel = panel.child(
-            div()
-                .text_size(px(10.0))
-                .text_color(rgb(PANEL_LABEL))
-                .child(if self.connected {
-                    "d describe · l logs (pods)"
-                } else {
-                    "no cluster connected; events and logs need one"
-                }),
-        );
-        panel
+            .border_color(rgb(theme.shell.border))
+            .role(Role::Complementary)
+            .aria_label("Inspector")
+            .child(panel_header(theme, fonts, "Inspector"))
+            .child(body)
+            .child(Self::resize_handle(DockEdge::Right))
     }
 
     fn detail_section(
+        theme: &Theme,
+        fonts: &Typography,
         title: &'static str,
         detail: Option<&Detail>,
         rows: impl Fn(&Detail) -> Vec<String>,
     ) -> impl IntoElement {
         let mut section = div().flex().flex_col().gap(px(4.0)).child(
             div()
-                .text_size(px(10.0))
-                .text_color(rgb(PANEL_LABEL))
+                .text_size(px(fonts.small()))
+                .text_color(rgb(theme.shell.text_muted))
                 .child(title),
         );
         section = match detail {
             None => section.child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(PANEL_LABEL))
-                    .child("..."),
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text_muted))
+                    .child("Loading…"),
             ),
             Some(Detail::Denied(what)) => section.child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(PANEL_HEADING))
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text))
                     .child(format!("{what}: access denied for this account")),
             ),
             Some(Detail::Failed(why)) => section.child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(PANEL_HEADING))
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text))
                     .child(why.clone()),
             ),
             Some(detail) => {
@@ -652,15 +1655,16 @@ impl Workspace {
                 if lines.is_empty() {
                     section.child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(PANEL_LABEL))
-                            .child("none"),
+                            .text_size(px(fonts.small()))
+                            .text_color(rgb(theme.shell.text_muted))
+                            .child("None"),
                     )
                 } else {
                     section.children(lines.into_iter().map(|line| {
                         div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(PANEL_VALUE))
+                            .text_size(px(fonts.small()))
+                            .line_height(px(18.0))
+                            .text_color(rgb(theme.shell.text))
                             .child(line)
                     }))
                 }
@@ -669,89 +1673,982 @@ impl Workspace {
         section
     }
 
-    fn tab_bar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let active = self.active;
+    fn status_line(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(if self.connected {
+            "cluster connected".to_string()
+        } else {
+            "no cluster".to_string()
+        });
+        if let Some(selection) = &self.selection {
+            parts.push(format!("{} {}", selection.kind, selection.name));
+        }
+        if let Some(root) = &self.files_root {
+            parts.push(format!("folder {}", root.display()));
+        }
+        let open = self.bottom.len();
+        if open > 0 {
+            parts.push(format!(
+                "{open} panel{} below",
+                if open == 1 { "" } else { "s" }
+            ));
+        }
+        if let Some(note) = &self.status_note {
+            parts.push(note.clone());
+        }
+        parts.join("  ·  ")
+    }
+
+    fn item_view(tab: &Tab) -> gpui::AnyElement {
+        tab.view.to_any().into_any_element()
+    }
+
+    // A modal's scrim: click-outside dismisses, click-inside does not, and
+    // the sheet lands where every other modal lands.
+    fn modal_scrim(
+        view: gpui::AnyElement,
+        dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
         div()
-            .h(px(26.0))
-            .flex()
-            .flex_row()
-            .bg(rgb(TAB_BAR_BG))
-            .border_b_1()
-            .border_color(rgb(PANEL_BORDER))
-            .children(self.items.iter().enumerate().map(|(index, item)| {
-                let mut tab = div()
-                    .px(px(12.0))
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, dismiss)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(MODAL_TOP))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(view),
+            )
+    }
+
+    // Zed's dock toggle button: the panel's own icon, lit while its dock is
+    // showing it, tooltip carrying the action's live keybinding, and the
+    // click dispatching the same action the key would.
+    fn panel_button<A: gpui::Action + Clone>(
+        id: &'static str,
+        icon: &'static str,
+        label: &'static str,
+        active: bool,
+        action: A,
+        theme: &Theme,
+    ) -> impl IntoElement {
+        let tooltip_action = action.clone();
+        icon_button(id, icon, label, active, theme)
+            .on_click(move |_, window, cx| {
+                window.dispatch_action(Box::new(action.clone()), cx);
+            })
+            .tooltip(move |window, cx| {
+                let tooltip = ui::Tooltip::with_binding(label, &tooltip_action, window);
+                cx.new(move |_| tooltip).into()
+            })
+    }
+
+    fn resize(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
+        if self.viewport.update(width, height) {
+            cx.notify();
+        }
+    }
+
+    fn requested_dock_sizes(&self, cx: &App) -> DockSizes {
+        self.dock_size_override.unwrap_or_else(|| {
+            let settings = settings::active(cx);
+            DockSizes {
+                left: settings.left_dock_width,
+                right: settings.right_dock_width,
+                bottom: settings.bottom_dock_height,
+            }
+        })
+    }
+
+    fn resize_dock(&mut self, event: &DragMoveEvent<DraggedDockResize>, cx: &mut Context<Self>) {
+        let mut sizes = self.requested_dock_sizes(cx);
+        let position_x = f32::from(event.event.position.x);
+        let position_y = f32::from(event.event.position.y);
+        match event.drag(cx).0 {
+            DockEdge::Left => sizes.left = position_x.clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE),
+            DockEdge::Right => {
+                sizes.right =
+                    (self.viewport.width - position_x).clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
+            }
+            DockEdge::Bottom => {
+                let body_bottom = self.viewport.height - STATUS_BAR_HEIGHT;
+                sizes.bottom = (body_bottom - position_y).clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
+            }
+        }
+        if self.dock_size_override != Some(sizes) {
+            self.dock_size_override = Some(sizes);
+            cx.notify();
+        }
+    }
+
+    fn resize_handle(edge: DockEdge) -> gpui::AnyElement {
+        let (id, handle) = match edge {
+            DockEdge::Left => (
+                "left-dock-resize",
+                div()
+                    .right_0()
+                    .top_0()
                     .h_full()
+                    .w(px(RESIZE_HANDLE_SIZE))
+                    .cursor_col_resize(),
+            ),
+            DockEdge::Right => (
+                "right-dock-resize",
+                div()
+                    .left_0()
+                    .top_0()
+                    .h_full()
+                    .w(px(RESIZE_HANDLE_SIZE))
+                    .cursor_col_resize(),
+            ),
+            DockEdge::Bottom => (
+                "bottom-dock-resize",
+                div()
+                    .left_0()
+                    .top_0()
+                    .w_full()
+                    .h(px(RESIZE_HANDLE_SIZE))
+                    .cursor_row_resize(),
+            ),
+        };
+        handle
+            .id(id)
+            .absolute()
+            .on_drag(DraggedDockResize(edge), |drag, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| drag.clone())
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .occlude()
+            .into_any_element()
+    }
+
+    // The Linux window control strip, shown exactly when the compositor
+    // hands us client-side decorations -- Zed's own bail-out rule. GNOME
+    // style: 20 px circular hovers around 16 px glyphs, Zed's shipped icons.
+    fn window_controls(theme: &Theme, window: &Window) -> Option<impl IntoElement> {
+        if !matches!(window.window_decorations(), Decorations::Client { .. }) {
+            return None;
+        }
+        let supported = window.window_controls();
+        let maximize_icon = if window.is_maximized() {
+            "icons/generic_restore.svg"
+        } else {
+            "icons/generic_maximize.svg"
+        };
+        let control = |id: &'static str, icon: &'static str, act: fn(&mut Window)| {
+            div()
+                .id(id)
+                .size(px(20.0))
+                .rounded_full()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .role(Role::Button)
+                .aria_label(id)
+                .hover(|button| button.bg(rgb(theme.shell.element_hover)))
+                .child(
+                    svg()
+                        .path(icon)
+                        .size(px(16.0))
+                        .text_color(rgb(theme.shell.text_muted)),
+                )
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    act(window);
+                })
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .pl(px(12.0))
+                // A press on a control must not arm the window drag.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(supported.minimize.then(|| {
+                    control("minimize", "icons/generic_minimize.svg", |window| {
+                        window.minimize_window()
+                    })
+                }))
+                .children(
+                    supported
+                        .maximize
+                        .then(|| control("maximize", maximize_icon, |window| window.zoom_window())),
+                )
+                .child(control("close", "icons/generic_close.svg", |window| {
+                    window.remove_window()
+                })),
+        )
+    }
+
+    fn title_bar(
+        &self,
+        theme: &Theme,
+        fonts: &Typography,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let active_title = self
+            .center
+            .get(self.center_active)
+            .map(|tab| tab.view.title(cx))
+            .unwrap_or_else(|| "map".into());
+        let connection = if self.connected {
+            "cluster connected"
+        } else {
+            "local starmap"
+        };
+
+        div()
+            .id("title-bar")
+            .h(px(title_bar_height(window)))
+            .w_full()
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(6.0))
+            .bg(rgb(theme.shell.background))
+            .role(Role::Toolbar)
+            .aria_label("Title bar")
+            // Zed's drag-to-move state machine: arm on mouse down, hand the
+            // window to the compositor on the first movement, disarm on
+            // every other outcome. Interactive children stop propagation on
+            // mouse down so a button press never starts a move.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, _| this.should_move = true),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.should_move = false),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, _| this.should_move = false))
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, window, _| {
+                if this.should_move {
+                    this.should_move = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_click(|event: &ClickEvent, window, _| {
+                if event.click_count() == 2 {
+                    window.zoom_window();
+                }
+            })
+            .when(window.window_controls().window_menu, |bar| {
+                bar.on_mouse_down(MouseButton::Right, |event: &MouseDownEvent, window, _| {
+                    window.show_window_menu(event.position);
+                })
+            })
+            .child(
+                div()
                     .flex()
                     .items_center()
-                    .text_size(px(11.0))
-                    .text_color(if index == active {
-                        rgb(TAB_TEXT)
+                    .gap(px(8.0))
+                    .child(
+                        icon_button(
+                            "app-menu",
+                            "icons/menu.svg",
+                            "Application menu",
+                            self.app_menu_open,
+                            theme,
+                        )
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.app_menu_open = !this.app_menu_open;
+                            cx.notify();
+                        }))
+                        .tooltip(|_, cx| {
+                            cx.new(|_| ui::Tooltip {
+                                label: "Application Menu".into(),
+                                key: None,
+                            })
+                            .into()
+                        }),
+                    )
+                    .child(
+                        div()
+                            .size(px(8.0))
+                            .rounded_full()
+                            .bg(rgb(if self.connected {
+                                theme.shell.success
+                            } else {
+                                theme.shell.text_muted
+                            })),
+                    )
+                    // The one place the product says its own name, so the
+                    // one place the display face belongs: League Spartan is a
+                    // headline typeface and reads as noise anywhere else.
+                    .child(
+                        div()
+                            .font_family(k10s_theme::DISPLAY_FAMILY)
+                            .text_size(px(fonts.ui_size))
+                            .text_color(rgb(theme.shell.text))
+                            .child("k10s"),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text_muted))
+                    .child(active_title),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(fonts.small()))
+                            .text_color(rgb(theme.shell.text_muted))
+                            .child(connection),
+                    )
+                    .children(Self::window_controls(theme, window)),
+            )
+    }
+
+    // The burger's dropdown: the workspace commands with their bindings,
+    // anchored under the title bar the way Zed deploys its application menu.
+    // Click-out and escape dismiss; confirming dispatches and dismisses.
+    fn app_menu(
+        &self,
+        theme: &Theme,
+        fonts: &Typography,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let entry = |id: usize, label: &'static str, action: Box<dyn gpui::Action>| {
+            let key = window
+                .bindings_for_action(action.as_ref())
+                .into_iter()
+                .next()
+                .map(|binding| {
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(|keystroke| keystroke.inner().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+            div()
+                .id(("app-menu-item", id))
+                .h(px(26.0))
+                .px(px(10.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.0))
+                .cursor_pointer()
+                .hover(|item| item.bg(rgb(theme.shell.element_hover)))
+                .text_size(px(fonts.small()))
+                .text_color(rgb(theme.shell.text))
+                .role(Role::MenuItem)
+                .aria_label(label)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.app_menu_open = false;
+                    window.dispatch_action(action.boxed_clone(), cx);
+                    cx.notify();
+                }))
+                .child(label)
+                .children(key.map(|key| {
+                    div()
+                        .text_size(px(fonts.xsmall()))
+                        .text_color(rgb(theme.shell.text_muted))
+                        .child(SharedString::from(key))
+                }))
+        };
+        let separator = || {
+            div()
+                .h(px(1.0))
+                .my(px(4.0))
+                .flex_none()
+                .bg(rgb(theme.shell.border_variant))
+        };
+
+        div()
+            .id("app-menu-backdrop")
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.app_menu_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("app-menu")
+                    .absolute()
+                    .top(px(title_bar_height(window)))
+                    .left(px(6.0))
+                    .w(px(280.0))
+                    .flex()
+                    .flex_col()
+                    .py(px(4.0))
+                    .bg(rgb(theme.shell.elevated_surface_background))
+                    .border_1()
+                    .border_color(rgb(theme.shell.border_variant))
+                    .rounded(px(8.0))
+                    .shadow_lg()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .role(Role::Menu)
+                    .aria_label("Application menu")
+                    .child(entry(0, "Command Palette…", Box::new(OpenPalette)))
+                    .child(separator())
+                    .child(entry(1, "Browse Resources", Box::new(OpenBrowser)))
+                    .child(entry(2, "Node Capacity", Box::new(OpenNodes)))
+                    .child(entry(3, "Port Forwards", Box::new(OpenForwards)))
+                    .child(entry(4, "Terminal", Box::new(ToggleTerminal)))
+                    .child(separator())
+                    .child(entry(5, "Toggle Left Dock", Box::new(ToggleLeftDock)))
+                    .child(entry(6, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
+                    .child(entry(7, "Toggle Inspector", Box::new(ToggleRightDock)))
+                    .child(separator())
+                    .child(entry(8, "Quit", Box::new(Quit))),
+            )
+    }
+
+    // A panel with multiple items gets Zed's 32 px tab strip. Individual
+    // panels still own their toolbars, just as Zed's terminal and project
+    // panels do.
+    fn dock_tabs(
+        &self,
+        dock: &Dock<Tab>,
+        id: &'static str,
+        activate: fn(&mut Self, usize, &mut Window, &mut Context<Self>),
+        theme: &Theme,
+        fonts: &Typography,
+        cx: &Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if dock.len() < 2 {
+            return None;
+        }
+        let active = dock.active_index();
+        Some(
+            div()
+                .id(id)
+                .h(px(TAB_HEIGHT))
+                .flex_none()
+                .flex()
+                .flex_row()
+                .overflow_x_hidden()
+                .bg(rgb(theme.shell.tab_bar_background))
+                .border_b_1()
+                .border_color(rgb(theme.shell.border))
+                .role(Role::TabList)
+                .aria_label("Dock tabs")
+                .children(dock.panels().map(|(index, tab)| {
+                    let selected = index == active;
+                    div()
+                        // A workspace can show left and bottom tab strips at
+                        // once. Include the strip identity so GPUI never
+                        // aliases interaction state between equal indices.
+                        .id((id, index))
+                        .px(px(12.0))
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .bg(rgb(if selected {
+                            theme.shell.tab_active_background
+                        } else {
+                            theme.shell.tab_inactive_background
+                        }))
+                        .border_r_1()
+                        .when(!selected, |tab| tab.border_b_1())
+                        .border_color(rgb(theme.shell.border))
+                        .hover(|tab| tab.bg(rgb(theme.shell.element_hover)))
+                        .text_size(px(fonts.ui_size))
+                        .text_color(rgb(if selected {
+                            theme.shell.text
+                        } else {
+                            theme.shell.text_muted
+                        }))
+                        .role(Role::Tab)
+                        .aria_selected(selected)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this: &mut Self, _: &MouseDownEvent, window, cx| {
+                                activate(this, index, window, cx);
+                            }),
+                        )
+                        .child(tab.view.title(cx))
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn tab_bar(&self, theme: &Theme, fonts: &Typography, cx: &Context<Self>) -> impl IntoElement {
+        let active = self.center_active;
+        div()
+            .id("center-tabs")
+            .h(px(TAB_HEIGHT))
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .overflow_x_hidden()
+            .bg(rgb(theme.shell.tab_bar_background))
+            .border_b_1()
+            .border_color(rgb(theme.shell.border))
+            .role(Role::TabList)
+            .aria_label("Center tabs")
+            .children(self.center.iter().enumerate().map(|(index, tab)| {
+                let selected = index == active;
+                div()
+                    .id(("center-tab", index))
+                    .px(px(12.0))
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .bg(rgb(if selected {
+                        theme.shell.tab_active_background
                     } else {
-                        rgb(TAB_DIM)
-                    })
+                        theme.shell.tab_inactive_background
+                    }))
+                    .border_r_1()
+                    .when(!selected, |tab| tab.border_b_1())
+                    .border_color(rgb(theme.shell.border))
+                    .hover(|tab| tab.bg(rgb(theme.shell.element_hover)))
+                    .text_size(px(fonts.ui_size))
+                    .text_color(rgb(if selected {
+                        theme.shell.text
+                    } else {
+                        theme.shell.text_muted
+                    }))
+                    .role(Role::Tab)
+                    .aria_selected(selected)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this: &mut Self, _: &MouseDownEvent, window, cx| {
-                            this.activate(index, window, cx);
+                            this.activate_center(index, window, cx);
                         }),
                     )
-                    .child(self.item_title(item, cx));
-                if index == active {
-                    tab = tab.bg(rgb(TAB_ACTIVE_BG));
-                }
-                tab
+                    .child(tab.view.title(cx))
             }))
     }
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_is_map = matches!(
-            self.items.get(self.active).map(|item| &item.view),
-            Some(ItemView::Map) | None
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = k10s_theme::active(cx).clone();
+        let fonts = k10s_theme::typography(cx).clone();
+        let requested = self.requested_dock_sizes(cx);
+        let workspace = cx.entity();
+        let sizes = DockSizes::resolve(
+            self.viewport,
+            requested,
+            self.left.is_open(),
+            self.inspector_open,
+            self.bottom.is_open(),
         );
-        let panel = (!self.bench && active_is_map && self.inspector_open)
-            .then(|| self.selection.clone())
-            .flatten();
-        let content: gpui::AnyElement = match self.items.get(self.active).map(|item| &item.view) {
-            Some(ItemView::Browse(view, _)) => view.clone().into_any_element(),
-            Some(ItemView::Text(view)) => view.clone().into_any_element(),
-            _ => self.map.clone().into_any_element(),
-        };
-        div()
+        let content: gpui::AnyElement = self
+            .center
+            .get(self.center_active)
+            .map(Self::item_view)
+            .unwrap_or_else(|| self.map.clone().into_any_element());
+        let left = (!self.bench && self.left.is_open()).then(|| {
+            div()
+                .id("left-dock")
+                .w(px(sizes.left))
+                .h_full()
+                .relative()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(rgb(theme.shell.panel_background))
+                .border_r_1()
+                .border_color(rgb(theme.shell.border))
+                .role(Role::Complementary)
+                .aria_label("Left dock")
+                .children(self.dock_tabs(
+                    &self.left,
+                    "left-dock-tabs",
+                    Self::activate_left,
+                    &theme,
+                    &fonts,
+                    cx,
+                ))
+                .children(
+                    self.left
+                        .active()
+                        .map(|tab| div().flex_1().min_h(px(0.0)).child(Self::item_view(tab))),
+                )
+                .child(Self::resize_handle(DockEdge::Left))
+        });
+        let bottom = (!self.bench && self.bottom.is_open()).then(|| {
+            div()
+                .id("bottom-dock")
+                .h(px(sizes.bottom))
+                .w_full()
+                .relative()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(rgb(theme.shell.panel_background))
+                .border_t_1()
+                .border_color(rgb(theme.shell.border))
+                .role(Role::Complementary)
+                .aria_label("Bottom dock")
+                .children(self.dock_tabs(
+                    &self.bottom,
+                    "bottom-dock-tabs",
+                    Self::activate_bottom,
+                    &theme,
+                    &fonts,
+                    cx,
+                ))
+                .children(
+                    self.bottom
+                        .active()
+                        .map(|tab| div().flex_1().min_h(px(0.0)).child(Self::item_view(tab))),
+                )
+                .child(Self::resize_handle(DockEdge::Bottom))
+        });
+        let right = (!self.bench && self.inspector_open)
+            .then(|| self.inspector(&theme, &fonts, sizes.right, self.selection.clone()));
+        let status = (!self.bench).then(|| {
+            // Lit exactly when the dock is showing that panel, Zed's
+            // is_active_button rule.
+            let terminal_active = self.bottom.is_open()
+                && self
+                    .bottom
+                    .active()
+                    .is_some_and(|tab| tab.tag == ItemTag::LocalTerm);
+            div()
+                .id("status-bar")
+                .h(px(STATUS_BAR_HEIGHT))
+                .w_full()
+                .flex_none()
+                .px(px(6.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .bg(rgb(theme.shell.status_bar_background))
+                .border_t_1()
+                .border_color(rgb(theme.shell.border))
+                .text_size(px(fonts.small()))
+                .text_color(rgb(theme.shell.text_muted))
+                .role(Role::Toolbar)
+                .aria_label("Status bar")
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(Self::panel_button(
+                            "toggle-left-dock",
+                            "icons/file_tree.svg",
+                            "Toggle Left Dock",
+                            self.left.is_open(),
+                            ToggleLeftDock,
+                            &theme,
+                        ))
+                        .child(Self::panel_button(
+                            "toggle-terminal",
+                            "icons/terminal_alt.svg",
+                            "Toggle Terminal",
+                            terminal_active,
+                            ToggleTerminal,
+                            &theme,
+                        ))
+                        .child(
+                            div()
+                                .w(px(1.0))
+                                .h(px(14.0))
+                                .mx(px(4.0))
+                                .flex_none()
+                                .bg(rgb(theme.shell.border)),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .child(SharedString::from(self.status_line())),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .flex_none()
+                        .child(key_hint(&theme, &fonts, "Ctrl Shift P", "Commands"))
+                        .child(Self::panel_button(
+                            "toggle-inspector",
+                            "icons/info.svg",
+                            "Toggle Inspector",
+                            self.inspector_open,
+                            ToggleRightDock,
+                            &theme,
+                        )),
+                )
+        });
+        let viewport_observer = (!self.bench).then(|| {
+            canvas(
+                move |bounds, _, cx| {
+                    let _ = workspace.update(cx, |this, cx| {
+                        this.resize(
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                            cx,
+                        );
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
             .size_full()
+        });
+        let center = div()
+            .h_full()
+            .flex_1()
+            .min_w(px(0.0))
             .flex()
             .flex_col()
+            .overflow_hidden()
+            .children((!self.bench).then(|| self.tab_bar(&theme, &fonts, cx)))
+            .child(
+                div()
+                    .id("workspace-content")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .role(Role::Main)
+                    .aria_label("Workspace")
+                    .child(content),
+            )
+            .children(bottom);
+        let title_bar = (!self.bench).then(|| self.title_bar(&theme, &fonts, window, cx));
+        let app_menu =
+            (self.app_menu_open && !self.bench).then(|| self.app_menu(&theme, &fonts, window, cx));
+        let palette = self.palette.as_ref().map(|(view, _)| {
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.close_palette(window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(MODAL_TOP))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(view.clone()),
+                )
+        });
+        // The picker and the finder share the palette's scrim, dismissal,
+        // and placement: three modals, one chrome.
+        let picker = self.picker.as_ref().map(|(view, _)| {
+            Self::modal_scrim(
+                view.clone().into_any_element(),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.close_picker(window, cx);
+                }),
+            )
+        });
+        let finder = self.finder.as_ref().map(|(view, _)| {
+            Self::modal_scrim(
+                view.clone().into_any_element(),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.close_finder(window, cx);
+                }),
+            )
+        });
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(theme.shell.background))
+            .font_family(fonts.ui_family.clone())
+            .text_size(px(fonts.ui_size))
+            .text_color(rgb(theme.shell.text))
             .key_context("Workspace")
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedDockResize>, _, cx| {
+                    this.resize_dock(event, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
+                this.toggle_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &k10s_map::ToggleChurn, _, cx| {
+                this.map.update(cx, |map, cx| map.toggle_churn(cx));
+            }))
+            .on_action(cx.listener(|this, _: &k10s_map::ToggleEdges, _, cx| {
+                this.map.update(cx, |map, cx| map.toggle_edges(cx));
+            }))
+            .on_action(cx.listener(|this, _: &k10s_map::ToggleHud, _, cx| {
+                this.map.update(cx, |map, cx| map.toggle_hud(cx));
+            }))
+            .on_action(cx.listener(|this, _: &k10s_map::FitView, window, cx| {
+                this.map.update(cx, |map, cx| map.fit(window, cx));
+            }))
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
-                this.inspector_open = !this.inspector_open && this.selection.is_some();
+                this.inspector_open = !this.inspector_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleLeftDock, _, cx| {
+                this.left.toggle();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleRightDock, _, cx| {
+                this.inspector_open = !this.inspector_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBottomDock, _, cx| {
+                this.bottom.toggle();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                if this.app_menu_open {
+                    this.app_menu_open = false;
+                    cx.notify();
+                    return;
+                }
                 if this.selection.take().is_some() {
                     this.inspector_open = false;
                     this.refresh_detail(cx);
                     cx.notify();
                 }
             }))
+            .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
             .on_action(cx.listener(|this, _: &OpenBrowser, window, cx| {
                 this.open_browse(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenNodes, window, cx| {
                 this.open_nodes(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenForwards, window, cx| {
+                this.open_forwards(None, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                this.toggle_terminal(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &DescribeSelection, window, cx| {
                 if let Some(selection) = this.selection.clone() {
                     this.open_doc(selection.describe_request(), window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &EditSelection, window, cx| {
+                if let Some(selection) = this.selection.clone() {
+                    this.open_editor(selection.describe_request(), window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenFile, window, cx| {
+                this.status_note = None;
+                let seed = this
+                    .files_root
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                this.open_picker(seed, PickerMode::OpenFile, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenFolder, window, cx| {
+                this.status_note = None;
+                let seed = this
+                    .files_root
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                this.open_picker(seed, PickerMode::OpenFolder, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FindFile, window, cx| {
+                this.open_finder(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewFile, window, cx| {
+                this.status_note = None;
+                this.new_file(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_config(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenKeymap, window, cx| {
+                this.open_config(true, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &LogsSelection, window, cx| {
+                let Some(selection) = this.selection.clone() else {
+                    return;
+                };
+                let Some(namespace) = selection.namespace.as_deref() else {
+                    return;
+                };
+                match selection.level {
+                    Level::Cell => this.open_logs(
+                        namespace.to_string(),
+                        selection.name.to_string(),
+                        window,
+                        cx,
+                    ),
+                    // A workload's logs are the merged follows of its pods;
+                    // a kind without a pod selector answers with a labelled
+                    // failure from the data plane, not a guess here.
+                    Level::Block => this.open_workload_logs(
+                        WorkloadLogRequest {
+                            namespace: namespace.to_string(),
+                            kind: selection.kind_id,
+                            name: selection.name.to_string(),
+                        },
+                        window,
+                        cx,
+                    ),
+                    _ => {}
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ExecSelection, window, cx| {
                 if let Some(selection) = this.selection.clone()
                     && selection.level == Level::Cell
                     && let Some(namespace) = selection.namespace.as_deref()
                 {
-                    this.open_logs(
+                    this.open_terminal(
                         namespace.to_string(),
                         selection.name.to_string(),
                         window,
@@ -760,26 +2657,34 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &NextItem, window, cx| {
-                let next = (this.active + 1) % this.items.len();
-                this.activate(next, window, cx);
+                let next = (this.center_active + 1) % this.center.len();
+                this.activate_center(next, window, cx);
             }))
             .on_action(cx.listener(|this, _: &PrevItem, window, cx| {
-                let previous = (this.active + this.items.len() - 1) % this.items.len();
-                this.activate(previous, window, cx);
+                let previous = (this.center_active + this.center.len() - 1) % this.center.len();
+                this.activate_center(previous, window, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseItem, window, cx| {
-                this.close_active(window, cx);
+                this.close_focused(window, cx);
             }))
-            .children((!self.bench).then(|| self.tab_bar(cx)))
+            .children(viewport_observer)
+            .children(title_bar)
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.0))
                     .flex()
                     .flex_row()
-                    .child(div().flex_1().min_w(px(0.0)).child(content))
-                    .children(panel.map(|selection| self.inspector(selection))),
+                    .overflow_hidden()
+                    .children(left)
+                    .child(center)
+                    .children(right),
             )
+            .children(status)
+            .children(app_menu)
+            .children(palette)
+            .children(picker)
+            .children(finder)
     }
 }
 
@@ -904,7 +2809,6 @@ mod tests {
 
     #[test]
     fn every_binding_names_a_context_the_shell_actually_sets() {
-        const CONTEXTS: [&str; 4] = ["Workspace", "Browse", "Doc", "Typing"];
         let bindings = keybindings();
         assert!(!bindings.is_empty());
         for binding in &bindings {
@@ -913,10 +2817,146 @@ mod tests {
                 .map(|p| p.to_string())
                 .unwrap_or_default();
             assert!(
-                CONTEXTS.contains(&predicate.as_str()),
+                KEY_CONTEXTS.contains(&predicate.as_str()),
                 "a binding is scoped to an unknown context: {predicate:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_terminal_captures_every_typing_workspace_binding_but_keeps_the_chords() {
+        let bindings = keybindings();
+        // The canonical spelling of a keystroke that types text; Display is
+        // for people ("shift-F") and must not leak into matching.
+        let typed = |b: &KeyBinding| {
+            let stroke = &b.keystrokes()[0];
+            if stroke.modifiers().shift {
+                format!("shift-{}", stroke.key())
+            } else {
+                stroke.key().to_string()
+            }
+        };
+        let workspace_typing: Vec<String> = bindings
+            .iter()
+            .filter(|b| {
+                b.predicate().map(|p| p.to_string()).as_deref() == Some("Workspace")
+                    && b.keystrokes().len() == 1
+                    && {
+                        let modifiers = b.keystrokes()[0].modifiers();
+                        !(modifiers.control
+                            || modifiers.alt
+                            || modifiers.platform
+                            || modifiers.function)
+                    }
+            })
+            .map(typed)
+            .collect();
+        assert!(
+            workspace_typing.contains(&"escape".to_string()),
+            "escape must reach the shell process, vim depends on it"
+        );
+        assert!(
+            workspace_typing.contains(&"shift-f".to_string()),
+            "shift-f is how an F is typed and must be guarded like a plain letter"
+        );
+        for key in &workspace_typing {
+            assert!(
+                bindings.iter().any(|b| {
+                    b.predicate().map(|p| p.to_string()).as_deref() == Some("Terminal")
+                        && b.keystrokes().len() == 1
+                        && typed(b) == *key
+                        && gpui::is_no_action(b.action())
+                }),
+                "pressing {key:?} in a terminal would dispatch a command instead of typing"
+            );
+        }
+        for chord in ["ctrl-tab", "ctrl-shift-tab", "ctrl-w"] {
+            assert!(
+                !bindings.iter().any(|b| {
+                    b.predicate().map(|p| p.to_string()).as_deref() == Some("Terminal")
+                        && format!("{}", b.keystrokes()[0]) == chord
+                }),
+                "{chord} is the way out of a terminal and must stay live"
+            );
+        }
+    }
+
+    #[test]
+    fn the_editor_types_every_plain_workspace_key_but_keeps_its_own_escape() {
+        let bindings = keybindings();
+        let typed = |b: &KeyBinding| {
+            let stroke = &b.keystrokes()[0];
+            if stroke.modifiers().shift {
+                format!("shift-{}", stroke.key())
+            } else {
+                stroke.key().to_string()
+            }
+        };
+        let editor_binding = |key: &str| {
+            bindings
+                .iter()
+                .filter(|b| {
+                    b.predicate().map(|p| p.to_string()).as_deref() == Some("Editor")
+                        && b.keystrokes().len() == 1
+                        && {
+                            let modifiers = b.keystrokes()[0].modifiers();
+                            !(modifiers.control
+                                || modifiers.alt
+                                || modifiers.platform
+                                || modifiers.function)
+                        }
+                })
+                .find(|b| typed(b) == key)
+        };
+        for key in ["b", "n", "d", "l", "s", "i", "y", "shift-f"] {
+            let binding = editor_binding(key)
+                .unwrap_or_else(|| panic!("{key} needs a guard or typing it runs a command"));
+            assert!(
+                gpui::is_no_action(binding.action()),
+                "pressing {key} in the editor must type, not dispatch"
+            );
+        }
+        let escape = editor_binding("escape").expect("escape is bound in the editor");
+        assert!(
+            !gpui::is_no_action(escape.action()),
+            "escape is the editor's cancel, an explicit binding the suppressors must not replace"
+        );
+        for chord in ["ctrl-tab", "ctrl-shift-tab", "ctrl-w"] {
+            assert!(
+                !bindings.iter().any(|b| {
+                    b.predicate().map(|p| p.to_string()).as_deref() == Some("Editor")
+                        && format!("{}", b.keystrokes()[0]) == chord
+                }),
+                "{chord} is the way out of the editor and must stay live"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_map_focus_shadows_no_workspace_key() {
+        let bindings = keybindings();
+        let strokes_in = |context: &str| -> std::collections::BTreeSet<String> {
+            bindings
+                .iter()
+                .filter(|b| b.predicate().map(|p| p.to_string()).as_deref() == Some(context))
+                .filter(|b| !gpui::is_no_action(b.action()))
+                .map(|b| {
+                    b.keystrokes()
+                        .iter()
+                        .map(|stroke| stroke.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect()
+        };
+        let map = strokes_in("Map");
+        let workspace = strokes_in("Workspace");
+        let shadowed: Vec<&String> = map.intersection(&workspace).collect();
+        assert!(
+            shadowed.is_empty(),
+            "the map holds default focus, so these Workspace bindings could never fire: \
+             {shadowed:?}"
+        );
     }
 
     #[test]
@@ -934,15 +2974,46 @@ mod tests {
             .collect();
         assert!(!workspace_letters.is_empty());
         for letter in &workspace_letters {
-            assert!(
-                bindings.iter().any(|b| {
-                    b.predicate().map(|p| p.to_string()).as_deref() == Some("Typing")
-                        && b.keystrokes().len() == 1
-                        && b.keystrokes()[0].key() == letter
-                        && gpui::is_no_action(b.action())
-                }),
-                "typing a {letter:?} into a filter would dispatch a command instead"
-            );
+            for context in ["Typing", "Palette"] {
+                assert!(
+                    bindings.iter().any(|b| {
+                        b.predicate().map(|p| p.to_string()).as_deref() == Some(context)
+                            && b.keystrokes().len() == 1
+                            && b.keystrokes()[0].key() == letter
+                            && gpui::is_no_action(b.action())
+                    }),
+                    "typing a {letter:?} into a {context} input would dispatch a command instead"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn user_workspace_bindings_are_guarded_without_overriding_explicit_input_bindings() {
+        let mut all = keybindings();
+        all.extend([
+            KeyBinding::new("z", NoAction, Some("Workspace")),
+            KeyBinding::new("q", NoAction, Some("Workspace")),
+            KeyBinding::new("q", NoAction, Some("Palette")),
+        ]);
+        let suppressors = input_suppressors(all.iter());
+        let has = |key: &str, context: &str| {
+            suppressors.iter().any(|binding| {
+                binding.predicate().map(|p| p.to_string()).as_deref() == Some(context)
+                    && binding.keystrokes().len() == 1
+                    && binding.keystrokes()[0].key() == key
+                    && gpui::is_no_action(binding.action())
+            })
+        };
+
+        for context in ["Typing", "Palette", "Terminal"] {
+            assert!(has("z", context), "z is not guarded in {context}");
+        }
+        assert!(has("q", "Typing"));
+        assert!(has("q", "Terminal"));
+        assert!(
+            !has("q", "Palette"),
+            "an explicit Palette binding must remain authoritative"
+        );
     }
 }
