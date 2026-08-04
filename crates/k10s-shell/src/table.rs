@@ -4,13 +4,20 @@
 //! so the machine lives here with no gpui in sight. Layout is monospace
 //! column packing -- widths from content, capped, two-space gutters -- and
 //! selection is keyed by row identity across refetches, not by index, for
-//! the same reason the map keys selection by uid: rows move.
+//! the same reason the map keys selection by uid: rows move. Continuation
+//! pages append behind the rows already held, up to a hard cap of
+//! [`MAX_ROWS`]; past it the machine refuses more and says so.
 
 use crate::provider::{TablePage, TableRow};
 
 const MIN_COL: usize = 2;
 const MAX_COL: usize = 48;
 const GUTTER: &str = "  ";
+
+// Ten server pages of 500. A list bigger than this wants a filter, not a
+// longer scrollbar; the cap keeps the shell's memory bounded whatever the
+// cluster holds.
+pub const MAX_ROWS: usize = 5_000;
 
 #[derive(Debug, Default)]
 pub struct TableState {
@@ -21,6 +28,7 @@ pub struct TableState {
     selected: usize,
     top: usize,
     viewport: usize,
+    capped: bool,
 }
 
 impl TableState {
@@ -34,11 +42,42 @@ impl TableState {
     pub fn set_page(&mut self, page: TablePage) {
         let keep = self.selected_row().map(|row| row.uid.clone());
         self.page = page;
+        self.capped = false;
+        self.enforce_cap();
         self.recompute(keep.as_deref());
+    }
+
+    // A continuation page: rows join behind the ones already held, the new
+    // page's token replaces the old one, and the selection stays where the
+    // user put it. Columns keep the first page's shape -- the server renders
+    // the same table either way.
+    pub fn append_page(&mut self, page: TablePage) {
+        let keep = self.selected_row().map(|row| row.uid.clone());
+        self.page.rows.extend(page.rows);
+        self.page.truncated = page.truncated;
+        self.page.continue_token = page.continue_token;
+        self.enforce_cap();
+        self.recompute(keep.as_deref());
+    }
+
+    fn enforce_cap(&mut self) {
+        if self.page.rows.len() > MAX_ROWS {
+            self.page.rows.truncate(MAX_ROWS);
+            self.page.continue_token = None;
+            self.capped = true;
+        }
     }
 
     pub fn truncated(&self) -> bool {
         self.page.truncated
+    }
+
+    pub fn capped(&self) -> bool {
+        self.capped
+    }
+
+    pub fn continue_token(&self) -> Option<&str> {
+        self.page.continue_token.as_deref()
     }
 
     pub fn total_rows(&self) -> usize {
@@ -240,6 +279,26 @@ mod tests {
                 })
                 .collect(),
             truncated: false,
+            continue_token: None,
+        }
+    }
+
+    fn numbered_page(range: std::ops::Range<usize>, token: Option<&str>) -> TablePage {
+        TablePage {
+            columns: vec![TableColumn {
+                name: "Name".to_string(),
+                wide: false,
+            }],
+            rows: range
+                .map(|i| TableRow {
+                    cells: vec![format!("row-{i}")],
+                    name: format!("row-{i}"),
+                    namespace: None,
+                    uid: format!("u{i}"),
+                })
+                .collect(),
+            truncated: token.is_some(),
+            continue_token: token.map(str::to_string),
         }
     }
 
@@ -309,6 +368,46 @@ mod tests {
     }
 
     #[test]
+    fn a_continuation_page_appends_behind_the_held_rows_and_keeps_the_selection() {
+        let mut table = TableState::new();
+        table.set_viewport(10);
+        table.set_page(numbered_page(0..3, Some("tok-2")));
+        assert_eq!(table.continue_token(), Some("tok-2"));
+        table.move_selection(2);
+        assert_eq!(table.selected_row().unwrap().uid, "u2");
+
+        table.append_page(numbered_page(3..6, None));
+        assert_eq!(table.total_rows(), 6);
+        assert_eq!(
+            table.selected_row().unwrap().uid,
+            "u2",
+            "loading more must not move the selection"
+        );
+        assert_eq!(table.continue_token(), None, "the new page's token wins");
+        assert!(!table.truncated());
+
+        table.set_page(numbered_page(0..2, None));
+        assert_eq!(table.total_rows(), 2, "a refetch starts over");
+    }
+
+    #[test]
+    fn the_row_cap_bounds_what_the_table_holds_and_says_so() {
+        let mut table = TableState::new();
+        table.set_viewport(10);
+        table.set_page(numbered_page(0..MAX_ROWS - 1, Some("tok")));
+        assert!(!table.capped());
+
+        table.append_page(numbered_page(MAX_ROWS - 1..MAX_ROWS + 5, Some("tok-2")));
+        assert_eq!(table.total_rows(), MAX_ROWS);
+        assert!(table.capped());
+        assert_eq!(
+            table.continue_token(),
+            None,
+            "past the cap there is no next page to offer"
+        );
+    }
+
+    #[test]
     fn paging_keeps_the_selection_on_screen() {
         let mut table = TableState::new();
         table.set_viewport(5);
@@ -336,6 +435,7 @@ mod tests {
                 })
                 .collect(),
             truncated: true,
+            continue_token: None,
         };
         table.set_page(page);
         assert!(table.truncated());

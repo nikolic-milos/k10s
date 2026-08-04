@@ -2,10 +2,12 @@
 //!
 //! F needs a place for text to live, deliberately smaller than the editor
 //! §5.2 will eventually want: a virtualized, read-only pane over a bounded
-//! ring of lines with scrolling, follow, and substring search. All behaviour
-//! lives in the pure [`TextState`] so it is tested without a window; the
-//! gpui view is a thin shell that renders only the visible slice and repaints
-//! on notify -- a quiet feed paints nothing.
+//! ring of lines with scrolling, follow, and regex search (case-insensitive,
+//! with a bounded compiled-pattern size; an invalid pattern is a labelled
+//! state in the status line, never a panic or a silently empty result). All
+//! behaviour lives in the pure [`TextState`] so it is tested without a
+//! window; the gpui view is a thin shell that renders only the visible slice
+//! and repaints on notify -- a quiet feed paints nothing.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -13,13 +15,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
-    Context, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, ScrollWheelEvent,
-    SharedString, Styled, Window, div, prelude::*, px, rgb,
+    Context, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, Role, ScrollWheelEvent,
+    SharedString, Styled, Window, canvas, div, prelude::*, px, rgb,
 };
 
 use crate::provider::{
     ContainersOutcome, DescribeRequest, DocOutcome, LogChunk, LogRequest, LogStop, ReadProvider,
+    WorkloadLogRequest,
 };
+use crate::ui::{CONTENT_PADDING, PANEL_HEADER_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
     CancelDoc, CancelInput, CommitInput, CycleContainer, DeleteInputChar, DocEnd, DocHome,
     DocPageDown, DocPageUp, DocScrollDown, DocScrollUp, EnterSearch, NextMatch, PrevMatch, Reload,
@@ -28,11 +32,48 @@ use crate::{
 
 pub const MAX_LOG_LINES: usize = 10_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// A hostile or fat-fingered pattern must not balloon the compiled program;
+// the regex crate's default limit is 10 MiB, which is not "bounded" in this
+// repo's sense.
+const MAX_PATTERN_BYTES: usize = 1 << 20;
+
+#[derive(Debug, Clone)]
 pub struct Search {
     pub query: String,
+    // A failed compile keeps the query visible and the error printable; it
+    // matches nothing rather than something surprising.
+    pattern: Result<regex::Regex, String>,
     matches: Vec<usize>,
     current: usize,
+}
+
+impl Search {
+    fn compile(query: &str) -> Result<regex::Regex, String> {
+        regex::RegexBuilder::new(query)
+            .case_insensitive(true)
+            .size_limit(MAX_PATTERN_BYTES)
+            .build()
+            .map_err(|error| one_line(&error.to_string()))
+    }
+
+    fn matches_line(&self, line: &str) -> bool {
+        match &self.pattern {
+            Ok(regex) => regex.is_match(line),
+            Err(_) => false,
+        }
+    }
+}
+
+// Regex errors print multi-line with a caret; a status line gets one line.
+fn one_line(text: &str) -> String {
+    const MAX: usize = 120;
+    let flat: Vec<&str> = text.split_whitespace().collect();
+    let mut out = flat.join(" ");
+    if out.chars().count() > MAX {
+        out = out.chars().take(MAX).collect();
+        out.push('\u{2026}');
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -97,9 +138,8 @@ impl TextState {
         let first_new = self.lines.len();
         self.lines.extend(batch);
         if let Some(search) = &mut self.search {
-            let needle = search.query.to_lowercase();
             for index in first_new..self.lines.len() {
-                if self.lines[index].to_lowercase().contains(&needle) {
+                if search.matches_line(&self.lines[index]) {
                     search.matches.push(index);
                 }
             }
@@ -182,24 +222,26 @@ impl TextState {
             None => self.search = None,
             Some(query) if query.is_empty() => self.search = None,
             Some(query) => {
-                let needle = query.to_lowercase();
-                let matches: Vec<usize> = self
+                let mut search = Search {
+                    pattern: Search::compile(&query),
+                    query,
+                    matches: Vec::new(),
+                    current: 0,
+                };
+                search.matches = self
                     .lines
                     .iter()
                     .enumerate()
-                    .filter(|(_, line)| line.to_lowercase().contains(&needle))
+                    .filter(|(_, line)| search.matches_line(line))
                     .map(|(index, _)| index)
                     .collect();
-                let current = matches
+                search.current = search
+                    .matches
                     .iter()
                     .position(|m| *m >= self.top)
                     .unwrap_or(0)
-                    .min(matches.len().saturating_sub(1));
-                self.search = Some(Search {
-                    query,
-                    matches,
-                    current,
-                });
+                    .min(search.matches.len().saturating_sub(1));
+                self.search = Some(search);
                 self.jump_to_current();
             }
         }
@@ -209,6 +251,14 @@ impl TextState {
         self.search
             .as_ref()
             .map(|s| (s.query.as_str(), s.current + 1, s.matches.len()))
+    }
+
+    // The labelled invalid-pattern state: Some(reason) while the query does
+    // not compile, in which case the search is live but matches nothing.
+    pub fn search_error(&self) -> Option<&str> {
+        self.search
+            .as_ref()
+            .and_then(|s| s.pattern.as_ref().err().map(String::as_str))
     }
 
     pub fn next_match(&mut self) {
@@ -269,22 +319,21 @@ pub fn strip_timestamp(line: &str) -> &str {
     line
 }
 
-const DOC_BG: u32 = 0x0e0c17;
-const DOC_TEXT: u32 = 0xcfcae6;
-const DOC_DIM: u32 = 0x6e6890;
-const DOC_MATCH_BG: u32 = 0x3a2f5c;
-const DOC_STATUS: u32 = 0xb8b2d9;
-const ROW_PX: f32 = 16.0;
-const CHROME_PX: f32 = 92.0;
-const MONO: &str = "JetBrains Mono";
-
 enum Source {
     Doc(DescribeRequest),
     Logs(LogSource),
 }
 
+// One pod's stream, or the provider's merge over a workload's pods. The pod
+// feed owns container cycling and `previous`; the merged feed has neither --
+// those are per-pod questions.
+enum Feed {
+    Pod(LogRequest),
+    Workload(WorkloadLogRequest),
+}
+
 struct LogSource {
-    request: LogRequest,
+    feed: Feed,
     containers: Vec<String>,
     stop: Option<LogStop>,
     ended: Option<String>,
@@ -302,6 +351,7 @@ pub struct TextView {
     input: String,
     show_timestamps: bool,
     generation: u64,
+    viewport: Viewport,
 }
 
 impl TextView {
@@ -321,6 +371,7 @@ impl TextView {
             input: String::new(),
             show_timestamps: true,
             generation: 0,
+            viewport: Viewport::default(),
         };
         view.reload(cx);
         view
@@ -337,7 +388,7 @@ impl TextView {
             title: format!("logs {}", request.pod).into(),
             state: TextState::new(MAX_LOG_LINES),
             source: Source::Logs(LogSource {
-                request,
+                feed: Feed::Pod(request),
                 containers: Vec::new(),
                 stop: None,
                 ended: None,
@@ -348,9 +399,44 @@ impl TextView {
             input: String::new(),
             show_timestamps: true,
             generation: 0,
+            viewport: Viewport::default(),
         };
         view.state.toggle_follow();
         view.resolve_containers(cx);
+        view
+    }
+
+    pub fn workload_logs(
+        provider: Rc<dyn ReadProvider>,
+        request: WorkloadLogRequest,
+        cx: &mut Context<Self>,
+    ) -> TextView {
+        let mut view = TextView {
+            focus: cx.focus_handle(),
+            provider,
+            title: format!(
+                "logs {} {}",
+                k10s_core::kind_short(request.kind),
+                request.name
+            )
+            .into(),
+            state: TextState::new(MAX_LOG_LINES),
+            source: Source::Logs(LogSource {
+                feed: Feed::Workload(request),
+                containers: Vec::new(),
+                stop: None,
+                ended: None,
+                dropped_by_ui: Arc::new(AtomicU64::new(0)),
+            }),
+            status: None,
+            searching: false,
+            input: String::new(),
+            show_timestamps: true,
+            generation: 0,
+            viewport: Viewport::default(),
+        };
+        view.state.toggle_follow();
+        view.start_follow(cx);
         view
     }
 
@@ -404,13 +490,17 @@ impl TextView {
     }
 
     fn resolve_containers(&mut self, cx: &mut Context<Self>) {
-        let Source::Logs(logs) = &self.source else {
+        let Source::Logs(LogSource {
+            feed: Feed::Pod(request),
+            ..
+        }) = &self.source
+        else {
             return;
         };
         let (tx, rx) = futures::channel::oneshot::channel();
         self.provider.fetch_containers(
-            &logs.request.namespace,
-            &logs.request.pod,
+            &request.namespace,
+            &request.pod,
             Box::new(move |outcome| {
                 let _ = tx.send(outcome);
             }),
@@ -422,8 +512,10 @@ impl TextView {
             let _ = this.update(cx, |this, cx| {
                 if let Source::Logs(logs) = &mut this.source {
                     if let ContainersOutcome::Containers(containers) = outcome {
-                        if logs.request.container.is_none() {
-                            logs.request.container = containers.first().cloned();
+                        if let Feed::Pod(request) = &mut logs.feed
+                            && request.container.is_none()
+                        {
+                            request.container = containers.first().cloned();
                         }
                         logs.containers = containers;
                     }
@@ -452,21 +544,22 @@ impl TextView {
 
         let (tx, mut rx) = futures::channel::mpsc::channel::<LogChunk>(256);
         let dropped = logs.dropped_by_ui.clone();
-        let stop = self.provider.follow_log(
-            &logs.request,
-            Box::new(move |chunk| {
-                let mut tx = tx.clone();
-                let lines = match &chunk {
-                    LogChunk::Lines(lines) => lines.len() as u64,
-                    _ => 0,
-                };
-                if tx.try_send(chunk).is_err() {
-                    // The feed outran the UI; the count is shown, the
-                    // newest lines win, and memory stays bounded.
-                    dropped.fetch_add(lines, Ordering::Relaxed);
-                }
-            }),
-        );
+        let on_chunk: Box<dyn Fn(LogChunk) + Send + Sync> = Box::new(move |chunk| {
+            let mut tx = tx.clone();
+            let lines = match &chunk {
+                LogChunk::Lines(lines) => lines.len() as u64,
+                _ => 0,
+            };
+            if tx.try_send(chunk).is_err() {
+                // The feed outran the UI; the count is shown, the
+                // newest lines win, and memory stays bounded.
+                dropped.fetch_add(lines, Ordering::Relaxed);
+            }
+        });
+        let stop = match &logs.feed {
+            Feed::Pod(request) => self.provider.follow_log(request, on_chunk),
+            Feed::Workload(request) => self.provider.follow_workload_logs(request, on_chunk),
+        };
         if let Source::Logs(logs) = &mut self.source {
             logs.stop = Some(stop);
         }
@@ -504,13 +597,17 @@ impl TextView {
         cx.notify();
     }
 
+    // Container cycling and `previous` are pod-feed knobs; on a workload
+    // merge they do nothing rather than something surprising.
     fn restart_logs(
         &mut self,
         mutate: impl FnOnce(&mut LogRequest, &[String]),
         cx: &mut Context<Self>,
     ) {
-        if let Source::Logs(logs) = &mut self.source {
-            mutate(&mut logs.request, &logs.containers);
+        if let Source::Logs(logs) = &mut self.source
+            && let Feed::Pod(request) = &mut logs.feed
+        {
+            mutate(request, &logs.containers);
             self.start_follow(cx);
             cx.notify();
         }
@@ -525,18 +622,25 @@ impl TextView {
         if self.searching {
             parts.push(format!("/{}_", self.input));
         } else if let Some((query, current, total)) = self.state.search() {
-            if total == 0 {
+            if let Some(reason) = self.state.search_error() {
+                parts.push(format!("/{query} invalid pattern: {reason}"));
+            } else if total == 0 {
                 parts.push(format!("/{query} no matches"));
             } else {
                 parts.push(format!("/{query} {current}/{total}"));
             }
         }
         if let Source::Logs(logs) = &self.source {
-            if let Some(container) = &logs.request.container {
-                parts.push(format!("container {container}"));
-            }
-            if logs.request.previous {
-                parts.push("previous".to_string());
+            match &logs.feed {
+                Feed::Pod(request) => {
+                    if let Some(container) = &request.container {
+                        parts.push(format!("container {container}"));
+                    }
+                    if request.previous {
+                        parts.push("previous".to_string());
+                    }
+                }
+                Feed::Workload(_) => parts.push("merged pod follows".to_string()),
             }
             if self.state.following() {
                 parts.push("follow".to_string());
@@ -557,13 +661,42 @@ impl TextView {
         }
         parts.join("  ·  ")
     }
+
+    fn resize(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
+        if !self.viewport.update(width, height) {
+            return;
+        }
+        let panel_header = if matches!(self.source, Source::Logs(_)) {
+            PANEL_HEADER_HEIGHT
+        } else {
+            0.0
+        };
+        let rows = self.viewport.rows(
+            panel_header + STATUS_BAR_HEIGHT,
+            CONTENT_PADDING * 2.0,
+            k10s_theme::typography(cx).line_height(),
+            400,
+        );
+        self.state.set_viewport(rows.max(4));
+        cx.notify();
+    }
+}
+
+impl crate::item::Item for TextView {
+    fn title(&self) -> SharedString {
+        TextView::title(self)
+    }
+
+    fn focus_handle(&self) -> FocusHandle {
+        TextView::focus_handle(self)
+    }
 }
 
 impl Render for TextView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let height = f32::from(window.viewport_size().height);
-        let rows = (((height - CHROME_PX) / ROW_PX) as usize).clamp(4, 400);
-        self.state.set_viewport(rows);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = k10s_theme::active(cx).clone();
+        let fonts = k10s_theme::typography(cx).clone();
+        let view = cx.entity();
 
         let is_logs = matches!(self.source, Source::Logs(_));
         let match_line = self.state.current_match_line();
@@ -582,13 +715,32 @@ impl Render for TextView {
             .collect();
 
         div()
+            .id("text-view")
             .key_context(if self.searching { "Typing" } else { "Doc" })
             .track_focus(&self.focus)
             .size_full()
+            .relative()
             .flex()
             .flex_col()
-            .bg(rgb(DOC_BG))
-            .font_family(MONO)
+            .bg(rgb(theme.shell.editor_background))
+            .font_family(fonts.buffer_family.clone())
+            .text_color(rgb(theme.shell.editor_foreground))
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.resize(
+                                f32::from(bounds.size.width),
+                                f32::from(bounds.size.height),
+                                cx,
+                            );
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .on_action(cx.listener(|this, _: &DocScrollUp, _, cx| {
                 this.state.scroll_by(-1);
                 cx.notify();
@@ -698,40 +850,53 @@ impl Render for TextView {
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                let delta = f32::from(event.delta.pixel_delta(px(ROW_PX)).y);
-                this.state.scroll_by(-(delta / ROW_PX) as i64);
+                let row = k10s_theme::typography(cx).line_height();
+                let delta = f32::from(event.delta.pixel_delta(px(row)).y);
+                this.state.scroll_by(-(delta / row).round() as i64);
                 cx.notify();
             }))
+            .children(is_logs.then(|| panel_header(&theme, &fonts, self.title.clone())))
             .child(
                 div()
+                    .id("text-body")
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_hidden()
                     .p(px(8.0))
                     .flex()
                     .flex_col()
+                    .role(if is_logs { Role::Log } else { Role::Document })
+                    .aria_label(self.title.clone())
                     .children(lines.into_iter().map(|(index, text)| {
                         let mut line = div()
-                            .h(px(ROW_PX))
+                            .h(px(fonts.line_height()))
+                            .flex_none()
                             .overflow_hidden()
-                            .text_size(px(11.0))
-                            .text_color(rgb(DOC_TEXT))
+                            .text_size(px(fonts.buffer_size))
+                            .text_color(rgb(theme.shell.editor_foreground))
                             .whitespace_nowrap();
                         if Some(index) == match_line {
-                            line = line.bg(rgb(DOC_MATCH_BG));
+                            let (color, alpha) = theme.shell.search_match_background;
+                            line = line.bg(rgb(color).alpha(alpha));
                         }
                         line.child(text)
                     })),
             )
             .child(
                 div()
-                    .h(px(20.0))
+                    .h(px(STATUS_BAR_HEIGHT))
+                    .flex_none()
                     .px(px(8.0))
-                    .text_size(px(10.0))
+                    .flex()
+                    .items_center()
+                    .bg(rgb(theme.shell.panel_background))
+                    .border_t_1()
+                    .border_color(rgb(theme.shell.border_variant))
+                    .text_size(px(fonts.small()))
                     .text_color(if self.status.is_some() {
-                        rgb(DOC_STATUS)
+                        rgb(theme.shell.text)
                     } else {
-                        rgb(DOC_DIM)
+                        rgb(theme.shell.text_muted)
                     })
                     .whitespace_nowrap()
                     .overflow_hidden()
@@ -813,6 +978,53 @@ mod tests {
 
         state.set_search(None);
         assert!(state.search().is_none());
+    }
+
+    #[test]
+    fn a_regex_pattern_matches_structure_not_just_substrings() {
+        let mut state = TextState::new(100);
+        state.set_viewport(6);
+        state.set_lines(vec![
+            "error one".to_string(),
+            "an error mid-line".to_string(),
+            "GET /healthz 200".to_string(),
+            "GET /metrics 500".to_string(),
+        ]);
+
+        state.set_search(Some("^error".to_string()));
+        assert_eq!(state.search().unwrap().2, 1, "anchors anchor");
+        assert_eq!(state.current_match_line(), Some(0));
+        assert!(state.search_error().is_none());
+
+        state.set_search(Some(r"GET .* (200|500)".to_string()));
+        assert_eq!(state.search().unwrap().2, 2, "alternation works");
+
+        state.set_search(Some("get /HEALTHZ".to_string()));
+        assert_eq!(state.search().unwrap().2, 1, "still case-insensitive");
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_a_labelled_state_never_a_panic() {
+        let mut state = TextState::new(10);
+        state.set_viewport(4);
+        state.set_lines(vec!["error [one]".to_string()]);
+
+        state.set_search(Some("[".to_string()));
+        let (query, _, total) = state.search().expect("the search stays visible");
+        assert_eq!(query, "[");
+        assert_eq!(total, 0, "an invalid pattern matches nothing");
+        let reason = state.search_error().expect("the state is labelled");
+        assert!(!reason.contains('\n'), "one status line: {reason:?}");
+
+        state.append(vec!["error [two]".to_string()]);
+        state.next_match();
+        state.prev_match();
+        assert_eq!(state.search().unwrap().2, 0, "appends stay unmatched");
+        assert!(state.search_error().is_some());
+
+        state.set_search(Some(r"\[".to_string()));
+        assert!(state.search_error().is_none(), "a fix clears the label");
+        assert_eq!(state.search().unwrap().2, 2);
     }
 
     #[test]

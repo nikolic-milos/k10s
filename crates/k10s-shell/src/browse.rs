@@ -12,28 +12,23 @@ use std::rc::Rc;
 
 use gpui::{
     Context, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    ParentElement, Render, ScrollWheelEvent, SharedString, Styled, Window, div, prelude::*, px,
-    rgb,
+    ParentElement, Render, Role, ScrollWheelEvent, SharedString, Styled, Window, canvas, div,
+    prelude::*, px, rgb,
 };
 
 use crate::provider::{
-    DescribeRequest, KindRow, ReadProvider, TableColumn, TableOutcome, TablePage, TableRow,
+    DescribeRequest, ForwardRequest, KindRow, ReadProvider, TableColumn, TableOutcome, TablePage,
+    TableRow,
 };
 use crate::table::TableState;
+use crate::ui::{LIST_ROW_HEIGHT, PANEL_HEADER_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
-    Back, CancelInput, CommitInput, DeleteInputChar, EnterFilter, LogsRow, OpenRow, Refresh,
-    RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
+    Back, CancelInput, CommitInput, DeleteInputChar, EnterFilter, ExecRow, LoadMore, LogsRow,
+    OpenRow, Refresh, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp, StartForward,
 };
 
-const BG: u32 = 0x0e0c17;
-const TEXT: u32 = 0xcfcae6;
-const DIM: u32 = 0x6e6890;
-const HEAD: u32 = 0xb8b2d9;
-const SELECTED_BG: u32 = 0x2c2842;
-const STATUS: u32 = 0xb8b2d9;
-const ROW_PX: f32 = 16.0;
-const CHROME_PX: f32 = 110.0;
-const MONO: &str = "JetBrains Mono";
+const TABLE_HEADER_HEIGHT: f32 = 28.0;
+const VIEW_CHROME_HEIGHT: f32 = PANEL_HEADER_HEIGHT + TABLE_HEADER_HEIGHT + STATUS_BAR_HEIGHT;
 
 enum TableSource {
     Kind(KindRow),
@@ -52,7 +47,30 @@ enum Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowseEvent {
     OpenDoc(DescribeRequest),
-    OpenLogs { namespace: String, pod: String },
+    OpenEdit(DescribeRequest),
+    OpenLogs {
+        namespace: String,
+        pod: String,
+    },
+    OpenWorkloadLogs {
+        namespace: String,
+        kind: k10s_core::KindId,
+        name: String,
+    },
+    StartForward(ForwardRequest),
+    OpenExec {
+        namespace: String,
+        pod: String,
+    },
+}
+
+// The built-in kinds whose spec.selector selects pods, so a merged log
+// follow can find them. A CronJob's pods hang off its Jobs, not a selector.
+fn selects_pods(kind: &str) -> bool {
+    matches!(
+        kind,
+        "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" | "Job"
+    )
 }
 
 pub struct BrowseView {
@@ -63,6 +81,7 @@ pub struct BrowseView {
     phase: Phase,
     filtering: bool,
     generation: u64,
+    viewport: Viewport,
 }
 
 impl EventEmitter<BrowseEvent> for BrowseView {}
@@ -77,6 +96,7 @@ impl BrowseView {
             phase: Phase::Kinds,
             filtering: false,
             generation: 0,
+            viewport: Viewport::default(),
         };
         view.table.set_page(kinds_page(&view.kinds));
         view
@@ -95,6 +115,7 @@ impl BrowseView {
             },
             filtering: false,
             generation: 0,
+            viewport: Viewport::default(),
         };
         view.fetch(cx);
         view
@@ -135,7 +156,7 @@ impl BrowseView {
                     let _ = tx.send(outcome);
                 });
                 match source {
-                    TableSource::Kind(kind) => self.provider.fetch_table(kind.id, reply),
+                    TableSource::Kind(kind) => self.provider.fetch_table(kind.id, None, reply),
                     TableSource::Nodes => self.provider.fetch_node_table(reply),
                 }
             }
@@ -161,6 +182,58 @@ impl BrowseView {
                                 this.table.set_page(TablePage::default());
                                 *status = Some(why);
                             }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    // The explicit next page: only a kind table can continue (the node table
+    // has no token), only when the server offered one, and never while a
+    // fetch is already in flight.
+    fn fetch_more(&mut self, cx: &mut Context<Self>) {
+        let Phase::Table {
+            source: TableSource::Kind(kind),
+            loading: loading @ false,
+            ..
+        } = &mut self.phase
+        else {
+            return;
+        };
+        let Some(token) = self.table.continue_token().map(str::to_string) else {
+            return;
+        };
+        *loading = true;
+        self.generation += 1;
+        let generation = self.generation;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.provider.fetch_table(
+            kind.id,
+            Some(token),
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        cx.spawn(async move |this, cx| {
+            if let Ok(outcome) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return;
+                    }
+                    if let Phase::Table {
+                        loading, status, ..
+                    } = &mut this.phase
+                    {
+                        *loading = false;
+                        match outcome {
+                            TableOutcome::Table(page) => this.table.append_page(page),
+                            TableOutcome::Denied(what) => {
+                                *status = Some(format!("{what}: access denied for this account"));
+                            }
+                            TableOutcome::Failed(why) => *status = Some(why),
                         }
                     }
                     cx.notify();
@@ -214,7 +287,50 @@ impl BrowseView {
         }
     }
 
+    fn edit_selected(&mut self, cx: &mut Context<Self>) {
+        let Phase::Table {
+            source: TableSource::Kind(kind),
+            ..
+        } = &self.phase
+        else {
+            return;
+        };
+        let Some(row) = self.table.selected_row() else {
+            return;
+        };
+        cx.emit(BrowseEvent::OpenEdit(describe_request(kind.id, row)));
+    }
+
     fn logs_selected(&mut self, cx: &mut Context<Self>) {
+        let Phase::Table {
+            source: TableSource::Kind(kind),
+            ..
+        } = &self.phase
+        else {
+            return;
+        };
+        let Some(row) = self.table.selected_row() else {
+            return;
+        };
+        let Some(namespace) = row.namespace.clone() else {
+            return;
+        };
+        if kind.kind == "Pod" {
+            cx.emit(BrowseEvent::OpenLogs {
+                namespace,
+                pod: row.name.clone(),
+            });
+        } else if selects_pods(&kind.kind) {
+            cx.emit(BrowseEvent::OpenWorkloadLogs {
+                namespace,
+                kind: kind.id,
+                name: row.name.clone(),
+            });
+        }
+    }
+
+    // A shell opens into a pod row; other kinds have no tty to offer.
+    fn exec_selected(&mut self, cx: &mut Context<Self>) {
         let Phase::Table {
             source: TableSource::Kind(kind),
             ..
@@ -231,10 +347,36 @@ impl BrowseView {
         let Some(namespace) = row.namespace.clone() else {
             return;
         };
-        cx.emit(BrowseEvent::OpenLogs {
+        cx.emit(BrowseEvent::OpenExec {
             namespace,
             pod: row.name.clone(),
         });
+    }
+
+    // A forward starts from what a row names: a pod directly, a service
+    // through its selector. Anything else has no port to offer.
+    fn forward_selected(&mut self, cx: &mut Context<Self>) {
+        let Phase::Table {
+            source: TableSource::Kind(kind),
+            ..
+        } = &self.phase
+        else {
+            return;
+        };
+        if kind.kind != "Pod" && kind.kind != "Service" {
+            return;
+        }
+        let Some(row) = self.table.selected_row() else {
+            return;
+        };
+        let Some(namespace) = row.namespace.clone() else {
+            return;
+        };
+        cx.emit(BrowseEvent::StartForward(ForwardRequest {
+            namespace,
+            name: row.name.clone(),
+            service: kind.kind == "Service",
+        }));
     }
 
     fn back(&mut self, cx: &mut Context<Self>) {
@@ -280,7 +422,14 @@ impl BrowseView {
                 text
             }
         };
-        if self.table.truncated() {
+        if self.table.capped() {
+            crumb.push_str(&format!(
+                "  (holding the first {} rows; filter to narrow)",
+                crate::table::MAX_ROWS
+            ));
+        } else if self.table.continue_token().is_some() {
+            crumb.push_str("  (more on the server; m loads the next page)");
+        } else if self.table.truncated() {
             crumb.push_str("  (first page only; the list is larger)");
         }
         if self.filtering {
@@ -289,6 +438,18 @@ impl BrowseView {
             crumb.push_str(&format!("  filter: {}", self.table.filter));
         }
         crumb
+    }
+
+    fn resize(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
+        if !self.viewport.update(width, height) {
+            return;
+        }
+        let rows = self
+            .viewport
+            .rows(VIEW_CHROME_HEIGHT, 0.0, LIST_ROW_HEIGHT, 400)
+            .max(4);
+        self.table.set_viewport(rows);
+        cx.notify();
     }
 }
 
@@ -335,14 +496,25 @@ fn kinds_page(kinds: &[KindRow]) -> TablePage {
         columns,
         rows,
         truncated: false,
+        continue_token: None,
+    }
+}
+
+impl crate::item::Item for BrowseView {
+    fn title(&self) -> SharedString {
+        BrowseView::title(self)
+    }
+
+    fn focus_handle(&self) -> FocusHandle {
+        BrowseView::focus_handle(self)
     }
 }
 
 impl Render for BrowseView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let height = f32::from(window.viewport_size().height);
-        let rows = (((height - CHROME_PX) / ROW_PX) as usize).clamp(4, 400);
-        self.table.set_viewport(rows);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = k10s_theme::active(cx).clone();
+        let fonts = k10s_theme::typography(cx).clone();
+        let view = cx.entity();
 
         let empty_hint = match &self.phase {
             Phase::Kinds if self.kinds.is_empty() => {
@@ -356,13 +528,32 @@ impl Render for BrowseView {
         };
 
         div()
+            .id("browse-view")
             .key_context(if self.filtering { "Typing" } else { "Browse" })
             .track_focus(&self.focus)
             .size_full()
+            .relative()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
-            .font_family(MONO)
+            .bg(rgb(theme.shell.panel_background))
+            .font_family(fonts.ui_family.clone())
+            .text_color(rgb(theme.shell.text))
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.resize(
+                                f32::from(bounds.size.width),
+                                f32::from(bounds.size.height),
+                                cx,
+                            );
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .on_action(cx.listener(|this, _: &RowUp, _, cx| {
                 this.table.move_selection(-1);
                 cx.notify();
@@ -393,8 +584,21 @@ impl Render for BrowseView {
             .on_action(cx.listener(|this, _: &LogsRow, _, cx| {
                 this.logs_selected(cx);
             }))
+            .on_action(cx.listener(|this, _: &crate::EditRow, _, cx| {
+                this.edit_selected(cx);
+            }))
+            .on_action(cx.listener(|this, _: &StartForward, _, cx| {
+                this.forward_selected(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExecRow, _, cx| {
+                this.exec_selected(cx);
+            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 this.fetch(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &LoadMore, _, cx| {
+                this.fetch_more(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &EnterFilter, _, cx| {
@@ -431,46 +635,58 @@ impl Render for BrowseView {
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                let delta = f32::from(event.delta.pixel_delta(px(ROW_PX)).y);
-                this.table.move_selection(-(delta / ROW_PX) as i64);
+                let delta = f32::from(event.delta.pixel_delta(px(LIST_ROW_HEIGHT)).y);
+                this.table
+                    .move_selection(-(delta / LIST_ROW_HEIGHT).round() as i64);
                 cx.notify();
             }))
+            .child(panel_header(&theme, &fonts, self.breadcrumb()))
             .child(
                 div()
-                    .h(px(22.0))
-                    .px(px(8.0))
-                    .text_size(px(11.0))
-                    .text_color(rgb(STATUS))
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .child(self.breadcrumb()),
-            )
-            .child(
-                div()
-                    .h(px(ROW_PX))
-                    .px(px(8.0))
-                    .text_size(px(11.0))
-                    .text_color(rgb(HEAD))
+                    .h(px(TABLE_HEADER_HEIGHT))
+                    .flex_none()
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .bg(rgb(theme.shell.editor_background))
+                    .border_b_1()
+                    .border_color(rgb(theme.shell.border_variant))
+                    .font_family(fonts.buffer_family.clone())
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text_muted))
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .child(self.table.header_line()),
             )
             .child(
                 div()
+                    .id("browse-rows")
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_hidden()
                     .flex()
                     .flex_col()
+                    .role(Role::ListBox)
+                    .aria_label("Resources")
                     .children(self.table.visible_lines().into_iter().enumerate().map(
                         |(offset, (selected, line))| {
                             let mut row = div()
-                                .h(px(ROW_PX))
-                                .px(px(8.0))
-                                .text_size(px(11.0))
-                                .text_color(rgb(TEXT))
+                                .id(("browse-row", offset))
+                                .h(px(LIST_ROW_HEIGHT))
+                                .flex_none()
+                                .px(px(12.0))
+                                .flex()
+                                .items_center()
+                                .font_family(fonts.buffer_family.clone())
+                                .text_size(px(fonts.small()))
+                                .text_color(rgb(theme.shell.editor_foreground))
                                 .whitespace_nowrap()
                                 .overflow_hidden()
+                                .cursor_pointer()
+                                .role(Role::ListBoxOption)
+                                .aria_label(line.clone())
+                                .aria_selected(selected)
+                                .hover(|style| style.bg(rgb(theme.shell.element_hover)))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -479,32 +695,38 @@ impl Render for BrowseView {
                                     }),
                                 );
                             if selected {
-                                row = row.bg(rgb(SELECTED_BG));
+                                row = row.bg(rgb(theme.shell.element_selected));
                             }
                             row.child(line)
                         },
                     ))
                     .children(empty_hint.map(|hint| {
                         div()
-                            .p(px(8.0))
-                            .text_size(px(11.0))
-                            .text_color(rgb(DIM))
+                            .p(px(12.0))
+                            .text_size(px(fonts.ui_size))
+                            .text_color(rgb(theme.shell.text_muted))
                             .child(hint)
                     }))
                     .children(status.map(|status| {
                         div()
-                            .p(px(8.0))
-                            .text_size(px(11.0))
-                            .text_color(rgb(STATUS))
+                            .p(px(12.0))
+                            .text_size(px(fonts.ui_size))
+                            .text_color(rgb(theme.shell.text))
                             .child(status)
                     })),
             )
             .child(
                 div()
-                    .h(px(20.0))
+                    .h(px(STATUS_BAR_HEIGHT))
+                    .flex_none()
                     .px(px(8.0))
-                    .text_size(px(10.0))
-                    .text_color(rgb(DIM))
+                    .flex()
+                    .items_center()
+                    .bg(rgb(theme.shell.panel_background))
+                    .border_t_1()
+                    .border_color(rgb(theme.shell.border_variant))
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text_muted))
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .child(match &self.phase {
@@ -514,10 +736,19 @@ impl Render for BrowseView {
                         Phase::Table { source, .. } => {
                             let mut hints =
                                 "enter describe · / filter · r refresh · esc back".to_string();
-                            if let TableSource::Kind(kind) = source
-                                && kind.kind == "Pod"
-                            {
-                                hints.push_str(" · l logs");
+                            if self.table.continue_token().is_some() {
+                                hints.push_str(" · m more");
+                            }
+                            if let TableSource::Kind(kind) = source {
+                                if kind.kind == "Pod" || selects_pods(&kind.kind) {
+                                    hints.push_str(" · l logs");
+                                }
+                                if kind.kind == "Pod" {
+                                    hints.push_str(" · s shell");
+                                }
+                                if kind.kind == "Pod" || kind.kind == "Service" {
+                                    hints.push_str(" · F forward");
+                                }
                             }
                             hints
                         }
