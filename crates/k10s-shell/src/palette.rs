@@ -522,6 +522,25 @@ mod tests {
         }
     }
 
+    // The launch screen is reopenable *because* it is a command, so the palette
+    // listing it is the feature, not a side effect of one. `OpenPalette` is
+    // hidden by name and this reads similarly enough to be hidden with it by
+    // accident.
+    #[test]
+    fn the_cluster_chooser_is_searchable_by_the_words_someone_would_type() {
+        assert!(palette_visible("k10s_shell::ChooseCluster"));
+        assert_eq!(
+            humanize("k10s_shell::ChooseCluster"),
+            "shell: choose cluster"
+        );
+        for query in ["cluster", "choose", "chc"] {
+            assert!(
+                fuzzy_score(query, "shell: choose cluster").is_some(),
+                "{query:?} finds nothing"
+            );
+        }
+    }
+
     // §6.7 asks that a feature be keyboard reachable *and* in the palette. The
     // write path is the one where discoverability matters most, and the trap is
     // structural: anything named `Editor*` is hidden unless it is listed, so a

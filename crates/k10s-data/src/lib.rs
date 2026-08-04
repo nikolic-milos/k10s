@@ -55,6 +55,10 @@ const INTERNAL_QUEUE: usize = DEFAULT_EVENT_SINK_CAPACITY;
 #[derive(Debug, Clone)]
 pub struct Options {
     pub context: Option<String>,
+    /// One kubeconfig to use instead of whatever the environment points at. The
+    /// launch screen can name a file `KUBECONFIG` and `~/.kube/config` do not,
+    /// and a context picked out of that file has to be connected through it.
+    pub kubeconfig: Option<std::path::PathBuf>,
     pub probe_namespaces: Vec<String>,
     pub sync_timeout: Duration,
 }
@@ -63,6 +67,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             context: None,
+            kubeconfig: None,
             probe_namespaces: Vec::new(),
             sync_timeout: Duration::from_secs(30),
         }
@@ -232,7 +237,10 @@ async fn cold_start(
     metrics: Arc<IngestMetrics>,
 ) -> Result<Sync, DataError> {
     let started = Instant::now();
-    let mut connector = Connector::load(&Env::from_process())?;
+    let mut connector = match &options.kubeconfig {
+        Some(path) => Connector::from_file(path)?,
+        None => Connector::load(&Env::from_process())?,
+    };
     let connection = connector.connect(options.context.as_deref()).await?;
     let connect_ms = ms(started);
 

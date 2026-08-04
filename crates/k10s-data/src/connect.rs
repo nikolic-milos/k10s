@@ -141,6 +141,111 @@ pub fn contexts(cfg: &Kubeconfig) -> Vec<String> {
     cfg.contexts.iter().map(|c| c.name.clone()).collect()
 }
 
+/// One context, reduced to the fields that may be shown to somebody.
+///
+/// A kubeconfig is a credential store: `token`, `password`,
+/// `client-certificate-data` and `client-key-data` are the credential itself
+/// rather than a path to one, and an exec plugin's argument vector routinely
+/// carries an account, a project or a cluster ARN. This struct is where that is
+/// decided rather than remembered downstream -- the only fields it has are the
+/// name a person picks by, the server they would be talking to, and the
+/// namespace the context defaults to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextInfo {
+    pub name: String,
+    /// This kubeconfig's own `current-context`.
+    pub current: bool,
+    pub server: Option<String>,
+    pub namespace: Option<String>,
+}
+
+/// One place a cluster could come from, and what it offers.
+///
+/// [`Connector::load`] returns the *first* source that works, which is the right
+/// answer for connecting and the wrong one for choosing: somebody with a
+/// `KUBECONFIG` and an in-cluster account needs to see both. So this lists every
+/// candidate, and a source that will not read keeps its place with the reason
+/// attached rather than disappearing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    pub source: Source,
+    pub contexts: Vec<ContextInfo>,
+    /// Why this source produced nothing, when that is a failure rather than an
+    /// empty file. Already redaction-filtered.
+    pub failure: Option<String>,
+}
+
+/// Every source this process can see, in the order [`plan`] prefers them.
+pub fn list(env: &Env) -> Vec<Listing> {
+    plan(env)
+        .into_iter()
+        .map(|source| match &source {
+            Source::Kubeconfig(files) => match merge_files(files) {
+                Ok(cfg) => Listing {
+                    source,
+                    contexts: context_info(&cfg),
+                    failure: None,
+                },
+                Err(why) => Listing {
+                    source,
+                    contexts: Vec::new(),
+                    failure: Some(why),
+                },
+            },
+            // A service account declares no contexts and needs none: it is
+            // connectable with nothing named, which is what makes it a row
+            // rather than an empty heading.
+            Source::InCluster => Listing {
+                source,
+                contexts: Vec::new(),
+                failure: None,
+            },
+        })
+        .collect()
+}
+
+/// One named file, for a kubeconfig the environment does not point at.
+pub fn list_file(path: &Path) -> Listing {
+    let source = Source::Kubeconfig(vec![path.to_path_buf()]);
+    match merge_files(std::slice::from_ref(&path.to_path_buf())) {
+        Ok(cfg) => Listing {
+            source,
+            contexts: context_info(&cfg),
+            failure: None,
+        },
+        Err(why) => Listing {
+            source,
+            contexts: Vec::new(),
+            failure: Some(why),
+        },
+    }
+}
+
+fn context_info(cfg: &Kubeconfig) -> Vec<ContextInfo> {
+    let server = |cluster: &str| {
+        cfg.clusters
+            .iter()
+            .find(|named| named.name == cluster)
+            .and_then(|named| named.cluster.as_ref())
+            .and_then(|cluster| cluster.server.clone())
+    };
+    cfg.contexts
+        .iter()
+        .map(|named| ContextInfo {
+            current: cfg.current_context.as_deref() == Some(named.name.as_str()),
+            name: named.name.clone(),
+            server: named
+                .context
+                .as_ref()
+                .and_then(|context| server(&context.cluster)),
+            namespace: named
+                .context
+                .as_ref()
+                .and_then(|context| context.namespace.clone()),
+        })
+        .collect()
+}
+
 pub fn resolve_context(cfg: &Kubeconfig, requested: Option<&str>) -> Result<String, ConnectError> {
     let available = contexts(cfg);
     match requested {
@@ -242,6 +347,24 @@ impl Connector {
             source: Source::Kubeconfig(Vec::new()),
             kubeconfig: Some(kubeconfig),
             clients: HashMap::new(),
+        }
+    }
+
+    /// One named file, ignoring `KUBECONFIG` and the default path. What the
+    /// launch screen connects through when somebody opened a kubeconfig this
+    /// process would never have found on its own.
+    pub fn from_file(path: &Path) -> Result<Connector, ConnectError> {
+        let files = vec![path.to_path_buf()];
+        match merge_files(&files) {
+            Ok(cfg) => Ok(Connector {
+                source: Source::Kubeconfig(files),
+                kubeconfig: Some(cfg),
+                clients: HashMap::new(),
+            }),
+            Err(why) => Err(ConnectError::NoUsableSource(vec![(
+                Source::Kubeconfig(files),
+                why,
+            )])),
         }
     }
 
@@ -655,6 +778,88 @@ contexts:
         assert_eq!(c.resolve(None).unwrap().as_deref(), Some("prod"));
         assert_eq!(c.resolve(Some("dev")).unwrap().as_deref(), Some("dev"));
         assert!(c.kubeconfig().is_some());
+    }
+
+    #[test]
+    fn a_listing_carries_the_name_the_server_and_the_namespace_and_nothing_else() {
+        let cfg = parse(TWO_CONTEXTS);
+        let listed = context_info(&cfg);
+        assert_eq!(
+            listed,
+            vec![
+                ContextInfo {
+                    name: "prod".to_string(),
+                    current: true,
+                    server: Some("https://prod.example:6443".to_string()),
+                    namespace: Some("payments".to_string()),
+                },
+                ContextInfo {
+                    name: "dev".to_string(),
+                    current: false,
+                    server: Some("https://dev.example:6443".to_string()),
+                    namespace: None,
+                },
+            ]
+        );
+
+        // The fixture's users carry tokens. What a screen is handed must not.
+        let rendered = format!("{listed:?}");
+        assert!(
+            !rendered.contains("not-a-real-token"),
+            "a credential reached the listing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_context_naming_a_cluster_the_file_does_not_declare_still_lists() {
+        let cfg = parse(
+            "apiVersion: v1\nkind: Config\ncontexts:\n- name: orphan\n  context:\n    cluster: gone\n    user: u\n",
+        );
+        assert_eq!(
+            context_info(&cfg),
+            vec![ContextInfo {
+                name: "orphan".to_string(),
+                current: false,
+                server: None,
+                namespace: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn listing_keeps_every_source_and_a_broken_one_keeps_its_place_with_the_reason() {
+        let dir = std::env::temp_dir().join(format!("k10s-listing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let good = dir.join("good.yaml");
+        let bad = dir.join("bad.yaml");
+        std::fs::write(&good, TWO_CONTEXTS).expect("write");
+        std::fs::write(&bad, "apiVersion: v1\nkind: Config\nclusters: 3\n").expect("write");
+
+        let listed = list(&Env {
+            kubeconfig: Some(OsString::from(good.as_os_str())),
+            default_kubeconfig: None,
+            in_cluster: true,
+        });
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert_eq!(listed[0].contexts.len(), 2);
+        assert_eq!(listed[0].failure, None);
+        assert_eq!(
+            listed[1].source,
+            Source::InCluster,
+            "an account with no contexts is still a source somebody can pick"
+        );
+        assert!(listed[1].contexts.is_empty());
+
+        let broken = list_file(&bad);
+        assert!(broken.contexts.is_empty());
+        assert!(
+            broken.failure.is_some_and(|why| why.contains("bad.yaml")),
+            "a file that will not parse says which file it was"
+        );
+
+        let missing = list_file(&dir.join("nowhere.yaml"));
+        assert!(missing.failure.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

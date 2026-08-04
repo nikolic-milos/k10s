@@ -33,6 +33,7 @@ pub mod forwards;
 pub mod fs;
 pub mod item;
 pub mod keymap;
+pub mod launch;
 pub mod palette;
 pub mod provider;
 pub mod pty;
@@ -48,8 +49,8 @@ use std::sync::Arc;
 use gpui::{
     App, ClickEvent, Context, Decorations, DragMoveEvent, Entity, FocusHandle, IntoElement,
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoAction, ParentElement,
-    Render, Role, SharedString, Styled, Subscription, Window, actions, canvas, div, prelude::*, px,
-    rgb, svg,
+    Render, Role, SharedString, Styled, Subscription, Window, actions, canvas, div, img,
+    prelude::*, px, rgb, svg,
 };
 
 use k10s_core::{KindId, Level, SceneSnapshot, kind_short};
@@ -63,19 +64,23 @@ use files::{FilesEvent, FilesView};
 use finder::{FileFinderView, FinderEvent, PathPickerView, PickerEvent, PickerMode};
 use forwards::ForwardsView;
 pub use item::{Item, ItemHandle};
+use launch::{LaunchEvent, LaunchView};
 use palette::{PaletteEvent, PaletteView};
 pub use provider::{
-    ApplyOutcome, ApplyRequest, Conflicted, ContainersOutcome, DescribeRequest, Detail, DocOutcome,
+    ApplyOutcome, ApplyRequest, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest,
+    Connection, ContainersOutcome, ContextRow, DemoOutcome, DescribeRequest, Detail, DocOutcome,
     EventRow, ExecEvent, ExecRequest, ExecSession, ForwardOutcome, ForwardRequest, ForwardRow,
-    ForwardState, KindRow, LogChunk, LogRequest, LogStop, ManifestOutcome, NullExecSession,
-    NullProvider, ReadProvider, Reply, SchemaCatalogOutcome, SchemaSource, SchemaTextOutcome,
+    ForwardState, KindRow, LaunchProvider, LogChunk, LogRequest, LogStop, ManifestOutcome,
+    NullExecSession, NullLaunchProvider, NullProvider, ProviderFactory, ProviderSlot, ReadProvider,
+    Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome, SchemaSource, SchemaTextOutcome,
     TableColumn, TableOutcome, TablePage, TableRow, WorkloadLogRequest,
 };
 use term::TerminalView;
 use text::TextView;
 use ui::{
     DockSizes, MAX_DOCK_SIZE, MIN_DOCK_SIZE, MODAL_TOP, RESIZE_HANDLE_SIZE, STATUS_BAR_HEIGHT,
-    TAB_HEIGHT, Viewport, icon_button, key_hint, panel_header, title_bar_height,
+    TAB_HEIGHT, TITLE_MARK_SIZE, Viewport, brand_mark, icon_button, key_hint, panel_header,
+    title_bar_height,
 };
 
 actions!(
@@ -84,6 +89,7 @@ actions!(
         ToggleInspector,
         ClearSelection,
         OpenPalette,
+        ChooseCluster,
         OpenBrowser,
         OpenNodes,
         OpenForwards,
@@ -342,6 +348,11 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-p", FindFile, workspace),
         KeyBinding::new("ctrl-,", OpenSettings, workspace),
         KeyBinding::new("ctrl-k ctrl-s", OpenKeymap, workspace),
+        // Zed's ctrl-k prefix, whose only other tenant here is the keymap file.
+        // A chord rather than a plain chord-free key because every unmodified
+        // letter is either a map command or something the terminal has to be
+        // able to type, and the launch screen is not worth taking one from.
+        KeyBinding::new("ctrl-k ctrl-c", ChooseCluster, workspace),
         KeyBinding::new("up", RowUp, Some("Palette")),
         KeyBinding::new("down", RowDown, Some("Palette")),
         KeyBinding::new("enter", CommitInput, Some("Palette")),
@@ -583,6 +594,15 @@ enum DockEdge {
     Bottom,
 }
 
+// What the path picker was opened for. One value rather than a flag per caller:
+// a second boolean beside the save target is exactly how two of these end up
+// true at once.
+enum PickerPurpose {
+    Open,
+    Save(gpui::WeakEntity<EditorView>),
+    Kubeconfig,
+}
+
 #[derive(Clone)]
 struct DraggedDockResize(DockEdge);
 
@@ -596,6 +616,9 @@ pub struct Workspace {
     map: Entity<MapView>,
     palette: Option<(Entity<PaletteView>, Subscription)>,
     palette_previous_focus: Option<FocusHandle>,
+    launch: Option<(Entity<LaunchView>, Subscription)>,
+    launch_previous_focus: Option<FocusHandle>,
+    launch_provider: Rc<dyn LaunchProvider>,
     center: Vec<Tab>,
     center_active: usize,
     left: Dock<Tab>,
@@ -607,18 +630,29 @@ pub struct Workspace {
     // compositor move on the first movement, disarmed everywhere else.
     should_move: bool,
     bench: bool,
+    // Everything that reads the cluster holds a clone of the slot, so adopting
+    // a connection after the window is open re-points all of them at once.
+    slot: Rc<ProviderSlot>,
     provider: Rc<dyn ReadProvider>,
     schema: Rc<std::cell::RefCell<editor::SchemaStore>>,
     fs: std::sync::Arc<dyn fs::Fs>,
     config: Option<ConfigPaths>,
     files_root: Option<std::path::PathBuf>,
     picker: Option<(Entity<PathPickerView>, Subscription)>,
-    picker_save_target: Option<gpui::WeakEntity<EditorView>>,
+    picker_purpose: PickerPurpose,
     picker_previous_focus: Option<FocusHandle>,
     finder: Option<(Entity<FileFinderView>, Subscription)>,
     scratch_counter: usize,
     status_note: Option<String>,
     connected: bool,
+    // Which cluster, for the label the state dot describes. `None` while
+    // connected is an in-cluster service account, which has no context name.
+    context: Option<String>,
+    // Whether anything has been put in the world yet -- a cluster, or the
+    // generator. Only used to decide whether dismissing the chooser needs to
+    // say how to get back to it, which is a question that only has a wrong
+    // answer when the map behind it is empty.
+    scene_chosen: bool,
     events: Option<Detail>,
     log: Option<Detail>,
     fetch_generation: u64,
@@ -632,6 +666,7 @@ impl Workspace {
         map: Entity<MapView>,
         bench: bool,
         provider: Option<Rc<dyn ReadProvider>>,
+        launch_provider: Option<Rc<dyn LaunchProvider>>,
         config: Option<ConfigPaths>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -642,10 +677,17 @@ impl Workspace {
             cx.notify();
         });
         let connected = provider.is_some();
+        let slot = Rc::new(match provider {
+            Some(provider) => ProviderSlot::new(provider),
+            None => ProviderSlot::empty(),
+        });
         Workspace {
             map: map.clone(),
             palette: None,
             palette_previous_focus: None,
+            launch: None,
+            launch_previous_focus: None,
+            launch_provider: launch_provider.unwrap_or_else(|| Rc::new(NullLaunchProvider)),
             center: vec![Tab::new(ItemTag::Map, map)],
             center_active: 0,
             left: Dock::default(),
@@ -655,18 +697,24 @@ impl Workspace {
             app_menu_open: false,
             should_move: false,
             bench,
-            provider: provider.unwrap_or_else(|| Rc::new(NullProvider)),
+            provider: slot.clone(),
+            slot,
             schema: Rc::new(std::cell::RefCell::new(editor::SchemaStore::new())),
             fs: std::sync::Arc::new(fs::RealFs),
             config,
             files_root: None,
             picker: None,
-            picker_save_target: None,
+            picker_purpose: PickerPurpose::Open,
             picker_previous_focus: None,
             finder: None,
             scratch_counter: 0,
             status_note: None,
             connected,
+            context: None,
+            // A bench flight is handed its scene at spawn and a command line
+            // that named a cluster has already connected; only the path that
+            // opens the chooser starts with an empty world.
+            scene_chosen: connected || bench,
             events: None,
             log: None,
             fetch_generation: 0,
@@ -903,8 +951,8 @@ impl Workspace {
             |this, editor, event: &EditorEvent, window, cx| match event {
                 EditorEvent::SaveAsRequested => {
                     let seed = this.picker_seed(editor.read(cx).source());
-                    this.picker_save_target = Some(editor.downgrade());
-                    this.open_picker(seed, PickerMode::Save, window, cx);
+                    let purpose = PickerPurpose::Save(editor.downgrade());
+                    this.open_picker(seed, PickerMode::Save, purpose, window, cx);
                 }
                 EditorEvent::DiffRequested { dry_run } => {
                     this.open_diff(editor, *dry_run, window, cx);
@@ -1151,7 +1199,7 @@ impl Workspace {
 
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.picker.take().is_some() {
-            self.picker_save_target = None;
+            self.picker_purpose = PickerPurpose::Open;
             if let Some(previous) = self.picker_previous_focus.take() {
                 window.focus(&previous, cx);
             }
@@ -1163,6 +1211,7 @@ impl Workspace {
         &mut self,
         seed: std::path::PathBuf,
         mode: PickerMode,
+        purpose: PickerPurpose,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1174,6 +1223,7 @@ impl Workspace {
         if self.picker.is_some() {
             self.close_picker(window, cx);
         }
+        self.picker_purpose = purpose;
         self.picker_previous_focus = window.focused(cx);
         let fs = self.fs.clone();
         let view = cx.new(|cx| PathPickerView::new(fs, seed, mode, cx));
@@ -1184,10 +1234,10 @@ impl Workspace {
                 PickerEvent::Dismissed => this.close_picker(window, cx),
                 PickerEvent::Confirmed(path) => {
                     let path = path.clone();
-                    let target = this.picker_save_target.take();
+                    let purpose = std::mem::replace(&mut this.picker_purpose, PickerPurpose::Open);
                     this.close_picker(window, cx);
-                    match target {
-                        Some(editor) => match editor.upgrade() {
+                    match purpose {
+                        PickerPurpose::Save(editor) => match editor.upgrade() {
                             Some(editor) => editor.update(cx, |editor, cx| {
                                 editor.assign_path_and_save(path, cx);
                             }),
@@ -1199,7 +1249,8 @@ impl Workspace {
                                 cx.notify();
                             }
                         },
-                        None => this.open_path(path, window, cx),
+                        PickerPurpose::Kubeconfig => this.scan_kubeconfig(path, cx),
+                        PickerPurpose::Open => this.open_path(path, window, cx),
                     }
                 }
             },
@@ -1430,6 +1481,298 @@ impl Workspace {
         self.palette = Some((view, subscription));
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// Show the chooser: the contexts this process can see, a way to reach a
+    /// kubeconfig it cannot, and the generated starmap.
+    ///
+    /// Opened at startup when the command line named no cluster, and reopenable
+    /// from the palette or its chord at any time after. It is an overlay rather
+    /// than a separate window because the workspace behind it is already the
+    /// thing being filled in.
+    pub fn open_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench || self.launch.is_some() {
+            return;
+        }
+        self.close_palette(window, cx);
+        self.launch_previous_focus = window.focused(cx);
+        let view = cx.new(LaunchView::new);
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, view, event: &LaunchEvent, window, cx| match event {
+                LaunchEvent::Dismissed => this.dismiss_launch(window, cx),
+                LaunchEvent::Chose(choice) => {
+                    this.chose_launch(view.clone(), choice.clone(), window, cx)
+                }
+            },
+        );
+        let focus = view.read(cx).focus_handle();
+        self.launch = Some((view.clone(), subscription));
+        window.focus(&focus, cx);
+        cx.notify();
+        self.scan_launch(&view, ScanRequest::Detected, cx);
+    }
+
+    fn toggle_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.launch.is_some() {
+            self.dismiss_launch(window, cx);
+        } else {
+            self.open_launch(window, cx);
+        }
+    }
+
+    fn close_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.launch.take().is_some() {
+            if let Some(previous) = self.launch_previous_focus.take() {
+                window.focus(&previous, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    // Escape, or a click outside. Leaving with nothing chosen is allowed -- an
+    // empty map is a legitimate place to stand -- but it has to say how to come
+    // back, because the alternative is an empty window and a guess.
+    fn dismiss_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let nothing_chosen = !self.scene_chosen;
+        self.close_launch(window, cx);
+        if nothing_chosen {
+            self.status_note =
+                Some("nothing chosen; ctrl-k ctrl-c picks a cluster or the starmap".to_string());
+            cx.notify();
+        }
+    }
+
+    // Reading and merging kubeconfigs is file I/O on paths that can be stalled
+    // network mounts, so it happens behind the seam and lands here one turn
+    // later. The request travels with the answer: two scans can be in flight and
+    // each has to land under its own header.
+    fn scan_launch(
+        &mut self,
+        view: &Entity<LaunchView>,
+        request: ScanRequest,
+        cx: &mut Context<Self>,
+    ) {
+        view.update(cx, |view, cx| view.rescanning(cx));
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.launch_provider.scan(
+            request.clone(),
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        let view = view.downgrade();
+        cx.spawn(async move |_, cx| {
+            if let Ok(outcome) = rx.await {
+                let _ = view.update(cx, |view, cx| view.scanned(&request, outcome, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn scan_kubeconfig(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let Some((view, _)) = self.launch.as_ref() else {
+            return;
+        };
+        let view = view.clone();
+        self.scan_launch(&view, ScanRequest::File(path), cx);
+    }
+
+    fn chose_launch(
+        &mut self,
+        view: Entity<LaunchView>,
+        choice: launch::Choice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match choice {
+            launch::Choice::OpenKubeconfig => {
+                // The picker opens over the chooser rather than instead of it,
+                // so dismissing it returns to the list already on screen.
+                let seed = self.kubeconfig_seed();
+                self.open_picker(
+                    seed,
+                    PickerMode::OpenFile,
+                    PickerPurpose::Kubeconfig,
+                    window,
+                    cx,
+                );
+            }
+            launch::Choice::Demo => self.start_demo(view, window, cx),
+            launch::Choice::Context { request, .. } => self.connect(view, request, window, cx),
+        }
+    }
+
+    // Where a kubeconfig usually is, which is the only useful guess: the picker
+    // lists whatever is there and a typed path overrides it.
+    fn kubeconfig_seed(&self) -> std::path::PathBuf {
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| std::path::PathBuf::from(home).join(".kube"))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+    }
+
+    fn connect(
+        &mut self,
+        view: Entity<LaunchView>,
+        request: ConnectRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Nothing is given up until the new connection exists. A refused attempt
+        // has to leave the window exactly as it was -- somebody who mistypes a
+        // context while looking at production must not lose production for it --
+        // and the seam is written the same way: it retires the previous cluster
+        // only once the next one has synced.
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.launch_provider.connect(
+            request,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        let this = cx.weak_entity();
+        let view = view.downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let Ok(outcome) = rx.await else {
+                    let _ = view.update(cx, |view, cx| {
+                        view.refused("the connection attempt was dropped".to_string(), cx)
+                    });
+                    return;
+                };
+                match outcome {
+                    ConnectOutcome::Connected(connection) => {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.adopt(connection, cx);
+                            this.close_launch(window, cx);
+                        });
+                    }
+                    // The screen stays open and usable, which is the whole point
+                    // of it being a screen: an unreachable cluster is where a
+                    // dead end would cost the most.
+                    ConnectOutcome::Failed(why) => {
+                        let _ = view.update(cx, |view, cx| view.refused(why, cx));
+                    }
+                }
+            })
+            .detach();
+    }
+
+    // Adopting is a provider swap and a notify, because every view reads through
+    // the one slot rather than through a clone it was built with.
+    fn adopt(&mut self, connection: Connection, cx: &mut Context<Self>) {
+        // Every cluster-shaped view open right now belongs to the connection this
+        // one replaces, and a table that keeps painting a cluster the window has
+        // left is the one failure nothing on screen would admit to.
+        let retired = self.retire_cluster_views(cx);
+        self.slot.set((connection.provider)());
+        self.connected = true;
+        self.chose_scene(cx);
+        self.context = connection.context;
+        let mut note = connection.summary;
+        // The notes themselves go to stderr, where they always went. Their count
+        // goes here, because somebody who launched from a desktop entry has no
+        // stderr to look at and must at least know there is something to look
+        // for.
+        match connection.notes.len() {
+            0 => {}
+            1 => note.push_str("  ·  1 degradation note on stderr"),
+            many => note.push_str(&format!("  ·  {many} degradation notes on stderr")),
+        }
+        if retired > 0 {
+            note.push_str(&format!(
+                "  ·  closed {retired} view{} belonging to the previous cluster",
+                if retired == 1 { "" } else { "s" }
+            ));
+        }
+        self.status_note = Some(note);
+        self.refresh_detail(cx);
+        cx.notify();
+    }
+
+    // A scene has been chosen, whatever it is. The map forgets its framing rather
+    // than being told to fit: the scene this is about is still on its way, and the
+    // camera that framed the last one says nothing about it.
+    fn chose_scene(&mut self, cx: &mut Context<Self>) {
+        self.scene_chosen = true;
+        self.map.update(cx, |map, cx| map.refit(cx));
+    }
+
+    fn start_demo(
+        &mut self,
+        view: Entity<LaunchView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.launch_provider.generate(Box::new(move |outcome| {
+            let _ = tx.send(outcome);
+        }));
+        let this = cx.weak_entity();
+        let weak_view = view.downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let Ok(outcome) = rx.await else {
+                    let _ = weak_view.update(cx, |view, cx| {
+                        view.refused("the generator was dropped".to_string(), cx)
+                    });
+                    return;
+                };
+                match outcome {
+                    DemoOutcome::Started(summary) => {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.chose_scene(cx);
+                            this.status_note = Some(summary);
+                            this.close_launch(window, cx);
+                        });
+                    }
+                    DemoOutcome::Failed(why) => {
+                        let _ = weak_view.update(cx, |view, cx| view.refused(why, cx));
+                    }
+                }
+            })
+            .detach();
+    }
+
+    // A tab whose content came out of the cluster. An editor is deliberately not
+    // on this list: its buffer is text a person may have typed, and discarding
+    // unsaved work to keep a provider tidy is the wrong trade -- the slot means
+    // its next apply reaches the cluster this window is actually on.
+    fn is_cluster_bound(tag: &ItemTag) -> bool {
+        matches!(
+            tag,
+            ItemTag::Browse
+                | ItemTag::Nodes
+                | ItemTag::Forwards
+                | ItemTag::Doc(_)
+                | ItemTag::Diff(_)
+                | ItemTag::Logs(_)
+                | ItemTag::Term(_)
+        )
+    }
+
+    fn retire_cluster_views(&mut self, cx: &mut Context<Self>) -> usize {
+        let held = self
+            .center
+            .get(self.center_active)
+            .map(|tab| tab.tag.clone());
+        let before = self.center.len() + self.left.len() + self.bottom.len();
+        // The map is not cluster-bound, so the center can never empty here.
+        self.center.retain(|tab| !Self::is_cluster_bound(&tab.tag));
+        self.left.retain(|tab| !Self::is_cluster_bound(&tab.tag));
+        self.bottom.retain(|tab| !Self::is_cluster_bound(&tab.tag));
+        // The tab strip is corrected without `activate_center`, because that
+        // focuses what it activates -- and the chooser is still on screen and
+        // still the thing the keyboard belongs to. Taking focus here left a
+        // refused connection with a list the arrow keys could no longer move.
+        self.center_active = held
+            .and_then(|tag| self.center.iter().position(|tab| tab.tag == tag))
+            .unwrap_or(0);
+        cx.notify();
+        before - (self.center.len() + self.left.len() + self.bottom.len())
     }
 
     // ctrl-w closes whatever has focus, if it is closable: a bottom panel, a
@@ -1675,10 +2018,10 @@ impl Workspace {
 
     fn status_line(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        parts.push(if self.connected {
-            "cluster connected".to_string()
-        } else {
-            "no cluster".to_string()
+        parts.push(match (self.connected, self.context.as_deref()) {
+            (true, Some(context)) => format!("connected to {context}"),
+            (true, None) => "connected in-cluster".to_string(),
+            (false, _) => "no cluster".to_string(),
         });
         if let Some(selection) = &self.selection {
             parts.push(format!("{} {}", selection.kind, selection.name));
@@ -1750,6 +2093,22 @@ impl Workspace {
                 let tooltip = ui::Tooltip::with_binding(label, &tooltip_action, window);
                 cx.new(move |_| tooltip).into()
             })
+    }
+
+    /// The sentence the title bar's state dot is about.
+    ///
+    /// Which cluster, not merely that there is one: somebody holding a prod and a
+    /// staging context has to be able to answer "which of these am I about to
+    /// apply to" by looking rather than by remembering, and a cluster is chosen on
+    /// screen now, so the command line they started with no longer says.
+    fn connection_label(connected: bool, context: Option<&str>) -> SharedString {
+        match (connected, context) {
+            (true, Some(context)) => context.to_string().into(),
+            // A service account has no context name, and saying "connected" twice
+            // over -- once as a dot, once as a word -- says nothing.
+            (true, None) => "in-cluster".into(),
+            (false, _) => "local starmap".into(),
+        }
     }
 
     fn resize(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
@@ -1905,11 +2264,7 @@ impl Workspace {
             .get(self.center_active)
             .map(|tab| tab.view.title(cx))
             .unwrap_or_else(|| "map".into());
-        let connection = if self.connected {
-            "cluster connected"
-        } else {
-            "local starmap"
-        };
+        let connection = Self::connection_label(self.connected, self.context.as_deref());
 
         div()
             .id("title-bar")
@@ -1979,15 +2334,15 @@ impl Workspace {
                             .into()
                         }),
                     )
+                    // The brand lockup: the symbol, then the wordmark. The
+                    // symbol rather than the helm because the wheel's spokes
+                    // mush at this size, and the appearance picks the artwork
+                    // rather than a tint, because a tinted brand colour is an
+                    // approximation of a brand colour.
                     .child(
-                        div()
-                            .size(px(8.0))
-                            .rounded_full()
-                            .bg(rgb(if self.connected {
-                                theme.shell.success
-                            } else {
-                                theme.shell.text_muted
-                            })),
+                        img(brand_mark(theme.appearance))
+                            .size(px(TITLE_MARK_SIZE))
+                            .flex_none(),
                     )
                     // The one place the product says its own name, so the
                     // one place the display face belongs: League Spartan is a
@@ -2016,11 +2371,30 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    // The state dot sits with the sentence it is about. It used
+                    // to sit beside the mark, where a coloured dot next to a
+                    // logo is decoration; next to the name of the thing it
+                    // describes it is an indicator.
                     .child(
                         div()
-                            .text_size(px(fonts.small()))
-                            .text_color(rgb(theme.shell.text_muted))
-                            .child(connection),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().size(px(8.0)).flex_none().rounded_full().bg(rgb(
+                                if self.connected {
+                                    theme.shell.success
+                                } else {
+                                    theme.shell.text_muted
+                                },
+                            )))
+                            .child(
+                                div()
+                                    .text_size(px(fonts.small()))
+                                    .text_color(rgb(theme.shell.text_muted))
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .child(connection),
+                            ),
                     )
                     .children(Self::window_controls(theme, window)),
             )
@@ -2120,17 +2494,18 @@ impl Workspace {
                     .role(Role::Menu)
                     .aria_label("Application menu")
                     .child(entry(0, "Command Palette…", Box::new(OpenPalette)))
+                    .child(entry(1, "Choose Cluster…", Box::new(ChooseCluster)))
                     .child(separator())
-                    .child(entry(1, "Browse Resources", Box::new(OpenBrowser)))
-                    .child(entry(2, "Node Capacity", Box::new(OpenNodes)))
-                    .child(entry(3, "Port Forwards", Box::new(OpenForwards)))
-                    .child(entry(4, "Terminal", Box::new(ToggleTerminal)))
+                    .child(entry(2, "Browse Resources", Box::new(OpenBrowser)))
+                    .child(entry(3, "Node Capacity", Box::new(OpenNodes)))
+                    .child(entry(4, "Port Forwards", Box::new(OpenForwards)))
+                    .child(entry(5, "Terminal", Box::new(ToggleTerminal)))
                     .child(separator())
-                    .child(entry(5, "Toggle Left Dock", Box::new(ToggleLeftDock)))
-                    .child(entry(6, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
-                    .child(entry(7, "Toggle Inspector", Box::new(ToggleRightDock)))
+                    .child(entry(6, "Toggle Left Dock", Box::new(ToggleLeftDock)))
+                    .child(entry(7, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
+                    .child(entry(8, "Toggle Inspector", Box::new(ToggleRightDock)))
                     .child(separator())
-                    .child(entry(8, "Quit", Box::new(Quit))),
+                    .child(entry(9, "Quit", Box::new(Quit))),
             )
     }
 
@@ -2501,6 +2876,22 @@ impl Render for Workspace {
                 }),
             )
         });
+        // The chooser stands down while it is asking for a file: two sheets at
+        // the same place is one sheet with a lid on it. It is only unpainted, not
+        // closed, so dismissing the picker brings back the list and the highlight
+        // exactly as they were.
+        let launch = self
+            .launch
+            .as_ref()
+            .filter(|_| self.picker.is_none())
+            .map(|(view, _)| {
+                Self::modal_scrim(
+                    view.clone().into_any_element(),
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.dismiss_launch(window, cx);
+                    }),
+                )
+            });
         div()
             .size_full()
             .relative()
@@ -2519,6 +2910,9 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 this.toggle_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ChooseCluster, window, cx| {
+                this.toggle_launch(window, cx);
             }))
             .on_action(cx.listener(|this, _: &k10s_map::ToggleChurn, _, cx| {
                 this.map.update(cx, |map, cx| map.toggle_churn(cx));
@@ -2590,7 +2984,7 @@ impl Render for Workspace {
                     .clone()
                     .or_else(|| std::env::current_dir().ok())
                     .unwrap_or_else(|| std::path::PathBuf::from("/"));
-                this.open_picker(seed, PickerMode::OpenFile, window, cx);
+                this.open_picker(seed, PickerMode::OpenFile, PickerPurpose::Open, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| {
                 this.status_note = None;
@@ -2599,7 +2993,13 @@ impl Render for Workspace {
                     .clone()
                     .or_else(|| std::env::current_dir().ok())
                     .unwrap_or_else(|| std::path::PathBuf::from("/"));
-                this.open_picker(seed, PickerMode::OpenFolder, window, cx);
+                this.open_picker(
+                    seed,
+                    PickerMode::OpenFolder,
+                    PickerPurpose::Open,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &FindFile, window, cx| {
                 this.open_finder(window, cx);
@@ -2683,6 +3083,7 @@ impl Render for Workspace {
             .children(status)
             .children(app_menu)
             .children(palette)
+            .children(launch)
             .children(picker)
             .children(finder)
     }
@@ -2805,6 +3206,63 @@ mod tests {
             before.uid, after.uid,
             "the same slot now names a different pod, and only the uid says so"
         );
+    }
+
+    #[test]
+    fn the_title_bar_names_the_cluster_rather_than_the_fact_of_one() {
+        assert_eq!(
+            Workspace::connection_label(true, Some("prod-eu-west")).as_ref(),
+            "prod-eu-west"
+        );
+        assert_eq!(
+            Workspace::connection_label(true, None).as_ref(),
+            "in-cluster",
+            "a service account has no context name and needs no invented one"
+        );
+        assert_eq!(
+            Workspace::connection_label(false, Some("prod-eu-west")).as_ref(),
+            "local starmap",
+            "a context that is only remembered is not a connection"
+        );
+        assert_eq!(
+            Workspace::connection_label(false, None).as_ref(),
+            "local starmap"
+        );
+    }
+
+    // Switching cluster invalidates every view whose content came out of the
+    // old one. What it must *not* invalidate is anything holding text a person
+    // typed, which is why the rule is a match on the tag rather than "close
+    // everything but the map".
+    #[test]
+    fn a_cluster_switch_retires_the_views_it_invalidates_and_keeps_the_rest() {
+        for tag in [
+            ItemTag::Browse,
+            ItemTag::Nodes,
+            ItemTag::Forwards,
+            ItemTag::Doc("uid/name".into()),
+            ItemTag::Diff("uid/name".into()),
+            ItemTag::Logs("prod/pod-1".into()),
+            ItemTag::Term("prod/pod-1".into()),
+        ] {
+            assert!(
+                Workspace::is_cluster_bound(&tag),
+                "{tag:?} paints the cluster it was opened against"
+            );
+        }
+        for tag in [
+            ItemTag::Map,
+            ItemTag::Files,
+            ItemTag::LocalTerm,
+            ItemTag::Edit("cluster:uid/name".into()),
+            ItemTag::Edit("file:/tmp/x.yaml".into()),
+            ItemTag::Edit(String::new()),
+        ] {
+            assert!(
+                !Workspace::is_cluster_bound(&tag),
+                "{tag:?} would take unsaved work or a local session with it"
+            );
+        }
     }
 
     #[test]
