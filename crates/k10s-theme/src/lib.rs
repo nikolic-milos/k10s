@@ -254,6 +254,14 @@ impl Typography {
         (self.ui_size - 4.0).max(6.0)
     }
 
+    /// The display step: the one place the product says its own name at size,
+    /// on the launch screen. A multiple rather than a fixed 28 px, because a
+    /// person who scales the interface scales this with it like every other
+    /// step on the ladder.
+    pub fn display(&self) -> f32 {
+        self.ui_size * 2.0
+    }
+
     /// The buffer row height in whole pixels. Rows are laid out and hit-tested
     /// against this, so it must be the same integer everywhere or a click
     /// lands on the wrong line at the bottom of a long file.

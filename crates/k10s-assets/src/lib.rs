@@ -19,13 +19,22 @@
 //! each family by name afterwards and reports the ones that are missing.
 //!
 //! Some of the table is shipped rather than drawn. `brand/k10s.png` is the X11
-//! window icon; `linux/icons/*` and `linux/k10s.desktop` are what a packager
-//! installs (see `assets/linux/README.md`); `brand/mark-{light,dark}.png` are
-//! the mark on a transparent field, carried so the brand kit travels with the
-//! binary. Nothing in the shell draws the marks: the one place the product says
-//! its own name is set in League Spartan, because a bitmap would not scale with
-//! `ui_font_size` and a wordmark that ignores the type scale is a wordmark that
-//! looks broken at 20 px.
+//! window icon, and `linux/icons/*` with `linux/k10s.desktop` are what a
+//! packager installs -- `linux/install-desktop-entry.sh` does it for one user
+//! and `linux/README.md` says why any of it is needed. The other four are drawn:
+//! `brand/mark-{light,dark}.png` is the cat-head symbol the title bar sets
+//! beside the wordmark, and `brand/logo-{light,dark}.png` is the full helm the
+//! launch screen shows. Both ship in two appearances because the artwork is
+//! flat colour on a transparent field -- brand blue reads on a light theme and
+//! disappears on a dark one -- and the shell picks by the active theme's
+//! `appearance` rather than tinting, since tinting a bitmap is how a brand
+//! colour quietly becomes an approximation of itself. Two sizes for the same
+//! reason: the helm's spokes mush at 18 px, which is why the title bar gets the
+//! symbol and only the launch screen gets the wheel.
+//!
+//! The wordmark is still type, not a bitmap: League Spartan scales with
+//! `ui_font_size` and a wordmark that ignores the type scale looks broken at
+//! 20 px.
 
 use std::borrow::Cow;
 
@@ -97,6 +106,8 @@ const EMBEDDED: &[(&str, &'static [u8])] = embedded![
     "brand/k10s.png",
     "brand/mark-light.png",
     "brand/mark-dark.png",
+    "brand/logo-light.png",
+    "brand/logo-dark.png",
     "linux/icons/k10s-16.png",
     "linux/icons/k10s-24.png",
     "linux/icons/k10s-32.png",
@@ -106,6 +117,7 @@ const EMBEDDED: &[(&str, &'static [u8])] = embedded![
     "linux/icons/k10s-256.png",
     "linux/icons/k10s-512.png",
     "linux/k10s.desktop",
+    "linux/install-desktop-entry.sh",
     "linux/README.md",
 ];
 
@@ -273,6 +285,23 @@ mod tests {
             "a desktop entry whose WM class does not match the app id matches nothing: {entry}"
         );
         assert!(entry.contains("Icon=k10s"));
+
+        // The installer is the fourth place that name appears, and the one that
+        // decides what the file on disk is called.
+        let script = Assets
+            .load("linux/install-desktop-entry.sh")
+            .expect("loads")
+            .expect("present");
+        let script = String::from_utf8_lossy(&script);
+        assert!(script.contains(&format!("id={APP_ID}")), "{script}");
+        assert!(
+            script.contains(&format!("entry={APP_ID}.desktop")),
+            "the installed basename is what a Wayland compositor matches against"
+        );
+        assert!(
+            !script.contains("/usr/share"),
+            "this script installs for one user and must not write outside their data home"
+        );
     }
 
     #[test]
@@ -284,6 +313,37 @@ mod tests {
             "the chain still reaches upstream: {fonts:?}"
         );
         let brand = Assets.list("brand/").expect("lists");
-        assert_eq!(brand.len(), 3, "{brand:?}");
+        assert_eq!(brand.len(), 5, "{brand:?}");
+    }
+
+    // The shell names these four paths as string literals, the way it names
+    // Zed's window-control SVGs: it draws bytes it does not own. Renaming a
+    // file here without renaming it in `k10s_shell::ui::brand_mark` and
+    // `brand_logo` produces a missing image and no error anywhere, so the
+    // literals are pinned on both sides.
+    #[test]
+    fn the_four_brand_bitmaps_the_shell_draws_resolve_and_decode() {
+        for path in [
+            "brand/mark-light.png",
+            "brand/mark-dark.png",
+            "brand/logo-light.png",
+            "brand/logo-dark.png",
+        ] {
+            let bytes = Assets
+                .load(path)
+                .expect("loads")
+                .unwrap_or_else(|| panic!("{path} is missing from the asset table"));
+            let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+                .unwrap_or_else(|error| panic!("{path} does not decode: {error}"));
+            assert_eq!(
+                image.width(),
+                image.height(),
+                "{path} is not square, so every box it is drawn in distorts it"
+            );
+            assert!(
+                image.color().has_alpha(),
+                "{path} has no alpha channel; the mark is drawn over theme background"
+            );
+        }
     }
 }

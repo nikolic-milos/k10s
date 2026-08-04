@@ -22,6 +22,21 @@ exactly that reason.
 
 ## Per user
 
+One command, from the repository root:
+
+    crates/k10s-assets/assets/linux/install-desktop-entry.sh
+
+It writes `k10s.desktop` into `$XDG_DATA_HOME/applications` (default
+`~/.local/share/applications`) and the eight PNGs into the matching
+`icons/hicolor/<size>x<size>/apps` directories, then refreshes the desktop and
+icon caches if those tools are installed. It is idempotent -- running it again
+overwrites what it wrote before and nothing else -- it writes nothing outside
+`$XDG_DATA_HOME`, and `--uninstall` removes exactly what it added. It warns
+rather than fails when `k10s` is not on `PATH`, because that is the one thing
+that makes the launcher entry start nothing (see the `Exec=` note below).
+
+By hand, if you would rather see it done:
+
     install -Dm644 crates/k10s-assets/assets/linux/k10s.desktop \
       ~/.local/share/applications/k10s.desktop
 
