@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile": {
     "label": "linux-x86_64-i5-12600k",
-    "recorded_at": "2026-08-02",
+    "recorded_at": "2026-08-03",
     "os": "Arch Linux",
     "kernel": "7.1.5-arch1-2",
     "architecture": "x86_64",
@@ -217,6 +217,77 @@
           "field": "p99_us",
           "maximum_ratio": 2.0,
           "absolute_slack": 50.0,
+          "minimum_samples": 100
+        }
+      ]
+    },
+    {
+      "name": "editor edit",
+      "file": "editor-edit.json",
+      "source_schema": 1,
+      "case_keys": [
+        "scenario",
+        "op"
+      ],
+      "top_exact": [
+        "mode"
+      ],
+      "exact": [
+        "bytes",
+        "lines",
+        "result"
+      ],
+      "ceilings": [
+        {
+          "field": "p50_rmad",
+          "maximum": 0.1
+        }
+      ],
+      "metrics": [
+        {
+          "field": "p50_ns",
+          "maximum_ratio": 1.12,
+          "absolute_slack": 20.0
+        },
+        {
+          "field": "p99_ns",
+          "maximum_ratio": 2.25,
+          "absolute_slack": 500.0,
+          "minimum_samples": 100
+        }
+      ]
+    },
+    {
+      "name": "shell state",
+      "file": "shell-state.json",
+      "source_schema": 1,
+      "case_keys": [
+        "scenario",
+        "op"
+      ],
+      "top_exact": [
+        "mode"
+      ],
+      "exact": [
+        "entries",
+        "result"
+      ],
+      "ceilings": [
+        {
+          "field": "p50_rmad",
+          "maximum": 0.1
+        }
+      ],
+      "metrics": [
+        {
+          "field": "p50_ns",
+          "maximum_ratio": 1.12,
+          "absolute_slack": 20.0
+        },
+        {
+          "field": "p99_ns",
+          "maximum_ratio": 2.25,
+          "absolute_slack": 500.0,
           "minimum_samples": 100
         }
       ]
