@@ -5,9 +5,10 @@
 //! both the cold-start lever §5.1 names and the reason a Secret row can never
 //! carry a value: the server's Table for secrets prints name, type, and a
 //! count. One page per fetch, bounded by `PAGE_LIMIT`; a continue token
-//! surfaces as `truncated` rather than a hidden second request. Cluster-wide
-//! lists of namespaced kinds gain a leading namespace column here, so every
-//! consumer sees the same shape kubectl users expect.
+//! surfaces on the page for the caller to hand back explicitly -- the next
+//! page is asked for, never chased. Cluster-wide lists of namespaced kinds
+//! gain a leading namespace column here, so every consumer sees the same
+//! shape kubectl users expect.
 
 use kube::Client;
 use kube::api::{ListParams, Request};
@@ -42,6 +43,10 @@ pub struct TablePage {
     pub columns: Vec<TableColumn>,
     pub rows: Vec<TableRow>,
     pub truncated: bool,
+    // Present exactly when one more page can be requested by handing it
+    // back; the node table is truncated without one because its per-node
+    // scans cannot resume from a token.
+    pub continue_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -98,9 +103,13 @@ pub(crate) async fn fetch_table(
     client: &Client,
     target: &KindTarget,
     namespace: Option<&str>,
+    continue_token: Option<&str>,
 ) -> Fetched<TablePage> {
     let path = collection_path(target, namespace);
-    let params = ListParams::default().limit(PAGE_LIMIT);
+    let mut params = ListParams::default().limit(PAGE_LIMIT);
+    if let Some(token) = continue_token {
+        params = params.continue_token(token);
+    }
     let mut request = match Request::new(path).list(&params) {
         Ok(request) => request,
         Err(error) => {
@@ -159,10 +168,12 @@ fn shape(wire: WireTable, add_namespace: bool) -> Fetched<TablePage> {
             }
         })
         .collect();
+    let continue_token = (!wire.metadata.cont.is_empty()).then_some(wire.metadata.cont);
     Fetched::Ok(TablePage {
         columns,
         rows,
-        truncated: !wire.metadata.cont.is_empty(),
+        truncated: continue_token.is_some(),
+        continue_token,
     })
 }
 
@@ -250,6 +261,21 @@ mod tests {
             panic!("{page:?}")
         };
         assert!(page.truncated);
+        assert_eq!(
+            page.continue_token.as_deref(),
+            Some("tok-1"),
+            "the token is surfaced for an explicit next-page request"
+        );
+
+        let done = shape(
+            wire(r#"{"kind":"Table","metadata":{},"columnDefinitions":[],"rows":[]}"#),
+            false,
+        );
+        let Fetched::Ok(done) = done else {
+            panic!("{done:?}")
+        };
+        assert!(!done.truncated);
+        assert_eq!(done.continue_token, None);
     }
 
     #[test]

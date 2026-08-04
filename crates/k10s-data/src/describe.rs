@@ -86,7 +86,7 @@ pub(crate) async fn fetch_describe(
     })
 }
 
-async fn fetch_object(
+pub(crate) async fn fetch_object(
     client: &Client,
     target: &KindTarget,
     namespace: Option<&str>,
@@ -100,22 +100,29 @@ async fn fetch_object(
     }
     .map_err(kube::Error::BuildRequest)?;
     let mut value: serde_json::Value = client.request(http_request).await?;
-    if let Some(map) = value.as_object_mut() {
-        // A Secret's wire shape says PartialObjectMetadata because that is
-        // what was fetched, and some servers omit kind on single objects;
-        // the document names what the object is either way.
-        if is_secret(target) || !map.contains_key("kind") {
-            map.insert("kind".into(), serde_json::Value::from(target.kind()));
-            map.insert(
-                "apiVersion".into(),
-                serde_json::Value::from(target.resource.api_version.as_str()),
-            );
-        }
-    }
+    stamp_identity(target, &mut value);
     Ok(value)
 }
 
-fn is_secret(target: &KindTarget) -> bool {
+// A Secret's wire shape says PartialObjectMetadata because that is what was
+// fetched, and some servers omit kind on single objects -- including on the
+// object an apply hands back. The document names what the object is either way,
+// or the editor's copy and the server's answer would differ in their first two
+// lines and every diff between them would say so.
+pub(crate) fn stamp_identity(target: &KindTarget, value: &mut serde_json::Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    if is_secret(target) || !map.contains_key("kind") {
+        map.insert("kind".into(), serde_json::Value::from(target.kind()));
+        map.insert(
+            "apiVersion".into(),
+            serde_json::Value::from(target.resource.api_version.as_str()),
+        );
+    }
+}
+
+pub(crate) fn is_secret(target: &KindTarget) -> bool {
     target.group().is_empty() && target.kind() == "Secret"
 }
 

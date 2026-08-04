@@ -583,6 +583,8 @@ mod tests {
                 namespaced,
                 listable: true,
                 watchable: true,
+                patchable: true,
+                status_subresource: false,
             },
             fidelity: Fidelity::Full,
             pass_through: false,
