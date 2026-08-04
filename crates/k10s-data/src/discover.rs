@@ -16,6 +16,15 @@ pub struct KindTarget {
     pub namespaced: bool,
     pub listable: bool,
     pub watchable: bool,
+    // What the server says it will accept here, as distinct from what this
+    // account is allowed to do: an apply affordance that is missing because the
+    // kind has no patch verb is a different labelled state from one the RBAC
+    // probe denied, and conflating them would tell a person to fix the wrong
+    // thing.
+    pub patchable: bool,
+    // Whether `status` is a subresource of its own, which is what decides
+    // whether an apply may carry a status block at all.
+    pub status_subresource: bool,
 }
 
 impl KindTarget {
@@ -185,6 +194,11 @@ pub fn intern(catalog: &mut Catalog, resource: ApiResource, caps: &ApiCapabiliti
         namespaced: caps.scope == Scope::Namespaced,
         listable: caps.supports_operation(verbs::LIST),
         watchable: caps.supports_operation(verbs::WATCH),
+        patchable: caps.supports_operation(verbs::PATCH),
+        status_subresource: caps
+            .subresources
+            .iter()
+            .any(|(subresource, _)| subresource.plural == "status"),
         resource,
     }
 }

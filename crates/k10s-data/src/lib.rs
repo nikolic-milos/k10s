@@ -11,15 +11,20 @@
 //! The `kube::Client` seam is a `tower` service, which is what lets
 //! `tests/scripted_apiserver.rs` be the API server.
 
+pub mod apply;
 pub mod assemble;
 pub mod browse;
 pub mod connect;
 pub mod describe;
 pub mod discover;
+pub mod exec;
+pub mod forward;
 pub mod inspect;
 pub mod logs;
+pub mod manifest;
 pub mod mapping;
 pub mod nodes;
+pub mod openapi;
 mod projection;
 pub mod rbac;
 pub mod read;

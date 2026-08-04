@@ -5,13 +5,20 @@
 //! effective-request rule (init containers sequence, sidecars accumulate),
 //! and usage comes from `metrics.k8s.io` only when the cluster serves it --
 //! absent metrics make the usage columns invisible, not broken, and install
-//! nothing. Every fetch is bounded (`limit` plus a `truncated` flag) and a
-//! node whose pods cannot be listed shows `?` cells rather than a guess.
+//! nothing. The "PDB blocked" column joins `PodDisruptionBudget`s to each
+//! node's pods -- how many pods sit under a budget with zero disruptions
+//! allowed -- and follows the same rule: if the budgets are unreadable,
+//! absent, or too many to list completely, the column disappears rather
+//! than under-count. Every fetch is bounded (`limit` plus a `truncated`
+//! flag) and a node whose pods cannot be listed shows `?` cells rather
+//! than a guess.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Container, Node, Pod, PodSpec};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kube::Client;
 use kube::api::{Api, ListParams, Request};
 use serde::Deserialize;
@@ -22,6 +29,7 @@ use crate::read::{Fetched, classify};
 const NODE_LIMIT: u32 = 500;
 const PODS_PER_NODE_LIMIT: u32 = 1_500;
 const CONCURRENT_NODE_SCANS: usize = 8;
+const PDB_LIMIT: u32 = 1_000;
 
 pub(crate) async fn fetch_node_table(client: &Client) -> Fetched<TablePage> {
     let api: Api<Node> = Api::all(client.clone());
@@ -35,13 +43,15 @@ pub(crate) async fn fetch_node_table(client: &Client) -> Fetched<TablePage> {
         .as_deref()
         .is_some_and(|token| !token.is_empty());
     let usage = fetch_usage(client).await;
+    let budgets = fetch_blocked_budgets(client).await;
 
     let scanned: Vec<(Node, Result<Load, kube::Error>)> =
         futures::stream::iter(nodes.items.into_iter().map(|node| {
             let client = client.clone();
+            let budgets = budgets.as_deref();
             async move {
                 let name = node.metadata.name.clone().unwrap_or_default();
-                let load = load_on(&client, &name).await;
+                let load = load_on(&client, &name, budgets).await;
                 (node, load)
             }
         }))
@@ -62,16 +72,22 @@ pub(crate) async fn fetch_node_table(client: &Client) -> Fetched<TablePage> {
         columns.push(column("CPU use"));
         columns.push(column("Memory use"));
     }
+    if budgets.is_some() {
+        columns.push(column("PDB blocked"));
+    }
     columns.push(column("Taints"));
 
     let rows = scanned
         .into_iter()
-        .map(|(node, load)| row(node, load, usage.as_ref()))
+        .map(|(node, load)| row(node, load, usage.as_ref(), budgets.is_some()))
         .collect();
     Fetched::Ok(TablePage {
         columns,
         rows,
         truncated,
+        // The rows are computed per node, so a continue token could not
+        // resume this table; more nodes than the limit means "narrow it".
+        continue_token: None,
     })
 }
 
@@ -86,9 +102,14 @@ struct Load {
     pods: usize,
     cpu_millis: i64,
     mem_bytes: i64,
+    pdb_blocked: usize,
 }
 
-async fn load_on(client: &Client, node: &str) -> Result<Load, kube::Error> {
+async fn load_on(
+    client: &Client,
+    node: &str,
+    budgets: Option<&[BlockedBudget]>,
+) -> Result<Load, kube::Error> {
     let api: Api<Pod> = Api::all(client.clone());
     let params = ListParams::default()
         .fields(&format!(
@@ -100,17 +121,109 @@ async fn load_on(client: &Client, node: &str) -> Result<Load, kube::Error> {
         pods: pods.items.len(),
         cpu_millis: 0,
         mem_bytes: 0,
+        pdb_blocked: 0,
     };
+    let empty = BTreeMap::new();
     for pod in &pods.items {
         if let Some(spec) = &pod.spec {
             load.cpu_millis += effective_request(spec, "cpu", parse_cpu_millis);
             load.mem_bytes += effective_request(spec, "memory", parse_bytes);
         }
+        if let Some(budgets) = budgets {
+            let namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
+            let labels = pod.metadata.labels.as_ref().unwrap_or(&empty);
+            if budgets
+                .iter()
+                .any(|budget| budget.namespace == namespace && budget.selects(labels))
+            {
+                load.pdb_blocked += 1;
+            }
+        }
     }
     Ok(load)
 }
 
-fn row(node: Node, load: Result<Load, kube::Error>, usage: Option<&Usage>) -> TableRow {
+// A budget that currently blocks eviction: `status.disruptionsAllowed == 0`.
+// Only these are held; a budget with headroom cannot block anything.
+struct BlockedBudget {
+    namespace: String,
+    selector: Option<LabelSelector>,
+}
+
+impl BlockedBudget {
+    fn selects(&self, labels: &BTreeMap<String, String>) -> bool {
+        selector_matches(self.selector.as_ref(), labels)
+    }
+}
+
+// None means the column must not exist: the kind is absent, unreadable, or
+// the list was too large to be complete -- an under-count would be a wrong
+// answer wearing a plausible one's clothes.
+async fn fetch_blocked_budgets(client: &Client) -> Option<Vec<BlockedBudget>> {
+    let api: Api<PodDisruptionBudget> = Api::all(client.clone());
+    let list = api
+        .list(&ListParams::default().limit(PDB_LIMIT))
+        .await
+        .ok()?;
+    if list
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
+    {
+        return None;
+    }
+    Some(
+        list.items
+            .into_iter()
+            .filter(|pdb| {
+                pdb.status
+                    .as_ref()
+                    .is_some_and(|status| status.disruptions_allowed == 0)
+            })
+            .map(|pdb| BlockedBudget {
+                namespace: pdb.metadata.namespace.unwrap_or_default(),
+                selector: pdb.spec.and_then(|spec| spec.selector),
+            })
+            .collect(),
+    )
+}
+
+// policy/v1 semantics: a nil selector selects no pods, an empty one selects
+// every pod in the namespace. An operator we do not know does not match --
+// Kubernetes defines exactly these four.
+fn selector_matches(selector: Option<&LabelSelector>, labels: &BTreeMap<String, String>) -> bool {
+    let Some(selector) = selector else {
+        return false;
+    };
+    for (key, value) in selector.match_labels.as_ref().unwrap_or(&BTreeMap::new()) {
+        if labels.get(key) != Some(value) {
+            return false;
+        }
+    }
+    for expression in selector.match_expressions.as_deref().unwrap_or_default() {
+        let value = labels.get(&expression.key);
+        let values = expression.values.as_deref().unwrap_or_default();
+        let matched = match expression.operator.as_str() {
+            "In" => value.is_some_and(|v| values.iter().any(|x| x == v)),
+            "NotIn" => value.is_none_or(|v| !values.iter().any(|x| x == v)),
+            "Exists" => value.is_some(),
+            "DoesNotExist" => value.is_none(),
+            _ => false,
+        };
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
+fn row(
+    node: Node,
+    load: Result<Load, kube::Error>,
+    usage: Option<&Usage>,
+    show_pdb: bool,
+) -> TableRow {
     let name = node.metadata.name.clone().unwrap_or_default();
     let uid = node.metadata.uid.clone().unwrap_or_default();
     let status = node.status.as_ref();
@@ -157,6 +270,12 @@ fn row(node: Node, load: Result<Load, kube::Error>, usage: Option<&Usage>) -> Ta
             mem_alloc,
             fmt_bytes,
         ));
+    }
+    if show_pdb {
+        cells.push(match &load {
+            Ok(load) => load.pdb_blocked.to_string(),
+            Err(_) => "?".to_string(),
+        });
     }
     cells.push(
         node.spec
@@ -519,6 +638,84 @@ mod tests {
         );
         assert_eq!(roles_text(&node), "control-plane,worker");
         assert_eq!(roles_text(&Node::default()), "<none>");
+    }
+
+    #[test]
+    fn pdb_selectors_follow_policy_v1_semantics_including_the_nil_empty_split() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement;
+
+        let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let api = labels(&[("app", "api"), ("tier", "web")]);
+
+        assert!(
+            !selector_matches(None, &api),
+            "a nil selector selects no pods"
+        );
+        assert!(
+            selector_matches(Some(&LabelSelector::default()), &api),
+            "an empty selector selects every pod in the namespace"
+        );
+
+        let by_label = LabelSelector {
+            match_labels: Some(labels(&[("app", "api")])),
+            ..Default::default()
+        };
+        assert!(selector_matches(Some(&by_label), &api));
+        assert!(!selector_matches(
+            Some(&by_label),
+            &labels(&[("app", "web")])
+        ));
+        assert!(!selector_matches(Some(&by_label), &BTreeMap::new()));
+
+        let expression = |key: &str, operator: &str, values: &[&str]| LabelSelector {
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: key.to_string(),
+                operator: operator.to_string(),
+                values: (!values.is_empty())
+                    .then(|| values.iter().map(|v| v.to_string()).collect()),
+            }]),
+            ..Default::default()
+        };
+        assert!(selector_matches(
+            Some(&expression("app", "In", &["api", "job"])),
+            &api
+        ));
+        assert!(!selector_matches(
+            Some(&expression("app", "In", &["job"])),
+            &api
+        ));
+        assert!(!selector_matches(
+            Some(&expression("app", "NotIn", &["api"])),
+            &api
+        ));
+        assert!(
+            selector_matches(
+                Some(&expression("app", "NotIn", &["api"])),
+                &BTreeMap::new()
+            ),
+            "NotIn matches a pod without the key at all"
+        );
+        assert!(selector_matches(
+            Some(&expression("tier", "Exists", &[])),
+            &api
+        ));
+        assert!(!selector_matches(
+            Some(&expression("gone", "Exists", &[])),
+            &api
+        ));
+        assert!(selector_matches(
+            Some(&expression("gone", "DoesNotExist", &[])),
+            &api
+        ));
+        assert!(
+            !selector_matches(Some(&expression("app", "Wildcard", &["*"])), &api),
+            "an unknown operator never matches, so the count cannot be wrong upward"
+        );
     }
 
     #[test]

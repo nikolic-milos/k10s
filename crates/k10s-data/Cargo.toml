@@ -23,3 +23,13 @@ http.workspace = true
 [dev-dependencies]
 k10s-world.workspace = true
 tower = { version = "0.5", features = ["util"] }
+# The scripted API server has to read request bodies to prove an apply sends
+# what it says it sends. Already in the lock through kube-client, so this costs
+# the dependency budget nothing.
+http-body-util = "0.1"
+# Test-only, and the reason is the live matrix: proving the write path end to end
+# means building the payload with the same prune the shell uses, and that prune
+# lives in the editor engine. The shipped data plane still knows nothing about
+# the editor.
+k10s-edit.workspace = true
+
