@@ -16,6 +16,7 @@ bench-alloc = []
 [dependencies]
 k10s-atlas.workspace = true
 k10s-core.workspace = true
+k10s-theme.workspace = true
 gpui.workspace = true
 arc-swap.workspace = true
 crossbeam-channel.workspace = true

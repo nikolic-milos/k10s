@@ -10,7 +10,6 @@
 //! walk at zero allocations.
 
 mod bench;
-mod colors;
 mod frame;
 mod hex;
 mod lod;
@@ -27,10 +26,9 @@ use crossbeam_channel::Sender;
 use futures::StreamExt as _;
 use futures::channel::mpsc::Receiver;
 use gpui::{
-    App, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString, TextAlign,
-    TextRun, TransformationMatrix, Window, canvas, div, fill, point, prelude::*, px, quad, rgb,
-    size,
+    App, Bounds, Context, FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString, TextAlign, TextRun,
+    TransformationMatrix, Window, canvas, div, fill, point, prelude::*, px, quad, rgb, size,
 };
 use k10s_atlas::{DrawnCounts, FLIGHT_VIEWPORT, FramePacer, FrameSpans, FrameStats, StageMachine};
 use k10s_core::{KindId, SceneSnapshot, SharedScene, ToolId, WorldCtrl};
@@ -46,6 +44,20 @@ pub struct Picked {
 }
 
 impl gpui::EventEmitter<Picked> for MapView {}
+
+gpui::actions!(k10s_map, [ToggleChurn, ToggleEdges, ToggleHud, FitView]);
+
+// The map's own commands, bound in its own context so the shell's letters
+// never collide with them and a user keymap can rebind them by name.
+pub fn keybindings() -> Vec<gpui::KeyBinding> {
+    let map = Some("Map");
+    vec![
+        gpui::KeyBinding::new("c", ToggleChurn, map),
+        gpui::KeyBinding::new("e", ToggleEdges, map),
+        gpui::KeyBinding::new("h", ToggleHud, map),
+        gpui::KeyBinding::new("f", FitView, map),
+    ]
+}
 pub use frame::FrameOpts;
 pub use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 pub use lod::{cull, stage_for_zoom};
@@ -56,9 +68,9 @@ pub mod testing {
     pub use crate::frame::{FramePaths, FrameSink, IconJob, LabelJob, PaintSink, walk};
 }
 
-use bench::{Bench, BenchFrame};
-use colors::*;
+use bench::{Bench, BenchOp};
 use frame::{IconJob, LabelJob, PaintSink};
+use k10s_theme::scale_alpha;
 use lod::lod;
 use text::TextCache;
 
@@ -239,6 +251,32 @@ impl MapView {
         self.focus_handle.clone()
     }
 
+    // The map's commands, invoked by the workspace's action handlers: the
+    // handlers live on the workspace element so the map's per-paint element
+    // build stays lean enough for the allocation ratchet to mean something.
+    pub fn toggle_churn(&mut self, cx: &mut Context<Self>) {
+        self.churn_on = !self.churn_on;
+        let _ = self.ctrl.send(WorldCtrl::SetChurn(self.churn_on));
+        cx.notify();
+    }
+
+    pub fn toggle_edges(&mut self, cx: &mut Context<Self>) {
+        self.edges_on = !self.edges_on;
+        cx.notify();
+    }
+
+    pub fn toggle_hud(&mut self, cx: &mut Context<Self>) {
+        self.hud_on = !self.hud_on;
+        cx.notify();
+    }
+
+    pub fn fit(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let scene = self.scene.load();
+        let (_, vw, vh) = self.map_viewport(window);
+        self.camera.fit(scene.bounds, vw, vh);
+        cx.notify();
+    }
+
     #[cfg(feature = "testing")]
     pub fn testing_set_camera(&mut self, camera: Camera) {
         self.camera = camera;
@@ -319,24 +357,26 @@ impl Render for MapView {
         let now = std::time::Instant::now();
         if let Some(bench) = self.bench.as_mut() {
             let active = window.is_window_active();
-            let frame = bench.frame(now, vw, vh, active, &scene, &mut self.stats.borrow_mut());
-            if frame.needs_frame() {
-                self.pacer.request_frame();
-            }
-            match frame {
-                BenchFrame::Camera(cam) => self.camera = cam,
-                BenchFrame::Waiting => {}
-                BenchFrame::Idle { camera, arm_timer } => {
-                    self.camera = camera;
-                    if let Some(delay) = arm_timer {
-                        cx.spawn(async move |this, cx| {
-                            cx.background_executor().timer(delay).await;
-                            this.update(cx, |_, cx| cx.notify()).ok();
-                        })
-                        .detach();
-                    }
+            let op = bench.drive(
+                now,
+                vw,
+                vh,
+                active,
+                &scene,
+                &mut self.stats.borrow_mut(),
+                &mut self.camera,
+                &mut self.pacer,
+            );
+            match op {
+                BenchOp::Continue => {}
+                BenchOp::ArmTimer(delay) => {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(delay).await;
+                        this.update(cx, |_, cx| cx.notify()).ok();
+                    })
+                    .detach();
                 }
-                BenchFrame::Done => cx.quit(),
+                BenchOp::Quit => cx.quit(),
             }
         } else if scene.rev > 0 && (!self.fitted || (!self.interacted && (vw, vh) != self.last_vp))
         {
@@ -412,23 +452,7 @@ impl Render for MapView {
                 this.interacted = true;
                 cx.notify();
             }))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                match ev.keystroke.key.as_str() {
-                    "c" => {
-                        this.churn_on = !this.churn_on;
-                        let _ = this.ctrl.send(WorldCtrl::SetChurn(this.churn_on));
-                    }
-                    "e" => this.edges_on = !this.edges_on,
-                    "h" => this.hud_on = !this.hud_on,
-                    "f" => {
-                        let scene = this.scene.load();
-                        let (_, vw, vh) = this.map_viewport(window);
-                        this.camera.fit(scene.bounds, vw, vh);
-                    }
-                    _ => return,
-                }
-                cx.notify();
-            }))
+            .key_context("Map")
             .child(
                 canvas(
                     |_, _, _| {},
@@ -563,13 +587,18 @@ fn paint_map(
 ) {
     let frame_start = std::time::Instant::now();
     stats.borrow_mut().begin_frame(frame_start, was_continuous);
+    // One refcount bump per frame, at walk setup and never inside it: the
+    // walk itself still reads plain `MapTheme` fields, which is the whole
+    // reason that struct is `Copy` scalars.
+    let theme = k10s_theme::active(cx).clone();
+    let typography = k10s_theme::typography(cx).clone();
     let mut bg = bg_buf.borrow_mut();
     let mut fg = fg_buf.borrow_mut();
     let mut labels = label_buf.borrow_mut();
     let mut icons = icon_buf.borrow_mut();
 
     let bounds = if bench_letterbox {
-        window.paint_quad(fill(canvas_bounds, rgb(BG)));
+        window.paint_quad(fill(canvas_bounds, rgb(theme.map.bg)));
         letterbox_bounds(canvas_bounds)
     } else {
         canvas_bounds
@@ -583,6 +612,7 @@ fn paint_map(
 
     let opts = FrameOpts {
         policy: lod(),
+        theme: &theme.map,
         edges_on,
         skip_blocks: skip_workloads(),
         hex: hex::hex_on(),
@@ -619,7 +649,7 @@ fn paint_map(
         let hex = paths.hex.build();
         debug_assert!(hex.is_ok(), "hex layer failed to tessellate");
         if let Ok(path) = hex {
-            window.paint_path(path, rgb(HEX_LINE).alpha(hex::level(zoom).1));
+            window.paint_path(path, rgb(theme.map.hex_line).alpha(hex::level(zoom).1));
         }
     }
 
@@ -627,7 +657,7 @@ fn paint_map(
         let edges = paths.edges.build();
         debug_assert!(edges.is_ok(), "edge layer failed to tessellate");
         if let Ok(path) = edges {
-            window.paint_path(path, rgb(EDGE).alpha(0.30 * cell_alpha));
+            window.paint_path(path, rgb(theme.map.edge).alpha(0.30 * cell_alpha));
         }
     }
 
@@ -636,13 +666,19 @@ fn paint_map(
             let glow = paths.curve_glow.build();
             debug_assert!(glow.is_ok(), "curve glow layer failed to tessellate");
             if let Ok(path) = glow {
-                window.paint_path(path, rgb(CURVE_GLOW).alpha(CURVE_GLOW_ALPHA * cell_alpha));
+                window.paint_path(
+                    path,
+                    rgb(theme.map.curve_glow).alpha(theme.map.curve_glow_alpha * cell_alpha),
+                );
             }
         }
         let core = paths.curve_core.build();
         debug_assert!(core.is_ok(), "curve core layer failed to tessellate");
         if let Ok(path) = core {
-            window.paint_path(path, rgb(CURVE_CORE).alpha(CURVE_CORE_ALPHA * cell_alpha));
+            window.paint_path(
+                path,
+                rgb(theme.map.curve_core).alpha(theme.map.curve_core_alpha * cell_alpha),
+            );
         }
     }
 
@@ -671,7 +707,7 @@ fn paint_map(
                             key,
                             data,
                             *b,
-                            scale_alpha(tool_color(*tool), 0.95 * block_alpha).into(),
+                            scale_alpha(theme.map.tool_color(*tool), 0.95 * block_alpha).into(),
                         )
                     }
                     IconJob::Sat(kind, b) => {
@@ -680,7 +716,7 @@ fn paint_map(
                             key,
                             data,
                             *b,
-                            scale_alpha(kind_color(*kind), cell_alpha).into(),
+                            scale_alpha(theme.map.kind_color(*kind), cell_alpha).into(),
                         )
                     }
                 };
@@ -697,7 +733,7 @@ fn paint_map(
     }
 
     let text_start = std::time::Instant::now();
-    let font = gpui::font("Noto Sans");
+    let font = gpui::font(typography.ui_family.clone());
     let mut label_counts = LabelCounts::default();
     let mut cache = text_cache.borrow_mut();
     let cache_before = cache.stats();
@@ -756,6 +792,8 @@ fn paint_map(
     let hud_start = std::time::Instant::now();
     paint_hud(
         scene,
+        &theme,
+        &typography,
         stats,
         camera.zoom,
         blend,
@@ -788,6 +826,8 @@ fn span_us(from: std::time::Instant, to: std::time::Instant) -> f32 {
 #[expect(clippy::too_many_arguments)]
 fn paint_hud(
     scene: &SceneSnapshot,
+    theme: &k10s_theme::Theme,
+    typography: &k10s_theme::Typography,
     stats: &Rc<RefCell<FrameStats>>,
     zoom: f32,
     blend: StageBlend,
@@ -892,19 +932,19 @@ fn paint_hud(
     window.paint_quad(quad(
         hud_bounds,
         px(6.0),
-        rgb(HUD_BG).alpha(0.88),
+        rgb(theme.map.hud_bg).alpha(0.88),
         px(1.0),
-        rgb(NS_BORDER),
+        rgb(theme.map.ns_border),
         Default::default(),
     ));
 
-    let font = gpui::font("JetBrains Mono");
+    let font = gpui::font(typography.buffer_family.clone());
     for (i, text) in lines.iter().enumerate() {
         let hash = text::content_hash(text);
         let run = TextRun {
             len: text.len(),
             font: font.clone(),
-            color: rgb(HUD_TEXT).into(),
+            color: rgb(theme.map.hud_text).into(),
             background_color: None,
             underline: None,
             strikethrough: None,

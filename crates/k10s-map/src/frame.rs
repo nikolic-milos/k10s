@@ -8,8 +8,8 @@ use k10s_core::{
     KindId, NsNode, PodNode, Rect, SatNode, SceneSnapshot, Severity, ToolId, WorkloadNode,
 };
 
-use crate::colors::*;
 use crate::hex;
+use k10s_theme::{HeatRamp, MapTheme, mix, scale_alpha};
 
 const NS_LABEL_PX: f32 = 13.0;
 const WL_LABEL_PX: f32 = 11.0;
@@ -29,6 +29,7 @@ const CURVE_GLOW_W: f32 = 5.0;
 #[derive(Debug, Clone, Copy)]
 pub struct FrameOpts<'a> {
     pub policy: &'a LodPolicy,
+    pub theme: &'a MapTheme,
     pub edges_on: bool,
     pub skip_blocks: bool,
     pub hex: bool,
@@ -104,10 +105,8 @@ struct FrameWalk<'a, S> {
     zoom: f32,
     stage: u8,
     z01_t: f32,
-    block_alpha: f32,
-    cell_alpha: f32,
-    cell_label_alpha: f32,
     policy: &'a LodPolicy,
+    heat: HeatRamp,
     skip_blocks: bool,
     hex_shown: bool,
     edges_on: bool,
@@ -116,6 +115,14 @@ struct FrameWalk<'a, S> {
     ns_fill_rgba: gpui::Rgba,
     ns_border_rgba: gpui::Rgba,
     header_fill: gpui::Background,
+    // Label colours, channel-converted and alpha-applied once at walk setup.
+    // A per-region loop must not touch the theme struct: that is the hoist the
+    // 14-18% regression bought, and these are text colours, not exceptions.
+    region_label: gpui::Rgba,
+    workload_label: gpui::Rgba,
+    sat_label: gpui::Rgba,
+    sat_detail_label: gpui::Rgba,
+    pod_label: gpui::Rgba,
     workload_paint: [(gpui::Background, gpui::Hsla); 4],
     pod_paint: [gpui::Background; 4],
     strip_paint: [gpui::Background; 4],
@@ -144,7 +151,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             self.sink.bg_quad(quad(
                 bounds,
                 px(6.0),
-                heat_color(region.ext.unhealthy_frac),
+                self.heat.color(region.ext.unhealthy_frac),
                 px(1.0),
                 self.ns_border,
                 Default::default(),
@@ -155,7 +162,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 px(8.0),
                 self.ns_fill,
                 px(1.0),
-                heat_border(region.ext.unhealthy_frac),
+                self.heat.border(region.ext.unhealthy_frac),
                 Default::default(),
             ));
         } else {
@@ -163,14 +170,14 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 bounds,
                 px(6.0 + 2.0 * self.z01_t),
                 mix(
-                    heat_color(region.ext.unhealthy_frac),
+                    self.heat.color(region.ext.unhealthy_frac),
                     self.ns_fill_rgba,
                     self.z01_t,
                 ),
                 px(1.0),
                 mix(
                     self.ns_border_rgba,
-                    heat_border(region.ext.unhealthy_frac),
+                    self.heat.border(region.ext.unhealthy_frac),
                     self.z01_t,
                 ),
                 Default::default(),
@@ -190,12 +197,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 x: self.origin.0 + x + 10.0,
                 y: self.origin.1 + y + 6.0,
                 size_px: NS_LABEL_PX,
-                color: gpui::Rgba {
-                    r: 0.62,
-                    g: 0.58,
-                    b: 0.75,
-                    a: 1.0,
-                },
+                color: self.region_label,
             });
         }
     }
@@ -313,12 +315,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                     x: self.origin.0 + x + 4.0,
                     y: self.origin.1 + y + 1.0,
                     size_px: WL_LABEL_PX,
-                    color: gpui::Rgba {
-                        r: 0.72,
-                        g: 0.68,
-                        b: 0.85,
-                        a: self.block_alpha,
-                    },
+                    color: self.workload_label,
                 });
             }
         }
@@ -441,24 +438,14 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 x: self.origin.0 + x - 8.0,
                 y: self.origin.1 + y + 2.0,
                 size_px: SAT_NAME_PX,
-                color: gpui::Rgba {
-                    r: 0.80,
-                    g: 0.75,
-                    b: 0.90,
-                    a: self.cell_alpha,
-                },
+                color: self.sat_label,
             });
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::from(&satellite.ext.detail),
                 x: self.origin.0 + x - 8.0,
                 y: self.origin.1 + y + 2.0 + SAT_NAME_PX * 1.25,
                 size_px: SAT_DETAIL_PX,
-                color: gpui::Rgba {
-                    r: 0.62,
-                    g: 0.57,
-                    b: 0.74,
-                    a: self.cell_alpha,
-                },
+                color: self.sat_detail_label,
             });
         }
 
@@ -497,12 +484,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 x: self.origin.0 + x,
                 y: self.origin.1 + y + 2.0,
                 size_px: POD_LABEL_PX,
-                color: gpui::Rgba {
-                    r: 0.55,
-                    g: 0.51,
-                    b: 0.66,
-                    a: self.cell_label_alpha,
-                },
+                color: self.pod_label,
             });
         }
     }
@@ -600,14 +582,14 @@ pub fn walk<S: FrameSink>(
     let block_alpha = blend.stage_alpha(1);
     let cell_alpha = blend.stage_alpha(2);
     let workload_paint = SEVERITIES.map(|severity| {
-        let (fill, border) = workload_colors(severity);
+        let (fill, border) = opts.theme.workload_colors(severity);
         (
             scale_alpha(fill, block_alpha).into(),
             scale_alpha(border, block_alpha).into(),
         )
     });
 
-    sink.bg_quad(fill(bounds, rgb(BG)));
+    sink.bg_quad(fill(bounds, rgb(opts.theme.bg)));
     let mut walk = FrameWalk {
         camera,
         visible: camera.visible_world(viewport.0, viewport.1),
@@ -622,22 +604,26 @@ pub fn walk<S: FrameSink>(
         } else {
             blend.fade_alpha()
         },
-        block_alpha,
-        cell_alpha,
-        cell_label_alpha: blend.stage_alpha(3),
         policy: opts.policy,
+        heat: opts.theme.heat_ramp(),
         skip_blocks: opts.skip_blocks,
         hex_shown: opts.hex_shown(),
         edges_on: opts.edges_on,
-        ns_border: rgb(NS_BORDER).into(),
-        ns_fill: rgb(NS_FILL).into(),
-        ns_fill_rgba: rgb(NS_FILL),
-        ns_border_rgba: rgb(NS_BORDER),
-        header_fill: scale_alpha(rgb(CARD_HEADER_FILL), block_alpha).into(),
+        ns_border: rgb(opts.theme.ns_border).into(),
+        ns_fill: rgb(opts.theme.ns_fill).into(),
+        ns_fill_rgba: rgb(opts.theme.ns_fill),
+        ns_border_rgba: rgb(opts.theme.ns_border),
+        header_fill: scale_alpha(rgb(opts.theme.card_header_fill), block_alpha).into(),
+        region_label: rgb(opts.theme.region_label),
+        workload_label: scale_alpha(rgb(opts.theme.workload_label), block_alpha),
+        sat_label: scale_alpha(rgb(opts.theme.sat_label), cell_alpha),
+        sat_detail_label: scale_alpha(rgb(opts.theme.sat_detail_label), cell_alpha),
+        pod_label: scale_alpha(rgb(opts.theme.pod_label), blend.stage_alpha(3)),
         workload_paint,
-        pod_paint: SEVERITIES.map(|severity| scale_alpha(pod_color(severity), cell_alpha).into()),
+        pod_paint: SEVERITIES
+            .map(|severity| scale_alpha(opts.theme.pod_color(severity), cell_alpha).into()),
         strip_paint: SEVERITIES
-            .map(|severity| scale_alpha(pod_color(severity), block_alpha).into()),
+            .map(|severity| scale_alpha(opts.theme.pod_color(severity), block_alpha).into()),
         sink,
         stats: CullStats {
             stage,
@@ -872,6 +858,7 @@ mod tests {
     fn walk_labels(scene: &SceneSnapshot) -> Collect {
         let pol = policy(Knobs::default());
         let opts = FrameOpts {
+            theme: &k10s_theme::K10S_DARK.map,
             policy: &pol,
             edges_on: false,
             skip_blocks: false,
