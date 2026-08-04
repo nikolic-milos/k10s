@@ -648,6 +648,7 @@ fn the_inspector_reads_events_and_logs_and_labels_a_denial() {
 fn options() -> Options {
     Options {
         context: None,
+        kubeconfig: None,
         probe_namespaces: vec!["prod".into()],
         sync_timeout: Duration::from_secs(5),
     }

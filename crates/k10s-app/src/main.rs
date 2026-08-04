@@ -1,4 +1,5 @@
 mod cli;
+mod launch;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +11,8 @@ use k10s_data::read::Fetched;
 use k10s_data::{DEFAULT_EVENT_SINK_CAPACITY, DataPlane};
 use k10s_map::{BenchMeta, MapView};
 use k10s_shell::Workspace;
+
+use launch::{Feed, LaunchService};
 
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
@@ -24,21 +27,22 @@ fn install_panic_hook() {
     }));
 }
 
+// What a command line that named a cluster connected to, before the window
+// opened. The screen's own connections are owned by `LaunchService` instead; both
+// end up in the same place, which is why this only carries what main has to hand
+// on rather than anything it keeps.
 struct Live {
-    // Field order is load-bearing: the receiver must drop before the plane, so
-    // a watch task blocked on a full bounded sink gets a disconnect error
-    // instead of deadlocking the runtime shutdown that plane's drop waits on.
     events: crossbeam_channel::Receiver<IngestEvent>,
     inspector: k10s_data::inspect::Inspector,
     reader: k10s_data::read::Reader,
-    _plane: DataPlane,
+    plane: DataPlane,
 }
 
 // The shell's provider seam, adapted to the data plane. The shell never sees
 // kube; it sees labelled outcomes. Every reply callback runs on the data
 // plane's runtime and the shell bridges onto its own executor, so no thread
 // is parked waiting for an answer.
-struct PlaneProvider {
+pub struct PlaneProvider {
     inspector: k10s_data::inspect::Inspector,
     reader: k10s_data::read::Reader,
 }
@@ -705,6 +709,10 @@ fn main() {
         std::process::exit(list_contexts());
     }
 
+    // A command line that named a cluster still connects before the window
+    // opens: somebody who said what they wanted has said it, and failing at a
+    // prompt is the right answer to `--context prd`. Everything else opens the
+    // window first and asks.
     let (events, live) = if args.cluster {
         match connect_cluster(&args) {
             Ok(pair) => pair,
@@ -713,25 +721,41 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    } else if args.scene_was_named() {
+        let generated = generate(&args);
+        eprintln!("k10s: {}", generated.summary);
+        (generated.events, None)
     } else {
-        (generate(&args), None)
+        (Vec::new(), None)
     };
+    let choose_on_launch = !args.scene_was_named();
 
     let scene = new_shared_scene();
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded(WORLD_CONTROL_CAPACITY);
-    let live_events = live
-        .as_ref()
-        .map(|connection| connection.events.clone())
-        .unwrap_or_else(crossbeam_channel::never);
+    // One live channel for the whole process, created before the world so a
+    // cluster connected after the window is open has somewhere to send its
+    // deltas. The scene itself never travels down it -- a choice sends
+    // `WorldCtrl::Rebuild` and carries its own stream -- so under `--bench` and
+    // `--cluster` nothing changes except that the channel exists.
+    let (live_tx, live_rx) = crossbeam_channel::bounded(DEFAULT_EVENT_SINK_CAPACITY);
+    let feed = Feed::new(live_tx);
+    // A scene the command line named keeps that command line's churn. One that
+    // has not been chosen yet gets none: an empty world has nothing to churn,
+    // and whichever choice arrives sets the rate it needs.
+    let churn = if choose_on_launch {
+        0.0
+    } else {
+        args.effective_churn()
+    };
 
     let (mut damage_tx, damage_rx) = futures::channel::mpsc::channel(1);
     let world = k10s_world::spawn_world(
         events,
-        live_events,
+        live_rx,
         scene.clone(),
         ctrl_rx,
         args.seed,
-        args.effective_churn(),
+        churn,
         args.layout,
         {
             move || {
@@ -739,6 +763,14 @@ fn main() {
             }
         },
     );
+
+    let launch = LaunchService::new(feed, ctrl_tx.clone(), &args);
+    let plane = live.map(|live| {
+        let provider = (live.inspector, live.reader);
+        launch.adopt_command_line(live.plane, live.events);
+        provider
+    });
+    let chooser = launch.clone();
 
     let shutdown_tx = ctrl_tx.clone();
     let bench_meta = args.bench.then(|| BenchMeta {
@@ -752,9 +784,6 @@ fn main() {
     });
     let window_failed = Arc::new(AtomicBool::new(false));
     let window_status = window_failed.clone();
-    let plane = live
-        .as_ref()
-        .map(|live| (live.inspector.clone(), live.reader.clone()));
     // A bench flight runs on the default theme and default keymap, whatever
     // the user's files say: a recording's environment must not depend on the
     // recording machine's home directory.
@@ -830,11 +859,23 @@ fn main() {
                         std::rc::Rc::new(PlaneProvider { inspector, reader })
                             as std::rc::Rc<dyn k10s_shell::ReadProvider>
                     });
+                    // The seam is an `Rc` for the shell and an `Arc` inside,
+                    // because the connect happens on a thread and the screen
+                    // asking for it does not.
+                    let chooser =
+                        Some(std::rc::Rc::new(chooser)
+                            as std::rc::Rc<dyn k10s_shell::LaunchProvider>);
                     let workspace = cx.new(|cx| {
-                        Workspace::new(map, is_bench, provider, config_paths.clone(), cx)
+                        Workspace::new(map, is_bench, provider, chooser, config_paths.clone(), cx)
                     });
                     let focus = workspace.read(cx).map_focus_handle(cx);
                     window.focus(&focus, cx);
+                    // Nothing is in the world and nothing on the command line
+                    // said what should be, so the screen asks. Opened after the
+                    // map takes focus, because it takes it straight back.
+                    if choose_on_launch {
+                        workspace.update(cx, |workspace, cx| workspace.open_launch(window, cx));
+                    }
                     workspace
                 },
             );
@@ -853,21 +894,33 @@ fn main() {
     if !world_ended_cleanly {
         eprintln!("k10s: the world thread panicked, cluster updates had stopped");
     }
-    drop(live);
+    // Whatever scene was attached, however it was chosen: the plane stops before
+    // the thread carrying its stream, which is the order that lets a watch parked
+    // on a full sink see a disconnect instead of a deadlock.
+    launch.retire();
     if !world_ended_cleanly || window_failed.load(Ordering::Relaxed) {
         std::process::exit(1);
     }
 }
 
-fn generate(args: &cli::Args) -> Vec<IngestEvent> {
+// A generated scene and the one line that describes it. The line used to go
+// straight to stderr, which was fine when the generator was the only way in;
+// now it is also what the launch screen puts in the status bar, because somebody
+// who started from a desktop entry has no stderr to read.
+pub struct Generated {
+    pub events: Vec<IngestEvent>,
+    pub summary: String,
+}
+
+fn generate(args: &cli::Args) -> Generated {
     let t0 = std::time::Instant::now();
     let spec = k10s_clustergen::generate(&GenConfig {
         seed: args.seed,
         target_objects: args.objects,
         scenario: args.scenario,
     });
-    eprintln!(
-        "k10s: generated {} namespaces / {} workloads / {} pods / {} sats / {} edges (seed {}, scenario {}, layout {}) in {:.1?}",
+    let summary = format!(
+        "generated {} namespaces / {} workloads / {} pods / {} sats / {} edges (seed {}, scenario {}, layout {}) in {:.1?}",
         spec.namespaces.len(),
         spec.total_workloads,
         spec.total_pods,
@@ -878,7 +931,10 @@ fn generate(args: &cli::Args) -> Vec<IngestEvent> {
         args.layout.as_str(),
         t0.elapsed(),
     );
-    k10s_clustergen::stream::snapshot(&spec, args.layout.emits_attachments())
+    Generated {
+        events: k10s_clustergen::stream::snapshot(&spec, args.layout.emits_attachments()),
+        summary,
+    }
 }
 
 fn list_contexts() -> i32 {
@@ -913,6 +969,7 @@ fn connect_cluster(args: &cli::Args) -> Result<(Vec<IngestEvent>, Option<Live>),
     let plane = k10s_data::spawn(tx).map_err(|e| format!("cannot start the data plane: {e}"))?;
     let options = k10s_data::Options {
         context: args.context.clone(),
+        kubeconfig: None,
         probe_namespaces: args.namespaces.clone(),
         sync_timeout: args.sync_timeout(),
     };
@@ -927,7 +984,7 @@ fn connect_cluster(args: &cli::Args) -> Result<(Vec<IngestEvent>, Option<Live>),
             events: rx,
             inspector: sync.inspector,
             reader: sync.reader,
-            _plane: plane,
+            plane,
         }),
     ))
 }

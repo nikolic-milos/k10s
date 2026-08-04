@@ -127,6 +127,23 @@ impl Args {
         std::time::Duration::from_secs_f32(self.sync_timeout_secs)
     }
 
+    /// Whether the command line already said what this window is going to show.
+    ///
+    /// The launch screen exists for the person who typed `k10s` and nothing
+    /// else. Somebody who named a cluster, or shaped a generated one, or is
+    /// recording a bench flight has answered the question the screen would ask,
+    /// and asking it again would be a modal in the way of an answer they already
+    /// gave. A recording is the strictest of the three: its environment must not
+    /// depend on the recording machine's home directory at all.
+    pub fn scene_was_named(&self) -> bool {
+        self.cluster
+            || self.bench
+            || self.objects_explicit
+            || self.seed_explicit
+            || self.scenario_explicit
+            || self.churn_explicit
+    }
+
     pub fn cluster_flags_without_cluster(&self) -> Vec<&'static str> {
         if self.cluster || self.list_contexts {
             return Vec::new();
@@ -609,6 +626,26 @@ mod tests {
         assert!(!ok(&["--cluster"]).churn_was_overridden());
         assert_eq!(ok(&["--cluster"]).effective_churn(), 0.0);
         assert!(!ok(&["--cluster", "--churn", "0"]).churn_was_overridden());
+    }
+
+    #[test]
+    fn a_bare_command_line_is_the_only_one_the_launch_screen_answers_for() {
+        assert!(!ok(&[]).scene_was_named());
+        assert!(!ok(&["--layout", "spread"]).scene_was_named());
+        for argv in [
+            vec!["--cluster"],
+            vec!["--cluster", "--context", "prod"],
+            vec!["--bench", "--machine", "ci"],
+            vec!["--objects", "1000"],
+            vec!["--seed", "7"],
+            vec!["--scenario", "data"],
+            vec!["--churn", "0"],
+        ] {
+            assert!(
+                ok(&argv).scene_was_named(),
+                "{argv:?} already says what to show"
+            );
+        }
     }
 
     #[test]

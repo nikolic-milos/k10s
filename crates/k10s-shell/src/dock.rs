@@ -77,6 +77,34 @@ impl<T> Dock<T> {
         self.panels.iter().position(matches)
     }
 
+    /// Drop every panel a predicate rejects and return how many went, keeping
+    /// the selection on a panel that survived. One act rather than a sequence of
+    /// removals whose indices shift under each other -- which is what a whole
+    /// class of panel ceasing to be true is: a cluster leaving takes its tables
+    /// with it, all at once.
+    pub fn retain(&mut self, keep: impl Fn(&T) -> bool) -> usize {
+        let before = self.panels.len();
+        let active_survives = self.active().is_some_and(&keep);
+        // Where the active panel lands: however many survivors sit in front of
+        // it. When it is one of the casualties, that index is the neighbour
+        // that took its place, which is the same rule `remove` follows.
+        let ahead = self.panels[..self.active.min(before)]
+            .iter()
+            .filter(|panel| keep(panel))
+            .count();
+        self.panels.retain(&keep);
+        self.active = if active_survives {
+            ahead
+        } else {
+            ahead.min(self.panels.len().saturating_sub(1))
+        };
+        if self.panels.is_empty() {
+            self.active = 0;
+            self.open = false;
+        }
+        before - self.panels.len()
+    }
+
     pub fn remove(&mut self, index: usize) -> Option<T> {
         if index >= self.panels.len() {
             return None;
@@ -138,6 +166,37 @@ mod tests {
         );
 
         assert!(dock.remove(9).is_none());
+    }
+
+    #[test]
+    fn retaining_keeps_the_selection_on_a_survivor_and_shuts_an_emptied_dock() {
+        let mut dock: Dock<&str> = Dock::default();
+        for panel in ["keep-a", "drop-b", "keep-c", "drop-d"] {
+            dock.push(panel);
+        }
+        dock.activate(2);
+        assert_eq!(dock.retain(|panel| panel.starts_with("keep")), 2);
+        assert_eq!(
+            dock.active(),
+            Some(&"keep-c"),
+            "a survivor that was selected stays selected under its new index"
+        );
+
+        dock.push("drop-e");
+        assert_eq!(dock.active(), Some(&"drop-e"));
+        dock.retain(|panel| panel.starts_with("keep"));
+        assert_eq!(
+            dock.active(),
+            Some(&"keep-c"),
+            "when the selected panel goes, its neighbour takes the selection"
+        );
+
+        assert_eq!(dock.retain(|_| false), 2);
+        assert!(
+            !dock.is_open(),
+            "a dock emptied by a retain shuts like one emptied by a remove"
+        );
+        assert_eq!(dock.active_index(), 0);
     }
 
     #[test]

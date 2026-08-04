@@ -64,6 +64,7 @@ fn connect(context: Option<&str>) -> (k10s_data::DataPlane, Sync) {
     let plane = k10s_data::spawn(sink).expect("a runtime");
     let options = Options {
         context: context.map(str::to_string),
+        kubeconfig: None,
         probe_namespaces: vec![namespace()],
         sync_timeout: Duration::from_secs(30),
     };

@@ -277,6 +277,31 @@ impl MapView {
         cx.notify();
     }
 
+    /// Forget that the camera was ever framed, so the next scene with anything in
+    /// it is framed again.
+    ///
+    /// A scene chosen on the launch screen is a new subject, not a moved camera:
+    /// the zoom that framed a 200-namespace starmap says nothing about the cluster
+    /// somebody switched to. Deliberately not a fit: the scene it is about has not
+    /// arrived yet.
+    pub fn refit(&mut self, cx: &mut Context<Self>) {
+        self.fitted = false;
+        self.interacted = false;
+        cx.notify();
+    }
+
+    /// Whether this frame frames the whole scene by itself.
+    ///
+    /// The automatic fit happens once, and again on a resize the user has not
+    /// overridden by touching the camera. What it must not do is spend that one
+    /// fit on an *empty* scene: a published revision used to imply content,
+    /// because the world was always built from a stream before the window opened.
+    /// The launch screen made an empty world reachable, and the starmap chosen a
+    /// moment later opened off-camera -- fitted to bounds that had held nothing.
+    fn should_fit_scene(regions: u32, fitted: bool, interacted: bool, resized: bool) -> bool {
+        regions > 0 && (!fitted || (!interacted && resized))
+    }
+
     #[cfg(feature = "testing")]
     pub fn testing_set_camera(&mut self, camera: Camera) {
         self.camera = camera;
@@ -378,8 +403,12 @@ impl Render for MapView {
                 }
                 BenchOp::Quit => cx.quit(),
             }
-        } else if scene.rev > 0 && (!self.fitted || (!self.interacted && (vw, vh) != self.last_vp))
-        {
+        } else if Self::should_fit_scene(
+            scene.totals.regions,
+            self.fitted,
+            self.interacted,
+            (vw, vh) != self.last_vp,
+        ) {
             self.camera.fit(scene.bounds, vw, vh);
             self.fitted = true;
             self.last_vp = (vw, vh);
@@ -986,7 +1015,7 @@ impl std::fmt::Display for Grouped {
 
 #[cfg(test)]
 mod tests {
-    use super::LabelCounts;
+    use super::{LabelCounts, MapView};
 
     const POD_LABELS: [&str; 3] = [
         "checkout-api-7f9c8d6b5-tzq4x",
@@ -1025,5 +1054,26 @@ mod tests {
         assert_eq!(counts.lines, 1);
         assert_eq!(counts.glyphs, 14);
         assert!(counts.glyphs < text.len());
+    }
+
+    #[test]
+    fn an_empty_scene_does_not_spend_the_one_automatic_fit() {
+        // The incident: a window can now open on an empty world and be filled
+        // from the launch screen a moment later. Fitting to nothing marked the
+        // view fitted, and the starmap that arrived opened off-camera.
+        assert!(!MapView::should_fit_scene(0, false, false, false));
+        assert!(!MapView::should_fit_scene(0, false, false, true));
+        assert!(MapView::should_fit_scene(197, false, false, false));
+
+        // And the rules that were already true stay true.
+        assert!(!MapView::should_fit_scene(197, true, false, false));
+        assert!(
+            MapView::should_fit_scene(197, true, false, true),
+            "a resize re-frames a camera nobody has touched"
+        );
+        assert!(
+            !MapView::should_fit_scene(197, true, true, true),
+            "and never one they have"
+        );
     }
 }

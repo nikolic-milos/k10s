@@ -109,9 +109,28 @@ pub fn new_shared_scene() -> SharedScene {
     Arc::new(ArcSwap::from_pointee(SceneSnapshot::default()))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum WorldCtrl {
     SetChurn(bool),
+    /// Flips per second the synthetic churn is allowed to spend. Set after
+    /// spawn because the scene's provenance is chosen on screen now: a world
+    /// that was still empty when it started must be able to learn that what
+    /// arrived is a real cluster, where inventing pod transitions would be a
+    /// lie, or the generator, where they are the point.
+    SetChurnRate(f32),
+    /// Replace the whole scene with one built from this stream: what a cluster
+    /// or a starmap chosen on screen sends.
+    ///
+    /// The stream travels *with* the instruction rather than down the event
+    /// channel behind it, for two reasons. A scene arriving all at once has to
+    /// be laid out the way the command line's scenes are, by the batch layout --
+    /// the incremental one exists for the namespace that appears at runtime, and
+    /// placing two hundred of them one after another produces a strip. And a
+    /// reset sent alongside the events it replaces would race them: control and
+    /// events are separate channels read at different points in a tick, so the
+    /// old scene would be re-applied on top of the new one from whatever was
+    /// still queued. Carrying the stream makes the replacement one act.
+    Rebuild(Vec<IngestEvent>),
     Shutdown,
 }
 
