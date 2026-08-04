@@ -11,7 +11,7 @@ use gpui::{
     Context, Div, IntoElement, ParentElement, Render, SharedString, Stateful, Styled, Window, div,
     prelude::*, px, rgb, svg,
 };
-use k10s_theme::{Theme, Typography};
+use k10s_theme::{Appearance, Theme, Typography};
 
 pub const TITLE_BAR_HEIGHT: f32 = 34.0;
 pub const TAB_HEIGHT: f32 = 32.0;
@@ -31,6 +31,36 @@ pub const MIN_DOCK_SIZE: f32 = 120.0;
 pub const MAX_DOCK_SIZE: f32 = 800.0;
 pub const MIN_CENTER_WIDTH: f32 = 320.0;
 pub const MIN_CENTER_HEIGHT: f32 = 160.0;
+
+/// The title bar's mark. 18 px is the size the symbol was cut for; the helm
+/// with its spokes is unreadable there, which is why the brand kit ships both
+/// and why only the launch screen gets the wheel.
+pub const TITLE_MARK_SIZE: f32 = 18.0;
+/// The launch screen's helm.
+pub const LAUNCH_LOGO_SIZE: f32 = 88.0;
+
+/// The brand bitmaps, named by the appearance they are drawn *on*. These are
+/// paths into the asset source the application installs, exactly like the
+/// window-control SVGs below: the shell draws bytes it does not carry, and the
+/// same four literals are pinned by a test in `k10s-assets`, because a rename
+/// on one side only is a missing image with no error anywhere.
+///
+/// Two files rather than one tinted file. The artwork is flat brand blue on a
+/// transparent field; tinting a bitmap to fit a theme turns a brand colour into
+/// an approximation of itself, and blue on a dark background is a smudge.
+pub fn brand_mark(appearance: Appearance) -> &'static str {
+    match appearance {
+        Appearance::Light => "brand/mark-light.png",
+        Appearance::Dark => "brand/mark-dark.png",
+    }
+}
+
+pub fn brand_logo(appearance: Appearance) -> &'static str {
+    match appearance {
+        Appearance::Light => "brand/logo-light.png",
+        Appearance::Dark => "brand/logo-dark.png",
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Viewport {
@@ -276,6 +306,14 @@ pub fn key_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_appearance_names_the_artwork_cut_for_it() {
+        assert_eq!(brand_mark(Appearance::Light), "brand/mark-light.png");
+        assert_eq!(brand_mark(Appearance::Dark), "brand/mark-dark.png");
+        assert_eq!(brand_logo(Appearance::Light), "brand/logo-light.png");
+        assert_eq!(brand_logo(Appearance::Dark), "brand/logo-dark.png");
+    }
 
     #[test]
     fn capacity_uses_the_allocated_view_not_the_window() {
