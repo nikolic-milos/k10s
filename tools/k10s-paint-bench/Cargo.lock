@@ -2130,6 +2130,7 @@ dependencies = [
  "gpui",
  "k10s-atlas",
  "k10s-core",
+ "k10s-theme",
  "serde",
  "serde_json",
 ]
@@ -2147,6 +2148,15 @@ dependencies = [
  "k10s-map",
  "k10s-world",
  "stats_alloc",
+]
+
+[[package]]
+name = "k10s-theme"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "k10s-core",
+ "serde_json",
 ]
 
 [[package]]

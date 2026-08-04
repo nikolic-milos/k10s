@@ -1,0 +1,21 @@
+[package]
+name = "k10s-assets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+k10s-theme.workspace = true
+gpui.workspace = true
+# The eight window-control and panel SVGs this build still uses are Zed's, so
+# the asset source chains rather than forks. Keeping the fork revision pinned
+# in the workspace manifest is what makes that safe.
+zed_assets.workspace = true
+# Already in the lock via gpui, and only the PNG decoder is asked for: the
+# X11 window icon wants an RgbaImage and nothing else here decodes anything.
+image = { workspace = true }

@@ -59,6 +59,16 @@ impl BenchFrame {
     }
 }
 
+// What the hosting view still owes the driver after a frame: the gpui side
+// effects the driver cannot perform itself. Everything else -- camera,
+// pacing, reporting -- the driver has already applied.
+#[must_use]
+pub enum BenchOp {
+    Continue,
+    ArmTimer(Duration),
+    Quit,
+}
+
 fn plan(a: &FlightAnchors, vw: f32, _vh: f32) -> Vec<Segment> {
     let at = |cx: f32, cy: f32, zoom: f32| Camera { cx, cy, zoom };
     let (rx, ry) = a.region_center;
@@ -128,7 +138,45 @@ impl Bench {
         }
     }
 
-    pub fn frame(
+    // The whole flight-driving decision, out of the view: apply the frame to
+    // the camera, keep the pacer fed, and hand back only the effects that
+    // need a window context.
+    pub fn drive(
+        &mut self,
+        now: Instant,
+        vw: f32,
+        vh: f32,
+        active: bool,
+        scene: &SceneSnapshot,
+        stats: &mut FrameStats,
+        camera: &mut Camera,
+        pacer: &mut k10s_atlas::FramePacer,
+    ) -> BenchOp {
+        let frame = self.frame(now, vw, vh, active, scene, stats);
+        if frame.needs_frame() {
+            pacer.request_frame();
+        }
+        match frame {
+            BenchFrame::Waiting => BenchOp::Continue,
+            BenchFrame::Camera(cam) => {
+                *camera = cam;
+                BenchOp::Continue
+            }
+            BenchFrame::Idle {
+                camera: cam,
+                arm_timer,
+            } => {
+                *camera = cam;
+                match arm_timer {
+                    Some(delay) => BenchOp::ArmTimer(delay),
+                    None => BenchOp::Continue,
+                }
+            }
+            BenchFrame::Done => BenchOp::Quit,
+        }
+    }
+
+    fn frame(
         &mut self,
         now: Instant,
         vw: f32,

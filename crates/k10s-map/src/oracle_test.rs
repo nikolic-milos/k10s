@@ -679,6 +679,7 @@ fn sweep(scene_name: &str, scene: &SceneSnapshot) -> Vec<(&'static str, Reached)
                                         knobs,
                                         budgets: budget_name,
                                         opts: FrameOpts {
+                                            theme: &k10s_theme::K10S_DARK.map,
                                             policy: &pol,
                                             edges_on,
                                             skip_blocks,
@@ -823,6 +824,7 @@ fn oracle_matches_painter_on_degenerate_scenes() {
                                 knobs,
                                 budgets: budget_name,
                                 opts: FrameOpts {
+                                    theme: &k10s_theme::K10S_DARK.map,
                                     policy: &pol,
                                     edges_on: true,
                                     skip_blocks: false,
@@ -848,6 +850,7 @@ fn every_placement_carries_the_frame_origin() {
     let scene = snapshot(uniform_spec());
     let pol = lod::policy(Knobs::default());
     let opts = FrameOpts {
+        theme: &k10s_theme::K10S_DARK.map,
         policy: &pol,
         edges_on: true,
         skip_blocks: false,
@@ -933,6 +936,7 @@ fn painter_sink_agrees_with_tally() {
                     let pol = with_budgets(lod::policy(knobs), budgets);
                     for glow in [true, false] {
                         let opts = FrameOpts {
+                            theme: &k10s_theme::K10S_DARK.map,
                             policy: &pol,
                             edges_on: true,
                             skip_blocks: false,

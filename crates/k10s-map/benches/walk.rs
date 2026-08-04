@@ -49,6 +49,7 @@ fn viewport() -> Bounds<Pixels> {
 
 fn opts(policy: &LodPolicy) -> FrameOpts<'_> {
     FrameOpts {
+        theme: &k10s_theme::K10S_DARK.map,
         policy,
         edges_on: true,
         skip_blocks: false,
