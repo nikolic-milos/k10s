@@ -219,3 +219,35 @@ was installed, because it is the one with no compilation anywhere inside it. The
 against it as an independent check and passed all 5,040 checks — which is precisely the property the
 2026-08-02 baseline turned out not to have, and the only evidence that a recording is reproducible
 rather than a snapshot of one afternoon.
+
+## 2026-08-05: two new cases, and a keystroke that was a third of a frame
+
+`shell state` gains `map-50k index` and `map-50k keystroke`: building the
+searchable list of everything on the map, and ranking it for one keystroke, at
+51,600 objects. Only the keystroke carries the 60 Hz budget, and the split
+between the two is what the budget is for. Building walks every object and
+allocates a string per row; ranking runs while somebody is still typing. They are
+separate cases because they are separate problems, and a single number covering
+both would hide whichever one moved.
+
+The keystroke case was **5.50 ms** when first measured — inside the budget the
+gate enforces, and a third of a frame spent scanning on behalf of an answer that
+is thirty-two rows long. That is the shape of number this file exists to make
+visible: nothing was failing, and a third of a frame per keystroke is still a
+third of a frame. The mechanism was in `fuzzy_match`, which builds a character
+vector and a range vector for every candidate it looks at — a hundred thousand
+allocations per keystroke, for highlight ranges belonging to rows nobody will
+see. Scoring in one allocation-free pass and matching only the survivors took it
+to **1.57 ms**, under a tenth of a frame, with an equivalence test holding the
+two scorers together so they cannot drift into sorting a list one way and
+highlighting it another.
+
+`map-50k index` is recorded at 195 samples rather than the 97 its first
+configuration produced. The comparator compares a p99 only when the baseline
+carries at least a hundred independent samples, so a case recorded just under
+that floor has a tail number nothing checks — which is the quietest way for a
+gate to be decorative.
+
+Recorded from a clean build of the committed tree, twice, on an idle machine:
+the two runs agree to 0.7% and 0.1% on the new cases, and the run that was *not*
+installed then passed against the one that was — 5,050 checks, no failures.
