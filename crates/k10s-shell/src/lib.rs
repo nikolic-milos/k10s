@@ -37,6 +37,7 @@ pub mod launch;
 pub mod palette;
 pub mod provider;
 pub mod pty;
+pub mod reveal;
 pub mod settings;
 pub mod table;
 pub mod term;

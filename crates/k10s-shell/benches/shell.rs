@@ -21,6 +21,7 @@ use k10s_shell::files::{FilesState, read_tree};
 use k10s_shell::finder::{PickerMode, PickerState, rank, scan_root};
 use k10s_shell::fs::Fs;
 use k10s_shell::fs::fake::FakeFs;
+use k10s_shell::reveal::MapIndex;
 
 // One 60 Hz frame: what a keystroke's share of the work has to fit inside. The
 // cases a person waits on are gated against it absolutely, not only against the
@@ -34,6 +35,12 @@ const TREE_FILES: usize = 5_000;
 const FLAT_ENTRIES: usize = 2_000;
 const VIEWPORT_ROWS: usize = 60;
 const DOCUMENT: usize = 256 << 10;
+// A cluster the size §6.4 sweeps to. Search-to-navigate scans every object in
+// it per keystroke, so this is the size at which "fits in a frame" has to be
+// true rather than plausible.
+const MAP_NAMESPACES: usize = 400;
+const MAP_WORKLOADS_PER_NS: usize = 8;
+const MAP_PODS_PER_WORKLOAD: usize = 15;
 
 struct Row {
     scenario: &'static str,
@@ -189,6 +196,87 @@ fn picker(rows: &mut Vec<Row>) {
         scenario: "dir-2k",
         op: "keystroke",
         entries,
+        result: matched,
+        samples,
+    });
+}
+
+fn map_scene() -> k10s_core::SceneSnapshot {
+    use k10s_core::{NsExt, NsNode, PodExt, PodNode, Rect, Severity, State, WlExt, WorkloadNode};
+    use std::sync::Arc;
+
+    let mut snap = k10s_core::SceneSnapshot::default();
+    let ids = Arc::make_mut(&mut snap.ids);
+    for namespace in 0..MAP_NAMESPACES {
+        let first_block = snap.scene.blocks.len() as u32;
+        for workload in 0..MAP_WORKLOADS_PER_NS {
+            let first_cell = snap.scene.cells.len() as u32;
+            for pod in 0..MAP_PODS_PER_WORKLOAD {
+                snap.scene.cells.push(PodNode {
+                    rect: Rect::new(0.0, 0.0, 8.0, 8.0),
+                    label: Arc::from(format!("checkout-{workload}-{pod}")),
+                    ext: PodExt { state: State::OK },
+                });
+                ids.cells
+                    .push(Arc::from(format!("pod-{namespace}-{workload}-{pod}")));
+            }
+            snap.scene.blocks.push(WorkloadNode {
+                rect: Rect::new(0.0, 0.0, 60.0, 40.0),
+                inner: Rect::new(2.0, 2.0, 56.0, 36.0),
+                label: Arc::from(format!("checkout-{workload}")),
+                children: first_cell..snap.scene.cells.len() as u32,
+                sats: 0..0,
+                ext: WlExt {
+                    kind: k10s_core::KindId::DEPLOYMENT,
+                    tool: k10s_core::ToolId::NONE,
+                    rollup: Severity::Ok,
+                    ns: namespace as u32,
+                },
+            });
+            ids.blocks
+                .push(Arc::from(format!("wl-{namespace}-{workload}")));
+        }
+        snap.scene.regions.push(NsNode {
+            rect: Rect::new(0.0, 0.0, 400.0, 300.0),
+            label: Arc::from(format!("team-{namespace}")),
+            weight: 0,
+            children: first_block..snap.scene.blocks.len() as u32,
+            ext: NsExt {
+                unhealthy_frac: 0.0,
+                rollup: Severity::Ok,
+            },
+        });
+        ids.regions.push(Arc::from(format!("ns-{namespace}")));
+    }
+    snap
+}
+
+fn map_search(rows: &mut Vec<Row>) {
+    let scene = map_scene();
+    let mut built = 0usize;
+    let samples = measure(SLOW, || {
+        built = MapIndex::build(&scene).candidates().len();
+    });
+    rows.push(Row {
+        scenario: "map-50k",
+        op: "index",
+        entries: built,
+        result: built,
+        samples,
+    });
+
+    let index = MapIndex::build(&scene);
+    // A query that matches deep into the label rather than at its start: the
+    // cheap answer is a prefix test, and benching one would measure the case
+    // that never happens while a person is still typing.
+    let mut matched = 0usize;
+    let samples = measure(FAST, || {
+        matched = index.rank("team7checkout3", 32).len();
+    });
+    rows.push(Row {
+        scenario: "map-50k",
+        op: "keystroke",
+        entries: index.candidates().len(),
         result: matched,
         samples,
     });
@@ -368,6 +456,7 @@ fn main() {
     file_tree(&mut rows);
     picker(&mut rows);
     finder(&mut rows);
+    map_search(&mut rows);
     viewport(&mut rows);
     diff_view(&mut rows);
     if json {
