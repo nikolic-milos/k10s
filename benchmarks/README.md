@@ -169,3 +169,53 @@ The consequence is stated in ROADMAP §8: until these six cases are re-recorded 
 gate is conservative by 7–23% on them, so a future regression back to the old numbers would pass.
 Re-record them, from a clean build, before trusting the `editor edit` suite to catch a diff
 regression again.
+
+## 2026-08-05: those six cases re-recorded from a commit, plus four the diff moved without touching
+
+The note above ends by saying re-record these before trusting the `editor edit` suite again. That is
+what this is. The change set it was measuring is now three commits — the G2 follow-ons, the Helm read
+path, and the seam work — and the tree was clean at `71fabb3` when both collections were taken, which
+is the provenance the previous recording lacked and the whole reason it was withheld.
+
+Ten cases move. Six are the diff, and the numbers land where the working-tree measurement said they
+would:
+
+| case | baseline | recorded | ratio | rows |
+| --- | --- | --- | --- | --- |
+| 16k diff-three-way | 100.4 µs | 93.3 µs | 0.93x | 521 = 521 |
+| 256k diff-three-way | 1.648 ms | 1.493 ms | 0.91x | 7,886 = 7,886 |
+| 1m diff-three-way | 6.162 ms | 5.572 ms | 0.90x | 31,291 = 31,291 |
+| 16k diff-two-way | 57.6 µs | 44.5 µs | 0.77x | 519 = 519 |
+| 256k diff-two-way | 922.5 µs | 699.9 µs | 0.76x | 7,884 = 7,884 |
+| 1m diff-two-way | 3.381 ms | 2.617 ms | 0.77x | 31,289 = 31,289 |
+
+The other four are the whole `cursor-context` family — 256k 387.1 → 362.9 µs, 1m 1.545 → 1.433 ms,
+json-16k 198.0 → 191.3 µs, json-256k 3.228 → 3.125 ms — and **nothing on that path changed.**
+`context_at` calls none of the diff code. This is the third recorded instance of the effect the
+2026-08-03 section is about: `k10s-edit` is one codegen unit under the pinned `codegen-units = 1`, so
+rewriting `diff.rs` re-laid out instructions in a crate-mate that never calls it. Last time the same
+mechanism moved this same case 12% the *other* way and was recorded rather than chased. It is
+recorded here for the symmetric reason: an improvement that is not recorded means a regression back
+to the old number passes, and 8% of headroom nobody earned is 8% of regression nobody would see.
+
+What was deliberately **not** re-recorded, and why, because a refresh is only as honest as what it
+leaves alone. `world fan-out cull` `platform/12000/63/200` at the Z0 fit camera reports 121.8 ns
+against a recorded 134.7 ns — in both collections, to the tenth of a nanosecond, so it is not wobble.
+It is also not explicable: nothing in `k10s-world` or `k10s-atlas` changed, and neither depends on
+`k10s-edit`. The likeliest reading is that the *baseline* for that one case was recorded high, which
+is the failure mode this file has already documented twice. A gate that is conservative by 9.5% on
+one case accepts a regression it should catch; a baseline refreshed on a number nobody can explain
+accepts something worse. It stays, named here, until a mechanism or a third independent collection
+settles it. `atlas fan-out` `E/padded/5000` and `/10000` moved 13% in the second collection and
+0.1% in the first, at 34 ns, which is the nanosecond-scale wobble the ratio-plus-absolute-slack gate
+exists to absorb; they are unchanged.
+
+Method, since the two dirty-baseline incidents both came from skipping a step. Every bench binary was
+pre-built first, then two full collections were taken on an otherwise idle machine — no subagents, no
+compilation during either — with sixty seconds of settle between them. The two agree within 0.5% to
+2.2% per case with p50 rMAD between 0.003 and 0.012, and every re-recorded case carries at least 100
+independent samples, so the p99s are gated rather than merely reported. The second collection is what
+was installed, because it is the one with no compilation anywhere inside it. The first was then run
+against it as an independent check and passed all 5,040 checks — which is precisely the property the
+2026-08-02 baseline turned out not to have, and the only evidence that a recording is reproducible
+rather than a snapshot of one afternoon.
