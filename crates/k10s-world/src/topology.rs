@@ -187,6 +187,7 @@ pub(super) fn apply_events(world: &mut World, events: &[IngestEvent], mode: Layo
         );
     }
     rebuild_selective(&mut topology, &dirt);
+    fit_after_departures(&mut topology, &dirt, mode);
     topology.spatial_revision += 1;
     if dirt.identity {
         topology.identity_revision += 1;
@@ -237,6 +238,10 @@ pub(super) fn apply_events(world: &mut World, events: &[IngestEvent], mode: Layo
 #[derive(Default)]
 struct BatchDirt {
     identity: bool,
+    // Something left a parent, so a parent may now be bigger than its contents.
+    // Separate from `wl_pod` because arrivals never need the fitting pass and
+    // adding one object is the path this engine is measured on.
+    shrank: bool,
     ns_wl: bool,
     wl_pod: bool,
     wl_sat: bool,
@@ -545,6 +550,9 @@ fn upsert_pod(
     {
         dirt.wls.push(old_workload);
         dirt.nss.push(topology.wl_ns[old_workload as usize]);
+        // A move is a departure from where it was, so the card it left may now
+        // be bigger than what remains in it.
+        dirt.shrank = true;
     }
     if inserted || moved {
         dirt.wl_pod = true;
@@ -710,6 +718,7 @@ fn remove_pod(
     if let Some(slot) = topology.pod_slots.remove(uid) {
         dirt.identity = true;
         dirt.wl_pod = true;
+        dirt.shrank = true;
         dirt.pods.push(slot);
         let index = slot as usize;
         let workload = topology.pod_wl[index];
@@ -732,6 +741,7 @@ fn remove_satellite(topology: &mut Topology, dirt: &mut BatchDirt, uid: &str) {
     if let Some(slot) = topology.sat_slots.remove(uid) {
         dirt.identity = true;
         dirt.wl_sat = true;
+        dirt.shrank = true;
         dirt.sats.push(slot);
         let index = slot as usize;
         topology.sat_labels[index] = Arc::from("");
@@ -983,6 +993,130 @@ fn place_satellite(topology: &mut Topology, slot: u32, workload: u32) -> Rect {
         }
         position += 1;
     }
+}
+
+// One parent's children, through whichever form the adjacency took.
+//
+// `Adjacency::build` drops the index vector when every parent's children are
+// already contiguous and in order, so an empty `indices` is not an empty scene --
+// it means the range *is* the answer. Reading the range without checking would
+// silently visit nothing on exactly the scenes that are cheapest to lay out.
+fn children(ranges: &[Range<u32>], indices: &[u32], parent: usize) -> Vec<usize> {
+    let Some(range) = ranges.get(parent) else {
+        return Vec::new();
+    };
+    let (start, end) = (range.start as usize, range.end as usize);
+    if indices.is_empty() {
+        return (start..end).collect();
+    }
+    let end = end.min(indices.len());
+    if start >= end {
+        return Vec::new();
+    }
+    indices[start..end].iter().map(|&at| at as usize).collect()
+}
+
+// Bring parents back down to what is actually in them.
+//
+// `grow_workload` and `grow_namespace` are the arriving half, and only growing is
+// right there: a pod must be visible the frame it appears, and a card that grew
+// to hold it has to stay grown while it is there. Nothing was ever the leaving
+// half, so a Deployment scaled to eighty and back to eight kept the card it
+// needed at eighty -- which is the first thing anyone notices on a real cluster,
+// and was noticed on one.
+//
+// Three rules make this safe against the property the whole layout exists for:
+//
+//  - a parent never shrinks below the union of what it still holds, so a child
+//    that kept its position can never be clipped by its parent shrinking. Keeping
+//    positions is the point; moving them is the reshuffle;
+//  - no sibling is repositioned. A shrunk card leaves a gap, and the gap stays
+//    until something is placed in it. A layout that closed gaps would move things
+//    nobody touched, which is exactly what must not happen;
+//  - and it runs only when something departed. Arrivals are the measured path,
+//    and they pay nothing for this.
+//
+// Cost is proportional to the change and not to the scene, because it runs after
+// `rebuild_selective` and reads the adjacency that just rebuilt: a workload costs
+// its own pods and satellites, a namespace its own workloads. Only the world
+// bounds are O(namespaces), which is the term §6.1 already budgets at Z0.
+fn fit_after_departures(topology: &mut Topology, dirt: &BatchDirt, mode: LayoutMode) {
+    if !dirt.shrank {
+        return;
+    }
+    let (pad, header) = match mode {
+        LayoutMode::Spread => (CARD_PAD, CARD_HEADER),
+        LayoutMode::Dense => (WL_PAD, WL_HEADER),
+    };
+
+    let mut workloads: Vec<u32> = dirt.wls.clone();
+    workloads.sort_unstable();
+    workloads.dedup();
+    for workload in workloads {
+        let index = workload as usize;
+        if !topology.wl_slots.is_active(index) {
+            continue;
+        }
+        let card = topology.wl_card_rects[index];
+        // An empty card keeps the size a single pod would need, so a workload
+        // that lost every pod does not collapse to a sliver and then jump back.
+        let mut fitted = Rect::new(
+            card.x,
+            card.y,
+            POD_SIZE + pad * 2.0,
+            POD_SIZE + pad * 2.0 + header,
+        );
+        for pod in children(&topology.wl_pod_range, &topology.block_cells, index) {
+            let rect = topology.pod_rects[pod];
+            fitted.w = fitted.w.max(rect.max_x() - card.x + pad);
+            fitted.h = fitted.h.max(rect.max_y() - card.y + pad);
+        }
+        topology.wl_card_rects[index] = fitted;
+        // The halo is the card and whatever orbits it. Satellites were placed on
+        // a ring sized by the card they had at the time and they keep those
+        // positions, so the halo must still contain them.
+        let mut halo = fitted;
+        for sat in children(&topology.wl_sat_range, &topology.block_sats, index) {
+            halo = rect_union(halo, topology.sat_rects[sat]);
+        }
+        topology.wl_rects[index] = halo;
+    }
+
+    let mut namespaces: Vec<u32> = dirt.nss.clone();
+    namespaces.sort_unstable();
+    namespaces.dedup();
+    for namespace in namespaces {
+        let index = namespace as usize;
+        if !topology.ns_slots.is_active(index) {
+            continue;
+        }
+        let region = topology.ns_rects[index];
+        let mut fitted = Rect::new(
+            region.x,
+            region.y,
+            NS_PAD * 2.0 + POD_SIZE + pad * 2.0,
+            NS_PAD * 2.0 + NS_HEADER + POD_SIZE + header + pad * 2.0,
+        );
+        for workload in children(&topology.ns_wl_range, &topology.region_blocks, index) {
+            let rect = topology.wl_rects[workload];
+            fitted.w = fitted.w.max(rect.max_x() - region.x + NS_PAD);
+            fitted.h = fitted.h.max(rect.max_y() - region.y + NS_PAD);
+        }
+        topology.ns_rects[index] = fitted;
+    }
+
+    // And the world, which the roadmap has carried as "bounds never shrink"
+    // since before there was anything to shrink them for.
+    let mut bounds = Rect::new(topology.bounds.x, topology.bounds.y, 0.0, 0.0);
+    for index in 0..topology.ns_slots.slots() {
+        if !topology.ns_slots.is_active(index) {
+            continue;
+        }
+        let rect = topology.ns_rects[index];
+        bounds.w = bounds.w.max(rect.max_x() - bounds.x);
+        bounds.h = bounds.h.max(rect.max_y() - bounds.y);
+    }
+    topology.bounds = bounds;
 }
 
 fn grow_workload(topology: &mut Topology, workload: u32, child: Rect, pad: f32) {
