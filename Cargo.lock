@@ -3631,7 +3631,9 @@ dependencies = [
 name = "k10s-data"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "crossbeam-channel",
+ "flate2",
  "futures",
  "http",
  "http-body-util",

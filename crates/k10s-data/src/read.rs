@@ -22,6 +22,7 @@ use crate::describe::{self, DescribeRequest, Described};
 use crate::discover::KindTarget;
 use crate::exec::{ExecEvent, ExecRequest, ExecSession, ExecTransport, KubeExecTransport};
 use crate::forward::{self, ForwardRegistry, ForwardRequest, ForwardRow, KubeForwarder};
+use crate::helm;
 use crate::logs::{self, LogChunk, LogRequest, LogStop};
 use crate::manifest;
 use crate::nodes;
@@ -238,6 +239,22 @@ impl Reader {
         let pod = pod.to_string();
         self.handle.spawn(async move {
             reply(logs::fetch_containers(&client, &namespace, &pod).await);
+        });
+    }
+
+    // Helm's own release state, read out of the Secrets it writes: nothing
+    // installed, nothing templated, and the narrowest list the server will serve
+    // -- `type=helm.sh/release.v1` and `owner=helm` -- so no Secret that is not a
+    // release ever crosses the wire.
+    pub fn fetch_releases(
+        &self,
+        namespace: Option<String>,
+        reply: impl FnOnce(Fetched<helm::Releases>) + Send + 'static,
+    ) {
+        let client = self.client.clone();
+        let targets = self.targets.clone();
+        self.handle.spawn(async move {
+            reply(helm::fetch_releases(&client, &targets, namespace.as_deref()).await);
         });
     }
 

@@ -19,6 +19,7 @@ pub mod describe;
 pub mod discover;
 pub mod exec;
 pub mod forward;
+pub mod helm;
 pub mod inspect;
 pub mod logs;
 pub mod manifest;

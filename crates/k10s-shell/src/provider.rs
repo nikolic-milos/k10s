@@ -356,6 +356,10 @@ pub trait ReadProvider {
     fn fetch_table(&self, kind: KindId, continue_token: Option<String>, reply: Reply<TableOutcome>);
     fn fetch_node_table(&self, reply: Reply<TableOutcome>);
     fn fetch_describe(&self, request: &DescribeRequest, reply: Reply<DocOutcome>);
+    // Helm's stored releases, as a document. Rendered on the far side of the seam
+    // like a describe is, for the same reason: one deterministic rendering a test
+    // can gate, and a shell that holds no release payload of its own.
+    fn fetch_releases(&self, reply: Reply<DocOutcome>);
     fn fetch_manifest(&self, request: &DescribeRequest, reply: Reply<ManifestOutcome>);
     // The one mutating method on the seam. Dry run and apply differ by one
     // field of the request, so a caller cannot reach the second without being
@@ -412,6 +416,10 @@ impl ReadProvider for NullProvider {
     }
 
     fn fetch_describe(&self, _: &DescribeRequest, reply: Reply<DocOutcome>) {
+        reply(DocOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_releases(&self, reply: Reply<DocOutcome>) {
         reply(DocOutcome::Failed(NO_CLUSTER.to_string()));
     }
 
@@ -535,6 +543,10 @@ impl ReadProvider for ProviderSlot {
 
     fn fetch_describe(&self, request: &DescribeRequest, reply: Reply<DocOutcome>) {
         self.get().fetch_describe(request, reply);
+    }
+
+    fn fetch_releases(&self, reply: Reply<DocOutcome>) {
+        self.get().fetch_releases(reply);
     }
 
     fn fetch_manifest(&self, request: &DescribeRequest, reply: Reply<ManifestOutcome>) {

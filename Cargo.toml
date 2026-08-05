@@ -85,6 +85,12 @@ streaming-iterator = "0.1"
 unicode-segmentation = "1"
 
 http = "1"
+# Both already in the lock through kube -- base64 for its own credential
+# handling, flate2 behind its gzip feature -- so reading Helm's release Secrets
+# costs the dependency budget nothing. Helm gzips its release JSON and base64s
+# the result, and neither layer is something to hand-roll.
+base64 = "0.22"
+flate2 = "1.1"
 kube = { version = "4.0", features = [
     "runtime",
     "oidc",

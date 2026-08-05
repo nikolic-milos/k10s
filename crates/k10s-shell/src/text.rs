@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::provider::{
     ContainersOutcome, DescribeRequest, DocOutcome, LogChunk, LogRequest, LogStop, ReadProvider,
-    WorkloadLogRequest,
+    Reply, WorkloadLogRequest,
 };
 use crate::ui::{CONTENT_PADDING, PANEL_HEADER_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
@@ -321,6 +321,10 @@ pub fn strip_timestamp(line: &str) -> &str {
 
 enum Source {
     Doc(DescribeRequest),
+    // Helm's stored releases. A document rather than a list view because that is
+    // what it is: an inventory with a history under each entry, read-only, with
+    // the same scrolling and regex search every other document here has.
+    Releases,
     Logs(LogSource),
 }
 
@@ -366,6 +370,24 @@ impl TextView {
             title: format!("describe {}", request.name).into(),
             state: TextState::new(usize::MAX),
             source: Source::Doc(request),
+            status: Some("loading...".to_string()),
+            searching: false,
+            input: String::new(),
+            show_timestamps: true,
+            generation: 0,
+            viewport: Viewport::default(),
+        };
+        view.reload(cx);
+        view
+    }
+
+    pub fn releases(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> TextView {
+        let mut view = TextView {
+            focus: cx.focus_handle(),
+            provider,
+            title: "helm releases".into(),
+            state: TextState::new(usize::MAX),
+            source: Source::Releases,
             status: Some("loading...".to_string()),
             searching: false,
             input: String::new(),
@@ -448,45 +470,47 @@ impl TextView {
         self.focus.clone()
     }
 
+    // Both documents this view can hold arrive the same way and are shown the
+    // same way; only the question differs, which is why the two live in one
+    // branch rather than in two copies of the spawn below.
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let reply: Reply<DocOutcome> = Box::new(move |outcome| {
+            let _ = tx.send(outcome);
+        });
         match &self.source {
-            Source::Doc(request) => {
-                self.status = Some("loading...".to_string());
-                let (tx, rx) = futures::channel::oneshot::channel();
-                self.provider.fetch_describe(
-                    request,
-                    Box::new(move |outcome| {
-                        let _ = tx.send(outcome);
-                    }),
-                );
-                cx.spawn(async move |this, cx| {
-                    if let Ok(outcome) = rx.await {
-                        let _ = this.update(cx, |this, cx| {
-                            if this.generation != generation {
-                                return;
-                            }
-                            match outcome {
-                                DocOutcome::Doc { title, lines } => {
-                                    this.title = title.into();
-                                    this.state.set_lines(lines);
-                                    this.status = None;
-                                }
-                                DocOutcome::Denied(what) => {
-                                    this.status =
-                                        Some(format!("{what}: access denied for this account"));
-                                }
-                                DocOutcome::Failed(why) => this.status = Some(why),
-                            }
-                            cx.notify();
-                        });
-                    }
-                })
-                .detach();
+            Source::Doc(request) => self.provider.fetch_describe(request, reply),
+            Source::Releases => self.provider.fetch_releases(reply),
+            Source::Logs(_) => {
+                self.start_follow(cx);
+                return;
             }
-            Source::Logs(_) => self.start_follow(cx),
         }
+        self.status = Some("loading...".to_string());
+        cx.spawn(async move |this, cx| {
+            if let Ok(outcome) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return;
+                    }
+                    match outcome {
+                        DocOutcome::Doc { title, lines } => {
+                            this.title = title.into();
+                            this.state.set_lines(lines);
+                            this.status = None;
+                        }
+                        DocOutcome::Denied(what) => {
+                            this.status = Some(format!("{what}: access denied for this account"));
+                        }
+                        DocOutcome::Failed(why) => this.status = Some(why),
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn resolve_containers(&mut self, cx: &mut Context<Self>) {
