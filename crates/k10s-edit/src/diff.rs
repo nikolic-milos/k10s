@@ -18,12 +18,28 @@
 //! and labelled [`Diff::coarse`]: never aligned wrongly, and never allowed to
 //! take a frame.
 //!
+//! There is a fourth classification because three were not honest. A region the
+//! base says *nothing* about, where the cluster and the buffer each hold
+//! something, is literally a conflict -- and reading it as one implies a refusal
+//! the server has not made. The ordinary reason a base declares nothing about a
+//! field is that nobody declared it and the server defaulted it, so
+//! [`Origin::Undeclared`] says that instead, and leaves the question of what an
+//! apply does there to the dry run, which is the only thing that can answer it.
+//!
 //! A [`Row`] is twelve bytes and carries a byte range into its own side rather
 //! than a copied line, so the diff of a megabyte is a vector rather than a
 //! second copy of the document, and only the visible rows are ever composed
 //! into runs. It held a line number too, until nothing was found to be reading
 //! it: at the 196,608-row ceiling that field was 786 KB of answers to a
 //! question no caller asks.
+//!
+//! A [`Hunk`] carries one thing its rows cannot supply: the span it covers on
+//! the *buffer* side, positioned even when the buffer has no lines there. That
+//! is what makes [`keep_theirs`] possible -- taking the cluster's side of one
+//! hunk is an edit to the buffer, and text only the cluster has still has a
+//! place in the buffer where it belongs. Summing row lengths afterwards would
+//! have derived the same number until the two sides spelled a line ending
+//! differently, and then it would have spliced at the wrong byte.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -74,6 +90,16 @@ pub enum Origin {
     Theirs,
     /// Cluster and buffer both moved away from the base, differently.
     Conflict,
+    /// Cluster and buffer differ where the base declared nothing at all.
+    ///
+    /// Strictly this is a conflict -- neither side's text was ever declared --
+    /// and labelling it one reads as a refusal the server has not made. The
+    /// usual reason a last-applied document is silent about a field is that
+    /// nobody declared it and the server defaulted it. Without `managedFields`
+    /// no client can say what an apply does to a field it never declared, which
+    /// is precisely why the dry run is the authoritative half of the review, so
+    /// this label says what is true and defers the rest to it.
+    Undeclared,
 }
 
 /// One rendered line: which document it came from, what class of change it
@@ -99,6 +125,18 @@ impl Row {
 pub struct Hunk {
     pub origin: Origin,
     pub rows: Range<usize>,
+    buffer_start: u32,
+    buffer_end: u32,
+}
+
+impl Hunk {
+    /// The bytes of the buffer this hunk covers -- empty, but *positioned*, when
+    /// the buffer has no lines here. An edit that takes the cluster's side of a
+    /// hunk the buffer is missing entirely has to know where the missing lines
+    /// belong, and the answer is a line boundary rather than nothing.
+    pub fn buffer(&self) -> Range<usize> {
+        self.buffer_start as usize..self.buffer_end as usize
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -106,6 +144,10 @@ pub struct Counts {
     pub mine: u32,
     pub theirs: u32,
     pub conflict: u32,
+    /// Hunks the base declared nothing about. Counted apart from `conflict`
+    /// because a summary that folds them together reports a refusal that is not
+    /// coming.
+    pub undeclared: u32,
     /// Buffer lines inside changed hunks: what the apply would add.
     pub added: u32,
     /// Live lines inside changed hunks: what the apply would replace.
@@ -161,7 +203,8 @@ impl Diff {
         if let Some(reason) = self.refused {
             return Verdict::Refused(reason);
         }
-        if self.counts.mine + self.counts.theirs + self.counts.conflict > 0 {
+        if self.counts.mine + self.counts.theirs + self.counts.conflict + self.counts.undeclared > 0
+        {
             return Verdict::Differs;
         }
         Verdict::Agreed
@@ -244,10 +287,12 @@ pub fn three_way(sides: Sides<'_>) -> Diff {
 
     let mut build = Build {
         rows: Vec::new(),
+        hunks: Vec::new(),
         counts: Counts::default(),
         base: &base_lines,
         live: live_lines,
         buffer: &buffer_lines,
+        buffer_bytes: sides.buffer.len() as u32,
     };
 
     let mut base_at = 0usize;
@@ -259,6 +304,7 @@ pub fn three_way(sides: Sides<'_>) -> Diff {
             if at as usize != base_at || live as usize != live_at || buffer as usize != buffer_at {
                 break;
             }
+            build.open(Origin::Common, buffer_at..buffer_at + 1);
             build.push(Side::Live, Origin::Common, live_at);
             base_at += 1;
             live_at += 1;
@@ -288,6 +334,12 @@ pub fn three_way(sides: Sides<'_>) -> Diff {
             &live_ids[live_at..live_end],
             &buffer_ids[buffer_at..buffer_end],
         );
+        // A region both sides removed is agreement with nothing to show: the
+        // live run is empty, so no row is pushed for it, and a hunk opened for
+        // it would be the one empty hunk in an otherwise row-backed list.
+        if origin != Origin::Common || live_at < live_end {
+            build.open(origin, buffer_at..buffer_end);
+        }
         match origin {
             Origin::Common => {
                 for line in live_at..live_end {
@@ -299,7 +351,9 @@ pub fn three_way(sides: Sides<'_>) -> Diff {
                 build.region(Side::Base, origin, base_at..base_end);
                 build.region(Side::Buffer, origin, buffer_at..buffer_end);
             }
-            Origin::Mine | Origin::Theirs => {
+            // The base is what is empty in an undeclared region, so there is no
+            // base row to show and it renders like the two-sided ones.
+            Origin::Mine | Origin::Theirs | Origin::Undeclared => {
                 build.region(Side::Live, origin, live_at..live_end);
                 build.region(Side::Buffer, origin, buffer_at..buffer_end);
             }
@@ -309,10 +363,9 @@ pub fn three_way(sides: Sides<'_>) -> Diff {
         buffer_at = buffer_end;
     }
 
-    let hunks = group(&build.rows);
     Diff {
         rows: build.rows,
-        hunks,
+        hunks: build.hunks,
         counts: build.counts,
         two_way,
         coarse,
@@ -331,13 +384,49 @@ fn refused(two_way: bool, reason: &'static str) -> Diff {
 
 struct Build<'a> {
     rows: Vec<Row>,
+    hunks: Vec<Hunk>,
     counts: Counts,
     base: &'a [Line],
     live: &'a [Line],
     buffer: &'a [Line],
+    buffer_bytes: u32,
 }
 
 impl Build<'_> {
+    // Open the hunk the rows about to be pushed belong to, or extend the one
+    // already open when it shares their origin. Hunks are built here rather than
+    // grouped out of the finished rows afterwards because this is the only place
+    // that knows the buffer coordinate: a region with no buffer rows in it has
+    // no trace of the buffer left in its rows, and its place in the buffer is
+    // what an edit taking the cluster's side of it needs.
+    fn open(&mut self, origin: Origin, buffer_lines: Range<usize>) {
+        let span = self.buffer_span(buffer_lines);
+        match self.hunks.last_mut() {
+            Some(hunk) if hunk.origin == origin => hunk.buffer_end = hunk.buffer_end.max(span.end),
+            _ => self.hunks.push(Hunk {
+                origin,
+                rows: self.rows.len()..self.rows.len(),
+                buffer_start: span.start,
+                buffer_end: span.end,
+            }),
+        }
+    }
+
+    // Byte bounds for a run of buffer lines. An empty run still has a place: the
+    // start of the line that follows it, which is a line boundary, or the end of
+    // the document when nothing follows.
+    fn buffer_span(&self, lines: Range<usize>) -> Range<u32> {
+        match self.buffer.get(lines.clone()) {
+            Some([first, .., last]) => first.start..last.end,
+            Some([only]) => only.start..only.end,
+            // Empty, or -- for a run that starts past the last line -- absent.
+            _ => match self.buffer.get(lines.start) {
+                Some(next) => next.start..next.start,
+                None => self.buffer_bytes..self.buffer_bytes,
+            },
+        }
+    }
+
     fn push(&mut self, side: Side, origin: Origin, line: usize) {
         let lines = match side {
             Side::Base => self.base,
@@ -351,6 +440,16 @@ impl Build<'_> {
             start: bounds.start,
             end: bounds.end,
         });
+        match self.hunks.last_mut() {
+            Some(hunk) => {
+                debug_assert_eq!(
+                    hunk.origin, origin,
+                    "every row belongs to the hunk opened for it"
+                );
+                hunk.rows.end = self.rows.len();
+            }
+            None => debug_assert!(false, "a row is pushed into an opened hunk"),
+        }
     }
 
     fn region(&mut self, side: Side, origin: Origin, lines: Range<usize>) {
@@ -364,6 +463,7 @@ impl Build<'_> {
                 Origin::Mine => self.counts.mine += 1,
                 Origin::Theirs => self.counts.theirs += 1,
                 Origin::Conflict => self.counts.conflict += 1,
+                Origin::Undeclared => self.counts.undeclared += 1,
                 Origin::Common => {}
             }
         }
@@ -381,25 +481,109 @@ fn classify(base: &[u32], live: &[u32], buffer: &[u32]) -> Origin {
     let buffer_changed = buffer != base;
     match (live_changed, buffer_changed) {
         (false, false) => Origin::Common,
+        // The base and the cluster agree there is nothing here and the buffer
+        // added something: an edit, whatever the base is.
         (false, true) => Origin::Mine,
-        (true, false) => Origin::Theirs,
         (true, true) if live == buffer => Origin::Common,
+        // A base with nothing here did not lose an argument: the ordinary reason
+        // it is silent is that nobody declared the field and the server filled
+        // it in. Calling that a conflict promises a refusal the server has not
+        // made -- and the dry run, not this alignment, is what can say otherwise.
+        //
+        // This covers *both* remaining shapes, which is the correction a reviewer
+        // found: the buffer holding different text, and the buffer holding none.
+        // The second one used to be `Theirs`, whose label says "the cluster
+        // changed this; applying reverts it" -- and an apply does not revert a
+        // field this client never declared, so that was the same false promise
+        // one arm over.
+        (true, _) if base.is_empty() => Origin::Undeclared,
+        (true, false) => Origin::Theirs,
         (true, true) => Origin::Conflict,
     }
 }
 
-fn group(rows: &[Row]) -> Vec<Hunk> {
-    let mut hunks: Vec<Hunk> = Vec::new();
-    for (at, row) in rows.iter().enumerate() {
-        match hunks.last_mut() {
-            Some(hunk) if hunk.origin == row.origin => hunk.rows.end = at + 1,
-            _ => hunks.push(Hunk {
-                origin: row.origin,
-                rows: at..at + 1,
-            }),
-        }
+/// The buffer edit that makes one hunk read the way the cluster reads it: which
+/// bytes of the buffer to replace, and with what.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keep {
+    pub range: Range<usize>,
+    pub text: String,
+    /// Lines taken from the cluster's document, and lines of the buffer they
+    /// replace, so a view can say what it did rather than that something
+    /// happened.
+    pub taken: usize,
+    pub dropped: usize,
+}
+
+/// The edit that keeps the cluster's side of one hunk, or None when there is
+/// nothing to keep: no such hunk, or one the three documents agree about.
+///
+/// This is the acting half of the three-way classification. Naming drift an
+/// apply would revert is only half an answer if the only way to keep it is to
+/// retype it, and the ranges to do it with are already here -- the hunk's rows
+/// on the cluster's side, and the hunk's own span on the buffer's.
+///
+/// The replacement is composed line by line from the cluster's rows rather than
+/// sliced whole out of the live document, so a line ending spelled differently
+/// on the two sides stays on its own side instead of being pasted into the
+/// buffer. Where the buffer has no lines at all the span is empty but placed at
+/// a line boundary, and the inserted text carries the terminator that boundary
+/// implies; where the cluster has none, the buffer's terminator goes with the
+/// text it terminated, or the deletion would leave the blank line behind.
+pub fn keep_theirs(diff: &Diff, hunk: usize, live: &str, buffer: &str) -> Option<Keep> {
+    let hunk = diff.hunks.get(hunk)?;
+    if hunk.origin == Origin::Common {
+        return None;
     }
-    hunks
+    let rows = diff.rows.get(hunk.rows.clone())?;
+    let taken: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.side == Side::Live)
+        .map(|row| live.get(row.bytes()).unwrap_or(""))
+        .collect();
+    let dropped = rows.iter().filter(|row| row.side == Side::Buffer).count();
+    let mut range = hunk.buffer();
+    let ending = line_ending(buffer, range.start);
+    let mut text = taken.join(ending);
+    if taken.is_empty() {
+        range.end += terminator(buffer, range.end);
+    // Whether the buffer has lines here, which is *not* the same question as
+    // whether its span is empty: a blank line's bytes are empty too, so a run of
+    // one blank line spans zero bytes at a real position. Discriminating on the
+    // span appended a terminator the blank line already had, and left it behind.
+    } else if dropped == 0 {
+        // Appending to a document whose last line has no terminator needs one
+        // first, or the two lines arrive spliced into one.
+        if range.start == buffer.len() && !buffer.is_empty() && !buffer.ends_with('\n') {
+            text.insert_str(0, ending);
+        }
+        text.push_str(ending);
+    }
+    Some(Keep {
+        range,
+        text,
+        taken: taken.len(),
+        dropped,
+    })
+}
+
+// How the line before `at` was terminated, so an edit spells its own line
+// endings the way the document around it does rather than the way the cluster's
+// emitter does.
+fn line_ending(text: &str, at: usize) -> &'static str {
+    match text.get(..at) {
+        Some(before) if before.ends_with("\r\n") => "\r\n",
+        _ => "\n",
+    }
+}
+
+// The one line terminator at `at`, in bytes, if that is what is there.
+fn terminator(text: &str, at: usize) -> usize {
+    match text.get(at..) {
+        Some(rest) if rest.starts_with("\r\n") => 2,
+        Some(rest) => usize::from(rest.starts_with('\n')),
+        None => 0,
+    }
 }
 
 // An empty document has no opinion about its own last byte, so it never
@@ -988,6 +1172,81 @@ mod tests {
         );
     }
 
+    // Both sides hold something the last apply never declared. It is a conflict
+    // by the letter of the classification and reads as a refusal the server has
+    // not made: the base is usually silent because the value was defaulted, not
+    // because anybody claimed it.
+    #[test]
+    fn a_region_the_base_never_declared_is_not_called_a_conflict() {
+        let base = "kind: Pod\nz: 1\n";
+        let live = "kind: Pod\nimagePullPolicy: Always\nz: 1\n";
+        let buffer = "kind: Pod\nimagePullPolicy: IfNotPresent\nz: 1\n";
+        let diff = three_way(Sides {
+            base: Some(base),
+            live,
+            buffer,
+        });
+        assert_eq!(diff.counts.undeclared, 1);
+        assert_eq!(diff.counts.conflict, 0, "no refusal is being promised");
+        assert_eq!(diff.counts.mine, 0);
+        assert_eq!(diff.counts.theirs, 0);
+        assert_eq!(diff.verdict(), Verdict::Differs);
+        let origins: Vec<Origin> = diff.hunks.iter().map(|hunk| hunk.origin).collect();
+        assert_eq!(
+            origins,
+            vec![Origin::Common, Origin::Undeclared, Origin::Common]
+        );
+        assert_eq!(
+            text_of(base, &diff.rows, Side::Base),
+            Vec::<String>::new(),
+            "there is no base row to show: the base is what is empty"
+        );
+
+        // And the shape a reviewer found: the buffer deletes the defaulted line
+        // instead of retyping it, so only the cluster holds text here. That used
+        // to be `Theirs` -- "the cluster changed this; applying reverts it" --
+        // which is the same false promise one arm over: an apply does not revert
+        // a field this client never declared.
+        let deleted = "kind: Pod\nz: 1\n";
+        let diff = three_way(Sides {
+            base: Some(base),
+            live,
+            buffer: deleted,
+        });
+        assert_eq!(diff.counts.undeclared, 1);
+        assert_eq!(
+            diff.counts.theirs, 0,
+            "nothing here is drift an apply would revert"
+        );
+        assert_eq!(
+            diff.hunks
+                .iter()
+                .map(|hunk| hunk.origin)
+                .collect::<Vec<Origin>>(),
+            vec![Origin::Common, Origin::Undeclared, Origin::Common]
+        );
+
+        // A base that declared it and a cluster that moved it *is* drift.
+        let declared_and_moved = "kind: Pod\nimagePullPolicy: Never\nz: 1\n";
+        let diff = three_way(Sides {
+            base: Some(declared_and_moved),
+            live,
+            buffer: declared_and_moved,
+        });
+        assert_eq!(diff.counts.theirs, 1);
+        assert_eq!(diff.counts.undeclared, 0);
+
+        // And a base that *did* declare something is still a conflict.
+        let declared = "kind: Pod\nimagePullPolicy: Never\nz: 1\n";
+        let diff = three_way(Sides {
+            base: Some(declared),
+            live,
+            buffer,
+        });
+        assert_eq!(diff.counts.conflict, 1);
+        assert_eq!(diff.counts.undeclared, 0);
+    }
+
     #[test]
     fn a_change_the_buffer_already_agrees_with_is_not_a_change() {
         let base = "a\nold\nz\n";
@@ -1019,6 +1278,29 @@ mod tests {
         assert_eq!(diff.counts.mine, 0);
         assert_eq!(text_of(live, &diff.rows, Side::Live)[0], "replicas: 5");
         assert_eq!(text_of(buffer, &diff.rows, Side::Buffer)[0], "replicas: 1");
+    }
+
+    // Both sides deleted what the base declared. That is agreement, and the one
+    // region in the alignment with no row on any side a reader can be shown:
+    // building hunks eagerly rather than grouping finished rows put an empty
+    // hunk in the list here, which every consumer counts as a change.
+    #[test]
+    fn a_region_both_sides_removed_is_agreement_with_no_hunk_of_its_own() {
+        let base = "a\ngone\nz\n";
+        let live = "a\nz\n";
+        let buffer = "a\nz\n";
+        let diff = three_way(Sides {
+            base: Some(base),
+            live,
+            buffer,
+        });
+        assert_eq!(diff.verdict(), Verdict::Agreed);
+        assert_eq!(diff.rows.len(), 2);
+        let origins: Vec<Origin> = diff.hunks.iter().map(|hunk| hunk.origin).collect();
+        assert_eq!(origins, vec![Origin::Common]);
+        for hunk in &diff.hunks {
+            assert!(!hunk.rows.is_empty(), "a hunk is never empty");
+        }
     }
 
     #[test]
@@ -1247,6 +1529,281 @@ mod tests {
         assert_eq!(diff.counts.removed, 1);
         assert!(!diff.coarse);
         assert_eq!(diff.rows.len(), 20_001);
+    }
+
+    fn kept(diff: &Diff, hunk: usize, live: &str, buffer: &str) -> String {
+        let keep = keep_theirs(diff, hunk, live, buffer).expect("this hunk has a side to keep");
+        let mut text = buffer.to_string();
+        text.replace_range(keep.range, &keep.text);
+        text
+    }
+
+    // Every hunk, taken from the last one backwards so that no edit moves the
+    // range of one not yet applied. Taking every side the cluster has is the
+    // whole cluster: the strongest statement available about the ranges being
+    // right, since one byte out anywhere shows up as a document that is not the
+    // live one.
+    fn kept_everywhere(diff: &Diff, live: &str, buffer: &str) -> String {
+        let mut text = buffer.to_string();
+        for at in (0..diff.hunks.len()).rev() {
+            if let Some(keep) = keep_theirs(diff, at, live, buffer) {
+                text.replace_range(keep.range, &keep.text);
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn keeping_the_clusters_side_of_a_drift_hunk_puts_its_lines_in_the_buffer() {
+        let base = "replicas: 1\nimage: nginx\n";
+        let live = "replicas: 5\nimage: nginx\n";
+        let buffer = "replicas: 1\nimage: nginx\n";
+        let diff = three_way(Sides {
+            base: Some(base),
+            live,
+            buffer,
+        });
+        let drift = diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk.origin == Origin::Theirs)
+            .expect("the cluster moved a line");
+        let keep = keep_theirs(&diff, drift, live, buffer).expect("it can be kept");
+        assert_eq!(keep.taken, 1);
+        assert_eq!(keep.dropped, 1);
+        assert_eq!(kept(&diff, drift, live, buffer), live);
+    }
+
+    #[test]
+    fn a_hunk_the_three_documents_agree_about_has_no_side_to_keep() {
+        let text = "a\nb\n";
+        let diff = two_way(text, text);
+        assert_eq!(diff.hunks[0].origin, Origin::Common);
+        assert_eq!(keep_theirs(&diff, 0, text, text), None);
+        assert_eq!(keep_theirs(&diff, 99, text, text), None, "no such hunk");
+
+        let big = "x".repeat(MAX_SIDE_BYTES + 1);
+        let refused = two_way(&big, "a\n");
+        assert!(refused.hunks.is_empty());
+        assert_eq!(
+            keep_theirs(&refused, 0, &big, "a\n"),
+            None,
+            "a comparison that was never made has nothing to act on"
+        );
+    }
+
+    // The buffer has no lines in this hunk at all, so the edit is an insertion
+    // and the only thing that says where is the hunk's own span.
+    #[test]
+    fn keeping_lines_the_buffer_does_not_have_inserts_them_where_they_belong() {
+        let live = "a\nb\nc\n";
+        let buffer = "a\nc\n";
+        let diff = two_way(live, buffer);
+        let hunk = diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk.origin != Origin::Common)
+            .expect("a line is missing from the buffer");
+        let keep = keep_theirs(&diff, hunk, live, buffer).expect("it can be kept");
+        assert_eq!(keep.taken, 1);
+        assert_eq!(keep.dropped, 0);
+        assert!(keep.range.is_empty(), "nothing is replaced, only inserted");
+        assert_eq!(keep.text, "b\n");
+        assert_eq!(kept(&diff, hunk, live, buffer), live);
+    }
+
+    #[test]
+    fn keeping_a_side_the_cluster_does_not_have_takes_the_line_terminator_too() {
+        let live = "a\nc\n";
+        let buffer = "a\nb\nc\n";
+        let diff = two_way(live, buffer);
+        let hunk = diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk.origin != Origin::Common)
+            .expect("the buffer has a line the cluster does not");
+        let keep = keep_theirs(&diff, hunk, live, buffer).expect("it can be kept");
+        assert_eq!(keep.taken, 0);
+        assert_eq!(keep.dropped, 1);
+        assert_eq!(keep.text, "");
+        assert_eq!(
+            kept(&diff, hunk, live, buffer),
+            live,
+            "the blank line the text sat on goes with it"
+        );
+    }
+
+    // A blank line's bytes are empty, so a run of one spans zero bytes at a real
+    // position -- the same encoding as "the buffer has no lines here". Reading the
+    // span instead of asking whether the hunk has buffer rows appended a
+    // terminator the blank line already had and left the blank line behind.
+    #[test]
+    fn keeping_a_side_over_a_blank_buffer_line_replaces_it_rather_than_pushing_it_down() {
+        for (live, buffer) in [
+            ("a\nX\nb\n", "a\n\nb\n"),
+            ("X\na\n", "\na\n"),
+            ("a\nX\n", "a\n\n"),
+            ("a\nX\nY\nb\n", "a\n\n\nb\n"),
+        ] {
+            let diff = two_way(live, buffer);
+            assert_eq!(
+                kept_everywhere(&diff, live, buffer),
+                live,
+                "live {live:?} buffer {buffer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_insertion_at_the_end_of_a_document_with_no_final_newline_gets_one_first() {
+        let live = "a\nb\n";
+        let buffer = "a";
+        let diff = two_way(live, buffer);
+        let hunk = diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk.origin != Origin::Common)
+            .expect("the buffer is missing a line");
+        assert_eq!(kept(&diff, hunk, live, buffer), "a\nb\n");
+
+        // And an empty buffer has no dangling line to terminate.
+        let diff = two_way(live, "");
+        assert_eq!(kept(&diff, 0, live, ""), live);
+    }
+
+    // Line-ending spelling is not content and the diff never reports it, so an
+    // edit must not smuggle one side's spelling into the other's document.
+    #[test]
+    fn an_edit_spells_its_line_endings_the_way_the_buffer_around_it_does() {
+        let live = "a\nb\nc\n";
+        let buffer = "a\r\nc\r\n";
+        let diff = two_way(live, buffer);
+        let hunk = diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk.origin != Origin::Common)
+            .expect("a line is missing from the buffer");
+        assert_eq!(
+            keep_theirs(&diff, hunk, live, buffer).unwrap().text,
+            "b\r\n"
+        );
+        assert_eq!(kept(&diff, hunk, live, buffer), "a\r\nb\r\nc\r\n");
+
+        // And a CRLF line that goes takes both of its bytes with it.
+        let live = "a\r\n";
+        let buffer = "a\r\nb\r\n";
+        let diff = two_way(live, buffer);
+        let hunk = diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk.origin != Origin::Common)
+            .expect("the buffer has a line the cluster does not");
+        assert_eq!(kept(&diff, hunk, live, buffer), "a\r\n");
+    }
+
+    // A two-way comparison calls every difference the user's own, and keeping the
+    // cluster's side of one is how an edit is put back.
+    #[test]
+    fn keeping_the_clusters_side_of_the_users_own_edit_reverts_it() {
+        let live = "replicas: 1\n";
+        let buffer = "replicas: 9\n";
+        let diff = two_way(live, buffer);
+        assert_eq!(diff.hunks[0].origin, Origin::Mine);
+        assert_eq!(kept(&diff, 0, live, buffer), live);
+    }
+
+    #[test]
+    fn keeping_the_clusters_side_of_an_undeclared_hunk_takes_the_defaulted_value() {
+        let base = "kind: Pod\nz: 1\n";
+        let live = "kind: Pod\nimagePullPolicy: Always\nz: 1\n";
+        let buffer = "kind: Pod\nimagePullPolicy: IfNotPresent\nz: 1\n";
+        let diff = three_way(Sides {
+            base: Some(base),
+            live,
+            buffer,
+        });
+        let hunk = diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk.origin == Origin::Undeclared)
+            .expect("neither side declared this");
+        assert_eq!(kept(&diff, hunk, live, buffer), live);
+    }
+
+    // The hunks' buffer spans are ordered and disjoint, which is what makes
+    // applying several of them one at a time safe.
+    #[test]
+    fn hunk_spans_march_forward_through_the_buffer_without_overlapping() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0x5a11);
+        for _ in 0..300 {
+            let document = |rng: &mut rand_chacha::ChaCha8Rng| {
+                let mut text = String::new();
+                for _ in 0..rng.random_range(0..24u32) {
+                    match rng.random_range(0..10u32) {
+                        // A blank line is a line whose bytes are empty, and its
+                        // absence from these fixtures is why an aliased empty span
+                        // went unnoticed.
+                        0 => text.push('\n'),
+                        key => text.push_str(&format!("k{key}: v\n")),
+                    }
+                }
+                text
+            };
+            let base = document(&mut rng);
+            let live = document(&mut rng);
+            let buffer = document(&mut rng);
+            let diff = three_way(Sides {
+                base: Some(&base),
+                live: &live,
+                buffer: &buffer,
+            });
+            let mut at = 0usize;
+            for hunk in &diff.hunks {
+                let span = hunk.buffer();
+                assert!(span.start <= span.end, "a span is never inverted");
+                assert!(
+                    span.start >= at,
+                    "spans ascend: {span:?} after {at} in {buffer:?}"
+                );
+                assert!(span.end <= buffer.len(), "a span stays inside the buffer");
+                assert!(
+                    buffer.is_char_boundary(span.start) && buffer.is_char_boundary(span.end),
+                    "a span is spliceable"
+                );
+                at = span.end;
+            }
+        }
+    }
+
+    // One byte out anywhere in the spans and this is not the live document.
+    #[test]
+    fn keeping_every_hunk_makes_the_buffer_the_clusters_document() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0xbeef);
+        for _ in 0..600 {
+            let document = |rng: &mut rand_chacha::ChaCha8Rng| {
+                let mut text = String::new();
+                for _ in 0..rng.random_range(0..20u32) {
+                    match rng.random_range(0..8u32) {
+                        0 => text.push('\n'),
+                        key => text.push_str(&format!("k{key}: v\n")),
+                    }
+                }
+                text
+            };
+            let base = document(&mut rng);
+            let live = document(&mut rng);
+            let buffer = document(&mut rng);
+            let diff = three_way(Sides {
+                base: Some(&base),
+                live: &live,
+                buffer: &buffer,
+            });
+            assert_eq!(
+                kept_everywhere(&diff, &live, &buffer),
+                live,
+                "base {base:?} live {live:?} buffer {buffer:?}"
+            );
+        }
     }
 
     #[test]

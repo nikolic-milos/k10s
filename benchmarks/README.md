@@ -128,3 +128,44 @@ its own change and its own review, not a footnote in a performance pass.
 Only these three cases were re-recorded. The other 5,040 checks in this collection passed against
 the existing baselines unchanged, including every map, atlas, world and shell case — which is also
 the evidence that extracting the theme into its own crate cost the map's paint path nothing.
+
+## 2026-08-04: the diff got faster, and the baseline has deliberately not been refreshed
+
+The G2 follow-ons changed how `k10s-edit::diff` builds hunks. It used to emit every row and then
+group the finished rows into hunks in a second pass; it now opens or extends a hunk inside the
+alignment loop, which is also the only place that knows the buffer coordinate a hunk needs to carry
+so that taking the cluster's side of one is an edit rather than a retype. Removing the second
+O(rows) walk is worth more than the per-hunk span costs:
+
+| case | baseline | now | ratio | rows |
+| --- | --- | --- | --- | --- |
+| 16k diff-three-way | 100.4 µs | 92.4 µs | 0.92x | 521 = 521 |
+| 256k diff-three-way | 1.648 ms | 1.505 ms | 0.91x | 7,886 = 7,886 |
+| 1m diff-three-way | 6.162 ms | 5.587 ms | 0.91x | 31,291 = 31,291 |
+| 16k diff-two-way | 57.6 µs | 44.1 µs | 0.77x | 519 = 519 |
+| 256k diff-two-way | 922.5 µs | 700.2 µs | 0.76x | 7,884 = 7,884 |
+| 1m diff-two-way | 3.381 ms | 2.623 ms | 0.78x | 31,289 = 31,289 |
+
+The row counts are identical to the byte, which is the useful half of the structure gate here: the
+alignment and the classification produced exactly the same document, so this is the same work done
+once instead of twice rather than less work done. Two-way gains most because it skips the second
+alignment entirely and is therefore dominated by row emission. The whole collection passed —
+5,040 checks, nine suites, no failures — so nothing else moved.
+
+One collection in the middle of this needed the documented discriminator. Taken immediately after a
+full clippy-plus-test-plus-bench-build pass, it reported **fourteen** `atlas cull` p99 regressions in
+a crate this change set does not touch and cannot reach; a targeted idle re-run of that one suite
+reported **one**, on a case that was not among the fourteen, and a second reported **none**. The p50s
+never moved at all (median ratio 1.000 against the collection before it), so no slope changed. That
+is the same signature this file and the project's notes have recorded twice before: `atlas cull`'s
+p99 tail is thermally sensitive, one to nine cases wobble per collection, they are different cases
+every time, and they return to baseline on an idle re-run. Pre-building the bench binaries is not
+enough — the machine has to be *idle*, not merely done compiling.
+
+**The baseline is not refreshed by this note, on purpose.** The measurement was taken from an
+uncommitted working tree, and this file's own procedure says a recording may only come from a clean
+build of a committed tree; the two dirty-baseline incidents above are what that rule is made of.
+The consequence is stated in ROADMAP §8: until these six cases are re-recorded from a commit, the
+gate is conservative by 7–23% on them, so a future regression back to the old numbers would pass.
+Re-record them, from a clean build, before trusting the `editor edit` suite to catch a diff
+regression again.

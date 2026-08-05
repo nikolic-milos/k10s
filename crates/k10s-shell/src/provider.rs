@@ -129,6 +129,12 @@ pub enum ManifestOutcome {
         // at all, and whether an apply may carry a status block.
         patchable: bool,
         status_subresource: bool,
+        // Which object this text is, from the response that produced it. An
+        // apply's answer carries the same field, and a server-side apply creates
+        // what is absent, so comparing the two is what tells an update from a
+        // recreation. Absent means the server sent none, which is neither
+        // answer.
+        uid: Option<String>,
     },
     Denied(&'static str),
     Failed(String),
@@ -164,6 +170,10 @@ pub enum ApplyOutcome {
     Applied {
         yaml: String,
         dry_run: bool,
+        // Which object the server answered about, so a review can say whether the
+        // press updated the object it was opened from or landed on a different
+        // one. None is "the answer carried no identity", never "the same".
+        uid: Option<String>,
     },
     // The server took the request and answered; only rendering that answer
     // failed, because the emitter caps a document at 2 MiB and 64 levels. On a
