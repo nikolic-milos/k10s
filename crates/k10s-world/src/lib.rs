@@ -2138,6 +2138,130 @@ mod tests {
     // namespace arriving grows the world and must move no namespace already in
     // it; and a delete must not close the gap it leaves by pulling its siblings
     // across.
+    // Scaling a workload up and back down leaves the card the size its contents
+    // need, not the size they once needed.
+    //
+    // Found on a real cluster rather than here: a Deployment taken to eighty
+    // replicas and back to eight kept the card it had at eighty. Growing was the
+    // only half that existed, which is correct for arrivals -- a pod must be
+    // visible the frame it appears -- and left departures with nothing to undo
+    // it.
+    //
+    // The three things this pins are the three that make shrinking safe rather
+    // than merely tidy: the card comes back down, it never comes down past what
+    // it still holds, and the workload beside it does not move while that
+    // happens. The last is the whole layout's reason for existing, and a fit that
+    // repacked to close the gap would break it.
+    #[test]
+    fn a_card_that_grew_for_pods_comes_back_down_when_they_leave() {
+        let initial = replay::initial_sync();
+        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
+
+        // A second workload beside the one that will grow, to have something that
+        // must not move.
+        bench.apply_events(&[replay::owner(
+            "wl-side",
+            "prod",
+            "side",
+            KindId::DEPLOYMENT,
+            Op::Added,
+        )]);
+        bench.run_publish();
+        let neighbour = workload_named(&bench.snapshot(), "side").1.rect;
+
+        let grown: Vec<IngestEvent> = (0..40)
+            .map(|i| {
+                replay::instance(
+                    &format!("pod-burst-{i}"),
+                    "prod",
+                    "wl-api",
+                    State::OK,
+                    Op::Added,
+                )
+            })
+            .collect();
+        bench.apply_events(&grown);
+        bench.run_publish();
+        let big = workload_named(&bench.snapshot(), "api").1.inner;
+
+        // The *last* ones, which is what fitting can act on: a pod keeps the grid
+        // position it was given, so the card can only come down as far as the
+        // furthest survivor. Deleting from the front leaves one at the bottom and
+        // the card stays tall -- correctly, and uselessly, which is the limitation
+        // recorded below.
+        let gone: Vec<IngestEvent> = (4..40)
+            .map(|i| {
+                replay::instance(
+                    &format!("pod-burst-{i}"),
+                    "prod",
+                    "wl-api",
+                    State::OK,
+                    Op::Deleted,
+                )
+            })
+            .collect();
+        bench.apply_events(&gone);
+        bench.run_publish();
+        let after = bench.snapshot();
+        let (api_slot, api) = workload_named(&after, "api");
+        let small = api.inner;
+
+        assert!(
+            small.h < big.h,
+            "the card kept the height it needed at forty pods: {big:?} -> {small:?}"
+        );
+
+        // Never smaller than what is still in it, or a pod that kept its place is
+        // clipped by its own card.
+        let mut held = 0usize;
+        after.for_each_block_cell(api_slot, |_, pod| {
+            held += 1;
+            assert!(
+                small.contains(&pod.rect),
+                "a pod that stayed put is outside the shrunk card: {:?} not in {small:?}",
+                pod.rect
+            );
+        });
+        assert_eq!(held, 6, "two from the initial sync and four of the burst");
+
+        // The limitation, pinned so it is a decision rather than a surprise: the
+        // card fits what is there and never moves it, so a survivor low in the
+        // grid holds the card open above itself. Closing that gap means repacking
+        // pods inside their own card -- cheaper than it sounds, and still a change
+        // of policy about what may move, which belongs with the layout work rather
+        // than with this fix.
+        let mut sparse = PublishBench::new(&initial.events, LayoutMode::Spread);
+        sparse.apply_events(&grown);
+        sparse.run_publish();
+        let tall = workload_named(&sparse.snapshot(), "api").1.inner;
+        let front: Vec<IngestEvent> = (0..36)
+            .map(|i| {
+                replay::instance(
+                    &format!("pod-burst-{i}"),
+                    "prod",
+                    "wl-api",
+                    State::OK,
+                    Op::Deleted,
+                )
+            })
+            .collect();
+        sparse.apply_events(&front);
+        sparse.run_publish();
+        assert_eq!(
+            workload_named(&sparse.snapshot(), "api").1.inner,
+            tall,
+            "deleting from the front leaves a survivor at the bottom, and the card \
+             stays as tall as that survivor needs"
+        );
+
+        assert_eq!(
+            workload_named(&after, "side").1.rect,
+            neighbour,
+            "the workload beside it did not move to close the gap"
+        );
+        topology::verify_derived_state(&mut bench.world);
+    }
+
     #[test]
     fn an_incremental_change_at_scale_moves_only_what_is_above_it() {
         let spec = generate(&GenConfig {
