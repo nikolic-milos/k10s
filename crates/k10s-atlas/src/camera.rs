@@ -3,7 +3,7 @@ use crate::scene::Rect;
 pub const MIN_ZOOM: f32 = 0.004;
 pub const MAX_ZOOM: f32 = 40.0;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
     pub cx: f32,
     pub cy: f32,
