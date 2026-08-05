@@ -806,6 +806,11 @@ fn main() {
         json: args.json,
     });
     let window_failed = Arc::new(AtomicBool::new(false));
+    // A bench flight that gives up is a failed run, and it must fail the same way
+    // everything else here does: after the world thread is joined and the plane is
+    // retired, not from inside the frame that noticed.
+    let bench_failed = Arc::new(AtomicBool::new(false));
+    let bench_status = bench_failed.clone();
     let window_status = window_failed.clone();
     // A bench flight runs on the default theme and default keymap, whatever
     // the user's files say: a recording's environment must not depend on the
@@ -876,7 +881,14 @@ fn main() {
                         })
                         .detach();
                     let map = cx.new(|cx| {
-                        MapView::new(scene.clone(), ctrl_tx.clone(), bench_meta, damage_rx, cx)
+                        MapView::new(
+                            scene.clone(),
+                            ctrl_tx.clone(),
+                            bench_meta,
+                            bench_status.clone(),
+                            damage_rx,
+                            cx,
+                        )
                     });
                     let provider = plane.clone().map(|(inspector, reader)| {
                         std::rc::Rc::new(PlaneProvider { inspector, reader })
@@ -921,6 +933,11 @@ fn main() {
     // the thread carrying its stream, which is the order that lets a watch parked
     // on a full sink see a disconnect instead of a deadlock.
     launch.retire();
+    if bench_failed.load(Ordering::Relaxed) {
+        // Its own status, because a recording that did not happen and a window
+        // that would not open are different answers to whatever ran this.
+        std::process::exit(3);
+    }
     if !world_ended_cleanly || window_failed.load(Ordering::Relaxed) {
         std::process::exit(1);
     }

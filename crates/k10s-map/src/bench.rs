@@ -51,6 +51,10 @@ pub enum BenchFrame {
         arm_timer: Option<Duration>,
     },
     Done,
+    /// The flight cannot run to completion and has already said why. Kept apart
+    /// from `Done` because a recording that did not happen must not look, to
+    /// whatever is reading the exit code, like one that did.
+    Aborted,
 }
 
 impl BenchFrame {
@@ -67,6 +71,9 @@ pub enum BenchOp {
     Continue,
     ArmTimer(Duration),
     Quit,
+    /// Leave, and let the caller fail. The reason is already on stderr; what the
+    /// caller owes is an orderly shutdown and a non-zero status, in that order.
+    Abort,
 }
 
 fn plan(a: &FlightAnchors, vw: f32, _vh: f32) -> Vec<Segment> {
@@ -173,6 +180,7 @@ impl Bench {
                 }
             }
             BenchFrame::Done => BenchOp::Quit,
+            BenchFrame::Aborted => BenchOp::Abort,
         }
     }
 
@@ -193,7 +201,7 @@ impl Bench {
                 self.finish(&result);
                 BenchFrame::Done
             }
-            FlightFrame::Aborted => std::process::exit(3),
+            FlightFrame::Aborted => BenchFrame::Aborted,
         }
     }
 
@@ -355,6 +363,27 @@ mod tests {
             block_center: (1050.0, 830.0),
             hub_center: (2400.0, 1400.0),
         }
+    }
+
+    // A frame that gave up owes the caller a leave, not a repaint, and it must
+    // not be mistaken for a finished flight. This used to be
+    // `std::process::exit(3)` in the middle of the render callback, which took
+    // the process out before the world thread was joined or the data plane
+    // retired -- and the order those two happen in is precisely what lets a watch
+    // parked on a full sink see a disconnect rather than deadlock.
+    #[test]
+    fn a_flight_that_gave_up_asks_to_leave_rather_than_to_be_painted_again() {
+        assert!(!BenchFrame::Aborted.needs_frame());
+        assert!(!BenchFrame::Done.needs_frame());
+        assert!(BenchFrame::Waiting.needs_frame());
+
+        // And the two terminal states stay distinguishable, because the exit
+        // status a script reads is the only difference between "the recording is
+        // in that file" and "there is no recording".
+        assert_ne!(
+            std::mem::discriminant(&BenchOp::Abort),
+            std::mem::discriminant(&BenchOp::Quit)
+        );
     }
 
     #[test]

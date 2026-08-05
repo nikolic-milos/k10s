@@ -205,6 +205,9 @@ pub struct MapView {
     // means no frame requested on its account, which is what keeps the measured
     // zero paints at idle true through an animation rather than despite one.
     fly: Option<FlyTo>,
+    // Set when a bench flight gave up, read by the binary after the app loop
+    // returns. A view cannot choose a process's exit status and should not try.
+    bench_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Advance a flight by one frame: where that leaves the camera, and whether the
@@ -232,10 +235,14 @@ fn advance_flight(fly: &mut Option<FlyTo>, camera: &mut Camera, dt: f32) -> bool
 }
 
 impl MapView {
+    /// `bench_failed` is set if a bench flight gives up, and read by the binary
+    /// after the app loop returns: a view is the wrong place to decide a
+    /// process's exit status, and the wrong place to leave from.
     pub fn new(
         scene: SharedScene,
         ctrl: Sender<WorldCtrl>,
         bench: Option<BenchMeta>,
+        bench_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
         damage: Receiver<()>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -272,6 +279,7 @@ impl MapView {
             text_cache: Rc::new(RefCell::new(TextCache::default())),
             pacer: FramePacer::default(),
             fly: None,
+            bench_failed,
             stage: StageMachine::new(lod::STAGE_FADE_SECS),
             last_stage_tick: None,
             bench: bench.map(Bench::new),
@@ -490,6 +498,17 @@ impl Render for MapView {
                     .detach();
                 }
                 BenchOp::Quit => cx.quit(),
+                // Quit the same way a finished flight does, having first said the
+                // run failed. Exiting from inside a render callback -- which this
+                // used to do -- skips the world thread's shutdown and the data
+                // plane's retirement, and the order those happen in is what lets
+                // a watch parked on a full sink see a disconnect instead of a
+                // deadlock.
+                BenchOp::Abort => {
+                    self.bench_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    cx.quit();
+                }
             }
         } else if Self::should_fit_scene(
             scene.totals.regions,
