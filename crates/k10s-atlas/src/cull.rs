@@ -1081,6 +1081,35 @@ mod tests {
         );
     }
 
+    // What this covers, and what it does not, because the name claims more than
+    // it delivers and the difference was measured rather than guessed.
+    //
+    // It covers the *decision*: that a scene with edge indexes and the same scene
+    // without them draw the same edges in the same order under every budget. That
+    // is a real property and it is the one a fallback path most easily breaks.
+    //
+    // It does not cover the tree. An unconditional `panic!` in the right-subtree
+    // recursion of `EdgeIndex::visit` is never reached by any of the seventy-nine
+    // tests in this crate -- only by one degenerate-scene case in `k10s-map`'s
+    // oracle sweep, which does not detect that subtree being dropped either.
+    // Deleting the right-subtree descent entirely leaves all 114 tests across both
+    // crates green.
+    //
+    // The mechanism is `EdgeIndex::is_selective`, which gives up past
+    // `EDGE_INDEX_CANDIDATE_LIMIT` candidates: the index therefore only engages
+    // for viewports whose answer is small, and a small answer fits in one leaf.
+    // Every viewport that would need two leaves is one the index declines, so the
+    // flat path serves it and the two agree for the wrong reason. Eight hundred
+    // thin strips swept across the scene found no viewport that distinguishes
+    // them, so this is a property of the geometry and the threshold together
+    // rather than a fixture that is merely too small.
+    //
+    // Closing it needs a scene whose edges are short and scattered enough that a
+    // viewport can see twenty of them from opposite ends of the segment array --
+    // `cross_scene`'s long diagonals cannot, because anything that intersects many
+    // of them intersects too many to stay selective. Left named rather than
+    // half-fixed: an index nothing exercises is a different problem from an index
+    // a test pretends to exercise, and only one of them is fixed by a comment.
     #[test]
     fn edge_indexes_preserve_flat_order_and_budgets() {
         let indexed = crate::testing::cross_scene(
