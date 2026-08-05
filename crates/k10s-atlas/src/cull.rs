@@ -1133,6 +1133,371 @@ mod tests {
         }
     }
 
+    // Which forests a sweep actually reached. A comparison between an indexed
+    // scene and a flat one is worth exactly nothing if the index was never built,
+    // or was built and never consulted, or was consulted and never declined --
+    // and each of those is a silent pass, so each is a field here.
+    #[derive(Default, Debug)]
+    struct ReachedIndex {
+        region_used: bool,
+        region_declined: bool,
+        block_used: bool,
+        block_declined: bool,
+        cell_used: bool,
+        cell_declined: bool,
+        stages: [bool; 4],
+        drew_regions: bool,
+        drew_blocks: bool,
+        drew_cells: bool,
+        drew_edges: bool,
+    }
+
+    // The cull oracle's independence is independence of *code*: two traversals,
+    // two crates, written apart. It is not independence of *data*. Both reach the
+    // scene through the same `for_each_*_candidate` helpers, so a `SpatialForest`
+    // that dropped a candidate would drop it for the painter and for the oracle
+    // alike, and the two would agree -- exactly, counter for counter -- about a
+    // scene with a region missing from it. Agreement can only mean something
+    // while something else says the index is telling the truth.
+    //
+    // The edge indexes have had that something since they were written, one test
+    // above. The region, block and cell forests have not: clearing
+    // `spatial_index` appears once in this repository, in a bench, where it
+    // measures how much faster the index is rather than whether it is right.
+    //
+    // Two fixtures, because the build thresholds cannot be satisfied by one. A
+    // region forest wants 64 regions and a block forest wants 128 blocks under a
+    // single region; a cell forest only drops to 128 cells per block while the
+    // whole scene has at most 64 blocks in it, and above that wants 8,192, which
+    // no unit test should build. So one scene is wide and one is deep, and each
+    // asserts the forest it exists for was really built.
+    fn assert_index_matches_flat(indexed: &Scene, label: &str, reached: &mut ReachedIndex) {
+        const VW: f32 = 1600.0;
+        const VH: f32 = 1000.0;
+        assert!(
+            !indexed.spatial_index.is_empty(),
+            "{label}: no forest was built, so this comparison proves nothing"
+        );
+        let mut flat = indexed.clone();
+        flat.spatial_index = Default::default();
+        assert!(flat.spatial_index.is_empty());
+
+        let pol = policy();
+        let (rx, ry) = indexed.regions[0].rect.center();
+        let (bx, by) = indexed.blocks[0].inner.center();
+        let mut fit = Camera::default();
+        fit.fit(indexed.bounds, VW, VH);
+        let cameras = [
+            fit,
+            Camera {
+                cx: rx,
+                cy: ry,
+                zoom: 0.05,
+            },
+            Camera {
+                cx: rx,
+                cy: ry,
+                zoom: 0.2,
+            },
+            Camera {
+                cx: rx,
+                cy: ry,
+                zoom: 1.0,
+            },
+            Camera {
+                cx: bx,
+                cy: by,
+                zoom: 1.0,
+            },
+            Camera {
+                cx: bx,
+                cy: by,
+                zoom: 4.5,
+            },
+            Camera {
+                cx: bx,
+                cy: by,
+                zoom: 18.0,
+            },
+            // Off the scene entirely: the empty answer has to match too, and it
+            // is the case where an index is most tempted to answer early.
+            Camera {
+                cx: indexed.bounds.x - indexed.bounds.w,
+                cy: indexed.bounds.y - indexed.bounds.h,
+                zoom: 2.0,
+            },
+        ];
+        // Settled at each stage, plus one crossfade in each direction, because
+        // `walk_stage` takes the max and the dispatcher branches on it.
+        let blends = [
+            StageBlend::settled(0),
+            StageBlend::settled(1),
+            StageBlend::settled(2),
+            StageBlend::settled(3),
+            StageBlend {
+                from: 1,
+                to: 2,
+                t: 0.5,
+            },
+            StageBlend {
+                from: 3,
+                to: 1,
+                t: 0.5,
+            },
+        ];
+
+        for cam in cameras {
+            let visible = cam.visible_world(VW, VH);
+            if indexed.region_index_is_selective(&visible) {
+                reached.region_used = true;
+            } else {
+                reached.region_declined = true;
+            }
+            for region in 0..indexed.regions.len() {
+                if indexed.region_block_index_is_selective(region, &visible) {
+                    reached.block_used = true;
+                } else {
+                    reached.block_declined = true;
+                }
+            }
+            for block in 0..indexed.blocks.len() {
+                if indexed.block_cell_index_is_selective(block, &visible) {
+                    reached.cell_used = true;
+                } else {
+                    reached.cell_declined = true;
+                }
+            }
+            for blend in blends {
+                reached.stages[blend.walk_stage() as usize] = true;
+                for edges_on in [false, true] {
+                    for skip_blocks in [false, true] {
+                        let with = cull(indexed, &cam, &pol, blend, VW, VH, edges_on, skip_blocks);
+                        let without = cull(&flat, &cam, &pol, blend, VW, VH, edges_on, skip_blocks);
+                        assert_eq!(
+                            with, without,
+                            "{label}: the index and a flat scan disagree at {cam:?} \
+                             {blend:?} edges={edges_on} skip_blocks={skip_blocks}"
+                        );
+                        reached.drew_regions |= with.drawn_regions > 0;
+                        reached.drew_blocks |= with.drawn_blocks > 0;
+                        reached.drew_cells |= with.drawn_cells > 0;
+                        reached.drew_edges |= with.edges > 0;
+                    }
+                }
+            }
+        }
+    }
+
+    // Queries small enough that a rect overlaps one by less than any plausible
+    // epsilon, placed around a point at several distances from it. The overlap
+    // has to be smaller than the mistake for the mistake to show: a probe that
+    // overlaps by half a unit cannot detect a query shaved by a quarter of one.
+    fn graze_at(x: f32, y: f32, out: &mut Vec<Rect>) {
+        const GRAZE: [f32; 4] = [-0.3, -0.003, 0.003, 0.3];
+        const TINY: f32 = 0.004;
+        for dx in GRAZE {
+            for dy in GRAZE {
+                out.push(Rect::new(x + dx, y + dy, TINY, TINY));
+            }
+        }
+    }
+
+    // Probe rects built out of the scene's own geometry, so their edges land
+    // exactly on the edges the forest split on, and small enough that a rect
+    // overlaps one by less than any plausible epsilon. Both halves matter: a
+    // grid of arbitrary rects tests the middle of things, which is where nothing
+    // goes wrong, and a probe that overlaps by half a unit cannot detect a query
+    // shaved by a quarter of one. The overlap has to be smaller than the mistake
+    // for the mistake to show.
+    fn boundary_probes(scene: &Scene) -> Vec<Rect> {
+        let mut probes = Vec::new();
+        let mut at = |x: f32, y: f32| graze_at(x, y, &mut probes);
+        let mut around = |r: Rect| {
+            at(r.x, r.y);
+            at(r.x + r.w, r.y + r.h);
+            at(r.x + r.w, r.y + r.h * 0.5);
+            at(r.x + r.w * 0.5, r.y);
+            // The centre too: an edge segment ends at a node's centre, so this is
+            // where a probe grazes the corner of a *segment's* bounds rather than
+            // a node's, which is what the edge forest splits on.
+            at(r.x + r.w * 0.5, r.y + r.h * 0.5);
+        };
+        // The scene's own corner first: the outermost leaf's bounds ends exactly
+        // where the scene does, so a probe there is the one guaranteed to sit in
+        // the outer band of every node above it. The rest are a handful from each
+        // level rather than a sweep of all of them -- the probes are the sharp
+        // part of this instrument, but each one costs a pass over the scene, and
+        // eight of a kind find what eight hundred would.
+        around(scene.bounds);
+        let some = |len: usize| (0..len).step_by((len / 8).max(1)).take(8);
+        for index in some(scene.regions.len()) {
+            around(scene.regions[index].rect);
+        }
+        for index in some(scene.blocks.len()) {
+            around(scene.blocks[index].rect);
+        }
+        for index in some(scene.cells.len()) {
+            around(scene.cells[index].rect);
+        }
+        probes
+    }
+
+    // One reusable membership set. A fresh `vec![false; n]` per parent per probe
+    // is what made the first draft of this too slow to afford enough probes to
+    // be sharp, which is a real trade and not a micro-optimisation: the probes
+    // are the whole instrument.
+    struct Offered {
+        seen: Vec<bool>,
+        touched: Vec<usize>,
+    }
+
+    impl Offered {
+        fn new(len: usize) -> Offered {
+            Offered {
+                seen: vec![false; len],
+                touched: Vec::new(),
+            }
+        }
+
+        fn mark(&mut self, index: usize) {
+            if !self.seen[index] {
+                self.seen[index] = true;
+                self.touched.push(index);
+            }
+        }
+
+        fn clear(&mut self) {
+            for index in self.touched.drain(..) {
+                self.seen[index] = false;
+            }
+        }
+    }
+
+    // What the counters above compare is what the cull *concluded*; this compares
+    // what the index *offered*. The difference is not academic: shrinking every
+    // node's bounds by a whole unit, or the query rect by a quarter of one,
+    // passes the counter comparison at every camera in that sweep and fails here.
+    // A camera sweep is a coarse way to go looking for a candidate that grazes,
+    // because a camera frames what is in front of it and the bug lives at the
+    // edge of what is not.
+    //
+    // The contract is a superset rather than an equality. A candidate list may
+    // contain rects that miss, because every caller re-tests with `intersects`;
+    // what may never happen is that something which really does intersect is
+    // absent from it.
+    fn assert_index_offers_every_intersecting_child(scene: &Scene, label: &str) {
+        let mut regions = Offered::new(scene.regions.len());
+        let mut blocks = Offered::new(scene.blocks.len());
+        let mut cells = Offered::new(scene.cells.len());
+        let mut wanted: Vec<usize> = Vec::new();
+
+        for probe in boundary_probes(scene) {
+            regions.clear();
+            scene.for_each_region_candidate(&probe, |index, _| regions.mark(index));
+            for (index, region) in scene.regions.iter().enumerate() {
+                assert!(
+                    !region.rect.intersects(&probe) || regions.seen[index],
+                    "{label}: region {index} at {:?} intersects {probe:?}, \
+                     and the index did not offer it",
+                    region.rect
+                );
+            }
+
+            for region in 0..scene.regions.len() {
+                wanted.clear();
+                scene.for_each_region_block(region, |index, block| {
+                    if block.rect.intersects(&probe) {
+                        wanted.push(index);
+                    }
+                });
+                if wanted.is_empty() {
+                    continue;
+                }
+                blocks.clear();
+                scene
+                    .for_each_region_block_candidate(region, &probe, |index, _| blocks.mark(index));
+                for &index in &wanted {
+                    assert!(
+                        blocks.seen[index],
+                        "{label}: block {index} of region {region} at {:?} intersects \
+                         {probe:?}, and the index did not offer it",
+                        scene.blocks[index].rect
+                    );
+                }
+            }
+
+            for block in 0..scene.blocks.len() {
+                wanted.clear();
+                scene.for_each_block_cell(block, |index, cell| {
+                    if cell.rect.intersects(&probe) {
+                        wanted.push(index);
+                    }
+                });
+                if wanted.is_empty() {
+                    continue;
+                }
+                cells.clear();
+                scene.for_each_block_cell_candidate(block, &probe, |index, _| cells.mark(index));
+                for &index in &wanted {
+                    assert!(
+                        cells.seen[index],
+                        "{label}: cell {index} of block {block} at {:?} intersects \
+                         {probe:?}, and the index did not offer it",
+                        scene.cells[index].rect
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_spatial_index_answers_what_a_flat_scan_answers() {
+        let mut reached = ReachedIndex::default();
+
+        // Wide: enough regions for a region forest, and enough blocks under each
+        // for a per-region block forest.
+        let wide = crate::testing::scene(SceneSpec {
+            cells_per_block: 2,
+            sats_per_block: 1,
+            edges_per_region: 3,
+            ..SceneSpec::uniform(72, 136)
+        });
+        assert_index_matches_flat(&wide, "wide", &mut reached);
+        assert_index_offers_every_intersecting_child(&wide, "wide");
+
+        // Deep: few enough blocks that the cell threshold stays at 128, and
+        // enough cells under each to cross it.
+        let deep = crate::testing::scene(SceneSpec {
+            cells_per_block: 160,
+            sats_per_block: 2,
+            edges_per_region: 3,
+            ..SceneSpec::uniform(8, 8)
+        });
+        assert_index_matches_flat(&deep, "deep", &mut reached);
+        assert_index_offers_every_intersecting_child(&deep, "deep");
+
+        assert!(
+            reached.region_used && reached.region_declined,
+            "the region forest was never both consulted and declined: {reached:?}"
+        );
+        assert!(
+            reached.block_used && reached.block_declined,
+            "the block forests were never both consulted and declined: {reached:?}"
+        );
+        assert!(
+            reached.cell_used && reached.cell_declined,
+            "the cell forests were never both consulted and declined: {reached:?}"
+        );
+        assert!(
+            reached.stages.iter().all(|hit| *hit),
+            "a walk stage was never reached: {reached:?}"
+        );
+        assert!(
+            reached.drew_regions && reached.drew_blocks && reached.drew_cells && reached.drew_edges,
+            "the sweep never drew one of the four things it compares: {reached:?}"
+        );
+    }
+
     #[test]
     fn visible_work_is_independent_of_scene_size() {
         const VW: f32 = 1600.0;
