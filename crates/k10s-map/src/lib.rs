@@ -325,6 +325,30 @@ impl MapView {
         cx.notify();
     }
 
+    /// Fly to the object with this uid, if the published scene has one.
+    ///
+    /// Answers whether it went, because "that object is not on the map" and "the
+    /// map is now going there" are different sentences and the caller is the one
+    /// with somewhere to say them. A uid the snapshot does not carry is the
+    /// ordinary case rather than an error: a search can outlive the object it
+    /// matched, and a cluster the window has since left has none of them.
+    pub fn reveal(&mut self, uid: &str, window: &Window, cx: &mut Context<Self>) -> bool {
+        let scene = self.scene.load();
+        let Some(found) = scene.locate(uid) else {
+            return false;
+        };
+        let (_, vw, vh) = self.map_viewport(window);
+        let target = self.camera.reveal(found.rect, vw, vh);
+        if self.bench.is_some() {
+            self.camera = target;
+            self.fly = None;
+        } else {
+            self.fly_to(target, Motion::reduced_when(cx.reduce_motion()));
+        }
+        cx.notify();
+        true
+    }
+
     /// Send the camera somewhere, from wherever it is now.
     ///
     /// Retargets an existing flight instead of replacing it, so a second
