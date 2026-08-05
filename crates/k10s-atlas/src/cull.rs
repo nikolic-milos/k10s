@@ -1081,35 +1081,187 @@ mod tests {
         );
     }
 
-    // What this covers, and what it does not, because the name claims more than
-    // it delivers and the difference was measured rather than guessed.
+    // A scene built to make the edge index's *tree* matter, which `cross_scene`
+    // structurally cannot.
+    //
+    // Two numbers govern this. `EDGE_INDEX_CANDIDATE_LIMIT` is two leaves' worth,
+    // and `is_selective` counts whole leaves rather than intersecting segments --
+    // so an index over a range that splits into full sixteens declines the moment
+    // a query needs a second leaf, and every query it accepts is answered by one.
+    // A range of 68 splits to leaves of eight and nine instead, and three of those
+    // still fit under the limit: a query can be selective *and* need more than one
+    // subtree.
+    //
+    // The other half is that the segments must be short and their array order must
+    // not follow their positions, or a small viewport picks up a contiguous run
+    // that lives in a single leaf anyway. Blocks are laid in a row, each edge joins
+    // two neighbours, and the edges are emitted under a stride that walks the row
+    // coprime to its length -- so segments that sit beside each other on screen are
+    // as far apart in the array as the permutation can put them.
+    const ROW_EDGES: usize = 68;
+    const ROW_PITCH: f32 = 30.0;
+
+    fn scattered_edge_scene() -> Scene {
+        let blocks: Vec<BlockNode> = (0..=ROW_EDGES)
+            .map(|i| {
+                let rect = Rect::new(i as f32 * ROW_PITCH, 100.0, 20.0, 20.0);
+                BlockNode {
+                    rect,
+                    inner: rect,
+                    label: "b".into(),
+                    children: 0..0,
+                    sats: 0..0,
+                    ext: (),
+                }
+            })
+            .collect();
+        // 37 is coprime with 68, so this visits every position exactly once and
+        // neighbouring positions land far apart in the array.
+        let edges: Vec<Edge> = (0..ROW_EDGES)
+            .map(|k| {
+                let at = (k * 37) % ROW_EDGES;
+                Edge::blocks(at as u32, at as u32 + 1)
+            })
+            .collect();
+        let width = (ROW_EDGES + 1) as f32 * ROW_PITCH;
+        // Collected rather than written as a literal: one region means one range,
+        // and a single-element vector of ranges reads to the linter as a range
+        // being used as a collection, which this is not.
+        let region_edges: Vec<std::ops::Range<u32>> =
+            std::iter::once(0..ROW_EDGES as u32).collect();
+        let mut scene = Scene {
+            rev: 1,
+            bounds: Rect::new(0.0, 0.0, width, 240.0),
+            regions: vec![RegionNode {
+                rect: Rect::new(0.0, 0.0, width, 240.0),
+                label: "row".into(),
+                weight: 1,
+                children: 0..blocks.len() as u32,
+                ext: (),
+            }],
+            totals: Totals {
+                regions: 1,
+                blocks: blocks.len() as u32,
+                cells: 0,
+                sats: 0,
+                edges: edges.len() as u32,
+            },
+            blocks,
+            cells: vec![],
+            sats: vec![],
+            region_blocks: vec![],
+            block_cells: vec![],
+            block_sats: vec![],
+            spatial_index: Default::default(),
+            region_edges,
+            region_edge_indexes: vec![],
+            cross_edges: ROW_EDGES as u32..ROW_EDGES as u32,
+            cross_edge_index: Default::default(),
+            edge_segments: vec![],
+            edges,
+        };
+        scene.rebuild_edge_indexes();
+        scene
+    }
+
+    #[test]
+    fn the_edge_index_answers_what_a_flat_scan_answers_when_its_tree_is_needed() {
+        let indexed = scattered_edge_scene();
+        assert!(
+            indexed.region_edge_indexes[0].covers(&indexed.region_edges[0]),
+            "the fixture is under the build threshold, so there is no tree to test"
+        );
+        let mut flat = indexed.clone();
+        flat.region_edge_indexes.clear();
+        flat.cross_edge_index = Default::default();
+
+        let mut engaged = 0usize;
+        let mut drew = 0usize;
+        for step in 0..ROW_EDGES {
+            // A window a few blocks wide: enough segments to need more than one
+            // leaf, few enough to stay under the candidate limit.
+            let x = step as f32 * ROW_PITCH;
+            for width in [ROW_PITCH * 2.5, ROW_PITCH * 3.5] {
+                let visible = Rect::new(x, 90.0, width, 40.0);
+                if indexed.region_edge_indexes[0].is_selective(&visible) {
+                    engaged += 1;
+                }
+                for budget in [1, 7, usize::MAX] {
+                    let mut with = Vec::new();
+                    let a = walk_edges(&indexed, &visible, budget, |p, q| with.push((p, q)));
+                    let mut without = Vec::new();
+                    let b = walk_edges(&flat, &visible, budget, |p, q| without.push((p, q)));
+                    assert_eq!(a, b, "{visible:?}, budget {budget}");
+                    assert_eq!(with, without, "{visible:?}, budget {budget}");
+                    drew += a;
+                }
+            }
+        }
+        assert!(
+            engaged > 0,
+            "the index declined every viewport, so the flat path answered them all"
+        );
+        assert!(
+            drew > 0,
+            "no viewport drew an edge, so nothing was compared"
+        );
+
+        // And the same grazing pass the spatial forests get, for the same reason:
+        // a window seventy-five units wide cannot notice a node whose bounds is
+        // short by one, because it overlaps by far more than the mistake. These
+        // sit on the corners of the segments themselves, which is where a leaf's
+        // own bounds ends.
+        let mut grazed = 0usize;
+        for k in 0..ROW_EDGES {
+            let at = (k * 37) % ROW_EDGES;
+            let x0 = at as f32 * ROW_PITCH + 10.0;
+            let x1 = (at + 1) as f32 * ROW_PITCH + 10.0;
+            for x in [x0, x1] {
+                for offset in [-0.003f32, -0.001] {
+                    let visible = Rect::new(x + offset, 109.0, 0.004, 3.0);
+                    let mut with = Vec::new();
+                    let a = walk_edges(&indexed, &visible, usize::MAX, |p, q| with.push((p, q)));
+                    let mut without = Vec::new();
+                    let b = walk_edges(&flat, &visible, usize::MAX, |p, q| without.push((p, q)));
+                    assert_eq!(a, b, "grazing {visible:?}");
+                    assert_eq!(with, without, "grazing {visible:?}");
+                    grazed += a;
+                }
+            }
+        }
+        assert!(
+            grazed > 0,
+            "no grazing viewport reached a segment, so none of them proves anything"
+        );
+    }
+
+    // What this covers, and what covers the rest, because the name claims more
+    // than it delivers and the difference was measured rather than guessed.
     //
     // It covers the *decision*: that a scene with edge indexes and the same scene
     // without them draw the same edges in the same order under every budget. That
-    // is a real property and it is the one a fallback path most easily breaks.
+    // is the property a fallback path most easily breaks, and it is real.
     //
-    // It does not cover the tree. An unconditional `panic!` in the right-subtree
-    // recursion of `EdgeIndex::visit` is never reached by any of the seventy-nine
-    // tests in this crate -- only by one degenerate-scene case in `k10s-map`'s
-    // oracle sweep, which does not detect that subtree being dropped either.
-    // Deleting the right-subtree descent entirely leaves all 114 tests across both
-    // crates green.
+    // It does not cover the tree, and cannot. An unconditional `panic!` in the
+    // right-subtree recursion of `EdgeIndex::visit` is reached by none of this
+    // crate's tests while this fixture is the only one -- deleting that descent
+    // outright left all 114 tests across this crate and `k10s-map` green. The
+    // mechanism is arithmetic rather than oversight: `is_selective` counts whole
+    // leaves against a limit of two leaves' worth, so an index whose range splits
+    // into full sixteens declines the moment a query needs a second leaf, and
+    // every query it accepts is answered inside one. `cross_scene`'s long
+    // diagonals cannot escape that -- a viewport intersecting several of them
+    // intersects far too many to stay selective -- and eight hundred thin strips
+    // swept across this scene found no viewport that tells the two apart.
     //
-    // The mechanism is `EdgeIndex::is_selective`, which gives up past
-    // `EDGE_INDEX_CANDIDATE_LIMIT` candidates: the index therefore only engages
-    // for viewports whose answer is small, and a small answer fits in one leaf.
-    // Every viewport that would need two leaves is one the index declines, so the
-    // flat path serves it and the two agree for the wrong reason. Eight hundred
-    // thin strips swept across the scene found no viewport that distinguishes
-    // them, so this is a property of the geometry and the threshold together
-    // rather than a fixture that is merely too small.
-    //
-    // Closing it needs a scene whose edges are short and scattered enough that a
-    // viewport can see twenty of them from opposite ends of the segment array --
-    // `cross_scene`'s long diagonals cannot, because anything that intersects many
-    // of them intersects too many to stay selective. Left named rather than
-    // half-fixed: an index nothing exercises is a different problem from an index
-    // a test pretends to exercise, and only one of them is fixed by a comment.
+    // `the_edge_index_answers_what_a_flat_scan_answers_when_its_tree_is_needed`
+    // is the fixture that can: 68 edges split into leaves of eight and nine, so
+    // three of them still fit under the candidate limit, over short segments whose
+    // array order is a coprime stride away from their positions. Dropping either
+    // subtree, dropping one segment from a leaf, or shrinking a node's bounds by a
+    // single unit all fail it -- the last only because it grazes the segments'
+    // own corners, since a window seventy-five units wide overlaps by far more
+    // than that mistake and would never notice.
     #[test]
     fn edge_indexes_preserve_flat_order_and_budgets() {
         let indexed = crate::testing::cross_scene(
