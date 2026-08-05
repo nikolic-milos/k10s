@@ -30,7 +30,9 @@ use gpui::{
     PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString, TextAlign, TextRun,
     TransformationMatrix, Window, canvas, div, fill, point, prelude::*, px, quad, rgb, size,
 };
-use k10s_atlas::{DrawnCounts, FLIGHT_VIEWPORT, FramePacer, FrameSpans, FrameStats, StageMachine};
+use k10s_atlas::{
+    DrawnCounts, FLIGHT_VIEWPORT, FlyTo, FramePacer, FrameSpans, FrameStats, Motion, StageMachine,
+};
 use k10s_core::{KindId, SceneSnapshot, SharedScene, ToolId, WorldCtrl};
 
 pub use bench::{BenchMeta, BenchReport};
@@ -199,6 +201,35 @@ pub struct MapView {
     stage: StageMachine,
     last_stage_tick: Option<std::time::Instant>,
     bench: Option<Bench>,
+    // The flight in progress, if any. `None` is the whole idle case: no flight
+    // means no frame requested on its account, which is what keeps the measured
+    // zero paints at idle true through an animation rather than despite one.
+    fly: Option<FlyTo>,
+    motion: Motion,
+}
+
+/// Advance a flight by one frame: where that leaves the camera, and whether the
+/// caller must ask to be painted again.
+///
+/// Free rather than a method, and holding no gpui type, because it is the only
+/// part of flying that can be wrong. A view that steps its own animation inside
+/// a render body can only be tested by painting, and the property worth testing
+/// -- that a finished flight stops asking for frames -- is exactly the one a
+/// paint-based test is worst at noticing.
+fn advance_flight(fly: &mut Option<FlyTo>, camera: &mut Camera, dt: f32) -> bool {
+    let Some(flight) = fly.as_mut() else {
+        return false;
+    };
+    let step = flight.step(dt);
+    *camera = step.camera();
+    if step.owes_a_frame() {
+        return true;
+    }
+    // Dropped on arrival rather than left finished. A flight nobody is holding
+    // cannot be stepped again by a later change to this function, and `None` is
+    // the same idle state the view starts in.
+    *fly = None;
+    false
 }
 
 impl MapView {
@@ -241,6 +272,8 @@ impl MapView {
             icon_buf: Rc::new(RefCell::new(Vec::new())),
             text_cache: Rc::new(RefCell::new(TextCache::default())),
             pacer: FramePacer::default(),
+            fly: None,
+            motion: Motion::Animate,
             stage: StageMachine::new(lod::STAGE_FADE_SECS),
             last_stage_tick: None,
             bench: bench.map(Bench::new),
@@ -270,11 +303,47 @@ impl MapView {
         cx.notify();
     }
 
+    /// Frame the whole scene, flying there rather than arriving there.
+    ///
+    /// A camera that jumps leaves a person to work out for themselves that what
+    /// they were looking at is now somewhere else, and at Z0 on a large cluster
+    /// there is nothing in the new frame to recognise. Under a bench it is still
+    /// a jump: a recording's camera path is the recording, and a flight would
+    /// make the frames after a fit depend on when the fit happened.
     pub fn fit(&mut self, window: &Window, cx: &mut Context<Self>) {
         let scene = self.scene.load();
         let (_, vw, vh) = self.map_viewport(window);
-        self.camera.fit(scene.bounds, vw, vh);
+        let mut target = self.camera;
+        target.fit(scene.bounds, vw, vh);
+        if self.bench.is_some() {
+            self.camera = target;
+            self.fly = None;
+        } else {
+            self.fly_to(target);
+        }
         cx.notify();
+    }
+
+    /// Send the camera somewhere, from wherever it is now.
+    ///
+    /// Retargets an existing flight instead of replacing it, so a second
+    /// destination while the first is still being flown to continues the
+    /// movement rather than snapping back to where the first one began. Marks the
+    /// camera as touched, because a flight is a camera the user chose and the
+    /// automatic fit must not overrule it mid-air.
+    pub fn fly_to(&mut self, target: Camera) {
+        match self.fly.as_mut() {
+            Some(flight) => flight.retarget(target, self.motion),
+            None => self.fly = Some(FlyTo::new(self.camera, target, self.motion)),
+        }
+        self.fitted = true;
+        self.interacted = true;
+    }
+
+    /// Whether this window animates. Reduced still arrives -- on the next frame,
+    /// which is still painted -- so no caller has to branch on it.
+    pub fn set_motion(&mut self, motion: Motion) {
+        self.motion = motion;
     }
 
     /// Forget that the camera was ever framed, so the next scene with anything in
@@ -418,6 +487,9 @@ impl Render for MapView {
             .last_stage_tick
             .map_or(0.0, |t| (now - t).as_secs_f32());
         self.last_stage_tick = Some(now);
+        if advance_flight(&mut self.fly, &mut self.camera, dt) {
+            self.pacer.request_frame();
+        }
         let blend = self.stage.update(lod(), self.camera.zoom, dt);
         if self.stage.animating() {
             self.pacer.request_frame();
@@ -1075,5 +1147,72 @@ mod tests {
             !MapView::should_fit_scene(197, true, true, true),
             "and never one they have"
         );
+    }
+}
+
+#[cfg(test)]
+mod flight_tests {
+    use super::*;
+    use k10s_atlas::motion::FLY_SECONDS;
+
+    fn camera(cx: f32, cy: f32, zoom: f32) -> Camera {
+        Camera { cx, cy, zoom }
+    }
+
+    #[test]
+    fn no_flight_asks_for_no_frames() {
+        let mut fly = None;
+        let mut at = camera(1.0, 2.0, 3.0);
+        assert!(!advance_flight(&mut fly, &mut at, 0.016));
+        assert_eq!(
+            at,
+            camera(1.0, 2.0, 3.0),
+            "an absent flight moved the camera"
+        );
+    }
+
+    #[test]
+    fn a_flight_stops_asking_the_frame_it_arrives_on() {
+        let start = camera(0.0, 0.0, 0.1);
+        let target = camera(400.0, 300.0, 2.0);
+        let mut at = start;
+        let mut fly = Some(FlyTo::new(start, target, Motion::Animate));
+
+        let mut frames = 0;
+        while advance_flight(&mut fly, &mut at, 0.016) {
+            frames += 1;
+            assert!(frames < 1_000, "a {FLY_SECONDS}s flight never arrived");
+            assert!(
+                fly.is_some(),
+                "the flight was dropped while it was still owed"
+            );
+        }
+        assert_eq!(at, target, "the flight stopped short of where it was sent");
+        assert!(
+            fly.is_none(),
+            "an arrived flight is still holding a frame's worth of state"
+        );
+
+        // The frames after arrival are the ones the whole shape is for: a single
+        // extra request here is one idle paint per fit, and `--churn 0` measures
+        // exactly zero.
+        for _ in 0..600 {
+            assert!(
+                !advance_flight(&mut fly, &mut at, 0.016),
+                "an arrived flight went on asking to be painted"
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_motion_costs_one_frame_and_not_a_flight() {
+        let target = camera(400.0, 300.0, 2.0);
+        let mut at = camera(0.0, 0.0, 0.1);
+        let mut fly = Some(FlyTo::new(at, target, Motion::Reduced));
+        // One step, which the caller has already been asked to paint by whatever
+        // started the flight, and no frame owed after it.
+        assert!(!advance_flight(&mut fly, &mut at, 0.016));
+        assert_eq!(at, target);
+        assert!(fly.is_none());
     }
 }
