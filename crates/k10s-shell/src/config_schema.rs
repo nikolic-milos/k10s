@@ -201,6 +201,15 @@ fn settings_fields(
         ("left_dock_width", dock_size("width of the left dock")),
         ("right_dock_width", dock_size("width of the right dock")),
         ("bottom_dock_height", dock_size("height of the bottom dock")),
+        (
+            "reduce_motion",
+            scalar(
+                ScalarKind::Boolean,
+                Vec::new(),
+                "arrive instead of animating: the camera stops flying and \
+                 non-essential motion is drawn in its settled state",
+            ),
+        ),
     ]
 }
 
