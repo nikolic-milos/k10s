@@ -72,7 +72,10 @@ data:
   timeout: "30s"
 YAML
 
-echo "deployment web"
+# The containerPort is not decoration: port-forward resolves a pod's port from
+# it, and without one k10s refuses by name -- "declares no containerPort" --
+# which is correct behaviour and a broken fixture.
+echo "deployment web (with a declared containerPort, which port-forward needs)"
 "${KUBECTL[@]}" apply -f - >/dev/null <<YAML
 apiVersion: apps/v1
 kind: Deployment
@@ -84,7 +87,38 @@ spec:
     metadata: { labels: { app: web } }
     spec:
       containers:
-      - { name: web, image: nginx:1.27-alpine }
+      - name: web
+        image: nginx:1.27-alpine
+        ports:
+        - containerPort: 80
+YAML
+
+# A second workload on a HIGH port, which port-forward needs and `web` cannot
+# provide. k10s picks the local port from the container's own, so a pod on 80
+# resolves to a local 80 that no unprivileged process may bind -- the forward
+# then reports `Dead { why: "... Permission denied" }`, correctly and uselessly.
+# This one serves a known string so the test can prove the bytes came from that
+# container rather than from anything listening locally.
+echo "deployment forward-probe (high port, for port-forward)"
+"${KUBECTL[@]}" apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: forward-probe, namespace: $NS }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: forward-probe } }
+  template:
+    metadata: { labels: { app: forward-probe } }
+    spec:
+      containers:
+      - name: probe
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - mkdir -p /www && echo k10s-forward-probe > /www/index.html && httpd -f -p 18081 -h /www
+        ports:
+        - containerPort: 18081
 YAML
 
 # Route one of the Secret rule: a value in the object itself.

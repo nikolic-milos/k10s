@@ -58,6 +58,13 @@
 //! `K10S_LIVE_READER_CONTEXT` (default `reader@k10s-lab`) must name a context
 //! whose account can read and cannot patch.
 //!
+//! Two of these tests need a cluster with a *kubelet*, and are skipped rather
+//! than failed where there is none: a standalone API server can serve every
+//! other row here, but port-forward and exec are HTTP upgrades that terminate at
+//! a node. Set `K10S_LIVE_KUBELET=1` when the cluster has one, and make sure the
+//! `web` Deployment's pod is actually Running -- a Deployment that no kubelet
+//! ever scheduled satisfies the other tests and neither of those.
+//!
 //! Both client-side applies must stay client-side. Server-side apply writes no
 //! `last-applied-configuration`, so a fixture created with `--server-side`
 //! quietly turns two three-way comparisons into two-way ones that still pass.
@@ -789,5 +796,177 @@ fn a_custom_resource_is_discovered_listed_and_applied_like_any_other_kind() {
         applied.yaml.contains("flavour: vanilla"),
         "and the server's answer is the object it would keep:\n{}",
         applied.yaml
+    );
+}
+
+// Whether this cluster has a node that can run a container. Port-forward and
+// exec are the only two things here that need one, so they ask rather than
+// assume: a standalone API server serves every other row in this file, and a
+// suite that failed on it would be punishing the wrong setup.
+fn has_kubelet() -> bool {
+    std::env::var("K10S_LIVE_KUBELET").is_ok_and(|value| value == "1")
+}
+
+fn running_pod(reader: &Reader, prefix: &str) -> String {
+    let pods = kind(reader, "pods");
+    let page = table(reader, pods.id);
+    page.rows
+        .iter()
+        .find(|row| row.name.starts_with(prefix))
+        .map(|row| row.name.clone())
+        .unwrap_or_else(|| panic!("a pod named {prefix}* is running"))
+}
+
+// Exec, against a kubelet, for the first time.
+//
+// This transport is a WebSocket upgrade, which is exactly what the scripted API
+// server in `scripted_apiserver.rs` cannot script -- `tower` serves requests and
+// responses, and an upgrade stops being either. So everything below the seam has
+// been unproven since it was written: the terminal was tested against a fake
+// transport and the transport against nothing.
+//
+// What is asserted is deliberately the round trip and not the grid. The bytes a
+// remote shell sends back are the one thing no fake can stand in for; how they
+// are laid out is `alacritty_terminal`'s business and is already tested without
+// a cluster.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn exec_reaches_a_container_and_brings_its_output_back() {
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "web-");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let session = sync.reader.start_exec(
+        &k10s_data::exec::ExecRequest {
+            namespace: namespace(),
+            pod,
+            container: None,
+            command: vec!["/bin/sh".to_string()],
+        },
+        Box::new(move |event| {
+            let _ = tx.send(event);
+        }),
+    );
+
+    // A marker rather than a prompt: a shell's prompt depends on the image, and
+    // an assertion on it would be an assertion about nginx's base layer.
+    session.write(b"echo k10s-exec-marker\n");
+
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(k10s_data::exec::ExecEvent::Output(bytes)) => {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+                if seen.contains("k10s-exec-marker") {
+                    break;
+                }
+            }
+            Ok(other) => panic!("the session ended before it answered: {other:?}"),
+            Err(_) => continue,
+        }
+    }
+    assert!(
+        seen.contains("k10s-exec-marker"),
+        "the container never answered through the upgrade; saw {seen:?}"
+    );
+    drop(session);
+}
+
+// Port-forward, against a kubelet, for the first time.
+//
+// The same upgrade problem as exec, plus a listener: the forward opens a local
+// socket and pumps it, so the only proof that works is to connect to that socket
+// from outside the client and get the remote server's own bytes back. Anything
+// short of that -- a row that says Active, a registry that lists it -- is the
+// bookkeeping this repository already tests against a fake `Forwarder`.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_port_forward_carries_real_bytes_from_the_pod() {
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    use std::io::{Read, Write};
+
+    let (_plane, sync) = connect(None);
+    // The high-port fixture, not `web`: k10s takes the local port from the
+    // container's own, so a pod on 80 resolves to a local 80 no unprivileged
+    // process may bind. That is a real limitation and it is recorded as one; it
+    // is not what this test is about.
+    let pod = running_pod(&sync.reader, "forward-probe-");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.open_forward(
+        k10s_data::forward::ForwardRequest {
+            namespace: namespace(),
+            name: pod.clone(),
+            service: false,
+        },
+        move |fetched| {
+            let _ = tx.send(fetched);
+        },
+    );
+    let row = match wait(&rx) {
+        Fetched::Ok(row) => row,
+        other => panic!("the forward must open: {other:?}"),
+    };
+    assert_eq!(row.spec.pod, pod);
+    assert_eq!(
+        row.spec.remote_port, 18081,
+        "the container declares one port and the spec took it"
+    );
+
+    // The listener is bound before the row is handed back, but the pump behind
+    // it may still be connecting, so this retries rather than assuming.
+    let address = format!("127.0.0.1:{}", row.spec.local_port);
+
+    let mut answer = String::new();
+    for attempt in 0..20 {
+        std::thread::sleep(Duration::from_millis(250));
+        let Ok(mut stream) = std::net::TcpStream::connect(&address) else {
+            continue;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a read timeout");
+        if stream
+            .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .is_err()
+        {
+            continue;
+        }
+        let mut buffer = Vec::new();
+        let _ = stream.read_to_end(&mut buffer);
+        answer = String::from_utf8_lossy(&buffer).to_string();
+        if answer.contains("k10s-forward-probe") {
+            break;
+        }
+        assert!(attempt < 19, "the forward never carried a reply");
+    }
+    assert!(
+        answer.contains("k10s-forward-probe"),
+        "the bytes are the ones that container serves and nothing else could \
+         have: {answer:?}"
+    );
+
+    let listed = sync.reader.forwards().list();
+    assert!(
+        listed.iter().any(|open| open.id == row.id),
+        "an open forward is listed while it is open"
+    );
+    assert!(sync.reader.forwards().close(row.id), "and closes by its id");
+    assert!(
+        !sync
+            .reader
+            .forwards()
+            .list()
+            .iter()
+            .any(|open| open.id == row.id),
+        "and is gone from the registry afterwards"
     );
 }
