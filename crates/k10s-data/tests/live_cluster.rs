@@ -28,11 +28,39 @@
 //! KUBECONFIG=/path/to/kubeconfig cargo test -p k10s-data --test live_cluster -- --ignored --nocapture
 //! ```
 //!
-//! `K10S_LIVE_NAMESPACE` (default `g2`) must already hold a ConfigMap named
-//! `settings` created by a *client-side* `kubectl apply` -- so that it carries a
-//! `last-applied-configuration` for the three-way base -- and a Deployment named
-//! `web`. `K10S_LIVE_READER_CONTEXT` (default `reader@k10s-lab`) must name a
-//! context whose account can read and cannot patch.
+//! Note `--test-threads=1`, which is not optional: the field-manager conflict
+//! test leaves a manager named `rival` owning `.data.retries` on the shared
+//! ConfigMap, and in parallel that reaches the staleness test as a conflict
+//! instead of as staleness.
+//!
+//! `live_fixtures.sh`, beside this file, creates everything below against
+//! whatever `KUBECONFIG` names. Prefer it to following this list by hand -- the
+//! list used to be shorter than the suite, and each thing missing from it fails
+//! an assertion a long way from the fixture that was absent.
+//!
+//! In `K10S_LIVE_NAMESPACE` (default `g2`):
+//!
+//! - a ConfigMap `settings` from a *client-side* `kubectl apply`, so it carries a
+//!   `last-applied-configuration` for the three-way base, labelled
+//!   `team: platform` and holding a `greeting: hello` key -- the label proves
+//!   that something which is not apply bookkeeping survives into the edited
+//!   document, and the key is read back out of the base;
+//! - a Deployment `web`;
+//! - a Secret `api-token` whose value is `super-secret-value`, for the route
+//!   where a value is in the object itself;
+//! - a Secret `declared-token` from a client-side apply with
+//!   `plaintext-in-the-annotation` as its value, for the subtler route: an
+//!   annotation is `ObjectMeta`, so the declared value survives the
+//!   metadata-only fetch that makes the first route safe;
+//! - a CRD `widgets.k10s.test` with `additionalPrinterColumns`, and one
+//!   `Widget` named `sprocket` with `size: 7` and `flavour: vanilla`.
+//!
+//! `K10S_LIVE_READER_CONTEXT` (default `reader@k10s-lab`) must name a context
+//! whose account can read and cannot patch.
+//!
+//! Both client-side applies must stay client-side. Server-side apply writes no
+//! `last-applied-configuration`, so a fixture created with `--server-side`
+//! quietly turns two three-way comparisons into two-way ones that still pass.
 
 use std::time::Duration;
 
@@ -101,6 +129,17 @@ fn manifest(reader: &Reader, kind: KindId, name: &str) -> k10s_data::manifest::M
     match wait(&rx) {
         Fetched::Ok(manifest) => manifest,
         other => panic!("{name} must resolve: {other:?}"),
+    }
+}
+
+fn table(reader: &Reader, kind: KindId) -> k10s_data::browse::TablePage {
+    let (tx, rx) = std::sync::mpsc::channel();
+    reader.fetch_table(kind, None, move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    match wait(&rx) {
+        Fetched::Ok(page) => page,
+        other => panic!("the table must resolve: {other:?}"),
     }
 }
 
@@ -667,4 +706,88 @@ fn an_apply_after_a_delete_creates_a_new_object_rather_than_updating_the_old_one
          difference a review has to be able to state"
     );
     delete_if_present(name);
+}
+
+// A kind this binary has never heard of, which is the whole open-model claim.
+//
+// §5.1 says arbitrary kinds including CRDs flow through unchanged and §2 says the
+// open model makes that true by construction, and both were argued from the
+// shape of the code rather than from a server that had been asked. A CRD is the
+// one case where every layer has to cooperate without a compiled-in name:
+// discovery has to find it over `/apis`, the browser has to list it through
+// server-side printing it cannot predict the columns of, and the write path has
+// to prune and dry-run an object whose schema arrived at runtime.
+//
+// The printer columns are the sharp part. `additionalPrinterColumns` is the CRD
+// author's choice, so a client that quietly fell back to its own idea of how to
+// render a row would still produce a table -- just not this one. Asserting the
+// CRD's own column names is what tells the two apart.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_custom_resource_is_discovered_listed_and_applied_like_any_other_kind() {
+    let (_plane, sync) = connect(None);
+
+    let widgets = kind(&sync.reader, "widgets.k10s.test");
+    assert!(widgets.namespaced, "the fixture CRD is namespaced");
+    assert!(
+        widgets.patchable,
+        "a served CRD takes a patch, so the write path applies to it"
+    );
+
+    let page = table(&sync.reader, widgets.id);
+    let columns: Vec<&str> = page.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(
+        columns.iter().any(|name| name.eq_ignore_ascii_case("size"))
+            && columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("flavour")),
+        "the CRD's own additionalPrinterColumns reach the browser, rather than a \
+         fallback rendering that would also have produced a table: {columns:?}"
+    );
+    let row = page
+        .rows
+        .iter()
+        .find(|row| row.name == "sprocket")
+        .expect("the fixture widget is listed");
+    assert!(
+        row.cells.iter().any(|cell| cell == "7"),
+        "and the row carries the value the column named: {:?}",
+        row.cells
+    );
+    assert!(!row.uid.is_empty(), "a listed row is identified by uid");
+
+    // The write path, on a kind whose schema this binary learned at runtime.
+    let live = manifest(&sync.reader, widgets.id, "sprocket");
+    assert!(
+        live.yaml.contains("kind: Widget"),
+        "the document is the custom kind:\n{}",
+        live.yaml
+    );
+    let built = payload(&live.yaml, live.status_subresource);
+    for owned in ["metadata.resourceVersion", "metadata.uid"] {
+        assert!(
+            built.pruned.iter().any(|field| field == owned),
+            "the prune is kind-agnostic and must remove {owned}: {:?}",
+            built.pruned
+        );
+    }
+    let outcome = apply(
+        &sync.reader,
+        request(
+            widgets.id,
+            "sprocket",
+            sent(&built).to_string(),
+            true,
+            false,
+        ),
+    );
+    let ApplyOutcome::Applied(applied) = &outcome else {
+        panic!("a dry run against a custom resource resolves: {outcome:?}");
+    };
+    assert!(applied.dry_run, "nothing was stored");
+    assert!(
+        applied.yaml.contains("flavour: vanilla"),
+        "and the server's answer is the object it would keep:\n{}",
+        applied.yaml
+    );
 }
