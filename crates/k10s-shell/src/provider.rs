@@ -347,23 +347,68 @@ impl Drop for LogStop {
     }
 }
 
-pub trait ReadProvider {
+// The seam's methods, declared once and consumed twice: as the trait, and as
+// [`ProviderSlot`]'s delegation of it.
+//
+// The slot's body for every method is `self.get()` and then the same call again,
+// so writing them out is twenty bodies that differ only in a name -- and a name
+// is the one thing a copy-paste gets wrong. A *missing* delegation is already a
+// compile error, because an incomplete trait impl does not build; a delegation
+// that compiles and asks the cluster a different question is not, and it is
+// silent all the way to a panel showing somebody else's answer. Generating them
+// removes that case rather than testing for it, and the delegation stops being
+// something a new method has to remember.
+//
+// Two constraints on anything written inside this invocation. A method's comment
+// must be a doc comment: an ordinary `//` is lexed away before expansion and
+// would never reach the trait it was written for. And every parameter must be
+// named even where the trait alone would not need it, because the name is what
+// the generated call passes on.
+macro_rules! read_provider {
+    (
+        $(
+            $(#[$attr:meta])*
+            fn $name:ident(&self $(, $arg:ident: $ty:ty)* $(,)?) $(-> $ret:ty)?;
+        )*
+    ) => {
+        pub trait ReadProvider {
+            $(
+                $(#[$attr])*
+                fn $name(&self $(, $arg: $ty)*) $(-> $ret)?;
+            )*
+        }
+
+        // Generated with the trait above. `get` is called once per method and the
+        // borrow it takes ends before the delegated call, which is the property
+        // its own comment explains and the reason this is not a `borrow()` held
+        // across the body.
+        impl ReadProvider for ProviderSlot {
+            $(
+                fn $name(&self $(, $arg: $ty)*) $(-> $ret)? {
+                    self.get().$name($($arg),*)
+                }
+            )*
+        }
+    };
+}
+
+read_provider! {
     fn fetch_events(&self, namespace: &str, name: &str, reply: Reply<Detail>);
     fn fetch_log_tail(&self, namespace: &str, pod: &str, reply: Reply<Detail>);
     fn kinds(&self) -> Vec<KindRow>;
-    // `continue_token` is a token a previous page carried; None means the
-    // first page.
+    /// `continue_token` is a token a previous page carried; None means the
+    /// first page.
     fn fetch_table(&self, kind: KindId, continue_token: Option<String>, reply: Reply<TableOutcome>);
     fn fetch_node_table(&self, reply: Reply<TableOutcome>);
     fn fetch_describe(&self, request: &DescribeRequest, reply: Reply<DocOutcome>);
-    // Helm's stored releases, as a document. Rendered on the far side of the seam
-    // like a describe is, for the same reason: one deterministic rendering a test
-    // can gate, and a shell that holds no release payload of its own.
+    /// Helm's stored releases, as a document. Rendered on the far side of the
+    /// seam like a describe is, for the same reason: one deterministic rendering
+    /// a test can gate, and a shell that holds no release payload of its own.
     fn fetch_releases(&self, reply: Reply<DocOutcome>);
     fn fetch_manifest(&self, request: &DescribeRequest, reply: Reply<ManifestOutcome>);
-    // The one mutating method on the seam. Dry run and apply differ by one
-    // field of the request, so a caller cannot reach the second without being
-    // able to reach the first.
+    /// The one mutating method on the seam. Dry run and apply differ by one
+    /// field of the request, so a caller cannot reach the second without being
+    /// able to reach the first.
     fn apply(&self, request: &ApplyRequest, reply: Reply<ApplyOutcome>);
     fn fetch_schema_catalog(&self, reply: Reply<SchemaCatalogOutcome>);
     fn fetch_schema_document(&self, url: &str, reply: Reply<SchemaTextOutcome>);
@@ -380,7 +425,7 @@ pub trait ReadProvider {
         on_chunk: Box<dyn Fn(LogChunk) + Send + Sync>,
     ) -> LogStop;
     fn open_forward(&self, request: &ForwardRequest, reply: Reply<ForwardOutcome>);
-    // Local registry state: synchronous, no cluster round trip.
+    /// Local registry state: synchronous, no cluster round trip.
     fn list_forwards(&self) -> Vec<ForwardRow>;
     fn close_forward(&self, id: u64) -> bool;
     fn start_exec(
@@ -512,101 +557,6 @@ impl ProviderSlot {
     // answer. An `Rc` clone is the price and it is not a real one.
     fn get(&self) -> Rc<dyn ReadProvider> {
         self.0.borrow().clone()
-    }
-}
-
-impl ReadProvider for ProviderSlot {
-    fn fetch_events(&self, namespace: &str, name: &str, reply: Reply<Detail>) {
-        self.get().fetch_events(namespace, name, reply);
-    }
-
-    fn fetch_log_tail(&self, namespace: &str, pod: &str, reply: Reply<Detail>) {
-        self.get().fetch_log_tail(namespace, pod, reply);
-    }
-
-    fn kinds(&self) -> Vec<KindRow> {
-        self.get().kinds()
-    }
-
-    fn fetch_table(
-        &self,
-        kind: KindId,
-        continue_token: Option<String>,
-        reply: Reply<TableOutcome>,
-    ) {
-        self.get().fetch_table(kind, continue_token, reply);
-    }
-
-    fn fetch_node_table(&self, reply: Reply<TableOutcome>) {
-        self.get().fetch_node_table(reply);
-    }
-
-    fn fetch_describe(&self, request: &DescribeRequest, reply: Reply<DocOutcome>) {
-        self.get().fetch_describe(request, reply);
-    }
-
-    fn fetch_releases(&self, reply: Reply<DocOutcome>) {
-        self.get().fetch_releases(reply);
-    }
-
-    fn fetch_manifest(&self, request: &DescribeRequest, reply: Reply<ManifestOutcome>) {
-        self.get().fetch_manifest(request, reply);
-    }
-
-    fn apply(&self, request: &ApplyRequest, reply: Reply<ApplyOutcome>) {
-        self.get().apply(request, reply);
-    }
-
-    fn fetch_schema_catalog(&self, reply: Reply<SchemaCatalogOutcome>) {
-        self.get().fetch_schema_catalog(reply);
-    }
-
-    fn fetch_schema_document(&self, url: &str, reply: Reply<SchemaTextOutcome>) {
-        self.get().fetch_schema_document(url, reply);
-    }
-
-    fn fetch_crd_schemas(&self, reply: Reply<SchemaTextOutcome>) {
-        self.get().fetch_crd_schemas(reply);
-    }
-
-    fn fetch_containers(&self, namespace: &str, pod: &str, reply: Reply<ContainersOutcome>) {
-        self.get().fetch_containers(namespace, pod, reply);
-    }
-
-    fn follow_log(
-        &self,
-        request: &LogRequest,
-        on_chunk: Box<dyn Fn(LogChunk) + Send + Sync>,
-    ) -> LogStop {
-        self.get().follow_log(request, on_chunk)
-    }
-
-    fn follow_workload_logs(
-        &self,
-        request: &WorkloadLogRequest,
-        on_chunk: Box<dyn Fn(LogChunk) + Send + Sync>,
-    ) -> LogStop {
-        self.get().follow_workload_logs(request, on_chunk)
-    }
-
-    fn open_forward(&self, request: &ForwardRequest, reply: Reply<ForwardOutcome>) {
-        self.get().open_forward(request, reply);
-    }
-
-    fn list_forwards(&self) -> Vec<ForwardRow> {
-        self.get().list_forwards()
-    }
-
-    fn close_forward(&self, id: u64) -> bool {
-        self.get().close_forward(id)
-    }
-
-    fn start_exec(
-        &self,
-        request: &ExecRequest,
-        on_event: Box<dyn Fn(ExecEvent) + Send + Sync>,
-    ) -> Box<dyn ExecSession> {
-        self.get().start_exec(request, on_event)
     }
 }
 
