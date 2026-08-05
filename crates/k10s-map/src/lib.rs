@@ -205,7 +205,6 @@ pub struct MapView {
     // means no frame requested on its account, which is what keeps the measured
     // zero paints at idle true through an animation rather than despite one.
     fly: Option<FlyTo>,
-    motion: Motion,
 }
 
 /// Advance a flight by one frame: where that leaves the camera, and whether the
@@ -273,7 +272,6 @@ impl MapView {
             text_cache: Rc::new(RefCell::new(TextCache::default())),
             pacer: FramePacer::default(),
             fly: None,
-            motion: Motion::Animate,
             stage: StageMachine::new(lod::STAGE_FADE_SECS),
             last_stage_tick: None,
             bench: bench.map(Bench::new),
@@ -319,7 +317,10 @@ impl MapView {
             self.camera = target;
             self.fly = None;
         } else {
-            self.fly_to(target);
+            // Asked of gpui rather than kept here, so the answer a person gave
+            // once reaches every animation in the application instead of
+            // whichever ones remembered to look at a copy of it.
+            self.fly_to(target, Motion::reduced_when(cx.reduce_motion()));
         }
         cx.notify();
     }
@@ -331,19 +332,13 @@ impl MapView {
     /// movement rather than snapping back to where the first one began. Marks the
     /// camera as touched, because a flight is a camera the user chose and the
     /// automatic fit must not overrule it mid-air.
-    pub fn fly_to(&mut self, target: Camera) {
+    pub fn fly_to(&mut self, target: Camera, motion: Motion) {
         match self.fly.as_mut() {
-            Some(flight) => flight.retarget(target, self.motion),
-            None => self.fly = Some(FlyTo::new(self.camera, target, self.motion)),
+            Some(flight) => flight.retarget(target, motion),
+            None => self.fly = Some(FlyTo::new(self.camera, target, motion)),
         }
         self.fitted = true;
         self.interacted = true;
-    }
-
-    /// Whether this window animates. Reduced still arrives -- on the next frame,
-    /// which is still painted -- so no caller has to branch on it.
-    pub fn set_motion(&mut self, motion: Motion) {
-        self.motion = motion;
     }
 
     /// Forget that the camera was ever framed, so the next scene with anything in

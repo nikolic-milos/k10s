@@ -27,6 +27,24 @@ pub enum Motion {
     Reduced,
 }
 
+impl Motion {
+    /// From the host's own switch.
+    ///
+    /// There is no platform query anywhere in this stack -- gpui carries a
+    /// `reduce_motion` flag because an application *sets* it, and Zed sets it
+    /// from a settings file rather than from GNOME, macOS or Windows. So "the
+    /// system asked for less motion" is a sentence this product can only say by
+    /// being told, and the constructor takes the answer rather than looking for
+    /// it.
+    pub fn reduced_when(reduced: bool) -> Motion {
+        if reduced {
+            Motion::Reduced
+        } else {
+            Motion::Animate
+        }
+    }
+}
+
 /// Where a flight is after a step, and whether it owes another frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Step {

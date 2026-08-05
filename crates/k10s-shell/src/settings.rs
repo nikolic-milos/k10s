@@ -112,6 +112,13 @@ pub struct Settings {
     pub left_dock_width: f32,
     pub right_dock_width: f32,
     pub bottom_dock_height: f32,
+    // Whether non-essential motion is suppressed: the camera arrives instead of
+    // flying, and any gpui animation renders in its static state. A setting
+    // rather than a platform query because there is no platform query to make --
+    // gpui holds the flag and expects to be told, and being told is what this
+    // field is. Published onto gpui rather than read separately by each view, so
+    // one answer reaches the whole application.
+    pub reduce_motion: bool,
 }
 
 impl Default for Settings {
@@ -123,6 +130,7 @@ impl Default for Settings {
             left_dock_width: 260.0,
             right_dock_width: 320.0,
             bottom_dock_height: 240.0,
+            reduce_motion: false,
         }
     }
 }
@@ -233,6 +241,7 @@ pub fn parse(text: &str) -> Loaded {
                 DOCK_SIZE_RANGE,
                 &mut notes,
             ),
+            "reduce_motion" => boolean(value, &mut settings.reduce_motion, key, &mut notes),
             unknown => notes.push(format!(
                 "settings field {unknown:?} is not one this version knows; ignored"
             )),
@@ -300,6 +309,15 @@ fn family(
         Some(name) if !name.trim().is_empty() => *into = name.trim().to_string().into(),
         _ => notes.push(format!(
             "settings field {key:?} must be a non-empty string, got {value}; keeping {into:?}"
+        )),
+    }
+}
+
+fn boolean(value: &serde_json::Value, into: &mut bool, key: &str, notes: &mut Vec<String>) {
+    match value.as_bool() {
+        Some(on) => *into = on,
+        None => notes.push(format!(
+            "settings field {key:?} must be true or false, got {value}; keeping {into}"
         )),
     }
 }
@@ -414,6 +432,26 @@ mod tests {
 
         let array = parse("[1, 2]");
         assert!(array.notes[0].contains("must be an object"));
+    }
+
+    #[test]
+    fn reduce_motion_reads_as_a_switch_and_says_so_when_it_is_not_one() {
+        assert!(
+            !Settings::default().reduce_motion,
+            "motion is on unless somebody asked for it not to be"
+        );
+        let on = parse(r#"{"reduce_motion": true}"#);
+        assert!(on.settings.reduce_motion);
+        assert!(on.notes.is_empty(), "{:?}", on.notes);
+
+        // A fault is a labelled note and the previous value stands, like every
+        // other field here: a settings file with one bad line is still a
+        // settings file, and losing the rest of it to a typo is the failure
+        // this whole loader is shaped to avoid.
+        let wrong = parse(r#"{"reduce_motion": "yes"}"#);
+        assert!(!wrong.settings.reduce_motion);
+        assert_eq!(wrong.notes.len(), 1, "{:?}", wrong.notes);
+        assert!(wrong.notes[0].contains("must be true or false"));
     }
 
     #[test]

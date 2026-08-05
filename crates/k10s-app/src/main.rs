@@ -610,6 +610,10 @@ fn apply_config(text: &ConfigText, cx: &mut gpui::App) {
     cx.set_global(k10s_theme::ActiveTypography(
         loaded.settings.typography.clone(),
     ));
+    // Onto gpui itself, not only into our own global: gpui refreshes every
+    // window when it changes and its own animation elements consult it, so
+    // telling it once is what makes the setting mean the same thing everywhere.
+    cx.set_reduce_motion(loaded.settings.reduce_motion);
     cx.set_global(k10s_shell::settings::ActiveSettings(loaded.settings));
     publish_theme(cx);
 
