@@ -1137,6 +1137,142 @@ mod tests {
     use k10s_clustergen::{GenConfig, Scenario, generate};
     use k10s_core::{Level, Op, replay};
 
+    // The workloads a generated stream puts under each namespace, keyed by that
+    // namespace's uid and name together -- the uid is what an event's `parent`
+    // must carry, and the name is what its `namespace` field must say.
+    type OwnersByScope = std::collections::HashMap<(Arc<str>, Arc<str>), Vec<Arc<str>>>;
+
+    // Where every object in a snapshot is, keyed by the uid that names it rather
+    // than by the slot that holds it -- a slot is reused, and a reused slot
+    // compared against itself is two different objects being asked to be in the
+    // same place.
+    struct Placement {
+        rect: std::collections::HashMap<Arc<str>, Rect>,
+        parent: std::collections::HashMap<Arc<str>, Arc<str>>,
+    }
+
+    fn placement(snap: &SceneSnapshot) -> Placement {
+        // A tombstoned slot's id is the empty string, and an empty string is not
+        // an object.
+        fn live(uid: Option<&Arc<str>>) -> Option<Arc<str>> {
+            uid.filter(|uid| !uid.is_empty()).cloned()
+        }
+
+        let mut rect = std::collections::HashMap::new();
+        let mut parent = std::collections::HashMap::new();
+        for (index, node) in snap.regions.iter().enumerate() {
+            if let Some(uid) = live(snap.ids.regions.get(index)) {
+                rect.insert(uid, node.rect);
+            }
+        }
+        for (index, node) in snap.blocks.iter().enumerate() {
+            if let Some(uid) = live(snap.ids.blocks.get(index)) {
+                rect.insert(uid, node.rect);
+            }
+        }
+        for (index, node) in snap.cells.iter().enumerate() {
+            if let Some(uid) = live(snap.ids.cells.get(index)) {
+                rect.insert(uid, node.rect);
+            }
+        }
+        for (index, node) in snap.sats.iter().enumerate() {
+            if let Some(uid) = live(snap.ids.sats.get(index)) {
+                rect.insert(uid, node.rect);
+            }
+        }
+        for region in 0..snap.regions.len() {
+            let Some(above) = live(snap.ids.regions.get(region)) else {
+                continue;
+            };
+            snap.for_each_region_block(region, |block, _| {
+                if let Some(uid) = live(snap.ids.blocks.get(block)) {
+                    parent.insert(uid, above.clone());
+                }
+            });
+        }
+        for block in 0..snap.blocks.len() {
+            let Some(above) = live(snap.ids.blocks.get(block)) else {
+                continue;
+            };
+            snap.for_each_block_cell(block, |cell, _| {
+                if let Some(uid) = live(snap.ids.cells.get(cell)) {
+                    parent.insert(uid, above.clone());
+                }
+            });
+            snap.for_each_block_sat(block, |sat, _| {
+                if let Some(uid) = live(snap.ids.sats.get(sat)) {
+                    parent.insert(uid, above.clone());
+                }
+            });
+        }
+        Placement { rect, parent }
+    }
+
+    // What "the map does not reshuffle" means, stated so a machine can check it.
+    //
+    // "Nothing already placed moves" is not true, and a test asserting it would
+    // be asserting a bug: a pod arriving on a card grows the card, and a card
+    // that grows can grow the namespace holding it. Growth upward is the layout
+    // working. What a person notices within ten seconds of a rolling update --
+    // and what §6.7's stability invariant is about -- is that the growth *stops
+    // there*: a pod arriving in one namespace must not move a workload in
+    // another, or a sibling pod on the same card, or anything under a namespace
+    // the batch never mentioned.
+    //
+    // So the invariant is that a change moves its own ancestors and nothing else,
+    // and the ancestors are excused by name rather than by a tolerance. The chain
+    // is walked in both snapshots, because a pod that changed parent has one
+    // ancestry before the batch and a different one after, and both of those
+    // cards legitimately resize.
+    fn assert_only_ancestors_moved(
+        before: &Placement,
+        after: &Placement,
+        touched: &[Arc<str>],
+        label: &str,
+    ) {
+        let mut excused: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
+        let mut walk: Vec<Arc<str>> = touched.to_vec();
+        while let Some(uid) = walk.pop() {
+            if !excused.insert(uid.clone()) {
+                continue;
+            }
+            walk.extend(before.parent.get(&uid).cloned());
+            walk.extend(after.parent.get(&uid).cloned());
+        }
+
+        let mut held = 0usize;
+        for (uid, was) in &before.rect {
+            if excused.contains(uid) {
+                continue;
+            }
+            // Absent afterwards is a deletion, and a deletion the batch did not
+            // name is a different failure with its own tests. This one is about
+            // what is still there.
+            let Some(now) = after.rect.get(uid) else {
+                continue;
+            };
+            assert_eq!(
+                was, now,
+                "{label}: {uid} moved, and nothing the batch touched is under it"
+            );
+            held += 1;
+        }
+        assert!(
+            held > 0,
+            "{label}: every object was excused as an ancestor, so this proves nothing"
+        );
+    }
+
+    fn touched_uids(batch: &[IngestEvent]) -> Vec<Arc<str>> {
+        batch
+            .iter()
+            .filter_map(|event| match event {
+                IngestEvent::Resource(resource) => Some(resource.uid.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn region_named<'a>(scene: &'a SceneSnapshot, name: &str) -> (usize, &'a NsNode) {
         scene
             .regions
@@ -1899,6 +2035,7 @@ mod tests {
         let held_before = (*held).clone();
 
         for (index, batch) in batches.iter().enumerate() {
+            let before = placement(&bench.snapshot());
             bench.apply_events(batch);
             bench.run_publish();
             topology::verify_derived_state(&mut bench.world);
@@ -1907,6 +2044,16 @@ mod tests {
             assert!(
                 snapshot.rev > index as u64,
                 "each structural batch must publish"
+            );
+            // The two assertions above are equivalence oracles: they compare this
+            // snapshot to a fresh materialize of the same state. Neither compares
+            // it to the snapshot *before* the batch, which is the only comparison
+            // that can see the map reshuffle.
+            assert_only_ancestors_moved(
+                &before,
+                &placement(&snapshot),
+                &touched_uids(batch),
+                &format!("batch {index}"),
             );
         }
 
@@ -1979,6 +2126,145 @@ mod tests {
         );
     }
 
+    // The stability invariant at a scale where the answer is not obvious by
+    // inspection, and across every structural shape rather than only the
+    // rolling-update one. A cluster of twelve thousand objects is where a reflow
+    // would be catastrophic and also where it would be hardest to notice: three
+    // named rects at three objects cannot tell you that the nine thousandth pod
+    // stayed put.
+    //
+    // Each shape is checked on its own, because they fail differently. A pod
+    // arriving grows one card; a workload arriving grows one namespace; a
+    // namespace arriving grows the world and must move no namespace already in
+    // it; and a delete must not close the gap it leaves by pulling its siblings
+    // across.
+    #[test]
+    fn an_incremental_change_at_scale_moves_only_what_is_above_it() {
+        let spec = generate(&GenConfig {
+            seed: 55,
+            target_objects: 12_000,
+            scenario: Scenario::Platform,
+        });
+        let events =
+            k10s_clustergen::stream::snapshot(&spec, LayoutMode::Spread.emits_attachments());
+        // The busiest namespace, not the first one, and keyed by the namespace
+        // *uid* the generator really used rather than by its name. Both halves
+        // were wrong in the first draft and both made this pass by leaving it
+        // nothing to be wrong about: a namespace holding one workload has no
+        // sibling for an arrival to disturb, and `replay::owner` spells a parent
+        // as `ns-{name}`, a convention this generator does not follow -- so the
+        // arriving workload landed in a fresh namespace of its own, where moving
+        // the neighbours it did not have was not observable.
+        let mut owners: OwnersByScope = std::collections::HashMap::new();
+        for event in &events {
+            if let IngestEvent::Resource(resource) = event
+                && matches!(resource.payload, k10s_core::Payload::Owner { .. })
+                && let Some(scope) = resource.parent.clone()
+            {
+                owners
+                    .entry((scope, resource.namespace.clone()))
+                    .or_default()
+                    .push(resource.uid.clone());
+            }
+        }
+        let ((scope, namespace), in_namespace) = owners
+            .into_iter()
+            .max_by_key(|((scope, _), uids)| (uids.len(), scope.clone()))
+            .expect("the generated stream has an owner");
+        assert!(
+            in_namespace.len() > 1,
+            "the busiest namespace holds one workload, so an arrival there disturbs nobody"
+        );
+        let owner = in_namespace[0].clone();
+        // Built here rather than through `replay::owner`, because the parent has
+        // to be the namespace this stream actually used.
+        let arriving_workload = IngestEvent::Resource(k10s_core::ResourceEvent {
+            kind: KindId::DEPLOYMENT,
+            uid: "wl-scale".into(),
+            namespace: namespace.clone(),
+            name: "scale".into(),
+            resource_version: 0,
+            parent: Some(scope),
+            op: Op::Added,
+            payload: k10s_core::Payload::Owner {
+                kind: KindId::DEPLOYMENT,
+                tool: k10s_core::ToolId::NONE,
+                depends_on: Vec::new(),
+            },
+        });
+        let mut bench = PublishBench::new(&events, LayoutMode::Spread);
+        let namespaces_before = bench.snapshot().regions.len();
+
+        let batches: Vec<(&str, Vec<IngestEvent>)> = vec![
+            (
+                "a pod arrives",
+                vec![replay::instance(
+                    "pod-scale-1",
+                    &namespace,
+                    &owner,
+                    State::OK,
+                    Op::Added,
+                )],
+            ),
+            ("a workload arrives", vec![arriving_workload]),
+            (
+                "a namespace arrives with content",
+                vec![
+                    replay::scope("ns-scale", "scale", Op::Added),
+                    replay::owner(
+                        "wl-scale-2",
+                        "scale",
+                        "scale-2",
+                        KindId::DEPLOYMENT,
+                        Op::Added,
+                    ),
+                    replay::instance("pod-scale-2", "scale", "wl-scale-2", State::OK, Op::Added),
+                ],
+            ),
+            (
+                "a pod leaves",
+                vec![replay::instance(
+                    "pod-scale-1",
+                    &namespace,
+                    &owner,
+                    State::OK,
+                    Op::Deleted,
+                )],
+            ),
+        ];
+
+        for (what, batch) in &batches {
+            let before = placement(&bench.snapshot());
+            bench.apply_events(batch);
+            bench.run_publish();
+            // Paired with the equivalence oracle on purpose, and the pairing is
+            // load-bearing rather than belt-and-braces. A stability oracle can
+            // only see what was published, and at this scale a structural patch
+            // rewrites the slots the batch touched and nothing else -- so a
+            // layout that moved an untouched sibling *in the topology* would
+            // leave the snapshot innocent and this assertion green. That
+            // divergence is precisely what comparing the patch to a fresh
+            // materialize catches, and neither question covers the other.
+            assert_published_matches_full(&bench.world, &bench.snapshot());
+            assert_only_ancestors_moved(
+                &before,
+                &placement(&bench.snapshot()),
+                &touched_uids(batch),
+                what,
+            );
+        }
+        // Exactly one of those four batches introduces a namespace. If the
+        // arriving workload had made one of its own -- which is how this test
+        // passed for the wrong reason once already -- it would have arrived
+        // somewhere with no neighbours to leave alone.
+        assert_eq!(
+            bench.snapshot().regions.len(),
+            namespaces_before + 1,
+            "only the namespace batch may add a namespace"
+        );
+        topology::verify_derived_state(&mut bench.world);
+    }
+
     #[test]
     fn a_structural_patch_deep_clones_around_a_held_reader_at_scale() {
         let spec = generate(&GenConfig {
@@ -2027,9 +2313,21 @@ mod tests {
                 State::of(ReasonId::NOT_READY),
                 Op::Added,
             )];
+            let placed = placement(&bench.snapshot());
             bench.apply_events(&batch);
             bench.run_publish();
             assert_published_matches_full(&bench.world, &bench.snapshot());
+            // The same stability question the batch-shape test asks, asked at a
+            // scale where the answer is not obvious by inspection: one pod
+            // arriving in a twelve-thousand-object cluster moves its own card and
+            // the namespace holding it, and leaves every other object in the
+            // cluster exactly where it was.
+            assert_only_ancestors_moved(
+                &placed,
+                &placement(&bench.snapshot()),
+                &touched_uids(&batch),
+                &format!("round {round} at 12k"),
+            );
         }
         topology::verify_derived_state(&mut bench.world);
 
