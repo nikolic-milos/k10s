@@ -32,10 +32,18 @@ pub const SETTINGS_TEMPLATE: &str = "\
 }
 ";
 
+// This used to spell the contexts out, and by the time anyone read it the
+// sentence was wrong: `Diff` had been added to the shell and to the schema's
+// enum and not to here. The list is not repeated now, because the file already
+// has a live source for it -- the schema offers `crate::KEY_CONTEXTS` as the
+// context field's enum, so ctrl-space in the file being described answers the
+// question from this build rather than from whenever this string was last
+// touched. A sentence that has to be maintained in step with a list is a
+// sentence that will not be.
 pub const KEYMAP_TEMPLATE: &str = "\
 // k10s keymap. Each section binds keystrokes inside one context.
-// Contexts: Workspace, Browse, Doc, Editor, Typing, Terminal, Palette, Map.
-// A null action unbinds a default. Action names complete with ctrl-space.
+// Context names and action names both complete with ctrl-space.
+// A null action unbinds a default.
 [
   {
     \"context\": \"Workspace\",
