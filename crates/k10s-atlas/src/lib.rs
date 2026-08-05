@@ -15,6 +15,7 @@ pub mod cull;
 pub mod curves;
 pub mod flight;
 pub mod lod;
+pub mod motion;
 pub mod pacing;
 pub mod scene;
 pub mod stats;
@@ -28,6 +29,7 @@ pub use flight::{
     Percentiles, Segment, SegmentResult,
 };
 pub use lod::{LodPolicy, StageBlend, StageMachine};
+pub use motion::{FLY_SECONDS, FlyTo, Motion, Step};
 pub use pacing::FramePacer;
 pub use scene::{
     BlockNode, CellNode, Edge, EdgeIndex, EdgeSegment, Endpoint, Level, Rect, RegionNode, Scene,
