@@ -1814,6 +1814,93 @@ mod tests {
         assert!(st.quads >= 2);
     }
 
+    // What the fit camera costs, since it is the one camera
+    // `visible_work_is_independent_of_scene_size` deliberately excludes.
+    //
+    // That exclusion is honest -- at Z0 with the whole scene framed, every region
+    // is visible, so visible work *cannot* be independent of how many there are.
+    // What has been prose rather than a test is the shape of the growth, and
+    // "unmeasured" and "linear" look identical in a roadmap. This pins it: the
+    // region term is exactly one quad each and grows exactly with the count, the
+    // label term is held by its budget rather than by the count, and nothing below
+    // the region level is touched at all.
+    //
+    // So a change that made Z0 quadratic, or that started drawing blocks there, or
+    // that let labels grow with the cluster, fails here -- and the aggregation §I
+    // needs before multi-cluster has a number to beat rather than an adjective.
+    #[test]
+    fn the_fit_camera_costs_one_quad_a_region_and_nothing_deeper() {
+        const VW: f32 = 1600.0;
+        const VH: f32 = 1000.0;
+        const SIZES: [usize; 4] = [200, 400, 800, 1600];
+        let pol = policy();
+
+        let mut costs: Vec<(usize, usize)> = Vec::new();
+        for regions in SIZES {
+            let scene = crate::testing::scene(SceneSpec::uniform(regions, 15));
+            let mut cam = Camera::default();
+            cam.fit(scene.bounds, VW, VH);
+            assert!(
+                cam.zoom < pol.stage_block,
+                "{regions} regions: fit is not Z0 at zoom {}",
+                cam.zoom
+            );
+            let st = cull(&scene, &cam, &pol, settled(&pol, &cam), VW, VH, true, false);
+
+            // Named explicitly, because at this zoom the deeper traversals draw
+            // no blocks either -- so every other assertion here would hold while
+            // the dispatcher quietly took the O(children) path.
+            assert_eq!(st.stage, 0, "{regions} regions: the fit camera left Z0");
+            assert_eq!(
+                st.drawn_regions, regions,
+                "{regions} regions: the fit camera must see all of them or this \
+                 measures something else"
+            );
+            // One backdrop quad plus one per region, and that is the whole quad
+            // cost at this stage. A second quad per region would double the term
+            // this test exists to bound.
+            assert_eq!(
+                st.quads,
+                1 + regions,
+                "{regions} regions: the per-region quad cost moved"
+            );
+            // Nothing below the region level is reached at Z0, which is the other
+            // half of the bound: the cost is O(regions), not O(objects).
+            assert_eq!(
+                (st.drawn_blocks, st.drawn_cells, st.drawn_sats, st.curves),
+                (0, 0, 0, 0),
+                "{regions} regions: Z0 descended past the region level"
+            );
+            // No text at all, and that is measured rather than hoped: a region
+            // framed inside a two-hundred-namespace scene is narrower on screen
+            // than `region_label_min_px`, so the pixel threshold refuses every one
+            // of them before the label budget is ever consulted. It is part of why
+            // Z0 is survivable at fleet scale, and equally why §I wants
+            // aggregation here -- what a person sees at fit is sixteen hundred
+            // unnamed rectangles.
+            assert_eq!(
+                (st.labels, st.labels_dropped),
+                (0, 0),
+                "{regions} regions: Z0 fit drew text, so the pixel threshold moved \
+                 and the budget is now the only thing standing between this camera \
+                 and text work shaped like the cluster"
+            );
+            costs.push((regions, st.quads));
+        }
+
+        // Linear, and exactly linear. Counts eight times apart must differ by
+        // exactly the ratio of their regions, or the per-region term has picked up
+        // a second factor -- which at this camera is the one growth the engine
+        // cannot absorb, since every region is visible here by definition.
+        let (small_n, small_q) = costs[0];
+        let (large_n, large_q) = costs[costs.len() - 1];
+        assert_eq!(
+            (large_q - 1) * small_n,
+            (small_q - 1) * large_n,
+            "the Z0 quad cost is not linear in regions: {costs:?}"
+        );
+    }
+
     #[test]
     fn cull_z2_draws_cells() {
         let snap = tiny_scene();
