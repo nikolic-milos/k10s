@@ -93,6 +93,7 @@ actions!(
         OpenBrowser,
         OpenNodes,
         OpenForwards,
+        OpenReleases,
         ToggleTerminal,
         Quit,
         DescribeSelection,
@@ -231,6 +232,10 @@ pub fn keybindings() -> Vec<KeyBinding> {
         // also the browser's row-forward mnemonic, so F means forwards
         // everywhere.
         KeyBinding::new("shift-f", OpenForwards, workspace),
+        // H for Helm, capitalised for the same reason F is: every unmodified
+        // letter here is either a map command or something the terminal has to be
+        // able to type.
+        KeyBinding::new("shift-h", OpenReleases, workspace),
         KeyBinding::new("d", DescribeSelection, workspace),
         KeyBinding::new("l", LogsSelection, workspace),
         KeyBinding::new("s", ExecSelection, workspace),
@@ -532,6 +537,7 @@ enum ItemTag {
     Nodes,
     Forwards,
     Files,
+    Releases,
     Doc(String),
     Edit(String),
     Diff(String),
@@ -929,6 +935,17 @@ impl Workspace {
             window,
             cx,
         );
+    }
+
+    // One tab, reused: the inventory is a whole-cluster answer, so a second
+    // press activates the one that is open rather than fetching it again.
+    fn open_releases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench || self.activate_existing(&ItemTag::Releases, window, cx) {
+            return;
+        }
+        let provider = self.provider.clone();
+        let view = cx.new(|cx| TextView::releases(provider, cx));
+        self.open_center(Tab::new(ItemTag::Releases, view), window, cx);
     }
 
     fn open_doc(&mut self, request: DescribeRequest, window: &mut Window, cx: &mut Context<Self>) {
@@ -1752,6 +1769,7 @@ impl Workspace {
             ItemTag::Browse
                 | ItemTag::Nodes
                 | ItemTag::Forwards
+                | ItemTag::Releases
                 | ItemTag::Doc(_)
                 | ItemTag::Diff(_)
                 | ItemTag::Logs(_)
@@ -2504,13 +2522,14 @@ impl Workspace {
                     .child(entry(2, "Browse Resources", Box::new(OpenBrowser)))
                     .child(entry(3, "Node Capacity", Box::new(OpenNodes)))
                     .child(entry(4, "Port Forwards", Box::new(OpenForwards)))
-                    .child(entry(5, "Terminal", Box::new(ToggleTerminal)))
+                    .child(entry(5, "Helm Releases", Box::new(OpenReleases)))
+                    .child(entry(6, "Terminal", Box::new(ToggleTerminal)))
                     .child(separator())
-                    .child(entry(6, "Toggle Left Dock", Box::new(ToggleLeftDock)))
-                    .child(entry(7, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
-                    .child(entry(8, "Toggle Inspector", Box::new(ToggleRightDock)))
+                    .child(entry(7, "Toggle Left Dock", Box::new(ToggleLeftDock)))
+                    .child(entry(8, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
+                    .child(entry(9, "Toggle Inspector", Box::new(ToggleRightDock)))
                     .child(separator())
-                    .child(entry(9, "Quit", Box::new(Quit))),
+                    .child(entry(10, "Quit", Box::new(Quit))),
             )
     }
 
@@ -2969,6 +2988,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenForwards, window, cx| {
                 this.open_forwards(None, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenReleases, window, cx| {
+                this.open_releases(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 this.toggle_terminal(window, cx);
             }))
@@ -3245,6 +3267,7 @@ mod tests {
             ItemTag::Browse,
             ItemTag::Nodes,
             ItemTag::Forwards,
+            ItemTag::Releases,
             ItemTag::Doc("uid/name".into()),
             ItemTag::Diff("uid/name".into()),
             ItemTag::Logs("prod/pod-1".into()),

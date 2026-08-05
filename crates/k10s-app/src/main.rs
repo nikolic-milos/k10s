@@ -124,6 +124,23 @@ impl k10s_shell::ReadProvider for PlaneProvider {
         });
     }
 
+    // Helm's release inventory, rendered on this side of the seam like a
+    // describe is: the shell shows lines and holds no release payload of its
+    // own, which is what keeps a payload that can carry secret material from
+    // living in a view's state.
+    fn fetch_releases(&self, reply: k10s_shell::Reply<k10s_shell::DocOutcome>) {
+        self.reader.fetch_releases(None, move |fetched| {
+            reply(match fetched {
+                Fetched::Ok(releases) => k10s_shell::DocOutcome::Doc {
+                    title: "helm releases".to_string(),
+                    lines: k10s_data::helm::render(&releases),
+                },
+                Fetched::Denied { what } => k10s_shell::DocOutcome::Denied(what),
+                Fetched::Failed { why, .. } => k10s_shell::DocOutcome::Failed(why),
+            })
+        });
+    }
+
     fn fetch_manifest(
         &self,
         request: &k10s_shell::DescribeRequest,
