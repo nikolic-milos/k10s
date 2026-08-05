@@ -30,6 +30,11 @@ const FRAME_NS: f64 = 16_666_667.0;
 
 const FAST: Config = Config::new(100, 100, 200_000, Duration::from_millis(120));
 const SLOW: Config = Config::new(3, 20, 2_000, Duration::from_millis(300));
+// Milliseconds an operation, and a hundred samples so its tail is gated rather
+// than merely reported: the comparator only compares a p99 backed by a hundred
+// independent samples, and a case recorded just under that floor carries a
+// number nothing checks.
+const HUNDRED: Config = Config::new(3, 100, 2_000, Duration::from_millis(600));
 
 const TREE_FILES: usize = 5_000;
 const FLAT_ENTRIES: usize = 2_000;
@@ -254,7 +259,7 @@ fn map_scene() -> k10s_core::SceneSnapshot {
 fn map_search(rows: &mut Vec<Row>) {
     let scene = map_scene();
     let mut built = 0usize;
-    let samples = measure(SLOW, || {
+    let samples = measure(HUNDRED, || {
         built = MapIndex::build(&scene).candidates().len();
     });
     rows.push(Row {
