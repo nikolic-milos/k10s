@@ -17,8 +17,12 @@
 //! discovering: it **creates** the object when it is absent. That is
 //! `kubectl apply`'s behaviour too, and it means an apply of a document whose
 //! object was deleted between the fetch and the press recreates it rather than
-//! failing. Detecting that -- the applied object's `uid` differs from the one
-//! that was read -- is not done yet and is named in §8 rather than assumed away.
+//! failing -- which is not what the person pressing the key is thinking about.
+//! It is detectable with no second round trip, because the answer to the apply
+//! carries the object's `uid`: [`Applied::uid`] is that field, and a caller that
+//! holds the uid the document was *read* at can compare the two. This layer
+//! reports the identity and draws no conclusion from it; the conclusion needs
+//! the read's uid, which lives with the review rather than with the request.
 //!
 //! `fieldManager=k10s` names us in `managedFields`, which is what makes a
 //! conflict possible in the first place -- and a conflict is a labelled state
@@ -83,6 +87,13 @@ pub struct Applied {
     // editor opened the object with.
     pub yaml: String,
     pub dry_run: bool,
+    // Which object the server answered about. Compared against the uid the
+    // document was read at, this is the difference between an update and a
+    // recreation -- an apply creates what is absent, so the object a press lands
+    // on need not be the object that was opened. Absent when the answer carried
+    // no uid, and a caller must read that as "cannot tell" rather than as either
+    // answer.
+    pub uid: Option<String>,
 }
 
 // A request the server answered 2xx to, whose answer the editor's own emitter
@@ -191,21 +202,28 @@ pub(crate) async fn apply(
     };
     *built.body_mut() = request.yaml.clone().into_bytes();
     match client.request::<serde_json::Value>(built).await {
-        Ok(mut value) => match manifest::document(target, &mut value) {
-            Ok((yaml, _)) => ApplyOutcome::Applied(Applied {
-                yaml,
-                dry_run: request.dry_run,
-            }),
-            // The server answered, so on a real apply the object is already
-            // stored. Only the emitter refused it -- it caps a document at
-            // 2 MiB and 64 levels, and a merged object can exceed either.
-            // Calling that a failure would tell someone their write did not
-            // happen while the cluster holds it.
-            Err(why) => ApplyOutcome::Unrendered(Unrendered {
-                dry_run: request.dry_run,
-                why: why.to_string(),
-            }),
-        },
+        Ok(mut value) => {
+            // Read before rendering: the emitter is handed the value by mutable
+            // reference, and the identity of what came back is not something a
+            // later reader of the text should have to parse back out of it.
+            let uid = manifest::uid_of(&value);
+            match manifest::document(target, &mut value) {
+                Ok((yaml, _)) => ApplyOutcome::Applied(Applied {
+                    yaml,
+                    dry_run: request.dry_run,
+                    uid,
+                }),
+                // The server answered, so on a real apply the object is already
+                // stored. Only the emitter refused it -- it caps a document at
+                // 2 MiB and 64 levels, and a merged object can exceed either.
+                // Calling that a failure would tell someone their write did not
+                // happen while the cluster holds it.
+                Err(why) => ApplyOutcome::Unrendered(Unrendered {
+                    dry_run: request.dry_run,
+                    why: why.to_string(),
+                }),
+            }
+        }
         Err(error) => classify(&error, request.dry_run),
     }
 }

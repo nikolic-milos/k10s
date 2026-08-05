@@ -286,8 +286,45 @@ impl DiffState {
             (_, Origin::Mine) => "you changed this",
             (_, Origin::Theirs) => "the cluster changed this; applying reverts it",
             (_, Origin::Conflict) => "both changed this since the last apply",
+            // Not "both changed this": nobody declared it, so nothing was taken
+            // from anyone and no refusal is coming. What an apply does to a field
+            // it never declared is the dry run's question, not this alignment's.
+            (_, Origin::Undeclared) => {
+                "the last apply declared nothing here; the dry run says what applying does"
+            }
             (_, Origin::Common) => "unchanged",
         }
+    }
+
+    /// Which hunk the viewport is reading, which is the one an action acts on.
+    /// A note stands above its own hunk's rows, so landing on one -- where the
+    /// next-change key leaves the reader -- answers with the hunk it heads
+    /// rather than the one that ended before it.
+    pub(crate) fn hunk_at_top(&self) -> Option<usize> {
+        let row = self.row_at_top()?;
+        self.diff
+            .hunks
+            .iter()
+            .position(|hunk| hunk.rows.contains(&row))
+    }
+
+    pub(crate) fn origin_of(&self, hunk: usize) -> Option<Origin> {
+        Some(self.diff.hunks.get(hunk)?.origin)
+    }
+
+    /// The buffer edit that keeps the cluster's side of one hunk. The two
+    /// documents its ranges point into are this state's own, which is why the
+    /// call lives here: in [`Mode::DryRun`] the right-hand document is the
+    /// server's answer rather than the editor's buffer, so an edit derived from
+    /// it would splice one document's ranges into another. [`refuse_keep`] is
+    /// what keeps that press from arriving.
+    pub(crate) fn keep(&self, hunk: usize) -> Option<diff::Keep> {
+        debug_assert_eq!(
+            self.mode,
+            Some(Mode::Local),
+            "only the local comparison's right-hand side is the editor's buffer"
+        );
+        diff::keep_theirs(&self.diff, hunk, &self.live, &self.other)
     }
 
     /// One line naming what the comparison found, for the footer.
@@ -318,6 +355,12 @@ impl DiffState {
             if counts.conflict > 0 {
                 pieces.push(format!("{} conflicting", counts.conflict));
             }
+            // Kept out of the conflict count on purpose: folded in, a summary
+            // reports a refusal the server has not made over a field nobody
+            // declared.
+            if counts.undeclared > 0 {
+                pieces.push(format!("{} undeclared", counts.undeclared));
+            }
         }
         if mode == Mode::Local && self.diff.two_way {
             pieces.push("no last-applied-configuration, so this is two-way".to_string());
@@ -327,6 +370,12 @@ impl DiffState {
         }
         if self.diff.final_newline_differs {
             pieces.push("the final newline differs".to_string());
+        }
+        // One hint, on the line that already carries them, rather than one on
+        // every hunk header: the action is in the registry, so the palette lists
+        // it with its key like every other command.
+        if mode == Mode::Local && verdict == Verdict::Differs {
+            pieces.push("t keeps the cluster's side of a hunk".to_string());
         }
         if self.folded && verdict == Verdict::Differs {
             pieces.push("folded".to_string());
@@ -575,6 +624,84 @@ pub(crate) fn refuse(wanted: Armed, at: Ready<'_>) -> Option<String> {
     None
 }
 
+/// What a press that edits the buffer -- rather than the cluster -- has to be
+/// true about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Keepable {
+    /// Which comparison is on screen. This is the load-bearing one: in
+    /// [`Mode::DryRun`] the right-hand document is what the *server* answered,
+    /// not the editor's buffer, so the hunk's ranges point into a document the
+    /// editor does not have. An edit built from them would splice bytes at
+    /// offsets that mean nothing where they land.
+    pub(crate) mode: Option<Mode>,
+    /// The hunk the reader is on, if there is one.
+    pub(crate) origin: Option<Origin>,
+    pub(crate) reviewed: BufferStamp,
+    pub(crate) editor: Option<BufferStamp>,
+}
+
+/// Why this hunk cannot be taken into the buffer, or None when it can.
+///
+/// Kept apart from [`refuse`] because nothing here reaches the cluster and none
+/// of that function's rules apply: an unpatchable kind, a blocked payload and a
+/// missing dry run all say nothing about whether a person may edit their own
+/// text. What is shared is the rule that a review is of one buffer -- ranges
+/// derived from a comparison of text the editor has since changed splice at the
+/// wrong bytes, which in an editor is worse than a refusal.
+pub(crate) fn refuse_keep(at: Keepable) -> Option<String> {
+    match at.editor {
+        None => {
+            return Some("the editor this diff came from is gone; nothing to edit".to_string());
+        }
+        Some(stamp) if stamp != at.reviewed => {
+            return Some(
+                "the buffer changed after this comparison; r compares it again".to_string(),
+            );
+        }
+        Some(_) => {}
+    }
+    if at.mode != Some(Mode::Local) {
+        return Some(
+            "this compares the server's own answer, not the cluster's; ctrl-alt-d compares \
+             against live"
+                .to_string(),
+        );
+    }
+    match at.origin {
+        None | Some(Origin::Common) => {
+            Some("nothing here differs from the cluster; n moves to the next change".to_string())
+        }
+        Some(_) => None,
+    }
+}
+
+/// What taking one hunk did, in the words of the classification it came from.
+/// The dry run that authorised an apply is void afterwards -- the bytes it
+/// answered for are not the bytes in the buffer any more -- so the sentence
+/// names the key that asks again.
+fn kept_note(origin: Origin, keep: &diff::Keep) -> String {
+    let what = match origin {
+        Origin::Theirs => "kept the cluster's change",
+        Origin::Mine => "put the cluster's own text back",
+        Origin::Conflict => "took the cluster's side of the conflict",
+        Origin::Undeclared => "took the value the cluster holds",
+        Origin::Common => "changed nothing",
+    };
+    let lines = match (keep.taken, keep.dropped) {
+        (0, dropped) => format!("dropped {}", lines_of(dropped)),
+        (taken, 0) => format!("added {}", lines_of(taken)),
+        (taken, dropped) => format!("{} in place of {dropped}", lines_of(taken)),
+    };
+    format!("{what}: {lines}; ctrl-alt-r asks the server about the result")
+}
+
+fn lines_of(count: usize) -> String {
+    if count == 1 {
+        return "1 line".to_string();
+    }
+    format!("{count} lines")
+}
+
 /// The two-press latch in front of every write. Pure, so the rule is tested
 /// without a window.
 #[derive(Debug, Default)]
@@ -612,6 +739,14 @@ struct Sent {
     dry_run: bool,
     // What the prune did to the bytes that went out, worded for after the fact.
     note: String,
+    // Which object the live document was read from *when this went out*. A real
+    // apply's reply always speaks, so reading the field live when the answer
+    // lands compares the server's answer against whatever a recompute has since
+    // pointed the view at -- and a recompute during a slow apply then reports a
+    // recreation that did not happen, over a write that did. This is the field
+    // this struct exists to be: settle against the request, not against the
+    // screen.
+    uid: Option<String>,
 }
 
 impl Sent {
@@ -623,6 +758,60 @@ impl Sent {
     fn still_speaks(&self, generation: u64) -> bool {
         !self.dry_run || self.generation == generation
     }
+}
+
+/// Whether an answer from the server is about the object the review was made of.
+///
+/// A server-side apply *creates* what is absent, so applying a document whose
+/// object was deleted between the read and the press brings it back instead of
+/// failing -- `kubectl apply`'s behaviour, and not what the person pressing the
+/// key is thinking about. The uid is what distinguishes the two, and it costs no
+/// second round trip: the answer to the apply carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Identity {
+    /// Both uids are known and equal, so whatever else changed, this is the same
+    /// object.
+    Same,
+    /// Both are known and differ: the object the server answered about is not the
+    /// one this document was read from.
+    Different,
+    /// One side carried no uid. Silence, not a guess: an unfounded claim that an
+    /// object was replaced sends someone looking for a deletion nobody made, and
+    /// the missing-field case is exactly where that claim would come from.
+    Unknown,
+}
+
+pub(crate) fn identity(read: Option<&str>, answered: Option<&str>) -> Identity {
+    match (read, answered) {
+        (Some(read), Some(answered)) if read == answered => Identity::Same,
+        (Some(_), Some(_)) => Identity::Different,
+        _ => Identity::Unknown,
+    }
+}
+
+/// What a *write* that landed on a different object has to say for itself. Which
+/// of the two mechanisms produced it -- the object was deleted and this apply
+/// recreated it, or someone else replaced it first and this apply updated the
+/// replacement -- is not knowable from here, and both share the sentence that
+/// matters: the object on screen is gone and this went somewhere else.
+fn landed_note(read: Option<&str>, answered: Option<&str>) -> &'static str {
+    match identity(read, answered) {
+        Identity::Different => recreated_note(),
+        Identity::Same | Identity::Unknown => "",
+    }
+}
+
+fn recreated_note() -> &'static str {
+    "; it did not update the object this was opened from -- that one is gone, so the write landed \
+     on a new object with a different uid"
+}
+
+/// And what a *dry run* about a different object says. Nothing has been written,
+/// so the point is not what happened but that the left-hand side of the
+/// comparison describes an object that no longer exists.
+fn stale_object_note() -> &'static str {
+    "the server answered about a different object than this was opened from -- that one is gone, \
+     so the live side of this comparison is out of date; open the object again"
 }
 
 /// What a dry-run answer means once the comparison against it has been made:
@@ -659,6 +848,13 @@ pub struct DiffView {
     // right-hand side of the review, so an apply of anything else is an apply
     // of bytes the server has never seen. Cleared by every recompute.
     reviewed: Option<BufferStamp>,
+    // Which object the live document was read from, and which object the server
+    // last answered a dry run about. They differ when the object was deleted or
+    // replaced since the read, which is the difference between an apply that
+    // updates and one that creates. Both come from a server response; neither is
+    // the uid of whatever was selected to open the editor.
+    uid: Option<String>,
+    answered: Option<String>,
     patchable: bool,
     status: Option<String>,
     gate: ApplyGate,
@@ -690,6 +886,8 @@ impl DiffView {
             payload: k10s_edit::Payload::default(),
             stamp: sources.stamp,
             reviewed: None,
+            uid: None,
+            answered: None,
             patchable: false,
             status: None,
             gate: ApplyGate::default(),
@@ -734,6 +932,7 @@ impl DiffView {
             live,
             base,
             buffer,
+            uid,
             payload,
             patchable,
         } = sources;
@@ -746,6 +945,8 @@ impl DiffView {
         self.payload = payload;
         self.stamp = stamp;
         self.reviewed = None;
+        self.uid = uid;
+        self.answered = None;
         self.patchable = patchable;
         self.state.set(Mode::Local, live, base, buffer);
         self.status = None;
@@ -807,6 +1008,57 @@ impl DiffView {
         self.send(false, force, cx);
     }
 
+    // Take the cluster's side of the hunk being read. The classification names
+    // drift an apply would revert; until this existed the only way to keep it was
+    // to retype it, and the ranges to do it with were already in the comparison.
+    //
+    // Nothing goes on the wire, so `refuse` is not the gate here and there is no
+    // two-press latch: an edit to a buffer is undoable, and the editor's own undo
+    // is what undoes it.
+    fn keep_theirs(&mut self, cx: &mut Context<Self>) {
+        let editor = self.editor.upgrade();
+        let hunk = self.state.hunk_at_top();
+        let at = Keepable {
+            mode: self.state.mode(),
+            origin: hunk.and_then(|hunk| self.state.origin_of(hunk)),
+            reviewed: self.stamp,
+            editor: editor.as_ref().map(|editor| editor.read(cx).buffer_stamp()),
+        };
+        if let Some(why) = refuse_keep(at) {
+            self.status = Some(why);
+            cx.notify();
+            return;
+        }
+        // Past `refuse_keep` both of these are present: it refused a missing
+        // editor and a hunk that is not there. Asking again rather than
+        // unwrapping keeps that agreement from being load-bearing.
+        let Some(((hunk, origin), editor)) = hunk.zip(at.origin).zip(editor) else {
+            self.status = Some("there is nothing here to keep".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(keep) = self.state.keep(hunk) else {
+            self.status = Some("there is nothing here to keep".to_string());
+            cx.notify();
+            return;
+        };
+        let note = kept_note(origin, &keep);
+        let took = editor.update(cx, |editor, cx| editor.keep_hunk(self.stamp, keep, cx));
+        if !took {
+            self.status =
+                Some("the buffer changed after this comparison; r compares it again".to_string());
+            cx.notify();
+            return;
+        }
+        // The buffer is not the buffer the dry run answered for any more, so the
+        // comparison is remade against live and the server is asked again on
+        // purpose rather than automatically: this is an edit, and edits are what
+        // the review comes after.
+        self.refresh_from_editor(false, cx);
+        self.status = Some(note);
+        cx.notify();
+    }
+
     fn send(&mut self, dry_run: bool, force: bool, cx: &mut Context<Self>) {
         // The one door the bytes come through. A payload the pruner refused
         // carries the document unpruned, and a dry run of *those* bytes is not
@@ -843,6 +1095,7 @@ impl DiffView {
             stamp: self.stamp,
             dry_run,
             note: prune_note(&self.payload),
+            uid: self.uid.clone(),
         };
         self.status = Some(if dry_run {
             "asking the server what it would store...".to_string()
@@ -882,8 +1135,13 @@ impl DiffView {
 
     fn settle(&mut self, outcome: ApplyOutcome, sent: &Sent, cx: &mut Context<Self>) {
         match outcome {
-            ApplyOutcome::Applied { yaml, dry_run } if dry_run => {
+            ApplyOutcome::Applied { yaml, dry_run, uid } if dry_run => {
                 self.forget_conflicts();
+                // Whose object the server answered about, before anything is said
+                // about what it holds: `status_line` derives the warning from it
+                // for as long as it stands, rather than printing it once into a
+                // message the next action overwrites.
+                self.answered = uid;
                 let live = self.state.live.clone();
                 self.state.set(Mode::DryRun, live, None, yaml);
                 self.status = Some(match reviewed(self.state.diff().verdict()) {
@@ -896,8 +1154,13 @@ impl DiffView {
                     Err(note) => note,
                 });
             }
-            ApplyOutcome::Applied { .. } => {
+            ApplyOutcome::Applied { uid, .. } => {
                 self.forget_conflicts();
+                // A write that landed on a different object than the one this
+                // document was opened from. An apply creates what is absent, so
+                // this is not an error -- it is `kubectl apply`'s behaviour -- but
+                // it is the one outcome nobody presses ctrl-s expecting.
+                let landed = landed_note(sent.uid.as_deref(), uid.as_deref());
                 // The object the cluster now holds is not necessarily the bytes
                 // that were sent: defaulting and admission both ran. Re-reading
                 // is the only honest way to show what landed -- and it only
@@ -911,11 +1174,11 @@ impl DiffView {
                     })
                     .unwrap_or(false);
                 self.status = Some(if reloaded {
-                    format!("applied as fieldManager k10s{}", sent.note)
+                    format!("applied as fieldManager k10s{}{landed}", sent.note)
                 } else {
                     format!(
-                        "applied as fieldManager k10s{}; the buffer moved meanwhile, so it was \
-                         left as it is",
+                        "applied as fieldManager k10s{}{landed}; the buffer moved meanwhile, so \
+                         it was left as it is",
                         sent.note
                     )
                 });
@@ -1050,6 +1313,12 @@ impl DiffView {
             }
             pieces.push(format!("owned elsewhere: {listed}"));
         }
+        // Derived rather than remembered, for the same reason the armed prompt is:
+        // it stands for as long as the comparison does, and a one-shot message
+        // would be overwritten by the next thing that happened.
+        if identity(self.uid.as_deref(), self.answered.as_deref()) == Identity::Different {
+            pieces.push(stale_object_note().to_string());
+        }
         if let Some(status) = &self.status {
             pieces.push(status.clone());
         }
@@ -1125,6 +1394,11 @@ fn row_color(theme: &Theme, painted: &Painted<'_>) -> u32 {
         (Origin::Mine, Some(Side::Buffer)) => theme.shell.success,
         (Origin::Theirs, Some(Side::Live)) => theme.shell.warning,
         (Origin::Theirs, Some(Side::Buffer)) => theme.shell.text_muted,
+        // Undeclared is not an error colour: nothing was taken from anyone and
+        // no refusal is coming. The cluster's side is what is there and nobody
+        // asked for, the buffer's is what would be sent.
+        (Origin::Undeclared, Some(Side::Live)) => theme.shell.warning,
+        (Origin::Undeclared, Some(Side::Buffer)) => theme.shell.success,
         (Origin::Conflict, _) => theme.shell.error,
     }
 }
@@ -1207,6 +1481,9 @@ impl Render for DiffView {
             .on_action(cx.listener(|this, _: &crate::ToggleFolded, _, cx| {
                 this.state.toggle_folded();
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::KeepTheirs, _, cx| {
+                this.keep_theirs(cx);
             }))
             .on_action(cx.listener(|this, _: &crate::Refresh, _, cx| {
                 let dry_run = this.state.mode() == Some(Mode::DryRun);
@@ -1769,6 +2046,7 @@ mod tests {
             stamp: BufferStamp::of(1, 4),
             dry_run,
             note: String::new(),
+            uid: Some("uid-1".to_string()),
         };
         assert!(sent(true).still_speaks(7));
         assert!(!sent(true).still_speaks(8), "the comparison moved on");
@@ -1824,6 +2102,215 @@ mod tests {
             "the key that looks like the remedy is named as not being one: {note}"
         );
         assert!(note.contains("open the object again"), "{note}");
+    }
+
+    // A field neither document declared. Reading it as a conflict promises a
+    // refusal the server has not made, over a value the server itself supplied.
+    #[test]
+    fn a_field_the_last_apply_never_declared_is_labelled_undeclared_not_conflicting() {
+        let base = "kind: Pod\nname: web\n";
+        let live = "kind: Pod\nimagePullPolicy: Always\nname: web\n";
+        let buffer = "kind: Pod\nimagePullPolicy: IfNotPresent\nname: web\n";
+        let state = local(live, Some(base), buffer);
+        let lines = texts(&state);
+        assert!(
+            lines.contains(
+                &"  the last apply declared nothing here; the dry run says what applying does"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            state.summary().contains("1 undeclared"),
+            "{}",
+            state.summary()
+        );
+        assert!(
+            !state.summary().contains("conflicting"),
+            "and no refusal is implied: {}",
+            state.summary()
+        );
+        assert_eq!(state.diff().verdict(), Verdict::Differs);
+    }
+
+    // Where the reader is, which is what an action acts on. `n` leaves the top on
+    // a hunk's own header, and the header belongs to the hunk it heads.
+    #[test]
+    fn the_hunk_under_the_reader_is_the_one_the_header_heads() {
+        let live = "a\nb\nc\nd\ne\n";
+        let buffer = "a\nB\nc\nd\nE\n";
+        let mut state = local(live, None, buffer);
+        state.set_viewport(4);
+        assert_eq!(
+            state.origin_of(state.hunk_at_top().expect("a hunk is on screen")),
+            Some(Origin::Common),
+            "the reader starts in the unchanged run"
+        );
+        assert!(state.next_change());
+        let first = state.hunk_at_top().expect("on a change now");
+        assert_eq!(state.origin_of(first), Some(Origin::Mine));
+        assert!(state.next_change());
+        let second = state.hunk_at_top().expect("and the next one");
+        assert_eq!(state.origin_of(second), Some(Origin::Mine));
+        assert_ne!(first, second, "a different hunk, not the same one twice");
+    }
+
+    // The acting half of the classification: naming drift an apply would revert
+    // is half an answer while the only way to keep it is to retype it.
+    #[test]
+    fn keeping_the_clusters_side_edits_the_buffer_into_the_clusters_document() {
+        let base = "replicas: 1\nimage: nginx\n";
+        let live = "replicas: 5\nimage: nginx\n";
+        let buffer = "replicas: 1\nimage: nginx\n";
+        let state = local(live, Some(base), buffer);
+        // The first hunk *is* the change, so the reader starts on it: there is
+        // nothing ahead for next-change to step to.
+        let hunk = state.hunk_at_top().expect("the reader is on it");
+        assert_eq!(state.origin_of(hunk), Some(Origin::Theirs));
+        let keep = state.keep(hunk).expect("it can be kept");
+        let mut text = buffer.to_string();
+        text.replace_range(keep.range.clone(), &keep.text);
+        assert_eq!(text, live);
+        assert_eq!(
+            kept_note(Origin::Theirs, &keep),
+            "kept the cluster's change: 1 line in place of 1; ctrl-alt-r asks the server about \
+             the result"
+        );
+    }
+
+    // The load-bearing refusal. In the dry-run comparison the right-hand document
+    // is the *server's* answer, not the editor's buffer, so a hunk's ranges point
+    // into a document the editor does not have: an edit built from them would
+    // splice bytes at offsets that mean nothing where they land.
+    #[test]
+    fn a_hunk_of_the_servers_own_answer_is_never_spliced_into_the_buffer() {
+        let stamp = BufferStamp::of(1, 4);
+        let at = Keepable {
+            mode: Some(Mode::DryRun),
+            origin: Some(Origin::Mine),
+            reviewed: stamp,
+            editor: Some(stamp),
+        };
+        let why = refuse_keep(at).expect("refused");
+        assert!(why.contains("the server's own answer"), "{why}");
+        assert!(why.contains("ctrl-alt-d"), "and names the way back: {why}");
+
+        let local = Keepable {
+            mode: Some(Mode::Local),
+            ..at
+        };
+        assert_eq!(refuse_keep(local), None, "the local one is the editor's");
+    }
+
+    #[test]
+    fn keeping_a_hunk_needs_the_buffer_the_comparison_was_made_of() {
+        let at = Keepable {
+            mode: Some(Mode::Local),
+            origin: Some(Origin::Theirs),
+            reviewed: BufferStamp::of(1, 4),
+            editor: Some(BufferStamp::of(1, 5)),
+        };
+        let why = refuse_keep(at).expect("refused");
+        assert!(
+            why.contains("the buffer changed after this comparison"),
+            "{why}"
+        );
+
+        let gone = Keepable { editor: None, ..at };
+        let why = refuse_keep(gone).expect("refused");
+        assert!(why.contains("nothing to edit"), "{why}");
+
+        // A reload restarts versions at zero, so the same number is a different
+        // document -- the rule an apply follows, and here it is sharper: a range
+        // from another document splices at a meaningless offset.
+        let replaced = Keepable {
+            editor: Some(BufferStamp::of(2, 4)),
+            ..at
+        };
+        assert!(refuse_keep(replaced).is_some());
+    }
+
+    #[test]
+    fn there_is_nothing_to_keep_where_the_documents_agree() {
+        let stamp = BufferStamp::of(1, 4);
+        let at = Keepable {
+            mode: Some(Mode::Local),
+            origin: Some(Origin::Common),
+            reviewed: stamp,
+            editor: Some(stamp),
+        };
+        let why = refuse_keep(at).expect("refused");
+        assert!(why.contains("nothing here differs"), "{why}");
+        assert!(
+            why.contains("n moves to the next change"),
+            "and names the key that moves: {why}"
+        );
+        assert!(refuse_keep(Keepable { origin: None, ..at }).is_some());
+
+        for origin in [
+            Origin::Mine,
+            Origin::Theirs,
+            Origin::Conflict,
+            Origin::Undeclared,
+        ] {
+            assert_eq!(
+                refuse_keep(Keepable {
+                    origin: Some(origin),
+                    ..at
+                }),
+                None,
+                "{origin:?} has a cluster side to keep"
+            );
+        }
+    }
+
+    #[test]
+    fn what_was_kept_is_named_by_the_classification_it_came_from() {
+        let keep = |taken, dropped| diff::Keep {
+            range: 0..0,
+            text: String::new(),
+            taken,
+            dropped,
+        };
+        assert!(
+            kept_note(Origin::Theirs, &keep(1, 0))
+                .starts_with("kept the cluster's change: added 1 line")
+        );
+        assert!(
+            kept_note(Origin::Mine, &keep(0, 2))
+                .starts_with("put the cluster's own text back: dropped 2 lines")
+        );
+        assert!(kept_note(Origin::Conflict, &keep(3, 1)).contains("3 lines in place of 1"));
+        assert!(
+            kept_note(Origin::Undeclared, &keep(1, 1)).contains("ctrl-alt-r"),
+            "the dry run that authorised an apply is void, and the sentence says which key asks again"
+        );
+    }
+
+    // A server-side apply creates what is absent, so a press can land on a
+    // different object than the one that was read. The uid says which, and a
+    // missing uid says nothing at all.
+    #[test]
+    fn an_answer_about_a_different_object_is_only_claimed_when_both_uids_are_known() {
+        assert_eq!(identity(Some("a"), Some("a")), Identity::Same);
+        assert_eq!(identity(Some("a"), Some("b")), Identity::Different);
+        assert_eq!(identity(None, Some("b")), Identity::Unknown);
+        assert_eq!(identity(Some("a"), None), Identity::Unknown);
+        assert_eq!(identity(None, None), Identity::Unknown);
+
+        assert!(recreated_note().contains("did not update the object this was opened from"));
+        // Which is only said when both are known, and is said about the uid the
+        // request went out with -- not about whatever the view points at when the
+        // answer lands. A real apply's reply always speaks, so a recompute during
+        // a slow apply would otherwise report a recreation that did not happen.
+        assert_eq!(landed_note(Some("a"), Some("b")), recreated_note());
+        assert_eq!(landed_note(Some("a"), Some("a")), "");
+        assert_eq!(landed_note(None, Some("b")), "");
+        assert_eq!(landed_note(Some("a"), None), "");
+        assert!(
+            stale_object_note().contains("open the object again"),
+            "a dry run about another object leaves the comparison's left side stale"
+        );
     }
 
     // The rule that cost a bug in the editor: one bit cannot tell two questions

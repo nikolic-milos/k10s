@@ -194,6 +194,7 @@ actions!(
         NextChange,
         PrevChange,
         ToggleFolded,
+        KeepTheirs,
     ]
 );
 
@@ -335,6 +336,10 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("n", NextChange, diff),
         KeyBinding::new("shift-n", PrevChange, diff),
         KeyBinding::new("c", ToggleFolded, diff),
+        // The one key in this context that changes a document. It edits the
+        // buffer rather than the cluster, so it needs no second press: undo is
+        // in the editor where the change lands.
+        KeyBinding::new("t", KeepTheirs, diff),
         KeyBinding::new("r", Refresh, diff),
         KeyBinding::new("ctrl-alt-d", DiffAgainstLive, diff),
         KeyBinding::new("ctrl-alt-r", ApplyDryRun, diff),

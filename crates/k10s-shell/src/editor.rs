@@ -420,6 +420,11 @@ pub struct DiffSources {
     pub live: String,
     pub base: Option<String>,
     pub buffer: String,
+    // Which object `live` was read from, as the server stated it in that read --
+    // not the uid of whatever was selected to open this editor, which can name
+    // an object that has since been replaced. An apply's answer carries the same
+    // field, and that comparison is what tells an update from a recreation.
+    pub uid: Option<String>,
     // The buffer with everything the server owns removed: what an apply sends.
     pub payload: k10s_edit::Payload,
     pub patchable: bool,
@@ -449,6 +454,9 @@ pub struct EditorView {
     live: Option<String>,
     // The `last-applied-configuration`, rendered: a three-way diff's base.
     base: Option<String>,
+    // Which object `live` came from. Replaced by every read, which is what keeps
+    // it from ageing into a claim about an object that has since been recreated.
+    uid: Option<String>,
     patchable: bool,
     status_subresource: bool,
     completion: Option<CompletionMenu>,
@@ -496,6 +504,7 @@ impl EditorView {
             schema_root: None,
             live: None,
             base: None,
+            uid: None,
             patchable: false,
             status_subresource: false,
             completion: None,
@@ -658,6 +667,7 @@ impl EditorView {
             live,
             base: self.base.clone(),
             buffer: self.buffer.text(),
+            uid: self.uid.clone(),
             payload: k10s_edit::apply::payload(
                 self.buffer.rope(),
                 &self.syntax,
@@ -690,6 +700,50 @@ impl EditorView {
         }
         self.saves.abandon();
         self.load(cx);
+        true
+    }
+
+    /// Splice one hunk of a comparison into the buffer, while the buffer is still
+    /// the one that comparison was made of. False when it is not, or when the
+    /// range does not land on this text.
+    ///
+    /// The stamp check is the same rule an apply follows and for a sharper
+    /// reason: an apply of text nobody reviewed is a bad write, but an *edit*
+    /// whose byte ranges came from a document the buffer no longer holds is a
+    /// splice at a meaningless offset -- it would corrupt the very text it was
+    /// meant to correct. The bounds check keeps that from being a panic in the
+    /// rope if the rule is ever broken elsewhere, since the ranges are data that
+    /// travelled.
+    ///
+    /// The selection is preserved rather than collapsed: this is a structural
+    /// edit like replace-all, not a keystroke, and the caret belongs where the
+    /// person left it.
+    pub fn keep_hunk(
+        &mut self,
+        stamp: BufferStamp,
+        keep: k10s_edit::diff::Keep,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.buffer_stamp() != stamp {
+            return false;
+        }
+        let text = self.buffer.rope();
+        if keep.range.end > text.len()
+            || !text.is_char_boundary(keep.range.start)
+            || !text.is_char_boundary(keep.range.end)
+        {
+            debug_assert!(
+                false,
+                "a hunk range belongs to the buffer it was taken from"
+            );
+            return false;
+        }
+        let splices = self.buffer.edit(
+            vec![(keep.range, keep.text)],
+            EditGroup::Other,
+            SelectionIntent::Preserve,
+        );
+        self.after_edit(splices, cx);
         true
     }
 
@@ -750,12 +804,14 @@ impl EditorView {
                             last_applied,
                             patchable,
                             status_subresource,
+                            uid,
                         } => {
                             this.title = title.into();
                             this.buffer = Buffer::new(&yaml);
                             this.syntax.reparse(this.buffer.rope());
                             this.live = Some(yaml);
                             this.base = last_applied;
+                            this.uid = uid;
                             this.patchable = patchable;
                             this.status_subresource = status_subresource;
                             this.meta = DocMeta {

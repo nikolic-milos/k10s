@@ -145,6 +145,7 @@ impl k10s_shell::ReadProvider for PlaneProvider {
                     last_applied: manifest.last_applied,
                     patchable: manifest.patchable,
                     status_subresource: manifest.status_subresource,
+                    uid: manifest.uid,
                 },
                 Fetched::Denied { what } => k10s_shell::ManifestOutcome::Denied(what),
                 Fetched::Failed { why, .. } => k10s_shell::ManifestOutcome::Failed(why),
@@ -172,6 +173,7 @@ impl k10s_shell::ReadProvider for PlaneProvider {
                 ApplyOutcome::Applied(applied) => k10s_shell::ApplyOutcome::Applied {
                     yaml: applied.yaml,
                     dry_run: applied.dry_run,
+                    uid: applied.uid,
                 },
                 ApplyOutcome::Unrendered(unrendered) => k10s_shell::ApplyOutcome::Unrendered {
                     dry_run: unrendered.dry_run,

@@ -141,6 +141,27 @@ fn sent(payload: &k10s_edit::Payload) -> &str {
         .expect("these fixtures prune cleanly; a blocked payload is never sent")
 }
 
+// This crate has exactly one mutating method and it is `apply`, so a test that
+// needs an object *gone* has to ask kube directly. That asymmetry is the design
+// and not an oversight: nothing in the shipped data plane deletes anything.
+fn delete_if_present(name: &str) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let client = kube::Client::try_default()
+            .await
+            .expect("a client from KUBECONFIG");
+        let request =
+            kube::api::Request::new(format!("/api/v1/namespaces/{}/configmaps", namespace()))
+                .delete(name, &kube::api::DeleteParams::default())
+                .expect("a delete request");
+        // A 404 is the state this asks for, so it is not a failure.
+        let _ = client.request::<serde_json::Value>(request).await;
+    });
+}
+
 #[test]
 #[ignore = "needs a live cluster; see the module comment"]
 fn a_client_side_applied_object_yields_a_three_way_base_and_a_sendable_payload() {
@@ -595,4 +616,55 @@ fn a_kind_with_a_status_subresource_applies_without_its_status() {
         "and the spec survives:\n{}",
         applied.yaml
     );
+}
+
+// A server-side apply *creates* what is absent, so a press on a document whose
+// object was deleted between the read and the press brings it back instead of
+// failing -- `kubectl apply`'s behaviour, and not what the person pressing the
+// key is thinking about. The uid is the whole evidence, and only a real server
+// can produce this: nothing scripted mints one.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn an_apply_after_a_delete_creates_a_new_object_rather_than_updating_the_old_one() {
+    let (_plane, sync) = connect(None);
+    let configmaps = kind(&sync.reader, "configmaps");
+    let name = "k10s-recreate-probe";
+    let document = format!(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {}\ndata:\n  probe: \"1\"\n",
+        namespace()
+    );
+
+    // Nothing server-owned is in this document, so the prune is a no-op on it and
+    // the bytes go as written.
+    delete_if_present(name);
+    let outcome = apply(
+        &sync.reader,
+        request(configmaps.id, name, document.clone(), false, false),
+    );
+    let ApplyOutcome::Applied(created) = outcome else {
+        panic!("an apply of an absent object creates it: {outcome:?}");
+    };
+    let first = created.uid.expect("a stored object has a uid");
+    assert_eq!(
+        manifest(&sync.reader, configmaps.id, name).uid.as_deref(),
+        Some(first.as_str()),
+        "the read and the apply agree about which object this is, which is what \
+         makes a disagreement mean something"
+    );
+
+    delete_if_present(name);
+    let outcome = apply(
+        &sync.reader,
+        request(configmaps.id, name, document, false, false),
+    );
+    let ApplyOutcome::Applied(again) = outcome else {
+        panic!("the apply recreates it rather than refusing: {outcome:?}");
+    };
+    let second = again.uid.expect("the new object has a uid too");
+    assert_ne!(
+        first, second,
+        "the object was deleted, so this apply created a new one -- which is the \
+         difference a review has to be able to state"
+    );
+    delete_if_present(name);
 }

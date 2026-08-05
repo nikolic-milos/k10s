@@ -56,6 +56,13 @@ pub struct Manifest {
     // here, and whether an apply may carry a status block.
     pub patchable: bool,
     pub status_subresource: bool,
+    // Whose object this text is, as the server states it in the very response
+    // that produced the text. An apply's answer carries the same field, and a
+    // server-side apply *creates* an absent object, so this is what tells an
+    // update from a recreation without a second round trip. Absent when the
+    // server sent none, which has to read as "cannot tell": the alternative is a
+    // client that announces a recreation because a field was missing.
+    pub uid: Option<String>,
 }
 
 pub(crate) async fn fetch_manifest(
@@ -74,6 +81,7 @@ pub(crate) async fn fetch_manifest(
             Ok(value) => value,
             Err(error) => return classify("manifest", &error),
         };
+    let uid = uid_of(&value);
     let (yaml, last_applied) = match document(target, &mut value) {
         Ok(rendered) => rendered,
         Err(reason) => {
@@ -84,6 +92,7 @@ pub(crate) async fn fetch_manifest(
         }
     };
     Fetched::Ok(Manifest {
+        uid,
         title: format!("{}.yaml", request.name),
         yaml,
         api_version: target.resource.api_version.clone(),
@@ -127,6 +136,16 @@ pub(crate) fn document(
             .as_deref()
             .and_then(|declared| render(declared, is_secret(target))),
     ))
+}
+
+// The object's own identity, as the server states it in the response the
+// document was rendered from. It is read here rather than taken from the
+// selection that opened the editor, because the two answer different questions:
+// a selection names what a person clicked, possibly some time ago, and this
+// names what the text on screen actually is. An empty string is no identity.
+pub(crate) fn uid_of(value: &serde_json::Value) -> Option<String> {
+    let uid = value.get("metadata")?.get("uid")?.as_str()?;
+    (!uid.is_empty()).then(|| uid.to_string())
 }
 
 fn withhold_values(value: &mut serde_json::Value) {
@@ -496,6 +515,19 @@ fn check(out: &str, depth: usize) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    // "Cannot tell" is a third answer, and it has to stay one: a reviewer that
+    // reads a missing uid as a mismatch announces that an object was deleted and
+    // recreated because a field was absent from a response.
+    #[test]
+    fn an_object_with_no_usable_uid_has_none_rather_than_a_blank_one() {
+        let uid = |json: &str| super::uid_of(&serde_json::from_str(json).unwrap());
+        assert_eq!(uid(r#"{"metadata":{"uid":"abc"}}"#).as_deref(), Some("abc"));
+        assert_eq!(uid(r#"{"metadata":{"uid":""}}"#), None);
+        assert_eq!(uid(r#"{"metadata":{"uid":7}}"#), None);
+        assert_eq!(uid(r#"{"metadata":{}}"#), None);
+        assert_eq!(uid(r#"{}"#), None);
+    }
+
     use super::*;
 
     fn emitted(value: &serde_json::Value) -> String {
