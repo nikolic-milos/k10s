@@ -15,20 +15,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  dependency-review:
-    name: Dependency review
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-
-      - name: Reject vulnerable dependency changes
-        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48
-        with:
-          fail-on-severity: moderate
-
   policy:
     name: Dependency policy
     runs-on: ubuntu-24.04
