@@ -251,3 +251,333 @@ gate to be decorative.
 Recorded from a clean build of the committed tree, twice, on an idle machine:
 the two runs agree to 0.7% and 0.1% on the new cases, and the run that was *not*
 installed then passed against the one that was — 5,050 checks, no failures.
+
+## 2026-08-05 — splitting a module can cost 4x with no change on the measured path
+
+`k10s-world/src/lib.rs` was 2,819 lines, 1,690 of which were one `mod tests`.
+Both halves were split up: the tests into `publish_test`, `stability_test`,
+`spawn_test` and a shared `test_support`, and the implementation into
+`publish`, `rollup`, `spawn` and `harness`. The code moved verbatim — a
+per-item diff of the result against the original is empty modulo `pub(crate)`
+and rustfmt reflow, and all 84 `world fan-out cull` cases agree on every
+structural field, so the snapshots the benchmark culls are identical in content.
+
+The implementation half was reverted anyway, because it cost this:
+
+| case | metric | before | after |
+|---|---|---|---|
+| ns-fanout 50k, Z1 widest ns | `p50_flat_spatial_ns` | 8,493 ns | 33,978 ns (**4.00x**) |
+| ns-fanout 50k, Z2 wide ns | `p50_flat_spatial_ns` | 6,838 ns | 25,859 ns (**3.78x**) |
+| platform 4k, Z3 deepest wl | `p50_no_edges_ns` | 165.6 ns | 200.6 ns (1.21x) |
+| ns-fanout 12k, Z3 deepest wl | `p50_ns` | 198.4 ns | 227.0 ns (1.14x) |
+| wl-fanout 4k, Z3 deepest wl | `p50_ns` | 992.9 ns | 1,127.5 ns (1.14x) |
+
+None of the moved code runs inside the measured region — the timed closure is
+`k10s-atlas`'s cull over an already-built snapshot. What changed is how the
+bench binary links: the cull is generic and monomorphizes in its calling crate,
+and five more modules in `k10s-world` moved ThinLTO's import decisions for that
+one binary. This is the effect `codegen-units = 1` was pinned to make
+*deterministic* rather than absent, at the upper end of the 15–380% the
+workspace manifest warns about.
+
+It does not reach the shipped app. The flight bench — the real binary, the real
+cull, per frame — is unchanged at worst 1.04x with identical draw counts, and
+`map walk` and `atlas cull` sit at a median ratio of 1.000 with no case over the
+gate. The regression exists only in `k10s-world`'s own bench binary.
+
+Two things were verified rather than argued. The pre-split tree was rebuilt from
+a snapshot and measured on the same idle machine minutes later: 8,493 ns,
+confirming the difference was the change and not the hour. And the tests-only
+split was then measured on its own: 8,447 ns, 6,828 ns, 198.5 ns, 165.6 ns,
+993.6 ns — every case within 0.5% of pre-split. That was predictable in advance,
+since `#[cfg(test)]` modules compile into no binary a benchmark links, and it is
+why the test split shipped and the implementation split did not.
+
+The lesson worth keeping: for a crate whose consumers monomorphize its
+neighbours' hot generics, a module boundary is not free, and "the code is
+identical" is not evidence that the machine code is. Measure the split, not the
+diff.
+
+Recorded on the same idle machine as the surrounding sections, with the
+`editor edit` suite re-run to confirm the machine itself was not the variable —
+it had drifted 17–31% high during one collection and returned to baseline
+(5,573,321 ns at 1 m against a recorded 5,571,538) on an unchanged binary.
+
+## 2026-08-06 — the Starmap redesign: one intended structural change, and one cost that is the feature
+
+The Starmap's visual language was rebuilt. Namespaces are islands with unequal, identity-stable
+corners instead of 6 px rectangles; every drawn workload wears its vendor or kind glyph, sized to the
+space it owns instead of pinned at 12 px in a corner; labels come from a type ladder derived from the
+user's typography, set in the display face for namespace names, centred and clipped inside the thing
+they name; pods are rounded and drawn hollow while terminating; and the pointer and selection rings
+are new. Separately, the live layout engine learned to widen a pod grid and to repack one after a
+scale-down.
+
+### What did not move
+
+`world publication` is unchanged end to end: every case between 0.97x and 1.01x, and
+`structural_patches` / `full_materializes` identical, so the pod-grid rework — `place_pod` widening
+the grid, `repack_pod_grid` compacting it, satellites re-orbiting — costs the measured path nothing
+and never tips a batch into a full materialize.
+
+`map allocation` passes every check: the walk still allocates nothing, and no label string is
+synthesized. `full GPUI paint allocation` holds `allocations_per_paint` exactly, with
+`bytes_per_paint` up 337 bytes for the second font and the label content masks.
+
+Every `exact` structural field in every suite matched except `icons`, and the 360,000-case
+cull-oracle sweep passed unchanged. That was the constraint the redesign was shaped around:
+appearance is carried by the *parameters* of quads the walk already emitted, and the two rings are
+painted outside `frame::walk` from a `PickPath` and the camera, so neither enters `CullStats` nor has
+to be mirrored across the five cull functions.
+
+### The one intended structural change
+
+`WL_ICON_MIN_PX` is now `4.0`, the same threshold as `WL_MIN_PX`: if a workload is drawn at all, it
+wears the mark that says what it is. `icons` therefore rises wherever workloads were previously drawn
+as bare rectangles — 0 → 476 on `map walk` at the Z1 region camera, and 44 cases across the suites.
+That is the change the redesign exists to make, not a side effect of it.
+
+It cost 1.61x on `walk_count` and 1.30x on `walk_paint` at that camera: 476 glyphs where there were
+none, about 6 ns each in the walk. `paint_svg` keys its sprite atlas on rasterized pixel size, so
+every camera-derived size on the map goes through `k10s_theme::quantize` — a fifteen-step geometric
+ladder — or a zoom would mint a fresh tile and a fresh GPU upload every frame.
+
+### The Z0 fit camera, and the four rounds it took
+
+`map walk` at the fit camera is the one walk §6.1 budgets at O(regions). Rounds on
+`uniform r400 b15 / Z0 fit`, `walk_count_p50_ns` against the committed 5,109 ns:
+
+| tree | ns | ratio | what changed |
+| --- | --- | --- | --- |
+| first cut | 12,698 | 2.49x | gradient fill and hashed corners on every island |
+| shading gated on size | 10,451 | 2.05x | a gradient nobody can see at forty pixels is not drawn |
+| corner hash gated on size | 9,830 | 1.92x | so the hash was not the cost either |
+| per-branch colour types | 6,505 | 1.27x | **this was the cost** |
+| screen sizes from world x zoom | 6,392 | 1.25x | no round trip through the `Bounds` just written |
+| thresholds pre-divided into world units | 6,347 | 1.24x | one comparison, no conversion, per island |
+
+The fourth row is the finding worth keeping. Folding `paint_region`'s three stage arms into one
+`(fill, border)` pair unifies the border's type across them, and the settled arm's border is an
+`Hsla` while the other two are `Rgba` — so the tidier code inserted an `Hsla -> Rgba -> Hsla` round
+trip per region on a conversion that is branchy. It cost more than the gradient and the hash
+together. Three explicit arms, each with its own natural types, is the shape that is fast.
+
+The same class of cost appeared once more and was designed out rather than accepted. The glyph gate
+briefly asked about the workload's halo (`block.rect.w`) instead of its card; every caller has
+already loaded `inner.w` for `block_painted`, so that added a second load to a loop that runs once
+per block, and it cost 1.13–1.17x across the `Z3 deepest wl` and `Z2 widest ns` cull cases **with the
+icon count held identical**. Lowering the card threshold instead reaches the same workloads for
+nothing, and those cases returned to 0.97–1.00x over three same-binary runs.
+
+What is left at Z0 is one comparison, one multiply and a four-way corner store per region — the
+island silhouette itself, about 3 ns per namespace. At four hundred namespaces the whole counting
+walk is 6.3 µs against a 16,666 µs frame. There is no way to draw a rounded island for less.
+
+Two thresholds keep it bounded rather than free: below 96 screen pixels an island's four corners
+collapse to one radius and its fill is flat, because at that size the asymmetry is two pixels and the
+gradient is invisible; above it, the number of islands that large is bounded by the viewport rather
+than by the cluster, which is §6.1 applied to a detail instead of to a node.
+
+### Final ratios, and what is not a regression
+
+| case | walk_count | walk_paint |
+| --- | --- | --- |
+| uniform r200/r400 / Z0 fit | 1.19x, 1.24x | 1.14x, 1.18x |
+| uniform r200/r400 / Z1 region | 1.64x | 1.34x |
+| every other map-walk case | 1.02–1.09x | 1.04–1.07x |
+
+`Scene` gained one field in the course of this, `card_header`: the band the layout reserves above a
+pod grid, in world units. It is the one piece of the layout's shape a painter cannot infer — the two
+layout modes reserve 26 and 16 units, no card's geometry reveals which, and guessing it from the
+card's height draws the header over the first row of pods in whichever mode was not guessed for.
+`assert_published_matches_full` compares it, so a publish path that forgets it fails loudly. It cost
+nothing measurable: every case above moved by at most 0.03x, which is this suite's run-to-run
+spread.
+
+Three fan-out cases remain flagged and are the host's documented instruction-layout sensitivity, not
+a mechanism. On one scene, `ns-fanout 50000`, `p50_flat_spatial_ns` reads **0.88x at `Z1 widest ns`
+and 2.15x at `Z2 wide ns`** — two neighbouring cameras, one code path, opposite signs, reproducible
+across three same-binary runs. This bench binary links `k10s-world`, whose implementation changed,
+and the 2026-08-05 note above records the same case moving 4.0x for a module split with no semantic
+change at all. `atlas cull` `Z4 extreme` p99 and `atlas fan-out` degree-64 p50 are the usual
+scattered singletons.
+
+**The baseline has deliberately NOT been refreshed.** These numbers come from an uncommitted working
+tree, which is the provenance both dirty-baseline incidents had. The gate rejects the Z0 and Z1 map
+cases and the `icons` counts; that rejection is correct, and it should be resolved by re-recording
+every suite from the commit that carries this change — not by editing the manifest.
+
+## 2026-08-11 — interaction chrome stays out of the canvas hot path
+
+The Starmap now has a semantic scale rail, summary, health legend, hover inspector and keyboardable
+camera controls. The shell hosts that furniture as a sibling GPUI entity rather than making it a
+child of `MapView`. Camera damage therefore rebuilds only the canvas; the fixed chrome is notified
+only when its bounded state changes: a scale-band crossing, resize, toggle, hover target or summary.
+
+Point picking no longer scans every workload or pod in a visible parent. It asks the existing
+hierarchical indexes for point candidates and then applies the same geometry tests as before.
+Deterministic 50,000-object tests cap both workload and pod probes at 64 candidates and verify that
+the expected target still wins.
+
+The allocation ratchets were rerun after this separation. Every map-walk case still reports zero
+label allocations. Forced full `MapView` paints report 71 cached / 74 uncached allocations against
+the committed 67.621 / 69.762 baseline and its 5% + 1 allocation allowance; reallocations fall to
+79 from 94.297 / 93.609, and bytes fall to 1,627,124 / 1,627,268 from 1,819,734 / 1,819,554. Text
+cache hit, miss and eviction counts remain exact. No baseline was refreshed.
+
+## 2026-08-11 — process start to first useful photon is a named contract
+
+Cold start now has its own one-process benchmark:
+
+```text
+cargo build --release --locked --bin k10s
+target/release/k10s --startup-bench --json --machine linux-x86_64-i5-12600k
+target/release/k10s --startup-bench --json --machine linux-x86_64-i5-12600k --objects 25000 --churn 0
+target/release/k10s --startup-bench --json --machine linux-x86_64-i5-12600k --objects 1000000 --churn 0
+```
+
+The versioned report starts its clock on the first line of Rust `main`, matching
+Zed's process-start convention and deliberately excluding the dynamic loader.
+GPUI exposes no renderer-submit or compositor feedback callback. A reported
+`*_presented` milestone is therefore the first platform frame callback after
+GPUI submitted the observed frame, not a claim about physical scan-out. The
+instrumentation lives at the application and `MapView` boundary; no timer,
+serialization, lock or benchmark branch enters `frame::walk`.
+
+`first_presented` is the first submitted frame. `useful_presented` is that same
+frame for the launch chooser, but a named source must first publish the scene it
+requested. Readiness is the later of content preparation and publication of a
+matching immutable snapshot, so generator/world callback order cannot change
+the number. The report separates argument parsing, source and content work,
+world spawn, platform launch, font/configuration setup, native window creation,
+first presentation, matching-scene publication and useful presentation.
+An incomplete run exits non-zero instead of printing a partial success.
+
+Named scenes no longer block native window creation. The generator and an
+explicit command-line cluster connection both run through the launch service
+while an empty world and the window start. Connection failure retains the CLI's
+non-zero exit contract; success adopts the provider in place. The world control
+wait is interruptible, so a ready scene does not sit behind the 50 ms simulation
+tick. Scene revisions remain monotonic across replacements, making the initial
+empty shell distinguishable from a later, legitimately empty cluster without a
+timing or object-count heuristic. Synthetic data crosses that control seam as a
+typed, owned `PreparedScene`: real clusters retain their native event contract,
+while a generator no longer allocates roughly one `ResourceEvent` per object
+merely for the world to fold those events back into the hierarchy it already
+owned.
+
+Initial world construction has a separate no-renderer phase benchmark:
+
+```text
+cargo bench --locked -p k10s-world --bench build
+cargo bench --locked -p k10s-clustergen --bench prepare
+```
+
+It led to three measured changes. UID maps in this crate use the same
+`rustc_hash::FxHashMap` policy as Zed's collections layer; every known topology
+cardinality is reserved once; and the production builder consumes its prepared
+input, moving labels, details and dependency vectors instead of cloning them
+just before the source is dropped. `rustc-hash` was already in the locked graph,
+so this changes no package count. An exact equality test holds the prepared
+generator output against the event-folded representation.
+
+The isolated million-object event build moved from 325.76 ms to 226.38 ms after
+the hasher change, then to 175.48 ms after capacity-correct construction. In the
+same pre-consuming binary, bypassing the event fold measured 138.73 ms. The
+then-current consuming benchmark reported source disposal inside assembly, so its
+160.35 ms prepared total is intentionally not compared as though the timing
+boundary were unchanged.
+
+Process-level observations on Wayland at 1600x1000, release profile,
+`linux-x86_64-i5-12600k`, are the comparable result:
+
+| state | runs | first presented | content ready | scene after content | useful presented |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| synchronous 1M starting point | 1 | 319.64 ms | — | — | 659.04 ms |
+| async 1M before world tuning, schema 2 | 3 | 77.30 ms | 283.55 ms | 410.83 ms | 701.43 ms |
+| second-ratchet release 1M | 5 | 78.62 ms | 201.88 ms | 140.68 ms | 350.87 ms |
+| snapshot-sharing checkpoint 1M | 5 | 78.77 ms | 201.38 ms | 123.15 ms | 335.41 ms |
+| current release 1M | 5 | 82.30 ms | 200.98 ms | 100.42 ms | 311.29 ms |
+| current release 25k | 5 | 75.12 ms | 8.53 ms | 3.38 ms | 75.12 ms |
+
+The current million-object first useful frame is 55.6% earlier than the
+instrumented async pre-tuning median and 52.8% earlier than the original
+blocking-path sample. First photon is 74.3% earlier than the original blocking
+path; the current five-run first-present median is slightly higher than the
+earlier release because window/compositor timing varied, not because it waits
+for scene construction. All five current 25k runs presented useful content on
+their first submitted frame. Once the immutable million-object scene exists,
+its useful presentation takes a 9.70 ms median; construction, not viewport
+paint, remains the dominant large-scene cost. Each release row was collected
+from the exact artifact described by that row.
+
+The second construction ratchet removed work rather than adding threads. UID
+formatting now writes decimal indices into a fixed stack buffer before the one
+required `Arc<str>` allocation, avoiding a temporary heap `String` for nearly
+every object. The 22-value satellite-detail vocabulary is interned once instead
+of allocating the same value for 277,268 attachments. Cross-namespace edge
+planning is a stable sparse list rather than 124k mostly-empty `Vec` headers,
+and workload-name uniqueness counts `(service, role)` pairs instead of retaining
+a cloned copy of every generated name. The isolated 1M generation-plus-prepare
+median moved from 176.26 ms to 152.99 ms; its prepare phase moved from 77.82 ms
+to 61.07 ms. At 25k the corresponding total is 3.59 ms.
+
+World assembly then resolved initial edges through the permanent workload slot
+map instead of building and discarding a second 124k-entry UID map, folded
+severity counts into the pass already consuming pods, and replaced per-pod
+components with one typed `PodHealth` resource vector. The component form had
+stored the same state in aggregates and in 591,688 Bevy entities even though no
+system queried those entities; every access first went through a parallel
+entity-index vector. Keeping the state as a resource preserved the ECS world
+and scheduled rollup/extract boundary while removing that duplicate storage and
+indirection. At that checkpoint, a dedicated high-water test pinned slot reuse
+and the isolated 1M prepared world build reported 45.41 ms layout, 57.40 ms
+assembly, 30.46 ms publication and 133.28 ms total, down from the prior 157.84
+ms total. Its exact release's 350.87 ms useful median was another 16.6% earlier
+than the 420.66 ms release immediately before that ratchet.
+
+The third construction ratchet removes the remaining repeated work while
+keeping small scenes sequential. Spread layout now streams orbit rings without
+temporary vectors, caches each golden-spiral square root and trigonometric pair
+once per layout, and uses a contiguous collision list for namespace packs up to
+the measured 128-item crossover. The large world pack retains a pre-sized grid
+index, so the fallback remains sub-quadratic. Committed bit-exact fingerprints
+pin every layout mode.
+
+Snapshot identity now uses `SlotIds`: each scene shares topology's contiguous
+immutable base and a live mutation copies only its touched 1,024-entry page.
+Topology stores one canonical UID per object; its map points compact
+fingerprints at full-identity collision chains, with a dense liveness byte for
+adjacency scans. Forced-collision tests cover lookup and removal at every chain
+position. `Aggregates::pod_state` is now the sole pod-state vector, and explicit
+old/new deltas update derived rollups correctly even when one pod changes
+several times in a tick. Finally, full node publication splits into three coarse
+lanes only at 250k nodes and on hosts with at least three available CPUs. A
+forced sequential/parallel equality test pins the result, while page sharing,
+truncation, slot reuse, snapshot isolation and derived-state oracles cover the
+mutation paths independently.
+
+Across four clean runs, the isolated 1M prepared-world median is 27.74 ms
+layout, 51.91 ms assembly, 14.30 ms publication and 94.34 ms total. That is
+29.2% below the preceding 133.28 ms checkpoint; layout is 38.9% lower and
+publication is 53.1% lower. The event-folded path is 132.66 ms and the prepared
+25k path is 1.92 ms. At process level, content preparation remained essentially
+flat while the 1M scene-after-content interval moved from 140.68 ms to 100.42
+ms. Useful presentation moved from 350.87 ms to 311.29 ms, an 11.3% reduction.
+
+Several plausible variants stayed out after measurement: 256- and 8,192-entry
+identity pages, an unstable layout sort with an explicit tie-break, paired
+`sin_cos`, and explicit bounds in the grid collision index were neutral or
+slower. The retained thresholds and representations are therefore empirical,
+not speculative complexity.
+
+One plausible optimization was measured and rejected: parallelizing prepared
+conversion by namespace raised median useful startup from 409.01 ms to
+431.52 ms and increased first-frame variance. These tasks allocate too finely;
+allocator contention and cache disruption cost more than the parallel work
+saved, so the release path remains sequential.
+
+These are working-tree observations, not a committed baseline. No baseline was
+refreshed; a real-cluster three-size recording still belongs on a clean,
+committed tree with the machine manifest and repetition discipline described at
+the top of this file.
