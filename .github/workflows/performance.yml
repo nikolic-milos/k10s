@@ -1,13 +1,11 @@
 name: Performance
 
-# Runs nightly and on demand rather than per push: the labelled runner is the
-# development desktop, and a timed suite on a machine somebody is using
-# measures the somebody, not the change. 03:30 is when this machine is
-# reliably idle; a perf-sensitive merge can ask for a run any time with
-# workflow_dispatch.
+# Runs on demand only: the labelled runner is the development desktop, which
+# is off at night and busy by day, so a schedule would either queue into a
+# void or measure the person using the machine rather than the change. A
+# perf-sensitive merge asks for a run with workflow_dispatch and gives the
+# machine thirty quiet minutes.
 on:
-  schedule:
-    - cron: "30 3 * * *"
   workflow_dispatch:
 
 permissions:
