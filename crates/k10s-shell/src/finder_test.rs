@@ -306,6 +306,9 @@ fn stepping_back_out_of_a_folder_lists_the_one_left_behind_again() {
     );
 }
 
+// A name that is bytes rather than text is a Unix fact; Windows file
+// names are UTF-16 and cannot carry one.
+#[cfg(unix)]
 #[test]
 fn a_file_whose_name_is_not_utf8_still_opens() {
     use std::os::unix::ffi::OsStrExt as _;

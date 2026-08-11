@@ -328,6 +328,9 @@ fn the_fake_fs_lists_directories_with_folders_first() {
     );
 }
 
+// A name that is bytes rather than text is a Unix fact; Windows file
+// names are UTF-16 and cannot carry one.
+#[cfg(unix)]
 #[test]
 fn a_name_that_is_not_utf8_still_names_a_file_that_opens() {
     use std::os::unix::ffi::OsStrExt as _;
