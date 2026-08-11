@@ -1,25 +1,13 @@
 name: Performance
 
+# Runs nightly and on demand rather than per push: the labelled runner is the
+# development desktop, and a timed suite on a machine somebody is using
+# measures the somebody, not the change. 03:30 is when this machine is
+# reliably idle; a perf-sensitive merge can ask for a run any time with
+# workflow_dispatch.
 on:
-  push:
-    branches: [dev, main]
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "third-party/**"
-      - "tools/k10s-paint-bench/**"
-      - "benchmarks/**"
-      - ".github/workflows/performance.yml"
-  pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "third-party/**"
-      - "tools/k10s-paint-bench/**"
-      - "benchmarks/**"
-      - ".github/workflows/performance.yml"
+  schedule:
+    - cron: "30 3 * * *"
   workflow_dispatch:
 
 permissions:
