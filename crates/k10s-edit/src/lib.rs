@@ -17,10 +17,16 @@
 pub mod apply;
 pub mod buffer;
 pub mod complete;
+#[cfg(test)]
+mod complete_test;
 pub mod diff;
+#[cfg(test)]
+mod diff_test;
 pub mod insert;
 pub mod rope;
 pub mod schema;
+#[cfg(test)]
+mod schema_test;
 pub mod search;
 pub mod syntax;
 
