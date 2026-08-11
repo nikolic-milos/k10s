@@ -350,8 +350,28 @@ impl TerminalView {
 
     /// The user's own shell in the same view: the transport is the only
     /// difference between a local terminal and a cluster exec.
+    #[cfg(unix)]
     pub fn local(cx: &mut Context<Self>) -> TerminalView {
         Self::with_transport("terminal".into(), crate::pty::spawn_local_shell, cx)
+    }
+
+    // A PTY is the one transport this build does not open on Windows yet; the
+    // view still exists so the terminal toggle answers with a labelled state
+    // instead of a missing action.
+    #[cfg(not(unix))]
+    pub fn local(cx: &mut Context<Self>) -> TerminalView {
+        Self::with_transport(
+            "terminal".into(),
+            |on_event| {
+                on_event(ExecEvent::Failed(
+                    "the local terminal needs a PTY, which this build does not open on this \
+                     platform yet"
+                        .to_string(),
+                ));
+                Box::new(crate::provider::NullExecSession)
+            },
+            cx,
+        )
     }
 
     fn with_transport(

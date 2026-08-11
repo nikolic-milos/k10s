@@ -50,6 +50,7 @@ pub mod keymap;
 pub mod launch;
 pub mod palette;
 pub mod provider;
+#[cfg(unix)]
 pub mod pty;
 pub mod reveal;
 pub mod settings;

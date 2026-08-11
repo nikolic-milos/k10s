@@ -433,7 +433,10 @@ fn current_umask() -> u32 {
     *UMASK.get_or_init(|| {
         let mode = rustix::process::umask(rustix::fs::Mode::empty());
         rustix::process::umask(mode);
-        mode.bits()
+        // `RawMode` is u32 on Linux and u16 on Apple and the BSDs; widen it
+        // here so the mask arithmetic stays one type on every platform.
+        #[allow(clippy::useless_conversion)]
+        u32::from(mode.bits())
     })
 }
 
