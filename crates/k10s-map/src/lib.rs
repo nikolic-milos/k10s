@@ -10,6 +10,7 @@
 //! walk at zero allocations.
 
 mod bench;
+mod chrome;
 mod frame;
 mod hex;
 mod lod;
@@ -21,14 +22,16 @@ mod text;
 use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 use std::rc::Rc;
+use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use futures::StreamExt as _;
 use futures::channel::mpsc::Receiver;
 use gpui::{
-    App, Bounds, Context, FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString, TextAlign, TextRun,
-    TransformationMatrix, Window, canvas, div, fill, point, prelude::*, px, quad, rgb, size,
+    App, Bounds, Context, FocusHandle, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString, TextAlign,
+    TextRun, TransformationMatrix, Window, canvas, div, fill, point, prelude::*, px, quad, rgb,
+    size,
 };
 use k10s_atlas::{
     DrawnCounts, FLIGHT_VIEWPORT, FlyTo, FramePacer, FrameSpans, FrameStats, Motion, StageMachine,
@@ -43,11 +46,23 @@ pub use bench::{BenchMeta, BenchReport};
 pub struct Picked {
     pub snapshot: std::sync::Arc<SceneSnapshot>,
     pub path: PickPath,
+    mark: Mark,
 }
 
 impl gpui::EventEmitter<Picked> for MapView {}
 
-gpui::actions!(k10s_map, [ToggleChurn, ToggleEdges, ToggleHud, FitView]);
+gpui::actions!(
+    k10s_map,
+    [
+        ToggleChurn,
+        ToggleEdges,
+        ToggleHud,
+        ToggleLegend,
+        FitView,
+        ZoomIn,
+        ZoomOut,
+    ]
+);
 
 // The map's own commands, bound in its own context so the shell's letters
 // never collide with them and a user keymap can rebind them by name.
@@ -56,25 +71,178 @@ pub fn keybindings() -> Vec<gpui::KeyBinding> {
     vec![
         gpui::KeyBinding::new("c", ToggleChurn, map),
         gpui::KeyBinding::new("e", ToggleEdges, map),
+        gpui::KeyBinding::new("g", ToggleLegend, map),
         gpui::KeyBinding::new("h", ToggleHud, map),
         gpui::KeyBinding::new("f", FitView, map),
+        gpui::KeyBinding::new("=", ZoomIn, map),
+        gpui::KeyBinding::new("-", ZoomOut, map),
     ]
 }
 pub use frame::FrameOpts;
 pub use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 pub use lod::{cull, stage_for_zoom};
-pub use pick::{PickPath, pick};
+pub use pick::{PickPath, path_rect, pick};
+
+type PresentCallback = Box<dyn FnOnce(Instant, &mut App)>;
+type SceneReady = Box<dyn Fn(&SceneSnapshot) -> bool>;
+
+/// One-shot observations of frames that crossed GPUI's presentation boundary.
+///
+/// GPUI does not expose the platform renderer's submit callback. A callback
+/// armed during a draw therefore runs at the beginning of the next platform
+/// frame: after the frame that armed it was submitted, and before any later
+/// frame is built. Keeping this seam here lets the application measure startup
+/// without putting clocks, serialization, or process policy in the painter.
+#[derive(Default)]
+pub struct PresentProbe {
+    first: Option<PresentCallback>,
+    scene: Option<PresentCallback>,
+    scene_ready: Option<SceneReady>,
+}
+
+impl PresentProbe {
+    pub fn first(callback: impl FnOnce(Instant, &mut App) + 'static) -> Self {
+        Self {
+            first: Some(Box::new(callback)),
+            scene: None,
+            scene_ready: None,
+        }
+    }
+
+    pub fn on_scene(mut self, callback: impl FnOnce(Instant, &mut App) + 'static) -> Self {
+        self.scene_ready = Some(Box::new(|scene| scene.rev != 0));
+        self.scene = Some(Box::new(callback));
+        self
+    }
+
+    pub fn on_scene_when(
+        mut self,
+        ready: impl Fn(&SceneSnapshot) -> bool + 'static,
+        callback: impl FnOnce(Instant, &mut App) + 'static,
+    ) -> Self {
+        self.scene_ready = Some(Box::new(ready));
+        self.scene = Some(Box::new(callback));
+        self
+    }
+
+    fn take(&mut self, scene_ready: bool) -> ArmedPresent {
+        if scene_ready {
+            self.scene_ready = None;
+        }
+        ArmedPresent {
+            first: self.first.take(),
+            scene: scene_ready.then(|| self.scene.take()).flatten(),
+        }
+    }
+
+    fn arm(&mut self, scene: &SceneSnapshot, window: &Window) {
+        let scene_ready = self.scene_ready.as_ref().is_some_and(|ready| ready(scene));
+        let callbacks = self.take(scene_ready);
+        if callbacks.is_empty() {
+            return;
+        }
+        window.on_next_frame(move |_, cx| callbacks.fire(Instant::now(), cx));
+    }
+}
+
+struct ArmedPresent {
+    first: Option<PresentCallback>,
+    scene: Option<PresentCallback>,
+}
+
+impl ArmedPresent {
+    fn is_empty(&self) -> bool {
+        self.first.is_none() && self.scene.is_none()
+    }
+
+    fn fire(self, presented_at: Instant, cx: &mut App) {
+        if let Some(callback) = self.first {
+            callback(presented_at, cx);
+        }
+        if let Some(callback) = self.scene {
+            callback(presented_at, cx);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "present_test.rs"]
+mod present_tests;
 
 #[cfg(feature = "testing")]
 pub mod testing {
-    pub use crate::frame::{FramePaths, FrameSink, IconJob, LabelJob, PaintSink, walk};
+    pub use crate::frame::{FramePaths, FrameSink, IconJob, LabelFace, LabelJob, PaintSink, walk};
 }
 
 use bench::{Bench, BenchOp};
-use frame::{IconJob, LabelJob, PaintSink};
+use frame::{IconJob, LabelFace, LabelJob, PaintSink};
 use k10s_theme::scale_alpha;
 use lod::lod;
 use text::TextCache;
+
+// A highlight is an index path plus the identities which made that path true.
+// World slots are intentionally reused; validating the non-empty ids before a
+// paint prevents a deleted pod's ring from jumping to its replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mark {
+    path: PickPath,
+    rev: u64,
+    ids: [Option<std::sync::Arc<str>>; 4],
+}
+
+impl Mark {
+    fn new(scene: &SceneSnapshot, path: PickPath) -> Option<Mark> {
+        path_rect(scene, &path)?;
+        let id = |ids: &k10s_core::SlotIds, slot: Option<u32>| {
+            slot.and_then(|slot| ids.get(slot as usize))
+                .filter(|id| !id.is_empty())
+                .cloned()
+        };
+        Some(Mark {
+            path,
+            rev: scene.rev,
+            ids: [
+                id(&scene.ids.regions, Some(path.region)),
+                id(&scene.ids.blocks, path.block),
+                id(&scene.ids.cells, path.cell),
+                id(&scene.ids.sats, path.sat),
+            ],
+        })
+    }
+
+    fn resolve(&self, scene: &SceneSnapshot) -> Option<PickPath> {
+        path_rect(scene, &self.path)?;
+        let current = [
+            scene.ids.regions.get(self.path.region as usize),
+            self.path
+                .block
+                .and_then(|slot| scene.ids.blocks.get(slot as usize)),
+            self.path
+                .cell
+                .and_then(|slot| scene.ids.cells.get(slot as usize)),
+            self.path
+                .sat
+                .and_then(|slot| scene.ids.sats.get(slot as usize)),
+        ];
+        let mut identified = false;
+        for (expected, current) in self.ids.iter().zip(current) {
+            if let Some(expected) = expected {
+                identified = true;
+                if current != Some(expected) {
+                    return None;
+                }
+            }
+        }
+        (identified || scene.rev == self.rev).then_some(self.path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HoverBasis {
+    rev: u64,
+    camera: Camera,
+    viewport: (f32, f32),
+}
 
 type Glyph = (&'static str, &'static [u8]);
 
@@ -185,9 +353,20 @@ pub struct MapView {
     churn_on: bool,
     edges_on: bool,
     hud_on: bool,
+    legend_on: bool,
     fitted: bool,
 
     interacted: bool,
+    // What the pointer is over and what the shell has selected. Both are drawn
+    // OUTSIDE `frame::walk`, from the path and the camera alone, so neither
+    // appears in `CullStats`, neither has to be mirrored in the cull oracle,
+    // and neither can move a benchmark's structural counters. An affordance
+    // that costs the engine nothing is an affordance that can be as generous as
+    // it likes.
+    hovered: Option<Mark>,
+    selected: Option<Mark>,
+    hover_position: Option<Point<Pixels>>,
+    hover_basis: Option<HoverBasis>,
     last_vp: (f32, f32),
     focus_handle: FocusHandle,
     stats: Rc<RefCell<FrameStats>>,
@@ -196,6 +375,10 @@ pub struct MapView {
     label_buf: Rc<RefCell<Vec<LabelJob>>>,
     icon_buf: Rc<RefCell<Vec<IconJob>>>,
     text_cache: Rc<RefCell<TextCache>>,
+    summary: chrome::SummaryCache,
+    chrome: gpui::Entity<chrome::Chrome>,
+    chrome_state: Option<chrome::State>,
+    present_probe: PresentProbe,
 
     pacer: FramePacer,
     stage: StageMachine,
@@ -246,6 +429,8 @@ impl MapView {
         damage: Receiver<()>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let measuring = bench.is_some();
+        let map_chrome = cx.new(|_| chrome::Chrome::default());
         cx.spawn(async move |this, cx| {
             let mut damage = damage;
             while damage.next().await.is_some() {
@@ -265,10 +450,18 @@ impl MapView {
             drag_total: 0.0,
             map_bounds: Rc::new(Cell::new(k10s_core::Rect::ZERO)),
             churn_on: true,
-            edges_on: true,
-            hud_on: true,
+            // Dense topology is opt-in for a person: it is useful during an
+            // investigation and visual noise at rest. Scripted flights retain
+            // the historical surface their baselines measure.
+            edges_on: measuring,
+            hud_on: measuring,
+            legend_on: !measuring,
             fitted: false,
             interacted: false,
+            hovered: None,
+            selected: None,
+            hover_position: None,
+            hover_basis: None,
             last_vp: (0.0, 0.0),
             focus_handle: cx.focus_handle(),
             stats: Rc::new(RefCell::new(FrameStats::default())),
@@ -277,6 +470,10 @@ impl MapView {
             label_buf: Rc::new(RefCell::new(Vec::new())),
             icon_buf: Rc::new(RefCell::new(Vec::new())),
             text_cache: Rc::new(RefCell::new(TextCache::default())),
+            summary: chrome::SummaryCache::default(),
+            chrome: map_chrome,
+            chrome_state: None,
+            present_probe: PresentProbe::default(),
             pacer: FramePacer::default(),
             fly: None,
             bench_failed,
@@ -288,6 +485,18 @@ impl MapView {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    pub fn with_present_probe(mut self, probe: PresentProbe) -> Self {
+        self.present_probe = probe;
+        self
+    }
+
+    /// Fixed map furniture is hosted beside the canvas by the workspace. That
+    /// gives both halves their own reactive boundary: camera frames rebuild the
+    /// map, while a semantic-band or hover change rebuilds this view alone.
+    pub fn chrome_view(&self) -> gpui::AnyView {
+        self.chrome.clone().into()
     }
 
     // The map's commands, invoked by the workspace's action handlers: the
@@ -307,6 +516,37 @@ impl MapView {
     pub fn toggle_hud(&mut self, cx: &mut Context<Self>) {
         self.hud_on = !self.hud_on;
         cx.notify();
+    }
+
+    pub fn toggle_legend(&mut self, cx: &mut Context<Self>) {
+        self.legend_on = !self.legend_on;
+        cx.notify();
+    }
+
+    pub fn zoom_in(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.zoom_by(1.35, window, cx);
+    }
+
+    pub fn zoom_out(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.zoom_by(1.0 / 1.35, window, cx);
+    }
+
+    fn zoom_by(&mut self, factor: f32, window: &Window, cx: &mut Context<Self>) {
+        let (_, vw, vh) = self.map_viewport(window);
+        self.camera.zoom_around(factor, vw * 0.5, vh * 0.5, vw, vh);
+        self.fly = None;
+        self.suppress_hover();
+        self.interacted = true;
+        cx.notify();
+    }
+
+    /// Stop a camera flight before Escape proceeds to selection dismissal.
+    pub fn cancel_flight(&mut self, cx: &mut Context<Self>) -> bool {
+        let cancelled = self.fly.take().is_some();
+        if cancelled {
+            cx.notify();
+        }
+        cancelled
     }
 
     /// Frame the whole scene, flying there rather than arriving there.
@@ -330,6 +570,7 @@ impl MapView {
             // whichever ones remembered to look at a copy of it.
             self.fly_to(target, Motion::reduced_when(cx.reduce_motion()));
         }
+        self.suppress_hover();
         cx.notify();
     }
 
@@ -353,6 +594,7 @@ impl MapView {
         } else {
             self.fly_to(target, Motion::reduced_when(cx.reduce_motion()));
         }
+        self.suppress_hover();
         cx.notify();
         true
     }
@@ -371,6 +613,87 @@ impl MapView {
         }
         self.fitted = true;
         self.interacted = true;
+    }
+
+    /// What the shell says is selected. The map does not decide this -- a click
+    /// leaves as a `Picked` event and comes back through here -- so selection
+    /// stays one fact held in one place even when it was set by the finder or
+    /// by a panel rather than by the pointer.
+    pub fn set_selection(&mut self, selected: Option<&Picked>, cx: &mut Context<Self>) {
+        let selected = selected.map(|picked| picked.mark.clone());
+        if self.selected != selected {
+            self.selected = selected;
+            cx.notify();
+        }
+    }
+
+    // Resolve what is under the pointer, and ask for a frame only if the answer
+    // changed. Notifying per move event would repaint at pointer rate and turn
+    // "zero paints at idle" into "zero paints unless the mouse is in the
+    // window"; notifying on change is one paint per object crossed.
+    fn hover_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.hover_position = Some(position);
+        let snapshot = self.scene.load_full();
+        let hovered = self.pick_mark_at(&snapshot, position);
+        self.hover_basis = Some(self.hover_basis(&snapshot));
+        if self.hovered != hovered {
+            self.hovered = hovered;
+            cx.notify();
+        }
+    }
+
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        let had_hover = self.hovered.is_some();
+        self.suppress_hover();
+        if had_hover {
+            cx.notify();
+        }
+    }
+
+    fn suppress_hover(&mut self) {
+        self.hover_position = None;
+        self.hover_basis = None;
+        self.hovered = None;
+    }
+
+    fn hover_basis(&self, scene: &SceneSnapshot) -> HoverBasis {
+        let rect = self.map_bounds.get();
+        HoverBasis {
+            rev: scene.rev,
+            camera: self.camera,
+            viewport: (rect.w, rect.h),
+        }
+    }
+
+    fn refresh_hover(&mut self, scene: &SceneSnapshot) {
+        let basis = self.hover_basis(scene);
+        if self.hover_basis == Some(basis) {
+            return;
+        }
+        self.hover_basis = Some(basis);
+        self.hovered = self
+            .hover_position
+            .and_then(|position| self.pick_mark_at(scene, position));
+    }
+
+    fn pick_mark_at(&self, scene: &SceneSnapshot, position: Point<Pixels>) -> Option<Mark> {
+        let rect = self.map_bounds.get();
+        if rect.w <= 0.0 || rect.h <= 0.0 || scene.rev == 0 {
+            return None;
+        }
+        let policy = lod();
+        let blend = StageBlend::settled(policy.stage_for_zoom(self.camera.zoom));
+        let path = pick(
+            scene,
+            &self.camera,
+            policy,
+            blend,
+            rect.w,
+            rect.h,
+            f32::from(position.x) - rect.x,
+            f32::from(position.y) - rect.y,
+        )?;
+        Mark::new(scene, path)
     }
 
     /// Forget that the camera was ever framed, so the next scene with anything in
@@ -430,14 +753,18 @@ impl MapView {
         }
     }
 
-    fn emit_pick(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn emit_pick(
+        &mut self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<(std::sync::Arc<SceneSnapshot>, PickPath)> {
         let rect = self.map_bounds.get();
         if rect.w <= 0.0 || rect.h <= 0.0 {
-            return;
+            return None;
         }
         let snapshot = self.scene.load_full();
         if snapshot.rev == 0 {
-            return;
+            return None;
         }
         // A click resolves at the stage the zoom is settling toward; a fade
         // lasts 180 ms and picking mid-fade should answer for where the user
@@ -454,9 +781,32 @@ impl MapView {
             f32::from(position.x) - rect.x,
             f32::from(position.y) - rect.y,
         ) else {
+            return None;
+        };
+        let mark = Mark::new(&snapshot, path)?;
+        cx.emit(Picked {
+            snapshot: snapshot.clone(),
+            path,
+            mark,
+        });
+        Some((snapshot, path))
+    }
+
+    fn focus_path(
+        &mut self,
+        scene: &SceneSnapshot,
+        path: PickPath,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rect) = path_rect(scene, &path) else {
             return;
         };
-        cx.emit(Picked { snapshot, path });
+        let (_, vw, vh) = self.map_viewport(window);
+        let target = self.camera.reveal(rect, vw, vh);
+        self.fly_to(target, Motion::reduced_when(cx.reduce_motion()));
+        self.suppress_hover();
+        cx.notify();
     }
 
     fn viewport(window: &Window) -> (f32, f32) {
@@ -468,7 +818,14 @@ impl MapView {
 impl Render for MapView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let scene = self.scene.load_full();
-        let (vw, vh) = Self::viewport(window);
+        self.present_probe.arm(&scene, window);
+        let window_viewport = Self::viewport(window);
+        let (_, map_width, map_height) = self.map_viewport(window);
+        let (vw, vh) = if self.bench.is_some() {
+            window_viewport
+        } else {
+            (map_width, map_height)
+        };
 
         let was_continuous = self.pacer.begin_frame();
         if repaint_always() {
@@ -532,6 +889,7 @@ impl Render for MapView {
         if self.stage.animating() {
             self.pacer.request_frame();
         }
+        self.refresh_hover(&scene);
 
         let animating = self.pacer.frame_requested();
         let camera = self.camera;
@@ -546,24 +904,87 @@ impl Render for MapView {
         let hud_on = self.hud_on;
         let bench_letterbox = self.bench.is_some();
         let map_bounds = self.map_bounds.clone();
+        let marks = Marks {
+            hovered: self.hovered.as_ref().and_then(|mark| mark.resolve(&scene)),
+            selected: self.selected.as_ref().and_then(|mark| mark.resolve(&scene)),
+        };
+        if !bench_letterbox {
+            let summary = self.summary.line(scene.totals);
+            let state = chrome::State::resolve(chrome::Overlay {
+                scene: &scene,
+                camera,
+                policy: lod(),
+                hovered: marks.hovered,
+                summary,
+                edges_on,
+                legend_on: self.legend_on,
+                viewport: (map_width, map_height),
+            });
+            if self.chrome_state.as_ref() != Some(&state) {
+                self.chrome_state = Some(state.clone());
+                // Keep entity mutation out of the render that discovered it.
+                // The deferred notification refreshes the workspace-hosted
+                // chrome sibling without invalidating this canvas-owning view.
+                let chrome = self.chrome.clone();
+                cx.defer(move |cx| {
+                    chrome.update(cx, |chrome, cx| chrome.sync(state, cx));
+                });
+            }
+        }
+
+        let pointer = if marks.hovered.is_some() {
+            gpui::CursorStyle::PointingHand
+        } else {
+            gpui::CursorStyle::Arrow
+        };
+        let paint_scene = scene.clone();
 
         div()
+            .id("starmap-view")
             .size_full()
+            .relative()
+            .cursor(pointer)
+            .role(gpui::Role::Application)
+            .aria_label("Interactive Kubernetes Starmap")
             .track_focus(&self.focus_handle)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, _| {
                     this.drag = Some(ev.position);
                     this.drag_total = 0.0;
+                    this.fly = None;
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &MouseDownEvent, _, _| {
+                    this.drag = Some(ev.position);
+                    this.drag_total = 4.0;
+                    this.fly = None;
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                cx.listener(|this, ev: &MouseUpEvent, window, cx| {
                     let clicked = this.drag.take().is_some() && this.drag_total < 4.0;
-                    if clicked {
-                        this.emit_pick(ev.position, cx);
+                    let mut focused = false;
+                    if clicked
+                        && let Some((scene, path)) = this.emit_pick(ev.position, cx)
+                        && ev.click_count >= 2
+                    {
+                        this.focus_path(&scene, path, window, cx);
+                        focused = true;
                     }
+                    if !focused {
+                        this.hover_at(ev.position, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                    this.drag = None;
+                    this.hover_at(ev.position, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
@@ -573,9 +994,16 @@ impl Render for MapView {
                     this.drag_total += dx.abs() + dy.abs();
                     this.camera.pan_px(dx, dy);
                     this.drag = Some(ev.position);
+                    this.suppress_hover();
                     this.interacted = true;
                     cx.notify();
+                } else {
+                    this.hover_at(ev.position, cx);
                 }
+            }))
+            .on_mouse_exit(cx.listener(|this, _: &MouseExitEvent, _, cx| {
+                this.drag = None;
+                this.clear_hover(cx);
             }))
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
                 let dy = f32::from(ev.delta.pixel_delta(px(24.0)).y);
@@ -588,6 +1016,8 @@ impl Render for MapView {
                     vw,
                     vh,
                 );
+                this.fly = None;
+                this.suppress_hover();
                 this.interacted = true;
                 cx.notify();
             }))
@@ -596,15 +1026,20 @@ impl Render for MapView {
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
-                        map_bounds.set(k10s_core::Rect::new(
+                        let next_bounds = k10s_core::Rect::new(
                             f32::from(bounds.origin.x),
                             f32::from(bounds.origin.y),
                             f32::from(bounds.size.width),
                             f32::from(bounds.size.height),
-                        ));
+                        );
+                        if map_bounds.replace(next_bounds) != next_bounds {
+                            // The next render now has the element-relative
+                            // viewport for fit, reveal, picking and chrome.
+                            window.request_animation_frame();
+                        }
                         paint_map(
                             bounds,
-                            &scene,
+                            &paint_scene,
                             camera,
                             blend,
                             &stats,
@@ -613,6 +1048,7 @@ impl Render for MapView {
                             &label_buf,
                             &icon_buf,
                             &text_cache,
+                            marks,
                             edges_on,
                             churn_on,
                             hud_on,
@@ -650,35 +1086,8 @@ fn letterbox_bounds(canvas: Bounds<Pixels>) -> Bounds<Pixels> {
 }
 
 #[cfg(test)]
-mod letterbox_tests {
-    use super::*;
-
-    #[test]
-    fn letterbox_keeps_logical_size_and_centers() {
-        let canvas = Bounds {
-            origin: point(px(0.0), px(0.0)),
-            size: size(px(1920.0), px(1200.0)),
-        };
-        let box_ = letterbox_bounds(canvas);
-        assert_eq!(f32::from(box_.size.width), FLIGHT_VIEWPORT[0]);
-        assert_eq!(f32::from(box_.size.height), FLIGHT_VIEWPORT[1]);
-        assert!((f32::from(box_.origin.x) - 160.0).abs() < 1e-3);
-        assert!((f32::from(box_.origin.y) - 100.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn letterbox_origin_may_go_negative_on_a_smaller_window() {
-        let canvas = Bounds {
-            origin: point(px(0.0), px(0.0)),
-            size: size(px(1512.0), px(837.0)),
-        };
-        let box_ = letterbox_bounds(canvas);
-        assert_eq!(f32::from(box_.size.width), FLIGHT_VIEWPORT[0]);
-        assert_eq!(f32::from(box_.size.height), FLIGHT_VIEWPORT[1]);
-        assert!(f32::from(box_.origin.x) < 0.0);
-        assert!(f32::from(box_.origin.y) < 0.0);
-    }
-}
+#[path = "letterbox_test.rs"]
+mod letterbox_tests;
 
 fn repaint_always() -> bool {
     static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -688,6 +1097,83 @@ fn repaint_always() -> bool {
 fn glow_on() -> bool {
     static GLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GLOW.get_or_init(|| std::env::var_os("K10S_NO_GLOW").is_none_or(|v| v == "0"))
+}
+
+/// The pointer and selection marks, carried into the paint closure as one
+/// `Copy` value so the closure captures a fact rather than the view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Marks {
+    hovered: Option<PickPath>,
+    selected: Option<PickPath>,
+}
+
+impl Marks {
+    fn is_empty(&self) -> bool {
+        self.hovered.is_none() && self.selected.is_none()
+    }
+}
+
+// How far the ring stands off the thing it marks and how thick it is, in screen
+// pixels. Both are constants rather than fractions of the target: a ring is
+// chrome, and chrome that scales with the camera stops reading as chrome. Its
+// CORNERS are not constant -- they follow the target, or a ring round an island
+// reads as a box drawn over a blob.
+const MARK_INSET: f32 = 3.0;
+const MARK_WIDTH: f32 = 2.0;
+const MARK_RADIUS_OF_SHORT: f32 = 0.2;
+const MARK_RADIUS_MAX: f32 = 20.0;
+const MARK_HALO_ALPHA: f32 = 0.16;
+
+// Draw whatever the pointer is on and whatever is selected, from the path and
+// the camera alone.
+//
+// Deliberately outside `frame::walk`: the walk's counters are an exact-gated
+// benchmark surface and are re-derived by an independently written cull oracle
+// on every debug frame, so a ring emitted inside it would have to be reproduced
+// in five cull functions and would move committed baselines. Out here it is two
+// quads, O(1), and it can be as expensive to look at as it likes.
+fn paint_marks(
+    bounds: Bounds<Pixels>,
+    scene: &SceneSnapshot,
+    camera: Camera,
+    marks: Marks,
+    theme: &k10s_theme::MapTheme,
+    window: &mut Window,
+) {
+    let vw = f32::from(bounds.size.width);
+    let vh = f32::from(bounds.size.height);
+    let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+    // Selection under hover: pointing at the selected thing must still show the
+    // pointer's own ring, or the map stops responding to the mouse the moment
+    // the two coincide.
+    for (path, color) in [
+        (marks.selected, theme.selection_ring),
+        (marks.hovered, theme.hover_ring),
+    ] {
+        let Some(path) = path else { continue };
+        let Some(rect) = path_rect(scene, &path) else {
+            continue;
+        };
+        let (x, y) = camera.w2s(rect.x, rect.y, vw, vh);
+        let ring = Bounds {
+            origin: point(px(origin.0 + x - MARK_INSET), px(origin.1 + y - MARK_INSET)),
+            size: size(
+                px(rect.w * camera.zoom + MARK_INSET * 2.0),
+                px(rect.h * camera.zoom + MARK_INSET * 2.0),
+            ),
+        };
+        let short = f32::from(ring.size.width).min(f32::from(ring.size.height));
+        let radius = px((short * MARK_RADIUS_OF_SHORT).min(MARK_RADIUS_MAX));
+        let stroke = rgb(color);
+        window.paint_quad(quad(
+            ring,
+            radius,
+            scale_alpha(stroke, MARK_HALO_ALPHA),
+            px(MARK_WIDTH),
+            stroke,
+            Default::default(),
+        ));
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -715,6 +1201,7 @@ fn paint_map(
     label_buf: &Rc<RefCell<Vec<LabelJob>>>,
     icon_buf: &Rc<RefCell<Vec<IconJob>>>,
     text_cache: &Rc<RefCell<TextCache>>,
+    marks: Marks,
     edges_on: bool,
     churn_on: bool,
     hud_on: bool,
@@ -752,6 +1239,7 @@ fn paint_map(
     let opts = FrameOpts {
         policy: lod(),
         theme: &theme.map,
+        type_: typography.map(),
         edges_on,
         skip_blocks: skip_workloads(),
         hex: hex::hex_on(),
@@ -823,16 +1311,14 @@ fn paint_map(
 
     let fg_quads_start = std::time::Instant::now();
     window.paint_quads(&fg);
+    if !marks.is_empty() {
+        paint_marks(bounds, scene, camera, marks, &theme.map, window);
+    }
 
     let icons_start = std::time::Instant::now();
     if !icons.is_empty() {
-        let wl_icon_color: gpui::Hsla = gpui::Rgba {
-            r: 0.62,
-            g: 0.58,
-            b: 0.78,
-            a: 0.9 * block_alpha,
-        }
-        .into();
+        let wl_icon_color: gpui::Hsla =
+            scale_alpha(rgb(theme.map.wl_icon), 0.95 * block_alpha).into();
         window.paint_layer(bounds, |window| {
             for job in icons.iter() {
                 let (key, data, icon_bounds, color) = match job {
@@ -872,30 +1358,56 @@ fn paint_map(
     }
 
     let text_start = std::time::Instant::now();
-    let font = gpui::font(typography.ui_family.clone());
+    let ui_font = gpui::font(typography.ui_family.clone());
+    let display_font = gpui::font(typography.display_family.clone());
+    let line_factor = typography.map().line_height;
     let mut label_counts = LabelCounts::default();
     let mut cache = text_cache.borrow_mut();
     let cache_before = cache.stats();
     for job in labels.iter() {
+        let font = match job.face {
+            LabelFace::Ui => &ui_font,
+            LabelFace::Display => &display_font,
+        };
         let line = cache.shape_label(
             job.text.clone(),
-            &font,
+            font,
             job.size_px,
             job.color.into(),
             blend.is_settled(),
             window.text_system(),
         );
-        if line
-            .paint(
-                point(px(job.x), px(job.y)),
-                px(job.size_px * 1.4),
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            )
-            .is_ok()
-        {
+        let origin = point(px(job.x), px(job.y));
+        let line_height = px(job.size_px * line_factor);
+        // A label with a box is centred in it and clipped to it; one without is
+        // set left and runs, which is what a pod cell's name wants. Clipping is
+        // a content mask rather than an ellipsis because building the elided
+        // string would allocate once per label per frame, and the walk's
+        // zero-allocation ratchet is worth more than three dots.
+        let painted = if job.width > 0.0 {
+            let mask = gpui::ContentMask {
+                bounds: Bounds {
+                    origin: point(origin.x, origin.y - line_height),
+                    size: size(px(job.width), line_height * 3.0),
+                },
+            };
+            // Centred while it fits, set left the moment it does not. Centring
+            // an overlong name clips it at BOTH ends, and a Kubernetes name is
+            // informative from the front: `payments-redis-primary` cut to
+            // `ments-redis-pri` names nothing. The line is already shaped, so
+            // this costs a comparison and no second pass.
+            let align = if line.width() > px(job.width) {
+                TextAlign::Left
+            } else {
+                TextAlign::Center
+            };
+            window.with_content_mask(Some(mask), |window| {
+                line.paint(origin, line_height, align, Some(px(job.width)), window, cx)
+            })
+        } else {
+            line.paint(origin, line_height, TextAlign::Left, None, window, cx)
+        };
+        if painted.is_ok() {
             label_counts.count(&job.text);
         }
     }
@@ -1124,133 +1636,9 @@ impl std::fmt::Display for Grouped {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{LabelCounts, MapView};
-
-    const POD_LABELS: [&str; 3] = [
-        "checkout-api-7f9c8d6b5-tzq4x",
-        "postgres-primary-0",
-        "otel-collector-agent-vv2mn",
-    ];
-
-    #[test]
-    fn label_counts_keep_lines_and_glyphs_apart() {
-        let mut counts = LabelCounts::default();
-        for text in POD_LABELS {
-            counts.count(text);
-        }
-        assert_eq!(counts.lines, POD_LABELS.len());
-        assert_eq!(
-            counts.glyphs,
-            POD_LABELS.iter().map(|t| t.chars().count()).sum::<usize>()
-        );
-        assert!(
-            counts.glyphs >= counts.lines,
-            "glyphs {} lines {}",
-            counts.glyphs,
-            counts.lines
-        );
-        assert_ne!(
-            counts.glyphs, counts.lines,
-            "a line counter must not be reported as a glyph counter"
-        );
-    }
-
-    #[test]
-    fn label_counts_measure_characters_not_bytes() {
-        let text = "naive-wörker-0";
-        let mut counts = LabelCounts::default();
-        counts.count(text);
-        assert_eq!(counts.lines, 1);
-        assert_eq!(counts.glyphs, 14);
-        assert!(counts.glyphs < text.len());
-    }
-
-    #[test]
-    fn an_empty_scene_does_not_spend_the_one_automatic_fit() {
-        // The incident: a window can now open on an empty world and be filled
-        // from the launch screen a moment later. Fitting to nothing marked the
-        // view fitted, and the starmap that arrived opened off-camera.
-        assert!(!MapView::should_fit_scene(0, false, false, false));
-        assert!(!MapView::should_fit_scene(0, false, false, true));
-        assert!(MapView::should_fit_scene(197, false, false, false));
-
-        // And the rules that were already true stay true.
-        assert!(!MapView::should_fit_scene(197, true, false, false));
-        assert!(
-            MapView::should_fit_scene(197, true, false, true),
-            "a resize re-frames a camera nobody has touched"
-        );
-        assert!(
-            !MapView::should_fit_scene(197, true, true, true),
-            "and never one they have"
-        );
-    }
-}
+#[path = "view_test.rs"]
+mod tests;
 
 #[cfg(test)]
-mod flight_tests {
-    use super::*;
-    use k10s_atlas::motion::FLY_SECONDS;
-
-    fn camera(cx: f32, cy: f32, zoom: f32) -> Camera {
-        Camera { cx, cy, zoom }
-    }
-
-    #[test]
-    fn no_flight_asks_for_no_frames() {
-        let mut fly = None;
-        let mut at = camera(1.0, 2.0, 3.0);
-        assert!(!advance_flight(&mut fly, &mut at, 0.016));
-        assert_eq!(
-            at,
-            camera(1.0, 2.0, 3.0),
-            "an absent flight moved the camera"
-        );
-    }
-
-    #[test]
-    fn a_flight_stops_asking_the_frame_it_arrives_on() {
-        let start = camera(0.0, 0.0, 0.1);
-        let target = camera(400.0, 300.0, 2.0);
-        let mut at = start;
-        let mut fly = Some(FlyTo::new(start, target, Motion::Animate));
-
-        let mut frames = 0;
-        while advance_flight(&mut fly, &mut at, 0.016) {
-            frames += 1;
-            assert!(frames < 1_000, "a {FLY_SECONDS}s flight never arrived");
-            assert!(
-                fly.is_some(),
-                "the flight was dropped while it was still owed"
-            );
-        }
-        assert_eq!(at, target, "the flight stopped short of where it was sent");
-        assert!(
-            fly.is_none(),
-            "an arrived flight is still holding a frame's worth of state"
-        );
-
-        // The frames after arrival are the ones the whole shape is for: a single
-        // extra request here is one idle paint per fit, and `--churn 0` measures
-        // exactly zero.
-        for _ in 0..600 {
-            assert!(
-                !advance_flight(&mut fly, &mut at, 0.016),
-                "an arrived flight went on asking to be painted"
-            );
-        }
-    }
-
-    #[test]
-    fn reduced_motion_costs_one_frame_and_not_a_flight() {
-        let target = camera(400.0, 300.0, 2.0);
-        let mut at = camera(0.0, 0.0, 0.1);
-        let mut fly = Some(FlyTo::new(at, target, Motion::Reduced));
-        // One step, which the caller has already been asked to paint by whatever
-        // started the flight, and no frame owed after it.
-        assert!(!advance_flight(&mut fly, &mut at, 0.016));
-        assert_eq!(at, target);
-        assert!(fly.is_none());
-    }
-}
+#[path = "view_flight_test.rs"]
+mod flight_tests;

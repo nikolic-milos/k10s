@@ -88,6 +88,16 @@ pub struct MapTheme {
     pub curve_glow: u32,
     pub curve_glow_alpha: f32,
     pub card_header_fill: u32,
+    /// The tint the workload kind glyph is drawn in. gpui rasterizes an SVG as
+    /// an alpha mask, so an icon is one colour and that colour is this one --
+    /// vendor marks take their own hue from [`MapTheme::tool_colors`] instead.
+    pub wl_icon: u32,
+    /// The ring drawn around whatever the pointer is over, and around whatever
+    /// is selected. Both are painted outside the frame walk, so neither is part
+    /// of the cull oracle's counters; they are still theme values because an
+    /// affordance a user cannot recolour is an affordance that fails somebody.
+    pub hover_ring: u32,
+    pub selection_ring: u32,
     // The five label colours the walk paints text with. They are theme fields
     // rather than the literals they used to be because a light canvas needs
     // dark labels, and because a colour that only exists inside a loop is a
@@ -200,11 +210,38 @@ pub struct ThemeFamily {
 pub struct Typography {
     pub ui_family: SharedString,
     pub ui_size: f32,
+    /// The headline face. It exists as a setting rather than a constant
+    /// because the map sets namespace names in it at display sizes, and a
+    /// person who dislikes a display face dislikes it everywhere at once.
+    pub display_family: SharedString,
     pub buffer_family: SharedString,
     pub buffer_size: f32,
     /// A multiple of the buffer size, the way every editor states it; the
     /// shell wants whole pixels, so [`Typography::line_height`] rounds.
     pub buffer_line_height: f32,
+}
+
+/// The map's type ladder, in screen pixels, derived once per frame from
+/// [`Typography`] and then read as plain scalars by the frame walk.
+///
+/// It is a `Copy` struct of scalars for the same reason [`MapTheme`] is: the
+/// walk reads fields per node and must not chase a pointer or recompute a
+/// derivation there. Namespace names are the one dynamic size on the map --
+/// they scale with how much of the screen the island covers -- so the ladder
+/// carries the band rather than a value, and the walk quantises inside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MapType {
+    /// Namespace names, smallest and largest the band allows.
+    pub region_min: f32,
+    pub region_max: f32,
+    pub workload: f32,
+    pub pod: f32,
+    pub sat: f32,
+    pub sat_detail: f32,
+    /// A multiple of the label size. Map labels are single lines placed against
+    /// a rect, so this sets the box a line is centred in, not leading between
+    /// rows.
+    pub line_height: f32,
 }
 
 /// The default UI face is Inter and the default mono face is Lilex, both
@@ -235,6 +272,7 @@ impl Default for Typography {
         Typography {
             ui_family: DEFAULT_UI_FAMILY.into(),
             ui_size: 14.0,
+            display_family: DISPLAY_FAMILY.into(),
             buffer_family: DEFAULT_BUFFER_FAMILY.into(),
             buffer_size: 15.0,
             buffer_line_height: 1.35,
@@ -270,6 +308,48 @@ impl Typography {
             .round()
             .max(1.0)
     }
+
+    /// The map's ladder, on the same steps as the shell's so that scaling the
+    /// interface scales the map with it. The two smallest sizes floor at 6 px
+    /// exactly as [`Typography::xsmall`] does: a label nobody can read is worse
+    /// than a label nobody drew.
+    pub fn map(&self) -> MapType {
+        MapType {
+            region_min: self.ui_size,
+            region_max: self.ui_size * 3.0,
+            workload: self.small(),
+            pod: self.xsmall(),
+            sat: self.xsmall(),
+            sat_detail: (self.ui_size - 5.5).max(6.0),
+            line_height: 1.35,
+        }
+    }
+}
+
+/// Snap a screen size to a coarse ladder.
+///
+/// Every dynamically sized thing on the map goes through this, and it is not a
+/// nicety. gpui keys its sprite atlas on the rasterized pixel size of an SVG
+/// and its shaped-line cache on the font size, so a size that varies smoothly
+/// with zoom mints a fresh atlas tile and a fresh shaped line on every frame of
+/// a zoom -- a per-frame allocation and GPU upload, on the one path that is
+/// measured for having neither.
+///
+/// The ladder is geometric rather than linear because it has to cover 8 px to
+/// 96 px without either crowding the small end or stepping visibly at the large
+/// one; `SIZE_STEPS` is the shipped set and `quantize` returns a member of it.
+pub const SIZE_STEPS: [f32; 15] = [
+    8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 28.0, 32.0, 40.0, 48.0, 56.0, 64.0, 80.0, 96.0,
+];
+
+#[inline]
+pub fn quantize(size: f32) -> f32 {
+    // A binary search rather than a scan. It is called once per glyph inside the
+    // frame walk, and the walk is the one loop in this product with a committed
+    // ratio gate on it; fifteen compares where four will do is the kind of thing
+    // that shows up there and nowhere else.
+    let at = SIZE_STEPS.partition_point(|step| *step <= size);
+    SIZE_STEPS[at.saturating_sub(1)]
 }
 
 // The heat ramp's stops, channel-converted once per frame: the per-region
@@ -515,5 +595,72 @@ mod tests {
         };
         assert_eq!(tiny.xsmall(), 6.0, "the ladder floors instead of inverting");
         assert_eq!(tiny.line_height(), 8.0);
+    }
+
+    #[test]
+    fn the_map_ladder_scales_with_the_ui_size_and_never_inverts() {
+        let map = Typography::default().map();
+        assert_eq!(
+            (map.region_min, map.workload, map.pod, map.sat_detail),
+            (14.0, 12.0, 10.0, 8.5)
+        );
+        assert!(map.region_max > map.region_min);
+
+        // Every step of the ladder must stay ordered and above the legibility
+        // floor at both ends of the settable UI range, or scaling the interface
+        // down turns the map into six-pixel mush in one direction and puts a
+        // pod label over its neighbour in the other.
+        for ui_size in [*UI_FONT_SIZE_RANGE.start(), 14.0, *UI_FONT_SIZE_RANGE.end()] {
+            let map = Typography {
+                ui_size,
+                ..Typography::default()
+            }
+            .map();
+            assert!(
+                map.sat_detail >= 6.0 && map.pod >= 6.0 && map.sat >= 6.0,
+                "ui {ui_size}: {map:?} drops below the legibility floor"
+            );
+            assert!(
+                map.sat_detail <= map.pod && map.pod <= map.workload,
+                "ui {ui_size}: {map:?} is out of order"
+            );
+            assert!(map.region_min <= map.region_max);
+        }
+    }
+
+    #[test]
+    fn quantize_lands_on_the_ladder_and_never_above_what_was_asked() {
+        for step in SIZE_STEPS {
+            assert_eq!(quantize(step), step, "a ladder value must be its own step");
+        }
+        assert_eq!(quantize(0.0), SIZE_STEPS[0], "below the ladder floors");
+        assert_eq!(quantize(-5.0), SIZE_STEPS[0]);
+        assert_eq!(
+            quantize(1_000.0),
+            SIZE_STEPS[SIZE_STEPS.len() - 1],
+            "above the ladder saturates"
+        );
+
+        // The property that matters for the sprite atlas and the shaped-line
+        // cache: a size that varies smoothly produces a small, fixed set of
+        // distinct answers, and never one larger than it was handed.
+        let mut seen: Vec<f32> = Vec::new();
+        let mut asked = 0.0f32;
+        while asked <= 120.0 {
+            let got = quantize(asked);
+            assert!(
+                got <= asked.max(SIZE_STEPS[0]),
+                "quantize({asked}) rounded up to {got}"
+            );
+            if !seen.contains(&got) {
+                seen.push(got);
+            }
+            asked += 0.05;
+        }
+        assert_eq!(
+            seen.len(),
+            SIZE_STEPS.len(),
+            "a sweep of the whole range must reach every step and invent none"
+        );
     }
 }

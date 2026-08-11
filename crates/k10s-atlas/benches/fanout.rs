@@ -108,6 +108,7 @@ fn measure_with_flat_control<R: Clone, B: Clone, C: Clone, S: Clone>(
 
 fn pad_ext(s: Scene) -> PaddedScene {
     PaddedScene {
+        card_header: 26.0,
         rev: s.rev,
         bounds: s.bounds,
         regions: s

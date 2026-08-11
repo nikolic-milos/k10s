@@ -12,8 +12,11 @@
 pub mod ingest;
 pub mod layout;
 pub mod model;
+mod prepared;
 pub mod replay;
 
+use std::fmt;
+use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -30,6 +33,7 @@ pub use model::{
     BUILTIN_TOOLS, Catalog, KindEntry, KindId, KindInfo, ReasonId, ReasonInfo, Role, Severity,
     State, ToolId, ToolInfo, kind_role, kind_short, reason_severity,
 };
+pub use prepared::{PreparedNamespace, PreparedPod, PreparedSat, PreparedScene, PreparedWorkload};
 pub use replay::RecordedStream;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,6 +70,248 @@ pub type EdgeInst = Edge;
 
 pub type SceneData = Scene<NsExt, WlExt, PodExt, SatExt>;
 
+const SLOT_ID_PAGE_LEN: usize = 1_024;
+
+/// Slot-ordered immutable identities with page-granular copy-on-write.
+///
+/// A million-object scene used to clone a million `Arc<str>` values into every
+/// newly materialized snapshot even though topology already owned the same
+/// immutable strings in the same order. `SlotIds` shares the original flat
+/// vector instead. A live insertion or reuse overlays only the affected
+/// 1,024-entry page, so held snapshots remain immutable without cloning the
+/// million-entry base. The common initial scene stays contiguous for both
+/// construction and search.
+///
+/// Tombstoned slots hold the empty string, just as the former flat vectors did.
+#[derive(Clone, Default)]
+pub struct SlotIds {
+    base: Arc<Vec<Arc<str>>>,
+    overrides: Vec<Option<Arc<Vec<Arc<str>>>>>,
+    len: usize,
+}
+
+impl SlotIds {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            base: Arc::new(Vec::with_capacity(capacity)),
+            overrides: Vec::new(),
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Arc<str>> {
+        if index >= self.len {
+            return None;
+        }
+        let page = index / SLOT_ID_PAGE_LEN;
+        let offset = index % SLOT_ID_PAGE_LEN;
+        match self.overrides.get(page).and_then(Option::as_deref) {
+            Some(values) => values.get(offset),
+            None => self.base.get(index),
+        }
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Arc<str>> {
+        if index >= self.len {
+            return None;
+        }
+        if self.overrides.is_empty() && Arc::strong_count(&self.base) == 1 {
+            return Arc::get_mut(&mut self.base)
+                .expect("the identity base is uniquely owned")
+                .get_mut(index);
+        }
+
+        let page = index / SLOT_ID_PAGE_LEN;
+        let offset = index % SLOT_ID_PAGE_LEN;
+        if self.overrides.len() <= page {
+            self.overrides.resize_with(page + 1, || None);
+        }
+        let values = self.overrides[page].get_or_insert_with(|| {
+            let start = page * SLOT_ID_PAGE_LEN;
+            let end = (start + SLOT_ID_PAGE_LEN)
+                .min(self.len)
+                .min(self.base.len());
+            let mut values = Vec::with_capacity(SLOT_ID_PAGE_LEN);
+            values.extend(self.base[start..end].iter().cloned());
+            Arc::new(values)
+        });
+        let base_len = self.base.len();
+        let values = Arc::make_mut(values);
+        assert!(
+            offset < values.len(),
+            "slot identity page is incomplete: index={index} len={} base_len={base_len} page={page} offset={offset} page_len={}",
+            self.len,
+            values.len(),
+        );
+        Some(&mut values[offset])
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Arc<str>> {
+        if self.overrides.is_empty() {
+            SlotIdsIter::Base(self.base[..self.len].iter())
+        } else {
+            SlotIdsIter::Indexed { ids: self, next: 0 }
+        }
+    }
+
+    pub fn push(&mut self, uid: Arc<str>) {
+        if self.overrides.is_empty()
+            && let Some(base) = Arc::get_mut(&mut self.base)
+        {
+            base.truncate(self.len);
+            base.push(uid);
+            self.len += 1;
+            return;
+        }
+
+        let page = self.len / SLOT_ID_PAGE_LEN;
+        let offset = self.len % SLOT_ID_PAGE_LEN;
+        if self.overrides.len() <= page {
+            self.overrides.resize_with(page + 1, || None);
+        }
+        let values = self.overrides[page].get_or_insert_with(|| {
+            let start = page * SLOT_ID_PAGE_LEN;
+            let end = (start + offset).min(self.base.len());
+            let mut values = Vec::with_capacity(SLOT_ID_PAGE_LEN);
+            if start < end {
+                values.extend(self.base[start..end].iter().cloned());
+            }
+            Arc::new(values)
+        });
+        let values = Arc::make_mut(values);
+        values.truncate(offset);
+        debug_assert_eq!(values.len(), offset);
+        values.push(uid);
+        self.len += 1;
+    }
+
+    pub fn clear(&mut self) {
+        self.base = Arc::new(Vec::new());
+        self.overrides.clear();
+        self.len = 0;
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        if self.overrides.is_empty()
+            && let Some(base) = Arc::get_mut(&mut self.base)
+        {
+            base.truncate(len);
+            self.len = len;
+            return;
+        }
+
+        self.len = len;
+        self.overrides.truncate(len.div_ceil(SLOT_ID_PAGE_LEN));
+        let tail_len = len % SLOT_ID_PAGE_LEN;
+        if tail_len > 0
+            && let Some(Some(values)) = self.overrides.last_mut()
+        {
+            Arc::make_mut(values).truncate(tail_len);
+        }
+    }
+}
+
+enum SlotIdsIter<'a> {
+    Base(std::slice::Iter<'a, Arc<str>>),
+    Indexed { ids: &'a SlotIds, next: usize },
+}
+
+impl<'a> Iterator for SlotIdsIter<'a> {
+    type Item = &'a Arc<str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            SlotIdsIter::Base(iter) => iter.next(),
+            SlotIdsIter::Indexed { ids, next } => {
+                let value = ids.get(*next)?;
+                *next += 1;
+                Some(value)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for SlotIdsIter<'_> {
+    fn len(&self) -> usize {
+        match self {
+            SlotIdsIter::Base(iter) => iter.len(),
+            SlotIdsIter::Indexed { ids, next } => ids.len - *next,
+        }
+    }
+}
+
+impl Extend<Arc<str>> for SlotIds {
+    fn extend<T: IntoIterator<Item = Arc<str>>>(&mut self, iter: T) {
+        for uid in iter {
+            self.push(uid);
+        }
+    }
+}
+
+impl FromIterator<Arc<str>> for SlotIds {
+    fn from_iter<T: IntoIterator<Item = Arc<str>>>(iter: T) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl From<Vec<Arc<str>>> for SlotIds {
+    fn from(ids: Vec<Arc<str>>) -> Self {
+        let len = ids.len();
+        Self {
+            base: Arc::new(ids),
+            overrides: Vec::new(),
+            len,
+        }
+    }
+}
+
+impl Index<usize> for SlotIds {
+    type Output = Arc<str>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index)
+            .unwrap_or_else(|| panic!("slot id index {index} out of bounds for {} ids", self.len()))
+    }
+}
+
+impl IndexMut<usize> for SlotIds {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        let len = self.len();
+        self.get_mut(index)
+            .unwrap_or_else(|| panic!("slot id index {index} out of bounds for {len} ids"))
+    }
+}
+
+impl PartialEq for SlotIds {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for SlotIds {}
+
+impl fmt::Debug for SlotIds {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
+    }
+}
+
 // Opaque per-slot identities, parallel to the scene's node vectors. The
 // engine below never reads them: they exist so a consumer holding a snapshot
 // can say what a slot *is* -- selection, data requests -- across publishes,
@@ -73,10 +319,10 @@ pub type SceneData = Scene<NsExt, WlExt, PodExt, SatExt>;
 // Tombstoned slots hold the empty string.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SceneIds {
-    pub regions: Vec<Arc<str>>,
-    pub blocks: Vec<Arc<str>>,
-    pub cells: Vec<Arc<str>>,
-    pub sats: Vec<Arc<str>>,
+    pub regions: SlotIds,
+    pub blocks: SlotIds,
+    pub cells: SlotIds,
+    pub sats: SlotIds,
 }
 
 // The scene the engine draws plus the identity the model layer needs, one
@@ -113,7 +359,7 @@ impl SceneSnapshot {
         if uid.is_empty() {
             return None;
         }
-        let find = |ids: &[Arc<str>]| ids.iter().position(|id| id.as_ref() == uid);
+        let find = |ids: &SlotIds| ids.iter().position(|id| id.as_ref() == uid);
         if let Some(slot) = find(&self.ids.sats)
             && let Some(node) = self.scene.sats.get(slot)
         {
@@ -177,7 +423,7 @@ pub fn new_shared_scene() -> SharedScene {
     Arc::new(ArcSwap::from_pointee(SceneSnapshot::default()))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum WorldCtrl {
     SetChurn(bool),
     /// Flips per second the synthetic churn is allowed to spend. Set after
@@ -187,7 +433,7 @@ pub enum WorldCtrl {
     /// lie, or the generator, where they are the point.
     SetChurnRate(f32),
     /// Replace the whole scene with one built from this stream: what a cluster
-    /// or a starmap chosen on screen sends.
+    /// chosen on screen sends.
     ///
     /// The stream travels *with* the instruction rather than down the event
     /// channel behind it, for two reasons. A scene arriving all at once has to
@@ -199,12 +445,68 @@ pub enum WorldCtrl {
     /// old scene would be re-applied on top of the new one from whatever was
     /// still queued. Carrying the stream makes the replacement one act.
     Rebuild(Vec<IngestEvent>),
+    /// Replace the whole scene from an already hierarchical batch. Synthetic
+    /// sources can produce this directly instead of allocating an event per
+    /// object only for the world to fold those events back into a hierarchy.
+    RebuildPrepared(PreparedScene),
     Shutdown,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uid(index: usize) -> Arc<str> {
+        Arc::from(format!("uid-{index}"))
+    }
+
+    #[test]
+    fn slot_ids_clone_shares_the_base_and_overlays_only_the_touched_page() {
+        let mut original = SlotIds::with_capacity(SLOT_ID_PAGE_LEN * 2 + 7);
+        original.extend((0..SLOT_ID_PAGE_LEN * 2 + 7).map(uid));
+        let mut changed = original.clone();
+
+        assert_eq!(original.len(), SLOT_ID_PAGE_LEN * 2 + 7);
+        assert!(Arc::ptr_eq(&original.base, &changed.base));
+        assert!(original.overrides.is_empty());
+        assert!(changed.overrides.is_empty());
+
+        changed[SLOT_ID_PAGE_LEN + 3] = Arc::from("replacement");
+
+        assert!(Arc::ptr_eq(&original.base, &changed.base));
+        assert!(original.overrides.is_empty());
+        assert!(changed.overrides[0].is_none());
+        assert!(changed.overrides[1].is_some());
+        assert_eq!(
+            original[SLOT_ID_PAGE_LEN + 3].as_ref(),
+            format!("uid-{}", SLOT_ID_PAGE_LEN + 3)
+        );
+        assert_eq!(changed[SLOT_ID_PAGE_LEN + 3].as_ref(), "replacement");
+        assert_eq!(original[original.len() - 1], changed[changed.len() - 1]);
+
+        let appended = changed.len();
+        changed.push(Arc::from("appended"));
+        changed[3] = Arc::from("front-page-change");
+        assert_eq!(changed[appended].as_ref(), "appended");
+        assert_eq!(changed[3].as_ref(), "front-page-change");
+        assert_eq!(original[3].as_ref(), "uid-3");
+    }
+
+    #[test]
+    fn slot_ids_truncate_preserves_flat_vector_semantics_across_a_page_boundary() {
+        let mut ids: SlotIds = (0..SLOT_ID_PAGE_LEN + 9).map(uid).collect();
+        ids.truncate(SLOT_ID_PAGE_LEN - 3);
+        assert_eq!(ids.len(), SLOT_ID_PAGE_LEN - 3);
+        assert_eq!(
+            ids[ids.len() - 1].as_ref(),
+            format!("uid-{}", SLOT_ID_PAGE_LEN - 4)
+        );
+        assert!(ids.get(ids.len()).is_none());
+
+        ids.push(Arc::from("after-truncate"));
+        assert_eq!(ids.len(), SLOT_ID_PAGE_LEN - 2);
+        assert_eq!(ids[ids.len() - 1].as_ref(), "after-truncate");
+    }
 
     #[test]
     fn node_extension_strides_are_pinned() {

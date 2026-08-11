@@ -1,5 +1,7 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
+use std::collections::hash_map::Entry;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -9,11 +11,13 @@ use k10s_core::layout::{
     SAT_RING0_GAP, SAT_SIZE, WL_GAP, WL_HEADER, WL_PAD,
 };
 use k10s_core::{
-    EdgeInst, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent, Severity, State, ToolId,
+    EdgeInst, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent, Severity, SlotIds, State,
+    ToolId,
 };
+use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
 use crate::{
-    Aggregates, Dirty, DirtyPods, Pending, PodH, SnapshotPool, Topology, layout::LayoutMode,
+    Aggregates, Dirty, DirtyPods, Pending, PodDelta, SnapshotPool, Topology, layout::LayoutMode,
     rollup_of,
 };
 
@@ -25,50 +29,247 @@ const DEAD_RECT: Rect = Rect {
     h: 0.0,
 };
 
+enum SlotStorage {
+    Building(Vec<Arc<str>>),
+    Shared(SlotIds),
+}
+
+impl Default for SlotStorage {
+    fn default() -> Self {
+        Self::Building(Vec::new())
+    }
+}
+
+impl SlotStorage {
+    fn with_capacity(capacity: usize) -> Self {
+        Self::Building(Vec::with_capacity(capacity))
+    }
+
+    fn get(&self, slot: usize) -> Option<&Arc<str>> {
+        match self {
+            SlotStorage::Building(ids) => ids.get(slot),
+            SlotStorage::Shared(ids) => ids.get(slot),
+        }
+    }
+
+    fn set(&mut self, slot: usize, uid: Arc<str>) {
+        match self {
+            SlotStorage::Building(ids) => ids[slot] = uid,
+            SlotStorage::Shared(ids) => ids[slot] = uid,
+        }
+    }
+
+    fn push(&mut self, uid: Arc<str>) {
+        match self {
+            SlotStorage::Building(ids) => ids.push(uid),
+            SlotStorage::Shared(ids) => ids.push(uid),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            SlotStorage::Building(ids) => ids.len(),
+            SlotStorage::Shared(ids) => ids.len(),
+        }
+    }
+
+    fn seal(&mut self) {
+        if let SlotStorage::Building(ids) = self {
+            *self = SlotStorage::Shared(std::mem::take(ids).into());
+        }
+    }
+
+    fn shared(&self) -> &SlotIds {
+        match self {
+            SlotStorage::Shared(ids) => ids,
+            SlotStorage::Building(_) => {
+                panic!("slot identities must be sealed before snapshot publication")
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SlotMap {
-    by_uid: HashMap<Arc<str>, u32>,
-    uid_by_slot: Vec<Option<Arc<str>>>,
+    // Keep the canonical Arc only in slot order. The map points from a compact
+    // fingerprint to a collision chain, whose nodes still compare the full UID;
+    // this removes a second Arc per live object without accepting false hits.
+    by_hash: HashMap<u64, u32>,
+    uid_by_slot: SlotStorage,
+    next_by_hash: Vec<u32>,
+    // Adjacency rebuilds scan every slot. A byte table is deliberately denser
+    // and cheaper to probe there than walking SlotIds' copy-on-write pages.
+    active_by_slot: Vec<u8>,
     free: BinaryHeap<Reverse<u32>>,
+    active: usize,
 }
 
 impl SlotMap {
-    pub(super) fn insert(&mut self, uid: Arc<str>) -> (u32, bool) {
-        if let Some(&slot) = self.by_uid.get(&uid) {
-            return (slot, false);
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            by_hash: HashMap::with_capacity_and_hasher(capacity, Default::default()),
+            uid_by_slot: SlotStorage::with_capacity(capacity),
+            next_by_hash: Vec::with_capacity(capacity),
+            active_by_slot: Vec::with_capacity(capacity),
+            free: BinaryHeap::new(),
+            active: 0,
         }
-        let slot = match self.free.pop() {
-            Some(Reverse(slot)) => {
-                self.uid_by_slot[slot as usize] = Some(uid.clone());
-                slot
+    }
+
+    pub(super) fn insert(&mut self, uid: Arc<str>) -> (u32, bool) {
+        let hash = hash_uid(&uid);
+        self.insert_hashed(uid, hash)
+    }
+
+    fn insert_hashed(&mut self, uid: Arc<str>, hash: u64) -> (u32, bool) {
+        let SlotMap {
+            by_hash,
+            uid_by_slot,
+            next_by_hash,
+            active_by_slot,
+            free,
+            active,
+        } = self;
+        match by_hash.entry(hash) {
+            Entry::Occupied(mut bucket) => {
+                let mut cursor = *bucket.get();
+                loop {
+                    if uid_by_slot
+                        .get(cursor as usize)
+                        .is_some_and(|stored| stored.as_ref() == uid.as_ref())
+                    {
+                        return (cursor, false);
+                    }
+                    cursor = next_by_hash[cursor as usize];
+                    if cursor == NO_SLOT {
+                        break;
+                    }
+                }
+
+                let previous_head = *bucket.get();
+                let slot = match free.pop() {
+                    Some(Reverse(slot)) => {
+                        uid_by_slot.set(slot as usize, uid);
+                        next_by_hash[slot as usize] = previous_head;
+                        active_by_slot[slot as usize] = 1;
+                        slot
+                    }
+                    None => {
+                        let slot = uid_by_slot.len() as u32;
+                        uid_by_slot.push(uid);
+                        next_by_hash.push(previous_head);
+                        active_by_slot.push(1);
+                        slot
+                    }
+                };
+                bucket.insert(slot);
+                *active += 1;
+                (slot, true)
             }
-            None => {
-                let slot = self.uid_by_slot.len() as u32;
-                self.uid_by_slot.push(Some(uid.clone()));
-                slot
+            Entry::Vacant(bucket) => {
+                let slot = match free.pop() {
+                    Some(Reverse(slot)) => {
+                        uid_by_slot.set(slot as usize, uid);
+                        next_by_hash[slot as usize] = NO_SLOT;
+                        active_by_slot[slot as usize] = 1;
+                        slot
+                    }
+                    None => {
+                        let slot = uid_by_slot.len() as u32;
+                        uid_by_slot.push(uid);
+                        next_by_hash.push(NO_SLOT);
+                        active_by_slot.push(1);
+                        slot
+                    }
+                };
+                bucket.insert(slot);
+                *active += 1;
+                (slot, true)
             }
-        };
-        self.by_uid.insert(uid, slot);
-        (slot, true)
+        }
     }
 
     pub(super) fn remove(&mut self, uid: &str) -> Option<u32> {
-        let slot = self.by_uid.remove(uid)?;
-        self.uid_by_slot[slot as usize] = None;
-        self.free.push(Reverse(slot));
+        let hash = hash_uid(uid);
+        self.remove_hashed(uid, hash)
+    }
+
+    fn remove_hashed(&mut self, uid: &str, hash: u64) -> Option<u32> {
+        let SlotMap {
+            by_hash,
+            uid_by_slot,
+            next_by_hash,
+            active_by_slot,
+            free,
+            active,
+        } = self;
+        let Entry::Occupied(mut bucket) = by_hash.entry(hash) else {
+            return None;
+        };
+        let mut previous = NO_SLOT;
+        let mut slot = *bucket.get();
+        loop {
+            if uid_by_slot
+                .get(slot as usize)
+                .is_some_and(|stored| stored.as_ref() == uid)
+            {
+                break;
+            }
+            previous = slot;
+            slot = next_by_hash[slot as usize];
+            if slot == NO_SLOT {
+                return None;
+            }
+        }
+
+        let next = next_by_hash[slot as usize];
+        if previous == NO_SLOT {
+            if next == NO_SLOT {
+                bucket.remove();
+            } else {
+                *bucket.get_mut() = next;
+            }
+        } else {
+            next_by_hash[previous as usize] = next;
+        }
+        next_by_hash[slot as usize] = NO_SLOT;
+        active_by_slot[slot as usize] = 0;
+        uid_by_slot.set(slot as usize, Arc::from(""));
+        free.push(Reverse(slot));
+        *active -= 1;
         Some(slot)
     }
 
     pub(super) fn get(&self, uid: &str) -> Option<u32> {
-        self.by_uid.get(uid).copied()
+        self.get_hashed(uid, hash_uid(uid))
+    }
+
+    fn get_hashed(&self, uid: &str, hash: u64) -> Option<u32> {
+        let mut slot = self.by_hash.get(&hash).copied()?;
+        loop {
+            if self
+                .uid_by_slot
+                .get(slot as usize)
+                .is_some_and(|stored| stored.as_ref() == uid)
+            {
+                return Some(slot);
+            }
+            slot = self.next_by_hash[slot as usize];
+            if slot == NO_SLOT {
+                return None;
+            }
+        }
     }
 
     pub(super) fn uid(&self, slot: u32) -> Option<&Arc<str>> {
-        self.uid_by_slot.get(slot as usize)?.as_ref()
+        if !self.is_active(slot as usize) {
+            return None;
+        }
+        self.uid_by_slot.get(slot as usize)
     }
 
     pub(super) fn is_active(&self, slot: usize) -> bool {
-        self.uid_by_slot.get(slot).is_some_and(Option::is_some)
+        self.active_by_slot.get(slot).copied() == Some(1)
     }
 
     pub(super) fn slots(&self) -> usize {
@@ -76,8 +277,22 @@ impl SlotMap {
     }
 
     pub(super) fn active(&self) -> usize {
-        self.by_uid.len()
+        self.active
     }
+
+    pub(super) fn ids(&self) -> &SlotIds {
+        self.uid_by_slot.shared()
+    }
+
+    pub(super) fn seal_ids(&mut self) {
+        self.uid_by_slot.seal();
+    }
+}
+
+fn hash_uid(uid: &str) -> u64 {
+    let mut hasher = FxHasher::default();
+    uid.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub(super) struct Adjacency {
@@ -134,6 +349,7 @@ pub(super) fn apply_events(world: &mut World, events: &[IngestEvent], mode: Layo
     if !structural {
         return world.resource_scope(|world, topology: Mut<Topology>| {
             world.resource_scope(|world, mut dirty: Mut<DirtyPods>| {
+                let mut aggregates = world.resource_mut::<Aggregates>();
                 let mut changed = false;
                 for event in events {
                     let IngestEvent::Resource(resource) = event else {
@@ -145,15 +361,17 @@ pub(super) fn apply_events(world: &mut World, events: &[IngestEvent], mode: Layo
                     let Some(slot) = topology.pod_slots.get(&resource.uid) else {
                         continue;
                     };
-                    let entity = topology.pod_entities[slot as usize];
-                    let Some(mut health) = world.get_mut::<PodH>(entity) else {
-                        continue;
-                    };
-                    if health.0 == state {
+                    let current = &mut aggregates.pod_state[slot as usize];
+                    let old = *current;
+                    if old == state {
                         continue;
                     }
-                    health.0 = state;
-                    dirty.0.push((slot, state));
+                    *current = state;
+                    dirty.0.push(PodDelta {
+                        slot,
+                        old,
+                        new: state,
+                    });
                     changed = true;
                 }
                 changed
@@ -168,8 +386,9 @@ pub(super) fn apply_events(world: &mut World, events: &[IngestEvent], mode: Layo
         .remove_resource::<Aggregates>()
         .expect("the world owns its aggregates while applying live events");
     let mut dirt = BatchDirt::default();
-    // Pod-state deltas queued for rollup() but not yet folded would be lost to
-    // the incremental path, whose "old state" is what aggregates already hold.
+    // Pod-state deltas queued for rollup() already changed the canonical state
+    // vector, but their severity counts have not been folded yet. A structural
+    // batch rebuilds those derived counts once instead of replaying two paths.
     if !world.resource::<DirtyPods>().0.is_empty() {
         dirt.aggregates_full = true;
     }
@@ -177,26 +396,17 @@ pub(super) fn apply_events(world: &mut World, events: &[IngestEvent], mode: Layo
         let IngestEvent::Resource(resource) = event else {
             continue;
         };
-        apply_resource(
-            world,
-            &mut topology,
-            &mut aggregates,
-            &mut dirt,
-            resource,
-            mode,
-        );
+        apply_resource(&mut topology, &mut aggregates, &mut dirt, resource, mode);
     }
     rebuild_selective(&mut topology, &dirt);
-    fit_after_departures(&mut topology, &dirt, mode);
+    refit_after_batch(&mut topology, &mut dirt, mode);
     topology.spatial_revision += 1;
     if dirt.identity {
         topology.identity_revision += 1;
     }
-    let aggregates = if dirt.aggregates_full {
-        rebuild_aggregates(world, &topology)
-    } else {
-        aggregates
-    };
+    if dirt.aggregates_full {
+        rebuild_aggregates(&topology, &mut aggregates);
+    }
     // A patch must win by construction: when the batch invalidated the
     // aggregates or counts wholesale, or touched a large share of the scene,
     // the full materialize is both simpler and cheaper.
@@ -242,6 +452,11 @@ struct BatchDirt {
     // Separate from `wl_pod` because arrivals never need the fitting pass and
     // adding one object is the path this engine is measured on.
     shrank: bool,
+    // Workloads that lost a pod, which is a smaller set than `wls`: a
+    // satellite, a label or an arrival touches a workload without punching a
+    // hole in its grid. Only these are asked whether their grid is worth
+    // repacking, and the question is O(1) per workload.
+    grids: Vec<u32>,
     ns_wl: bool,
     wl_pod: bool,
     wl_sat: bool,
@@ -348,7 +563,6 @@ impl Topology {
 }
 
 fn apply_resource(
-    world: &mut World,
     topology: &mut Topology,
     aggregates: &mut Aggregates,
     dirt: &mut BatchDirt,
@@ -369,7 +583,7 @@ fn apply_resource(
             topology, aggregates, dirt, resource, *kind, *tool, depends_on, mode,
         ),
         Payload::Instance { state } => {
-            upsert_pod(world, topology, aggregates, dirt, resource, *state, mode)
+            upsert_pod(topology, aggregates, dirt, resource, *state, mode)
         }
         Payload::Attached { kind, detail } if mode.emits_attachments() => {
             upsert_satellite(topology, dirt, resource, *kind, detail)
@@ -518,7 +732,6 @@ fn upsert_workload(
 }
 
 fn upsert_pod(
-    world: &mut World,
     topology: &mut Topology,
     aggregates: &mut Aggregates,
     dirt: &mut BatchDirt,
@@ -535,7 +748,7 @@ fn upsert_pod(
     };
     let (slot, inserted) = topology.pod_slots.insert(resource.uid.clone());
     let index = slot as usize;
-    ensure_pod(world, topology, index + 1);
+    ensure_pod(topology, index + 1);
     ensure_pod_aggregates(aggregates, index + 1);
     let moved = !inserted && topology.pod_wl[index] != workload;
     let previous = (!inserted).then(|| (topology.pod_wl[index], aggregates.pod_state[index]));
@@ -550,6 +763,7 @@ fn upsert_pod(
     {
         dirt.wls.push(old_workload);
         dirt.nss.push(topology.wl_ns[old_workload as usize]);
+        dirt.grids.push(old_workload);
         // A move is a departure from where it was, so the card it left may now
         // be bigger than what remains in it.
         dirt.shrank = true;
@@ -583,10 +797,6 @@ fn upsert_pod(
         }
     }
     aggregates.pod_state[index] = state;
-    let entity = topology.pod_entities[index];
-    if let Some(mut health) = world.get_mut::<PodH>(entity) {
-        health.0 = state;
-    }
 }
 
 fn upsert_satellite(
@@ -729,6 +939,7 @@ fn remove_pod(
             shift_pod_severity(topology, aggregates, Some((workload, state)), None);
             dirt.wls.push(workload);
             dirt.nss.push(namespace as u32);
+            dirt.grids.push(workload);
         }
         aggregates.pod_state[index] = State::OK;
         topology.pod_labels[index] = Arc::from("");
@@ -744,6 +955,16 @@ fn remove_satellite(topology: &mut Topology, dirt: &mut BatchDirt, uid: &str) {
         dirt.shrank = true;
         dirt.sats.push(slot);
         let index = slot as usize;
+        // The halo is the card plus whatever orbits it, so a satellite leaving
+        // shrinks its workload -- and the fitting pass only visits workloads
+        // and namespaces it was handed. Without these two the pass ran and
+        // fitted nothing, and the halo kept the departed satellite's extent
+        // forever, which kept the region at its old size too.
+        let workload = topology.sat_wl[index];
+        if topology.wl_slots.is_active(workload as usize) {
+            dirt.wls.push(workload);
+            dirt.nss.push(topology.wl_ns[workload as usize]);
+        }
         topology.sat_labels[index] = Arc::from("");
         topology.sat_details[index] = Arc::from("");
         topology.sat_rects[index] = DEAD_RECT;
@@ -808,45 +1029,51 @@ fn rebuild_edges(topology: &mut Topology) {
     topology.cross_edge_range = start..topology.edges.len() as u32;
 }
 
-fn rebuild_aggregates(world: &World, topology: &Topology) -> Aggregates {
-    let mut pod_state = vec![State::OK; topology.pod_slots.slots()];
-    let mut wl_sev_counts = vec![[0u32; 4]; topology.wl_slots.slots()];
-    let mut ns_sev_counts = vec![[0u32; 4]; topology.ns_slots.slots()];
-    let mut ns_unhealthy_count = vec![0u32; topology.ns_slots.slots()];
+fn rebuild_aggregates(topology: &Topology, aggregates: &mut Aggregates) {
+    aggregates
+        .pod_state
+        .resize(topology.pod_slots.slots(), State::OK);
+    aggregates
+        .wl_sev_counts
+        .resize(topology.wl_slots.slots(), [0; 4]);
+    aggregates.wl_sev_counts.fill([0; 4]);
+    aggregates
+        .ns_sev_counts
+        .resize(topology.ns_slots.slots(), [0; 4]);
+    aggregates.ns_sev_counts.fill([0; 4]);
+    aggregates
+        .ns_unhealthy_count
+        .resize(topology.ns_slots.slots(), 0);
+    aggregates.ns_unhealthy_count.fill(0);
     for pod in 0..topology.pod_slots.slots() {
         if !topology.pod_slots.is_active(pod) {
             continue;
         }
-        let state = world
-            .get::<PodH>(topology.pod_entities[pod])
-            .map(|health| health.0)
-            .unwrap_or(State::OK);
-        pod_state[pod] = state;
+        let state = aggregates.pod_state[pod];
         let workload = topology.pod_wl[pod] as usize;
         let namespace = topology.wl_ns[workload] as usize;
-        wl_sev_counts[workload][state.severity.rank() as usize] += 1;
-        ns_sev_counts[namespace][state.severity.rank() as usize] += 1;
+        aggregates.wl_sev_counts[workload][state.severity.rank() as usize] += 1;
+        aggregates.ns_sev_counts[namespace][state.severity.rank() as usize] += 1;
         if state.severity.is_unhealthy() {
-            ns_unhealthy_count[namespace] += 1;
+            aggregates.ns_unhealthy_count[namespace] += 1;
         }
     }
-    let wl_rollup = wl_sev_counts.iter().map(rollup_of).collect();
-    let ns_rollup = ns_sev_counts.iter().map(rollup_of).collect();
-    let ns_unhealthy = topology
-        .ns_pod_count
-        .iter()
-        .zip(&ns_unhealthy_count)
-        .map(|(&total, &unhealthy)| unhealthy as f32 / total.max(1) as f32)
-        .collect();
-    Aggregates {
-        pod_state,
-        wl_rollup,
-        ns_rollup,
-        ns_unhealthy,
-        wl_sev_counts,
-        ns_sev_counts,
-        ns_unhealthy_count,
-    }
+    aggregates.wl_rollup.clear();
+    aggregates
+        .wl_rollup
+        .extend(aggregates.wl_sev_counts.iter().map(rollup_of));
+    aggregates.ns_rollup.clear();
+    aggregates
+        .ns_rollup
+        .extend(aggregates.ns_sev_counts.iter().map(rollup_of));
+    aggregates.ns_unhealthy.clear();
+    aggregates.ns_unhealthy.extend(
+        topology
+            .ns_pod_count
+            .iter()
+            .zip(&aggregates.ns_unhealthy_count)
+            .map(|(&total, &unhealthy)| unhealthy as f32 / total.max(1) as f32),
+    );
 }
 
 // Every ensure_* grows and never shrinks: a reused tombstone slot arrives
@@ -875,16 +1102,11 @@ fn ensure_workload(topology: &mut Topology, len: usize) {
     }
 }
 
-fn ensure_pod(world: &mut World, topology: &mut Topology, len: usize) {
+fn ensure_pod(topology: &mut Topology, len: usize) {
     if topology.pod_labels.len() < len {
         topology.pod_labels.resize_with(len, || Arc::from(""));
         topology.pod_rects.resize(len, DEAD_RECT);
         topology.pod_wl.resize(len, NO_SLOT);
-    }
-    while topology.pod_entities.len() < len {
-        topology
-            .pod_entities
-            .push(world.spawn((PodH(State::OK),)).id());
     }
 }
 
@@ -925,7 +1147,6 @@ fn place_pod(topology: &mut Topology, slot: u32, workload: u32, mode: LayoutMode
         LayoutMode::Spread => (CARD_PAD, CARD_HEADER),
         LayoutMode::Dense => (WL_PAD, WL_HEADER),
     };
-    let columns = (((card.w - pad * 2.0 + POD_GAP) / POD_PITCH).floor() as usize).max(1);
     // One pass over the pod slots collects this workload's occupied corners;
     // probing then costs the candidate count, not candidates x every pod in
     // the world. Positions compare exactly because every pod rect comes from
@@ -941,6 +1162,19 @@ fn place_pod(topology: &mut Topology, slot: u32, workload: u32, mode: LayoutMode
             (rect.x.to_bits(), rect.y.to_bits())
         })
         .collect();
+    // The grid widens to the shape the batch engine would have chosen, and
+    // widening is free: a pod's rect is fixed by its column and row, and adding
+    // a column changes neither for any pod already placed -- it only makes the
+    // cells of the new column reachable. Probing is by rect, so the scan below
+    // finds them without disturbing anything.
+    //
+    // Without this the card could never get wider at all. `grow_workload` takes
+    // a max against the arriving pod's right edge, and the widest column a pod
+    // can be given is the last one the card already has, so growth was
+    // height-only and a workload created live -- born exactly one pod wide,
+    // because POD_PITCH == POD_SIZE + POD_GAP -- stayed a one-wide tower for
+    // every replica it ever gained.
+    let columns = grid_columns(card.w, pad).max(crate::layout::pod_grid(occupied.len() + 1).0);
     let mut position = 0usize;
     loop {
         let column = position % columns;
@@ -1016,7 +1250,7 @@ fn children(ranges: &[Range<u32>], indices: &[u32], parent: usize) -> Vec<usize>
     indices[start..end].iter().map(|&at| at as usize).collect()
 }
 
-// Bring parents back down to what is actually in them.
+// Bring the scene back down to what is actually in it.
 //
 // `grow_workload` and `grow_namespace` are the arriving half, and only growing is
 // right there: a pod must be visible the frame it appears, and a card that grew
@@ -1025,22 +1259,25 @@ fn children(ranges: &[Range<u32>], indices: &[u32], parent: usize) -> Vec<usize>
 // needed at eighty -- which is the first thing anyone notices on a real cluster,
 // and was noticed on one.
 //
-// Three rules make this safe against the property the whole layout exists for:
+// Two rules make this safe against the property the whole layout exists for:
 //
 //  - a parent never shrinks below the union of what it still holds, so a child
-//    that kept its position can never be clipped by its parent shrinking. Keeping
-//    positions is the point; moving them is the reshuffle;
-//  - no sibling is repositioned. A shrunk card leaves a gap, and the gap stays
-//    until something is placed in it. A layout that closed gaps would move things
-//    nobody touched, which is exactly what must not happen;
-//  - and it runs only when something departed. Arrivals are the measured path,
-//    and they pay nothing for this.
+//    that kept its position can never be clipped by its parent shrinking;
+//  - no *card* is repositioned, and no card in a namespace the batch never
+//    mentioned is touched at all. A shrunk card leaves a gap and the gap stays
+//    until something is placed in it. Closing gaps between cards would move
+//    things nobody touched, which is exactly what must not happen.
+//
+// The one thing that may be rearranged is the pod grid inside a single card, and
+// only under the conditions `repack_pod_grid` states.
 //
 // Cost is proportional to the change and not to the scene, because it runs after
 // `rebuild_selective` and reads the adjacency that just rebuilt: a workload costs
 // its own pods and satellites, a namespace its own workloads. Only the world
-// bounds are O(namespaces), which is the term §6.1 already budgets at Z0.
-fn fit_after_departures(topology: &mut Topology, dirt: &BatchDirt, mode: LayoutMode) {
+// bounds are O(namespaces), which is the term §6.1 already budgets at Z0, and a
+// batch of pure arrivals that leaves every grid alone returns before reaching
+// any of it.
+fn refit_after_batch(topology: &mut Topology, dirt: &mut BatchDirt, mode: LayoutMode) {
     if !dirt.shrank {
         return;
     }
@@ -1048,6 +1285,17 @@ fn fit_after_departures(topology: &mut Topology, dirt: &BatchDirt, mode: LayoutM
         LayoutMode::Spread => (CARD_PAD, CARD_HEADER),
         LayoutMode::Dense => (WL_PAD, WL_HEADER),
     };
+
+    let mut grids = std::mem::take(&mut dirt.grids);
+    grids.sort_unstable();
+    grids.dedup();
+    for workload in grids {
+        let index = workload as usize;
+        if !topology.wl_slots.is_active(index) {
+            continue;
+        }
+        repack_pod_grid(topology, &mut dirt.pods, &mut dirt.sats, index, pad, header);
+    }
 
     let mut workloads: Vec<u32> = dirt.wls.clone();
     workloads.sort_unstable();
@@ -1117,6 +1365,135 @@ fn fit_after_departures(topology: &mut Topology, dirt: &BatchDirt, mode: LayoutM
         bounds.h = bounds.h.max(rect.max_y() - bounds.y);
     }
     topology.bounds = bounds;
+}
+
+// How many pod cells wide and tall a card is, read back out of the rect that
+// `place_pod` and the fitting pass both write. Both derive the rect from
+// `POD_PITCH` and the same padding, so this is exact rather than an estimate.
+#[inline]
+fn grid_columns(card_w: f32, pad: f32) -> usize {
+    (((card_w - pad * 2.0 + POD_GAP) / POD_PITCH).floor() as usize).max(1)
+}
+
+#[inline]
+fn grid_rows(card_h: f32, pad: f32, header: f32) -> usize {
+    (((card_h - header - pad * 2.0 + POD_GAP) / POD_PITCH).floor() as usize).max(1)
+}
+
+// The pod grid is the one thing on this map that may be rearranged.
+//
+// A pod cell is a quantity readout, not a place a person navigates to: nobody
+// remembers which cell the eleventh replica sat in, and everybody notices a card
+// still sized for eighty replicas that holds eight. Everything outside the card
+// keeps its position, so the reshuffle SS5.9 forbids stays forbidden -- this moves
+// pods within one card and resizes that card, nothing else.
+//
+// Only departures ever need it. `place_pod` widens the grid as pods arrive and
+// no pod moves when it does, so growth reaches the right shape on its own; what
+// growth cannot do is close the holes that leaving pods punch in the middle of a
+// grid, and holes are the whole of the reported bug -- `place_pod` keeps every
+// survivor's cell, so eight survivors scattered through an eighty-cell grid
+// leave the union, and therefore the card, almost the size it had.
+//
+// The condition is hysteretic, because a rolling update must not trigger it:
+// fewer than half the grid's cells occupied. A `maxUnavailable` of 25% leaves
+// three quarters occupied and never comes near it; a scale to a tenth crosses it
+// at once. An eager repack would slide the grid on every step of every rollout,
+// which is the reshuffle SS5.9 forbids, dressed up as tidiness.
+//
+// The decision is O(1) -- both the occupancy and the ideal shape are read out of
+// the card rect -- so a batch that repacks nothing pays a comparison per touched
+// workload. Survivors keep their reading order, so a repack slides pods forward
+// instead of permuting them: a pod already in the first cells does not move.
+fn repack_pod_grid(
+    topology: &mut Topology,
+    dirt_pods: &mut Vec<u32>,
+    dirt_sats: &mut Vec<u32>,
+    workload: usize,
+    pad: f32,
+    header: f32,
+) {
+    let range = &topology.wl_pod_range[workload];
+    let pods = (range.end - range.start) as usize;
+    if pods == 0 {
+        return;
+    }
+    let card = topology.wl_card_rects[workload];
+    let columns = grid_columns(card.w, pad);
+    let rows = grid_rows(card.h, pad, header);
+    if pods * 2 >= columns * rows {
+        return;
+    }
+    let (want_columns, want_rows) = crate::layout::pod_grid(pods);
+    if want_columns == columns && want_rows == rows {
+        return;
+    }
+
+    let mut order = children(&topology.wl_pod_range, &topology.block_cells, workload);
+    order.sort_unstable_by_key(|&pod| {
+        let rect = topology.pod_rects[pod];
+        let column = ((rect.x - card.x - pad) / POD_PITCH).round().max(0.0) as u32;
+        let row = ((rect.y - card.y - header - pad) / POD_PITCH)
+            .round()
+            .max(0.0) as u32;
+        (row * columns as u32 + column, pod as u32)
+    });
+    for (position, &pod) in order.iter().enumerate() {
+        let rect = Rect::new(
+            card.x + pad + (position % want_columns) as f32 * POD_PITCH,
+            card.y + header + pad + (position / want_columns) as f32 * POD_PITCH,
+            POD_SIZE,
+            POD_SIZE,
+        );
+        if topology.pod_rects[pod] != rect {
+            topology.pod_rects[pod] = rect;
+            dirt_pods.push(pod as u32);
+        }
+    }
+    topology.wl_card_rects[workload] = Rect::new(
+        card.x,
+        card.y,
+        want_columns as f32 * POD_PITCH - POD_GAP + pad * 2.0,
+        header + want_rows as f32 * POD_PITCH - POD_GAP + pad * 2.0,
+    );
+    reorbit_satellites(topology, dirt_sats, workload);
+}
+
+// A satellite's ring radius is baked in from the card it orbited when it
+// arrived, and nothing ever re-placed it: a card that grew afterwards expanded
+// straight through its own ring, and a card that shrank left the halo -- and
+// therefore the region -- at its old size, which is most of why a scale-down
+// used to look like nothing happened.
+//
+// Rebuilding the orbit only when the grid was repacked is what keeps this
+// honest. A repack is already a visible, deliberate reorganisation of one card;
+// re-placing satellites on any lesser event would move objects a person is
+// entitled to keep pointing at. Slots are filled densely in adjacency order
+// from the same formula `place_satellite` probes with, so a satellite arriving
+// later still lands in the first free position.
+fn reorbit_satellites(topology: &mut Topology, dirt_sats: &mut Vec<u32>, workload: usize) {
+    let card = topology.wl_card_rects[workload];
+    let (center_x, center_y) = card.center();
+    let base_radius = 0.5 * (card.w * card.w + card.h * card.h).sqrt() + SAT_RING0_GAP;
+    for (position, sat) in children(&topology.wl_sat_range, &topology.block_sats, workload)
+        .into_iter()
+        .enumerate()
+    {
+        const RING_SLOTS: usize = 12;
+        let ring = position / RING_SLOTS;
+        let angle = (position % RING_SLOTS) as f32 * std::f32::consts::TAU / RING_SLOTS as f32;
+        let radius = base_radius + ring as f32 * SAT_RING_GAP;
+        let rect = Rect::new(
+            center_x + radius * angle.cos() - SAT_SIZE * 0.5,
+            center_y + radius * angle.sin() - SAT_SIZE * 0.5,
+            SAT_SIZE,
+            SAT_SIZE,
+        );
+        if topology.sat_rects[sat] != rect {
+            topology.sat_rects[sat] = rect;
+            dirt_sats.push(sat as u32);
+        }
+    }
 }
 
 fn grow_workload(topology: &mut Topology, workload: u32, child: Rect, pad: f32) {
@@ -1237,10 +1614,11 @@ pub(super) fn verify_derived_state(world: &mut World) {
         "cross range drifted"
     );
 
-    let fresh_aggregates = rebuild_aggregates(world, &topology);
+    let stored_aggregates = world.resource::<Aggregates>();
+    let mut fresh_aggregates = stored_aggregates.clone();
+    rebuild_aggregates(&topology, &mut fresh_aggregates);
     assert_eq!(
-        world.resource::<Aggregates>(),
-        &fresh_aggregates,
+        stored_aggregates, &fresh_aggregates,
         "aggregates drifted from a full rebuild"
     );
     world.insert_resource(topology);
@@ -1265,6 +1643,28 @@ mod tests {
     }
 
     #[test]
+    fn uid_hash_collisions_keep_full_identity_and_unlink_every_chain_position() {
+        let mut slots = SlotMap::default();
+        let collision = 7;
+        assert_eq!(slots.insert_hashed("a".into(), collision), (0, true));
+        assert_eq!(slots.insert_hashed("b".into(), collision), (1, true));
+        assert_eq!(slots.insert_hashed("c".into(), collision), (2, true));
+        assert_eq!(slots.insert_hashed("b".into(), collision), (1, false));
+        assert_eq!(slots.get_hashed("a", collision), Some(0));
+        assert_eq!(slots.get_hashed("b", collision), Some(1));
+        assert_eq!(slots.get_hashed("c", collision), Some(2));
+
+        assert_eq!(slots.remove_hashed("b", collision), Some(1));
+        assert_eq!(slots.get_hashed("b", collision), None);
+        assert_eq!(slots.get_hashed("a", collision), Some(0));
+        assert_eq!(slots.get_hashed("c", collision), Some(2));
+        assert_eq!(slots.remove_hashed("c", collision), Some(2));
+        assert_eq!(slots.remove_hashed("a", collision), Some(0));
+        assert_eq!(slots.active(), 0);
+        assert!(slots.by_hash.is_empty());
+    }
+
+    #[test]
     fn adjacency_groups_stable_child_slots_by_parent() {
         let mut children = SlotMap::default();
         for uid in ["a", "b", "c", "d"] {
@@ -1275,5 +1675,17 @@ mod tests {
         assert_eq!(adjacency.ranges, [0..1, 1..3]);
         assert_eq!(adjacency.indices, [3, 0, 2]);
         assert!(!adjacency.is_direct());
+    }
+
+    #[test]
+    fn pod_state_grows_to_a_slot_high_water_mark_and_never_shrinks() {
+        let mut aggregates = Aggregates {
+            pod_state: vec![State::OK; 3],
+            ..Aggregates::default()
+        };
+        ensure_pod_aggregates(&mut aggregates, 1);
+        assert_eq!(aggregates.pod_state.len(), 3);
+        ensure_pod_aggregates(&mut aggregates, 5);
+        assert_eq!(aggregates.pod_state.len(), 5);
     }
 }

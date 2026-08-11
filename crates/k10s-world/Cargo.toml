@@ -15,6 +15,7 @@ bevy_ecs.workspace = true
 crossbeam-channel.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
 k10s-bench.workspace = true
@@ -27,4 +28,8 @@ harness = false
 
 [[bench]]
 name = "fanout_cull"
+harness = false
+
+[[bench]]
+name = "build"
 harness = false

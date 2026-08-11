@@ -12,6 +12,8 @@
 
 pub mod camera;
 pub mod cull;
+#[cfg(test)]
+mod cull_test;
 pub mod curves;
 pub mod flight;
 pub mod lod;

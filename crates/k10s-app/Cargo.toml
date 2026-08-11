@@ -25,6 +25,8 @@ k10s-shell.workspace = true
 gpui.workspace = true
 crossbeam-channel.workspace = true
 futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_platform = { workspace = true, features = ["wayland", "x11"] }

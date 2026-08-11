@@ -194,6 +194,12 @@ pub fn parse(text: &str) -> Loaded {
                 key,
                 &mut notes,
             ),
+            "display_font_family" => family(
+                value,
+                &mut settings.typography.display_family,
+                key,
+                &mut notes,
+            ),
             "ui_font_size" => number(
                 value,
                 &mut settings.typography.ui_size,
@@ -384,6 +390,11 @@ pub fn resolve_families(settings: &mut Settings, available: &[String]) -> Vec<St
         k10s_theme::DEFAULT_BUFFER_FAMILY,
         "buffer_font_family",
     );
+    check(
+        &mut settings.typography.display_family,
+        k10s_theme::DISPLAY_FAMILY,
+        "display_font_family",
+    );
     notes
 }
 
@@ -558,7 +569,11 @@ mod tests {
 
     #[test]
     fn a_font_the_text_system_does_not_have_is_a_note_not_a_silent_substitution() {
-        let installed = ["Inter 18pt".to_string(), "Lilex".to_string()];
+        let installed = [
+            "Inter 18pt".to_string(),
+            "Lilex".to_string(),
+            "League Spartan".to_string(),
+        ];
 
         let mut typo = parse(r#"{ "ui_font_family": "Comic Sans MS" }"#).settings;
         let notes = resolve_families(&mut typo, &installed);
@@ -584,12 +599,21 @@ mod tests {
             "resolved to the name the font file declares, which is what gpui matches on"
         );
 
+        let mut display = parse(r#"{ "display_font_family": "Papyrus" }"#).settings;
+        let notes = resolve_families(&mut display, &installed);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("display_font_family"));
+        assert_eq!(
+            display.typography.display_family,
+            k10s_theme::DISPLAY_FAMILY
+        );
+
         let mut nothing = Settings::default();
         let notes = resolve_families(&mut nothing, &[]);
         assert_eq!(
             notes.len(),
-            2,
-            "a text system with no fonts at all complains about both: {notes:?}"
+            3,
+            "a text system with no fonts at all complains about all three: {notes:?}"
         );
     }
 

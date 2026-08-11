@@ -13,7 +13,12 @@ pub const STAGE_EXIT: f32 = 0.85;
 pub const STAGE_FADE_SECS: f32 = 0.18;
 
 pub const WL_MIN_PX: f32 = 4.0;
-pub const WL_ICON_MIN_PX: f32 = 14.0;
+// The same threshold as `WL_MIN_PX`, deliberately: if a workload is drawn at
+// all, it wears the mark that says what it is. A five-pixel rectangle in a
+// severity colour is not an identity, and a namespace full of them is the state
+// this redesign existed to fix. How big the glyph then gets is decided by the
+// space the workload owns, not here.
+pub const WL_ICON_MIN_PX: f32 = 4.0;
 pub const WL_CHROME_MIN_PX: f32 = 34.0;
 pub const NS_LABEL_MIN_PX: f32 = 70.0;
 pub const WL_LABEL_MIN_PX: f32 = 60.0;
@@ -163,6 +168,7 @@ mod tests {
         FrameOpts {
             theme: &k10s_theme::K10S_DARK.map,
             policy,
+            type_: k10s_theme::Typography::default().map(),
             edges_on: true,
             skip_blocks: false,
             hex: true,
@@ -175,6 +181,7 @@ mod tests {
         SceneSnapshot {
             ids: Default::default(),
             scene: SceneData {
+                card_header: 26.0,
                 rev: 1,
                 bounds: Rect::new(0.0, 0.0, 400.0, 200.0),
                 regions: vec![NsNode {

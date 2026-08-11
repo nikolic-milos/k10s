@@ -12,12 +12,12 @@
 //! [`Feed`] is the other half. `spawn_world` takes its live-event receiver once,
 //! at spawn, so a window can open before anything has been chosen only if there
 //! is one channel for the whole process that a choice attaches to afterwards. The
-//! *scene* a choice brings does not travel down it: it goes as
-//! `WorldCtrl::Rebuild`, carrying its own stream, so it is laid out by the same
-//! batch layout the command line's scenes are and so replacing a scene is one act
-//! rather than a race between two channels. What the feed carries is only what
-//! comes after: one data plane's live deltas, on a thread that ends when that
-//! plane does.
+//! *scene* a choice brings does not travel down it: a cluster carries its whole
+//! event snapshot in `WorldCtrl::Rebuild`, while the generator carries an owned
+//! hierarchy in `WorldCtrl::RebuildPrepared`. Both take the batch layout, and
+//! both make replacement one act rather than a race between channels. What the
+//! feed carries is only what comes after: one data plane's live deltas, on a
+//! thread that ends when that plane does.
 
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -124,17 +124,6 @@ impl LaunchService {
         }))
     }
 
-    /// Adopt a connection the command line made before the window opened. Its
-    /// snapshot went in as the world's initial event vector, so only the live
-    /// stream needs a pump; a cluster chosen from the screen later replaces the
-    /// whole world and does not care how this one arrived.
-    pub fn adopt_command_line(&self, plane: DataPlane, stream: Receiver<IngestEvent>) {
-        *self.0.held() = Some(Attached {
-            plane: Some(plane),
-            pump: Some(self.0.feed.clone().pump(stream)),
-        });
-    }
-
     /// Everything a chosen scene owns, dropped in the order that stops it
     /// cleanly. Called once, as the process winds down.
     pub fn retire(&self) {
@@ -213,7 +202,7 @@ impl Service {
         let summary = sync.report.summary();
         let context = sync.report.context.clone();
         eprintln!("k10s: {summary}");
-        let notes = crate::degradation_notes(&sync.report, &sync.catalog, &sync.events);
+        let notes = crate::diagnose::degradation_notes(&sync.report, &sync.catalog, &sync.events);
         for note in &notes {
             eprintln!("k10s: {note}");
         }
@@ -242,7 +231,8 @@ impl Service {
             // Built on the thread that will own it: the `Rc` cannot cross back
             // the way the rest of this can.
             provider: Box::new(move || {
-                Rc::new(crate::PlaneProvider { inspector, reader }) as Rc<dyn ReadProvider>
+                Rc::new(crate::provider::PlaneProvider::new(inspector, reader))
+                    as Rc<dyn ReadProvider>
             }),
         })
     }
@@ -262,7 +252,7 @@ impl Service {
             .send(WorldCtrl::SetChurnRate(self.args.effective_churn()));
         if self
             .ctrl
-            .send(WorldCtrl::Rebuild(generated.events))
+            .send(WorldCtrl::RebuildPrepared(generated.scene))
             .is_err()
         {
             return DemoOutcome::Failed(WORLD_GONE.to_string());

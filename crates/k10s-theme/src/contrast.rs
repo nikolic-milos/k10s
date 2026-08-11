@@ -255,6 +255,28 @@ fn audit(theme: &Theme) -> Vec<Pair> {
         map.bg,
         Floor::Separator,
     );
+    // Non-text marks a person has to make out against the canvas: the kind
+    // glyph a card is identified by, and the two rings that say what the
+    // pointer is on and what is selected.
+    check("map wl_icon on bg".into(), map.wl_icon, map.bg, Floor::Ui);
+    check(
+        "map wl_icon on ns_fill".into(),
+        map.wl_icon,
+        map.ns_fill,
+        Floor::Ui,
+    );
+    check(
+        "map hover_ring on bg".into(),
+        map.hover_ring,
+        map.bg,
+        Floor::Ui,
+    );
+    check(
+        "map selection_ring on bg".into(),
+        map.selection_ring,
+        map.bg,
+        Floor::Ui,
+    );
     for (index, color) in map.kind_colors.iter().enumerate() {
         check(format!("map kind[{index}]"), *color, map.bg, Floor::Ui);
     }
