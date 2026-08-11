@@ -591,6 +591,7 @@ pub struct Totals {
 
 #[derive(Debug, Clone)]
 pub struct Scene<R = (), B = (), C = (), S = ()> {
+    /// Publisher-assigned snapshot revision; zero means not yet published.
     pub rev: u64,
     pub bounds: Rect,
     pub regions: Vec<RegionNode<R>>,
@@ -609,6 +610,15 @@ pub struct Scene<R = (), B = (), C = (), S = ()> {
     pub cross_edges: Range<u32>,
     pub cross_edge_index: EdgeIndex,
     pub totals: Totals,
+    /// The band the layout reserved above a card's pod grid, in world units.
+    ///
+    /// The one piece of the layout's own shape a painter cannot infer from the
+    /// rects: two layout modes reserve different headers (26 and 16 units), the
+    /// difference is invisible in any card's geometry, and a painter guessing it
+    /// from the card's height draws its header over the first row of pods. The
+    /// engine itself never reads this -- it is carried for the same reason
+    /// `SceneIds` is.
+    pub card_header: f32,
 }
 
 impl<R, B, C, S> Scene<R, B, C, S> {
@@ -921,6 +931,7 @@ impl<R, B, C, S> Default for Scene<R, B, C, S> {
             cross_edges: 0..0,
             cross_edge_index: EdgeIndex::default(),
             totals: Totals::default(),
+            card_header: 0.0,
         }
     }
 }

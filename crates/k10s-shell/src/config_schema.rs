@@ -187,6 +187,10 @@ fn settings_fields(
             family("the typeface buffers and the terminal are drawn in"),
         ),
         (
+            "display_font_family",
+            family("the headline typeface, which the map sets namespace names in"),
+        ),
+        (
             "buffer_font_size",
             range("buffer text size", &BUFFER_FONT_SIZE_RANGE),
         ),
@@ -333,7 +337,9 @@ mod tests {
     fn probe_for(key: &str) -> String {
         let value = match key {
             "theme" => "\"k10s-dark\"".to_string(),
-            "ui_font_family" | "buffer_font_family" => "\"Inter\"".to_string(),
+            "ui_font_family" | "buffer_font_family" | "display_font_family" => {
+                "\"Inter\"".to_string()
+            }
             "experimental.theme_overrides" => "{}".to_string(),
             _ => "14".to_string(),
         };

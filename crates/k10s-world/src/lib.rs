@@ -12,6 +12,20 @@ pub mod input;
 pub mod layout;
 mod topology;
 
+// The suites live beside the code rather than inside it: 1,690 lines of tests
+// in this file made the implementation hard to find, and  modules
+// compile into no binary a benchmark or the app ever links, so splitting them
+// costs nothing at runtime. Splitting the *implementation* the same way did
+// cost something -- see benchmarks/README.md -- which is why it is still here.
+#[cfg(test)]
+mod publish_test;
+#[cfg(test)]
+mod spawn_test;
+#[cfg(test)]
+mod stability_test;
+#[cfg(test)]
+mod test_support;
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -22,8 +36,8 @@ use bevy_ecs::prelude::*;
 use crossbeam_channel::Receiver;
 use k10s_core::{
     EdgeInst, IngestEvent, Intake, KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, Rect, SatExt,
-    SatNode, SceneSnapshot, Severity, SharedScene, State, ToolId, Totals, WlExt, WorkloadNode,
-    WorldCtrl,
+    SatNode, SceneIds, SceneSnapshot, Severity, SharedScene, State, ToolId, Totals, WlExt,
+    WorkloadNode, WorldCtrl,
 };
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
@@ -32,42 +46,49 @@ pub use layout::LayoutMode;
 
 const TICK_HZ: f32 = 20.0;
 
-#[derive(Component)]
-struct PodH(State);
+#[derive(Clone, Copy)]
+struct PodDelta {
+    // Aggregates owns the canonical state and is updated immediately. Carry
+    // both ends of every transition so rollup can update derived counts later,
+    // including several transitions of the same slot in one tick.
+    slot: u32,
+    old: State,
+    new: State,
+}
 
 #[derive(Resource, Default)]
-struct DirtyPods(Vec<(u32, State)>);
+struct DirtyPods(Vec<PodDelta>);
 
 fn set_pod_state(world: &mut World, idx: u32, new: State) {
-    let e = world.resource::<Topology>().pod_entities[idx as usize];
-    let changed = match world.get_mut::<PodH>(e) {
-        Some(mut h) if h.0 != new => {
-            h.0 = new;
-            true
+    world.resource_scope(|world, mut dirty: Mut<DirtyPods>| {
+        let mut aggregates = world.resource_mut::<Aggregates>();
+        let current = &mut aggregates.pod_state[idx as usize];
+        let old = *current;
+        if old != new {
+            *current = new;
+            dirty.0.push(PodDelta {
+                slot: idx,
+                old,
+                new,
+            });
         }
-        _ => false,
-    };
-    if changed {
-        world.resource_mut::<DirtyPods>().0.push((idx, new));
-    }
+    });
 }
 
 fn update_pod_states(world: &mut World, indices: &[u32], mut f: impl FnMut(State) -> State) {
-    let entities: Vec<Entity> = {
-        let topo = world.resource::<Topology>();
-        indices
-            .iter()
-            .map(|&i| topo.pod_entities[i as usize])
-            .collect()
-    };
     world.resource_scope(|world, mut dirty: Mut<DirtyPods>| {
-        for (&idx, e) in indices.iter().zip(entities) {
-            if let Some(mut h) = world.get_mut::<PodH>(e) {
-                let new = f(h.0);
-                if new != h.0 {
-                    h.0 = new;
-                    dirty.0.push((idx, new));
-                }
+        let mut aggregates = world.resource_mut::<Aggregates>();
+        for &idx in indices {
+            let current = &mut aggregates.pod_state[idx as usize];
+            let old = *current;
+            let new = f(old);
+            if new != old {
+                *current = new;
+                dirty.0.push(PodDelta {
+                    slot: idx,
+                    old,
+                    new,
+                });
             }
         }
     });
@@ -99,7 +120,6 @@ struct Topology {
     pod_labels: Vec<Arc<str>>,
     pod_rects: Vec<Rect>,
     pod_wl: Vec<u32>,
-    pod_entities: Vec<Entity>,
     sat_slots: topology::SlotMap,
     sat_labels: Vec<Arc<str>>,
     sat_details: Vec<Arc<str>>,
@@ -110,9 +130,14 @@ struct Topology {
     ns_edge_range: Vec<Range<u32>>,
     cross_edge_range: Range<u32>,
     bounds: Rect,
+    // The header band this layout mode reserves above a card's pod grid. Held
+    // here so both publish paths can carry it onto the snapshot: the painter
+    // cannot infer it, and guessing it from a card's height draws the header
+    // over the first row of pods in whichever mode was not guessed for.
+    card_header: f32,
 }
 
-#[derive(Resource, Debug, Clone, PartialEq)]
+#[derive(Resource, Debug, Clone, Default, PartialEq)]
 struct Aggregates {
     pod_state: Vec<State>,
     wl_rollup: Vec<Severity>,
@@ -258,17 +283,12 @@ fn rollup(
     debug_assert!(scratch.wl_list.is_empty() && scratch.ns_list.is_empty());
 
     let mut changed = false;
-    for &(iu, new) in &dirty_pods.0 {
-        let i = iu as usize;
-        let old = agg.pod_state[i];
-        if old == new {
-            continue;
-        }
-        agg.pod_state[i] = new;
+    for &PodDelta { slot, old, new } in &dirty_pods.0 {
+        let i = slot as usize;
         changed = true;
         for p in &mut pool.pending {
             if !p.all {
-                p.pods.push(iu);
+                p.pods.push(slot);
             }
         }
         if old.severity == new.severity {
@@ -330,26 +350,9 @@ fn rollup(
     scratch.ns_list.clear();
 }
 
-fn materialize_into(
-    snap: &mut SceneSnapshot,
-    topo: &Topology,
-    agg: &Aggregates,
-    rev: u64,
-    rebuild_spatial_index: bool,
-    rebuild_ids: bool,
-) {
-    snap.rev = rev;
-    snap.bounds = topo.bounds;
-    snap.totals = Totals {
-        regions: topo.ns_slots.active() as u32,
-        blocks: topo.wl_slots.active() as u32,
-        cells: topo.pod_slots.active() as u32,
-        sats: topo.sat_slots.active() as u32,
-        edges: topo.edges.len() as u32,
-    };
-
-    snap.regions.clear();
-    snap.regions.extend(
+fn materialize_regions(out: &mut Vec<NsNode>, topo: &Topology, agg: &Aggregates) {
+    out.clear();
+    out.extend(
         topo.ns_rects
             .iter()
             .zip(&topo.ns_labels)
@@ -370,9 +373,11 @@ fn materialize_into(
                 },
             ),
     );
+}
 
-    snap.blocks.clear();
-    snap.blocks.extend(
+fn materialize_blocks(out: &mut Vec<WorkloadNode>, topo: &Topology, agg: &Aggregates) {
+    out.clear();
+    out.extend(
         topo.wl_rects
             .iter()
             .zip(&topo.wl_card_rects)
@@ -402,9 +407,11 @@ fn materialize_into(
                 },
             ),
     );
+}
 
-    snap.cells.clear();
-    snap.cells.extend(
+fn materialize_cells(out: &mut Vec<PodNode>, topo: &Topology, agg: &Aggregates) {
+    out.clear();
+    out.extend(
         topo.pod_rects
             .iter()
             .zip(&topo.pod_labels)
@@ -415,9 +422,11 @@ fn materialize_into(
                 ext: PodExt { state },
             }),
     );
+}
 
-    snap.sats.clear();
-    snap.sats.extend(
+fn materialize_sats(out: &mut Vec<SatNode>, topo: &Topology) {
+    out.clear();
+    out.extend(
         topo.sat_rects
             .iter()
             .zip(&topo.sat_labels)
@@ -432,33 +441,89 @@ fn materialize_into(
                 },
             }),
     );
+}
 
-    // Identity only moves when a slot table does, and the revision says so;
-    // skipping the rebuild spares two atomic operations per object on the
-    // repeated-materialize paths. The ids are Arc-shared so a snapshot clone
-    // costs one reference bump; make_mut pays copy-on-write only when a
-    // reader still holds the previous identity.
+// Below this measured crossover, creating scoped workers costs more than the
+// disjoint copies save. Above it, three coarse lanes avoid allocator-heavy
+// fine-grained parallelism while preserving deterministic output.
+const PARALLEL_NODE_MATERIALIZE_MIN: usize = 250_000;
+
+fn materialize_nodes(snap: &mut SceneSnapshot, topo: &Topology, agg: &Aggregates, parallel: bool) {
+    let scene = &mut snap.scene;
+    let (regions, blocks, cells, sats) = (
+        &mut scene.regions,
+        &mut scene.blocks,
+        &mut scene.cells,
+        &mut scene.sats,
+    );
+    if !parallel {
+        materialize_regions(regions, topo, agg);
+        materialize_blocks(blocks, topo, agg);
+        materialize_cells(cells, topo, agg);
+        materialize_sats(sats, topo);
+        return;
+    }
+
+    std::thread::scope(|scope| {
+        let hierarchy = scope.spawn(|| {
+            materialize_regions(regions, topo, agg);
+            materialize_blocks(blocks, topo, agg);
+        });
+        let satellites = scope.spawn(|| materialize_sats(sats, topo));
+        materialize_cells(cells, topo, agg);
+        hierarchy
+            .join()
+            .expect("hierarchy materialization worker panicked");
+        satellites
+            .join()
+            .expect("satellite materialization worker panicked");
+    });
+}
+
+fn should_parallelize_node_materialization(topo: &Topology) -> bool {
+    let nodes =
+        topo.ns_rects.len() + topo.wl_rects.len() + topo.pod_rects.len() + topo.sat_rects.len();
+    nodes >= PARALLEL_NODE_MATERIALIZE_MIN
+        && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 3)
+}
+
+fn materialize_into(
+    snap: &mut SceneSnapshot,
+    topo: &Topology,
+    agg: &Aggregates,
+    rev: u64,
+    rebuild_spatial_index: bool,
+    rebuild_ids: bool,
+) {
+    snap.rev = rev;
+    snap.bounds = topo.bounds;
+    snap.card_header = topo.card_header;
+    snap.totals = Totals {
+        regions: topo.ns_slots.active() as u32,
+        blocks: topo.wl_slots.active() as u32,
+        cells: topo.pod_slots.active() as u32,
+        sats: topo.sat_slots.active() as u32,
+        edges: topo.edges.len() as u32,
+    };
+
+    materialize_nodes(
+        snap,
+        topo,
+        agg,
+        should_parallelize_node_materialization(topo),
+    );
+
+    // Identity only moves when a slot table does, and the revision says so.
+    // SlotIds shares topology's flat immutable base, so a million-slot publish
+    // clones four handles instead of reference-counting a million strings; a
+    // later structural patch copies only its touched 1,024-entry page.
     if rebuild_ids {
-        let tombstone: Arc<str> = Arc::from("");
-        let uid_of = |slots: &topology::SlotMap, slot: usize| {
-            slots
-                .uid(slot as u32)
-                .cloned()
-                .unwrap_or_else(|| tombstone.clone())
-        };
-        let ids = Arc::make_mut(&mut snap.ids);
-        ids.regions.clear();
-        ids.regions
-            .extend((0..topo.ns_slots.slots()).map(|slot| uid_of(&topo.ns_slots, slot)));
-        ids.blocks.clear();
-        ids.blocks
-            .extend((0..topo.wl_slots.slots()).map(|slot| uid_of(&topo.wl_slots, slot)));
-        ids.cells.clear();
-        ids.cells
-            .extend((0..topo.pod_slots.slots()).map(|slot| uid_of(&topo.pod_slots, slot)));
-        ids.sats.clear();
-        ids.sats
-            .extend((0..topo.sat_slots.slots()).map(|slot| uid_of(&topo.sat_slots, slot)));
+        snap.ids = Arc::new(SceneIds {
+            regions: topo.ns_slots.ids().clone(),
+            blocks: topo.wl_slots.ids().clone(),
+            cells: topo.pod_slots.ids().clone(),
+            sats: topo.sat_slots.ids().clone(),
+        });
     }
 
     snap.region_blocks.clear();
@@ -478,6 +543,14 @@ fn materialize_into(
 
     snap.cross_edges = topo.cross_edge_range.clone();
     snap.rebuild_edge_indexes();
+}
+
+/// The header band a layout mode reserves above a card's pod grid.
+fn card_header_of(mode: LayoutMode) -> f32 {
+    match mode {
+        LayoutMode::Spread => k10s_core::layout::CARD_HEADER,
+        LayoutMode::Dense => k10s_core::layout::WL_HEADER,
+    }
 }
 
 fn materialize_snapshot(topo: &Topology, agg: &Aggregates, rev: u64) -> SceneSnapshot {
@@ -548,6 +621,7 @@ fn patch_structural_into(
     structural: &Structural,
 ) {
     snap.bounds = topo.bounds;
+    snap.card_header = topo.card_header;
     snap.totals = Totals {
         regions: topo.ns_slots.active() as u32,
         blocks: topo.wl_slots.active() as u32,
@@ -766,7 +840,7 @@ impl PublishBench {
     pub fn flip_pods(&mut self, k: usize) {
         let indices: Vec<u32> = {
             let topo = self.world.resource::<Topology>();
-            let n = topo.pod_entities.len();
+            let n = topo.pod_slots.slots();
             let stride = (n / k.max(1)).max(1);
             (0..k.min(n)).map(|j| ((j * stride) % n) as u32).collect()
         };
@@ -809,129 +883,166 @@ pub fn build_world_from_stream(
         fold_stats.orphaned, 0,
         "a conforming stream leaves nothing unplaced"
     );
-    build_world(&input, scene, mode)
+    build_world_owned(input, scene, mode)
 }
 
+#[cfg(test)]
 fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (World, Schedule) {
-    let lay = layout::layout(spec, mode);
-    let owner_index = spec.owner_indices();
+    build_world_owned(spec.clone(), scene, mode)
+}
+
+fn build_world_owned(
+    spec: ClusterInput,
+    scene: SharedScene,
+    mode: LayoutMode,
+) -> (World, Schedule) {
+    let lay = layout::layout(&spec, mode);
+    build_world_with_layout(spec, lay, scene, mode)
+}
+
+fn build_world_with_layout(
+    spec: ClusterInput,
+    lay: layout::LayoutOut,
+    scene: SharedScene,
+    mode: LayoutMode,
+) -> (World, Schedule) {
     let with_sats = mode.emits_attachments();
+    let namespaces = spec.namespaces.len();
+    let workloads = spec.total_workloads as usize;
+    let pods = spec.total_pods as usize;
+    let sats = if with_sats {
+        spec.total_sats as usize
+    } else {
+        0
+    };
+    let edge_capacity = spec.total_edges as usize;
 
-    let mut ns_slots = topology::SlotMap::default();
-    let mut ns_labels = Vec::new();
-    let mut ns_wl_range = Vec::new();
-    let mut ns_pod_range = Vec::new();
-    let mut wl_slots = topology::SlotMap::default();
-    let mut wl_labels = Vec::new();
-    let mut wl_kinds = Vec::new();
-    let mut wl_tools = Vec::new();
-    let mut wl_ns = Vec::new();
-    let mut wl_depends_on = Vec::new();
-    let mut wl_pod_range = Vec::new();
-    let mut wl_sat_range = Vec::new();
-    let mut pod_labels = Vec::new();
-    let mut pod_slots = topology::SlotMap::default();
-    let mut pod_wl = Vec::new();
-    let mut pod_state = Vec::new();
-    let mut sat_labels = Vec::new();
-    let mut sat_slots = topology::SlotMap::default();
-    let mut sat_details = Vec::new();
-    let mut sat_kinds = Vec::new();
-    let mut sat_wl = Vec::new();
-    let mut edges = Vec::new();
-    let mut ns_edge_range = Vec::with_capacity(spec.namespaces.len());
-    let mut cross_pending: Vec<(u32, u32)> = Vec::new();
+    let mut ns_slots = topology::SlotMap::with_capacity(namespaces);
+    let mut ns_labels = Vec::with_capacity(namespaces);
+    let mut ns_wl_range = Vec::with_capacity(namespaces);
+    let mut ns_pod_range = Vec::with_capacity(namespaces);
+    let mut wl_slots = topology::SlotMap::with_capacity(workloads);
+    let mut wl_labels = Vec::with_capacity(workloads);
+    let mut wl_kinds = Vec::with_capacity(workloads);
+    let mut wl_tools = Vec::with_capacity(workloads);
+    let mut wl_ns = Vec::with_capacity(workloads);
+    let mut wl_depends_on = Vec::with_capacity(workloads);
+    let mut wl_pod_range = Vec::with_capacity(workloads);
+    let mut wl_sat_range = Vec::with_capacity(workloads);
+    let mut pod_labels = Vec::with_capacity(pods);
+    let mut pod_slots = topology::SlotMap::with_capacity(pods);
+    let mut pod_wl = Vec::with_capacity(pods);
+    let mut pod_state = Vec::with_capacity(pods);
+    let mut wl_sev_counts = Vec::with_capacity(workloads);
+    let mut wl_rollup = Vec::with_capacity(workloads);
+    let mut ns_sev_counts = Vec::with_capacity(namespaces);
+    let mut ns_rollup = Vec::with_capacity(namespaces);
+    let mut ns_unhealthy_count = Vec::with_capacity(namespaces);
+    let mut sat_labels = Vec::with_capacity(sats);
+    let mut sat_slots = topology::SlotMap::with_capacity(sats);
+    let mut sat_details = Vec::with_capacity(sats);
+    let mut sat_kinds = Vec::with_capacity(sats);
+    let mut sat_wl = Vec::with_capacity(sats);
+    let mut edges = Vec::with_capacity(edge_capacity);
+    let mut ns_edge_range = Vec::with_capacity(namespaces);
+    let mut cross_pending: Vec<(u32, u32)> = Vec::with_capacity(edge_capacity);
 
-    for (ni, ns) in spec.namespaces.iter().enumerate() {
-        let (ns_slot, inserted) = ns_slots.insert(ns.uid.clone());
+    for (ni, ns) in spec.namespaces.into_iter().enumerate() {
+        let (ns_slot, inserted) = ns_slots.insert(ns.uid);
         debug_assert!(inserted && ns_slot as usize == ni);
         let wl_start = wl_labels.len() as u32;
         let ns_pod_start = pod_labels.len() as u32;
-        let edge_start = edges.len() as u32;
-        for wl in &ns.workloads {
+        let mut ns_counts = [0u32; 4];
+        for wl in ns.workloads {
             let wl_idx = wl_labels.len() as u32;
-            let (wl_slot, inserted) = wl_slots.insert(wl.uid.clone());
+            let (wl_slot, inserted) = wl_slots.insert(wl.uid);
             debug_assert!(inserted && wl_slot == wl_idx);
             let pod_start = pod_labels.len() as u32;
-            for pod in &wl.pods {
-                let (pod_slot, inserted) = pod_slots.insert(pod.uid.clone());
+            let mut wl_counts = [0u32; 4];
+            for pod in wl.pods {
+                let (pod_slot, inserted) = pod_slots.insert(pod.uid);
                 debug_assert!(inserted && pod_slot as usize == pod_labels.len());
-                pod_labels.push(pod.name.clone());
+                let severity = pod.state.severity.rank() as usize;
+                wl_counts[severity] += 1;
+                ns_counts[severity] += 1;
+                pod_labels.push(pod.name);
                 pod_wl.push(wl_idx);
                 pod_state.push(pod.state);
             }
+            wl_rollup.push(rollup_of(&wl_counts));
+            wl_sev_counts.push(wl_counts);
             let sat_start = sat_labels.len() as u32;
             if with_sats {
-                for sat in &wl.sats {
-                    let (sat_slot, inserted) = sat_slots.insert(sat.uid.clone());
+                for sat in wl.sats {
+                    let (sat_slot, inserted) = sat_slots.insert(sat.uid);
                     debug_assert!(inserted && sat_slot as usize == sat_labels.len());
-                    sat_labels.push(sat.name.clone());
-                    sat_details.push(sat.detail.clone());
+                    sat_labels.push(sat.name);
+                    sat_details.push(sat.detail);
                     sat_kinds.push(sat.kind);
                     sat_wl.push(wl_idx);
                 }
             }
-            for target in &wl.depends_on {
-                let Some(&to) = owner_index.get(target) else {
-                    continue;
-                };
-                if to >= wl_start && to < wl_start + ns.workloads.len() as u32 {
-                    edges.push(EdgeInst::blocks(wl_idx, to));
-                } else {
-                    cross_pending.push((wl_idx, to));
-                }
-            }
-            wl_labels.push(wl.name.clone());
+            wl_labels.push(wl.name);
             wl_kinds.push(wl.kind);
             wl_tools.push(wl.tool);
             wl_ns.push(ni as u32);
-            wl_depends_on.push(wl.depends_on.clone());
+            wl_depends_on.push(wl.depends_on);
             wl_pod_range.push(pod_start..pod_labels.len() as u32);
             wl_sat_range.push(sat_start..sat_labels.len() as u32);
         }
-        ns_labels.push(ns.name.clone());
+        ns_labels.push(ns.name);
         ns_wl_range.push(wl_start..wl_labels.len() as u32);
         ns_pod_range.push(ns_pod_start..pod_labels.len() as u32);
-        ns_edge_range.push(edge_start..edges.len() as u32);
+        ns_rollup.push(rollup_of(&ns_counts));
+        ns_unhealthy_count.push(
+            ns_counts[Severity::Warn.rank() as usize] + ns_counts[Severity::Err.rank() as usize],
+        );
+        ns_sev_counts.push(ns_counts);
     }
     debug_assert_eq!(sat_labels.len(), lay.sat_rects.len());
 
+    // Resolve only after the permanent slot map is complete. Building a second
+    // workload UID map before flattening cloned and hashed every workload just
+    // to discard that index here. Namespace/workload order is already stable,
+    // so local edge order remains byte-for-byte identical and cross edges still
+    // occupy the tail.
+    for (namespace, workloads) in ns_wl_range.iter().enumerate() {
+        let edge_start = edges.len() as u32;
+        for source in workloads.clone() {
+            for target in &wl_depends_on[source as usize] {
+                let Some(to) = wl_slots.get(target) else {
+                    continue;
+                };
+                if wl_ns[to as usize] as usize == namespace {
+                    edges.push(EdgeInst::blocks(source, to));
+                } else {
+                    cross_pending.push((source, to));
+                }
+            }
+        }
+        ns_edge_range.push(edge_start..edges.len() as u32);
+    }
     let cross_start = edges.len() as u32;
     for (a, b) in cross_pending {
         edges.push(EdgeInst::blocks(a, b));
     }
     let cross_edge_range = cross_start..edges.len() as u32;
 
-    let sev_counts = |r: &Range<u32>| {
-        let mut counts = [0u32; 4];
-        for i in r.start as usize..r.end as usize {
-            counts[pod_state[i].severity.rank() as usize] += 1;
-        }
-        counts
-    };
-    let wl_sev_counts: Vec<[u32; 4]> = wl_pod_range.iter().map(sev_counts).collect();
-    let wl_rollup: Vec<Severity> = wl_sev_counts.iter().map(rollup_of).collect();
-    let ns_sev_counts: Vec<[u32; 4]> = ns_pod_range.iter().map(sev_counts).collect();
-    let ns_rollup: Vec<Severity> = ns_sev_counts.iter().map(rollup_of).collect();
-    let ns_unhealthy_count: Vec<u32> = ns_pod_range
-        .iter()
-        .map(|r| {
-            (r.start as usize..r.end as usize)
-                .filter(|&i| pod_state[i].severity.is_unhealthy())
-                .count() as u32
-        })
-        .collect();
     let ns_unhealthy: Vec<f32> = ns_pod_range
         .iter()
         .zip(&ns_unhealthy_count)
         .map(|(r, &count)| count as f32 / (r.end - r.start).max(1) as f32)
         .collect();
 
-    let mut world = World::new();
-    let pod_entities: Vec<Entity> = world
-        .spawn_batch(pod_state.iter().map(|&h| (PodH(h),)).collect::<Vec<_>>())
-        .collect();
+    // Initial construction stays on contiguous Vec storage. Seal once all
+    // slots exist so immutable snapshots can share that storage and later live
+    // identity changes fall onto bounded copy-on-write pages.
+    ns_slots.seal_ids();
+    wl_slots.seal_ids();
+    pod_slots.seal_ids();
+    sat_slots.seal_ids();
 
+    let mut world = World::new();
     world.insert_resource(Topology {
         spatial_revision: 1,
         identity_revision: 1,
@@ -960,7 +1071,6 @@ fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (Wo
         pod_labels,
         pod_rects: lay.pod_rects,
         pod_wl,
-        pod_entities,
         sat_slots,
         sat_labels,
         sat_details,
@@ -971,6 +1081,7 @@ fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (Wo
         ns_edge_range,
         cross_edge_range,
         bounds: lay.bounds,
+        card_header: card_header_of(mode),
     });
     world.insert_resource(Aggregates {
         pod_state,
@@ -994,6 +1105,79 @@ fn build_world(spec: &ClusterInput, scene: SharedScene, mode: LayoutMode) -> (Wo
     (world, schedule)
 }
 
+/// Phase timings for construction of the first immutable world snapshot.
+///
+/// This profiles the same functions as `spawn_world`, but leaves generation and
+/// rendering out so regressions can be assigned to one owner before changing
+/// production code.
+#[derive(Clone, Copy, Debug)]
+pub struct WorldBuildProfile {
+    pub fold: Duration,
+    pub layout: Duration,
+    pub assemble: Duration,
+    pub publish: Duration,
+    pub total: Duration,
+}
+
+#[inline(never)]
+pub fn profile_world_build(
+    events: &[IngestEvent],
+    mode: LayoutMode,
+) -> (WorldBuildProfile, Arc<SceneSnapshot>) {
+    let started = Instant::now();
+
+    let phase = Instant::now();
+    let (input, fold_stats) = input::fold(events);
+    let fold = phase.elapsed();
+    debug_assert_eq!(
+        fold_stats.orphaned, 0,
+        "a conforming stream leaves nothing unplaced"
+    );
+
+    profile_prepared_world_build_from(input, mode, fold, started)
+}
+
+#[inline(never)]
+pub fn profile_prepared_world_build(
+    input: &ClusterInput,
+    mode: LayoutMode,
+) -> (WorldBuildProfile, Arc<SceneSnapshot>) {
+    let owned = input.clone();
+    profile_prepared_world_build_from(owned, mode, Duration::ZERO, Instant::now())
+}
+
+fn profile_prepared_world_build_from(
+    input: ClusterInput,
+    mode: LayoutMode,
+    fold: Duration,
+    started: Instant,
+) -> (WorldBuildProfile, Arc<SceneSnapshot>) {
+    let phase = Instant::now();
+    let layout = layout::layout(&input, mode);
+    let layout_elapsed = phase.elapsed();
+
+    let phase = Instant::now();
+    let scene = k10s_core::new_shared_scene();
+    let (mut world, mut schedule) = build_world_with_layout(input, layout, scene, mode);
+    let assemble = phase.elapsed();
+
+    let phase = Instant::now();
+    schedule.run(&mut world);
+    let publish = phase.elapsed();
+    let snapshot = world.resource::<SceneOut>().0.load_full();
+
+    (
+        WorldBuildProfile {
+            fold,
+            layout: layout_elapsed,
+            assemble,
+            publish,
+            total: started.elapsed(),
+        },
+        snapshot,
+    )
+}
+
 fn weighted_state(rng: &mut ChaCha8Rng) -> State {
     match rng.random_range(0..100u32) {
         0..90 => State::of(ReasonId::RUNNING),
@@ -1003,8 +1187,36 @@ fn weighted_state(rng: &mut ChaCha8Rng) -> State {
     }
 }
 
+/// One complete scene at the world's ownership boundary.
+///
+/// Cluster snapshots arrive in their native event representation. Sources
+/// that already own a hierarchy keep it, avoiding a flatten/fold round trip.
+pub enum WorldSeed {
+    Events(Vec<IngestEvent>),
+    Prepared(ClusterInput),
+}
+
+impl From<Vec<IngestEvent>> for WorldSeed {
+    fn from(events: Vec<IngestEvent>) -> Self {
+        Self::Events(events)
+    }
+}
+
+impl From<ClusterInput> for WorldSeed {
+    fn from(scene: ClusterInput) -> Self {
+        Self::Prepared(scene)
+    }
+}
+
+fn build_seed(seed: WorldSeed, scene: SharedScene, mode: LayoutMode) -> (World, Schedule) {
+    match seed {
+        WorldSeed::Events(events) => build_world_from_stream(&events, scene, mode),
+        WorldSeed::Prepared(prepared) => build_world_owned(prepared, scene, mode),
+    }
+}
+
 pub fn spawn_world(
-    events: Vec<IngestEvent>,
+    seed_scene: impl Into<WorldSeed>,
     live: Receiver<IngestEvent>,
     scene: SharedScene,
     ctrl: Receiver<WorldCtrl>,
@@ -1014,7 +1226,7 @@ pub fn spawn_world(
     on_publish: impl FnMut() + Send + 'static,
 ) -> JoinHandle<()> {
     spawn_world_boxed(
-        events,
+        seed_scene.into(),
         live,
         scene,
         ctrl,
@@ -1026,7 +1238,7 @@ pub fn spawn_world(
 }
 
 fn spawn_world_boxed(
-    events: Vec<IngestEvent>,
+    seed_scene: WorldSeed,
     live: Receiver<IngestEvent>,
     scene: SharedScene,
     ctrl: Receiver<WorldCtrl>,
@@ -1038,8 +1250,7 @@ fn spawn_world_boxed(
     std::thread::Builder::new()
         .name("k10s-world".into())
         .spawn(move || {
-            let (mut world, mut schedule) = build_world_from_stream(&events, scene.clone(), mode);
-            drop(events);
+            let (mut world, mut schedule) = build_seed(seed_scene, scene.clone(), mode);
             let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xC0FFEE);
             let tick = Duration::from_secs_f32(1.0 / TICK_HZ);
             let mut churn_rate = churn_rate;
@@ -1048,12 +1259,16 @@ fn spawn_world_boxed(
             let mut published_rev = 0u64;
             let mut intake = Intake::new();
             let mut batch = Vec::new();
+            let mut pending_ctrl = None;
 
             loop {
                 let start = Instant::now();
-                for msg in ctrl.try_iter() {
-                    match msg {
-                        WorldCtrl::SetChurn(on) => churn_on = on,
+                for msg in pending_ctrl.take().into_iter().chain(ctrl.try_iter()) {
+                    let replacement = match msg {
+                        WorldCtrl::SetChurn(on) => {
+                            churn_on = on;
+                            None
+                        }
                         // The carry is dropped with the rate: keeping a
                         // fractional flip banked at 120/s and spending it after
                         // a real cluster arrives is exactly the transition
@@ -1061,30 +1276,34 @@ fn spawn_world_boxed(
                         WorldCtrl::SetChurnRate(rate) => {
                             churn_rate = rate.max(0.0);
                             carry = 0.0;
+                            None
                         }
-                        WorldCtrl::Rebuild(stream) => {
-                            // Everything still queued belongs to the scene being
-                            // replaced. Whoever sends this has already stopped
-                            // what was producing that -- it joins the forwarding
-                            // thread first -- so draining discards exactly the
-                            // old scene's tail and nothing else. Draining here
-                            // rather than trusting an order between two channels
-                            // is the whole point: they are read at different
-                            // moments in a tick, so a reset that did not drain
-                            // would be undone by what sat in front of it.
-                            for _ in live.try_iter() {}
-                            intake = Intake::new();
-                            let rebuilt = build_world_from_stream(&stream, scene.clone(), mode);
-                            world = rebuilt.0;
-                            schedule = rebuilt.1;
-                            // A new world counts its own revisions from zero, and
-                            // the wake-up below compares for difference rather
-                            // than growth, so the map still hears about it.
-                            published_rev = 0;
-                            carry = 0.0;
-                        }
+                        WorldCtrl::Rebuild(stream) => Some(WorldSeed::Events(stream)),
+                        WorldCtrl::RebuildPrepared(prepared) => Some(WorldSeed::Prepared(prepared)),
                         WorldCtrl::Shutdown => return,
-                    }
+                    };
+                    let Some(replacement) = replacement else {
+                        continue;
+                    };
+                    // Everything still queued belongs to the scene being
+                    // replaced. Whoever sends this has already stopped what was
+                    // producing that -- it joins the forwarding thread first --
+                    // so draining discards exactly the old scene's tail and
+                    // nothing else. Control and events are separate channels;
+                    // carrying either whole seed makes replacement one act.
+                    for _ in live.try_iter() {}
+                    intake = Intake::new();
+                    let rebuilt = build_seed(replacement, scene.clone(), mode);
+                    world = rebuilt.0;
+                    schedule = rebuilt.1;
+                    // A replacement is a new snapshot in the same process, not
+                    // a new revision domain. Give its initially-dirty extract a
+                    // floor above every scene already published. This also
+                    // distinguishes a legitimately empty replacement from the
+                    // empty shell without object-count or thread-order guesses.
+                    world.resource_mut::<Rev>().0 = published_rev.max(1);
+                    world.resource_mut::<Dirty>().0 = true;
+                    carry = 0.0;
                 }
 
                 for event in live.try_iter() {
@@ -1100,7 +1319,7 @@ fn spawn_world_boxed(
                     carry += churn_rate / TICK_HZ;
                     let flips = carry as usize;
                     carry -= flips as f32;
-                    let n = world.resource::<Topology>().pod_entities.len();
+                    let n = world.resource::<Topology>().pod_slots.slots();
                     if n > 0 {
                         for _ in 0..flips {
                             let i = rng.random_range(0..n);
@@ -1122,1698 +1341,13 @@ fn spawn_world_boxed(
                 }
 
                 if let Some(rest) = tick.checked_sub(start.elapsed()) {
-                    std::thread::sleep(rest);
+                    match ctrl.recv_timeout(rest) {
+                        Ok(message) => pending_ctrl = Some(message),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                    }
                 }
             }
         })
         .expect("spawn k10s-world thread")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-
-    use super::*;
-    use k10s_clustergen::{GenConfig, Scenario, generate};
-    use k10s_core::{Level, Op, replay};
-
-    // The workloads a generated stream puts under each namespace, keyed by that
-    // namespace's uid and name together -- the uid is what an event's `parent`
-    // must carry, and the name is what its `namespace` field must say.
-    type OwnersByScope = std::collections::HashMap<(Arc<str>, Arc<str>), Vec<Arc<str>>>;
-
-    // Where every object in a snapshot is, keyed by the uid that names it rather
-    // than by the slot that holds it -- a slot is reused, and a reused slot
-    // compared against itself is two different objects being asked to be in the
-    // same place.
-    struct Placement {
-        rect: std::collections::HashMap<Arc<str>, Rect>,
-        parent: std::collections::HashMap<Arc<str>, Arc<str>>,
-    }
-
-    fn placement(snap: &SceneSnapshot) -> Placement {
-        // A tombstoned slot's id is the empty string, and an empty string is not
-        // an object.
-        fn live(uid: Option<&Arc<str>>) -> Option<Arc<str>> {
-            uid.filter(|uid| !uid.is_empty()).cloned()
-        }
-
-        let mut rect = std::collections::HashMap::new();
-        let mut parent = std::collections::HashMap::new();
-        for (index, node) in snap.regions.iter().enumerate() {
-            if let Some(uid) = live(snap.ids.regions.get(index)) {
-                rect.insert(uid, node.rect);
-            }
-        }
-        for (index, node) in snap.blocks.iter().enumerate() {
-            if let Some(uid) = live(snap.ids.blocks.get(index)) {
-                rect.insert(uid, node.rect);
-            }
-        }
-        for (index, node) in snap.cells.iter().enumerate() {
-            if let Some(uid) = live(snap.ids.cells.get(index)) {
-                rect.insert(uid, node.rect);
-            }
-        }
-        for (index, node) in snap.sats.iter().enumerate() {
-            if let Some(uid) = live(snap.ids.sats.get(index)) {
-                rect.insert(uid, node.rect);
-            }
-        }
-        for region in 0..snap.regions.len() {
-            let Some(above) = live(snap.ids.regions.get(region)) else {
-                continue;
-            };
-            snap.for_each_region_block(region, |block, _| {
-                if let Some(uid) = live(snap.ids.blocks.get(block)) {
-                    parent.insert(uid, above.clone());
-                }
-            });
-        }
-        for block in 0..snap.blocks.len() {
-            let Some(above) = live(snap.ids.blocks.get(block)) else {
-                continue;
-            };
-            snap.for_each_block_cell(block, |cell, _| {
-                if let Some(uid) = live(snap.ids.cells.get(cell)) {
-                    parent.insert(uid, above.clone());
-                }
-            });
-            snap.for_each_block_sat(block, |sat, _| {
-                if let Some(uid) = live(snap.ids.sats.get(sat)) {
-                    parent.insert(uid, above.clone());
-                }
-            });
-        }
-        Placement { rect, parent }
-    }
-
-    // What "the map does not reshuffle" means, stated so a machine can check it.
-    //
-    // "Nothing already placed moves" is not true, and a test asserting it would
-    // be asserting a bug: a pod arriving on a card grows the card, and a card
-    // that grows can grow the namespace holding it. Growth upward is the layout
-    // working. What a person notices within ten seconds of a rolling update --
-    // and what §6.7's stability invariant is about -- is that the growth *stops
-    // there*: a pod arriving in one namespace must not move a workload in
-    // another, or a sibling pod on the same card, or anything under a namespace
-    // the batch never mentioned.
-    //
-    // So the invariant is that a change moves its own ancestors and nothing else,
-    // and the ancestors are excused by name rather than by a tolerance. The chain
-    // is walked in both snapshots, because a pod that changed parent has one
-    // ancestry before the batch and a different one after, and both of those
-    // cards legitimately resize.
-    fn assert_only_ancestors_moved(
-        before: &Placement,
-        after: &Placement,
-        touched: &[Arc<str>],
-        label: &str,
-    ) {
-        let mut excused: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
-        let mut walk: Vec<Arc<str>> = touched.to_vec();
-        while let Some(uid) = walk.pop() {
-            if !excused.insert(uid.clone()) {
-                continue;
-            }
-            walk.extend(before.parent.get(&uid).cloned());
-            walk.extend(after.parent.get(&uid).cloned());
-        }
-
-        let mut held = 0usize;
-        for (uid, was) in &before.rect {
-            if excused.contains(uid) {
-                continue;
-            }
-            // Absent afterwards is a deletion, and a deletion the batch did not
-            // name is a different failure with its own tests. This one is about
-            // what is still there.
-            let Some(now) = after.rect.get(uid) else {
-                continue;
-            };
-            assert_eq!(
-                was, now,
-                "{label}: {uid} moved, and nothing the batch touched is under it"
-            );
-            held += 1;
-        }
-        assert!(
-            held > 0,
-            "{label}: every object was excused as an ancestor, so this proves nothing"
-        );
-    }
-
-    fn touched_uids(batch: &[IngestEvent]) -> Vec<Arc<str>> {
-        batch
-            .iter()
-            .filter_map(|event| match event {
-                IngestEvent::Resource(resource) => Some(resource.uid.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn region_named<'a>(scene: &'a SceneSnapshot, name: &str) -> (usize, &'a NsNode) {
-        scene
-            .regions
-            .iter()
-            .enumerate()
-            .find(|(_, node)| node.label.as_ref() == name)
-            .expect("the named region is present")
-    }
-
-    fn workload_named<'a>(scene: &'a SceneSnapshot, name: &str) -> (usize, &'a WorkloadNode) {
-        scene
-            .blocks
-            .iter()
-            .enumerate()
-            .find(|(_, node)| node.label.as_ref() == name)
-            .expect("the named workload is present")
-    }
-
-    fn pod_named<'a>(scene: &'a SceneSnapshot, name: &str) -> (usize, &'a PodNode) {
-        scene
-            .cells
-            .iter()
-            .enumerate()
-            .find(|(_, node)| node.label.as_ref() == name)
-            .expect("the named pod is present")
-    }
-
-    fn platform(seed: u64, target_objects: u32) -> ClusterInput {
-        input_of(seed, target_objects, Scenario::Platform)
-    }
-
-    fn input_of(seed: u64, target_objects: u32, scenario: Scenario) -> ClusterInput {
-        input::fold(&stream_of(seed, target_objects, scenario)).0
-    }
-
-    fn stream_of(seed: u64, target_objects: u32, scenario: Scenario) -> Vec<IngestEvent> {
-        let spec = generate(&GenConfig {
-            seed,
-            target_objects,
-            scenario,
-        });
-        k10s_clustergen::stream::snapshot(&spec, true)
-    }
-
-    fn st(sev: Severity) -> State {
-        match sev {
-            Severity::Ok => State::of(ReasonId::RUNNING),
-            Severity::Unknown => State::of(ReasonId::UNKNOWN),
-            Severity::Warn => State::of(ReasonId::NOT_READY),
-            Severity::Err => State::of(ReasonId::CRASH_LOOP_BACK_OFF),
-        }
-    }
-
-    fn flip_to_other(world: &mut World, pod: usize) {
-        let cur = world.resource::<Aggregates>().pod_state[pod];
-        let new = if cur.severity == Severity::Err {
-            State::of(ReasonId::NOT_READY)
-        } else {
-            State::of(ReasonId::CRASH_LOOP_BACK_OFF)
-        };
-        set_pod_state(world, pod as u32, new);
-    }
-
-    // A published snapshot -- state-patched, structurally patched, or fully
-    // materialized -- must be indistinguishable from a fresh materialize:
-    // node for node, range for range, and through the spatial index as the
-    // cull actually consumes it.
-    fn assert_published_matches_full(world: &World, snap: &SceneSnapshot) {
-        let topo = world.resource::<Topology>();
-        let agg = world.resource::<Aggregates>();
-        let full = materialize_snapshot(topo, agg, snap.rev);
-        assert_eq!(
-            snap.regions, full.regions,
-            "regions diverged at rev {}",
-            snap.rev
-        );
-        assert_eq!(
-            snap.blocks, full.blocks,
-            "blocks diverged at rev {}",
-            snap.rev
-        );
-        assert_eq!(snap.cells, full.cells, "cells diverged at rev {}", snap.rev);
-        assert_eq!(snap.sats, full.sats, "sats diverged at rev {}", snap.rev);
-        assert_eq!(
-            snap.region_blocks, full.region_blocks,
-            "region_blocks diverged"
-        );
-        assert_eq!(snap.block_cells, full.block_cells, "block_cells diverged");
-        assert_eq!(snap.block_sats, full.block_sats, "block_sats diverged");
-        assert_eq!(snap.edges, full.edges, "edges diverged");
-        assert_eq!(
-            snap.region_edges, full.region_edges,
-            "region_edges diverged"
-        );
-        assert_eq!(snap.cross_edges, full.cross_edges, "cross_edges diverged");
-        assert_eq!(snap.ids, full.ids, "identity vectors diverged");
-        assert_eq!(snap.totals, full.totals, "totals diverged");
-        assert_eq!(snap.bounds, full.bounds, "bounds diverged");
-
-        let policy = k10s_atlas::testing::lod_policy();
-        let mut fit = k10s_atlas::Camera::default();
-        fit.fit(snap.bounds, 1600.0, 1000.0);
-        let cameras = [fit.zoom, 0.12, 1.0, 4.5].map(|zoom| k10s_atlas::Camera {
-            cx: snap.bounds.center().0,
-            cy: snap.bounds.center().1,
-            zoom,
-        });
-        for camera in cameras {
-            let blend = k10s_atlas::StageBlend::settled(policy.stage_for_zoom(camera.zoom));
-            let through_patched =
-                k10s_atlas::cull(snap, &camera, &policy, blend, 1600.0, 1000.0, true, false);
-            let through_full =
-                k10s_atlas::cull(&full, &camera, &policy, blend, 1600.0, 1000.0, true, false);
-            assert_eq!(
-                through_patched, through_full,
-                "the cull sees different scenes at zoom {}",
-                camera.zoom
-            );
-        }
-    }
-
-    fn assert_rollup_arithmetic(world: &World) {
-        let topo = world.resource::<Topology>();
-        let agg = world.resource::<Aggregates>();
-        for wl in 0..topo.wl_slots.slots() {
-            let pods = (0..topo.pod_slots.slots())
-                .filter(|&pod| topo.pod_slots.is_active(pod) && topo.pod_wl[pod] as usize == wl);
-            let cells = pods.clone().count();
-            let counts = agg.wl_sev_counts[wl];
-            assert_eq!(
-                counts.iter().sum::<u32>() as usize,
-                cells,
-                "workload {wl} severity counts {counts:?} do not sum to {cells} cells"
-            );
-            let mut expect = [0u32; 4];
-            for pod in pods.clone() {
-                expect[agg.pod_state[pod].severity.rank() as usize] += 1;
-            }
-            assert_eq!(counts, expect, "workload {wl} severity counts drifted");
-            let worst = pods
-                .map(|pod| agg.pod_state[pod].severity)
-                .max()
-                .unwrap_or(Severity::Ok);
-            assert_eq!(agg.wl_rollup[wl], worst, "workload {wl} rollup drifted");
-        }
-        for ns in 0..topo.ns_slots.slots() {
-            let pods = (0..topo.pod_slots.slots()).filter(|&pod| {
-                let workload = topo.pod_wl[pod] as usize;
-                topo.pod_slots.is_active(pod)
-                    && topo.wl_slots.is_active(workload)
-                    && topo.wl_ns[workload] as usize == ns
-            });
-            let unhealthy = pods
-                .clone()
-                .filter(|&pod| agg.pod_state[pod].severity.is_unhealthy())
-                .count() as u32;
-            assert_eq!(
-                agg.ns_unhealthy_count[ns], unhealthy,
-                "namespace {ns} unhealthy count drifted"
-            );
-            let total = topo.ns_pod_count[ns].max(1) as f32;
-            assert_eq!(
-                agg.ns_unhealthy[ns],
-                unhealthy as f32 / total,
-                "namespace {ns} unhealthy fraction drifted"
-            );
-        }
-    }
-
-    #[test]
-    fn initial_snapshot_published_and_rollups_react() {
-        let spec = input_of(1, 3000, Scenario::Platform);
-        let scene = k10s_core::new_shared_scene();
-        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
-
-        schedule.run(&mut world);
-        let snap = scene.load();
-        assert_eq!(snap.rev, 1);
-        assert_eq!(snap.totals.cells as usize, snap.cells.len());
-        assert!(snap.totals.cells > 0);
-
-        schedule.run(&mut world);
-        assert_eq!(scene.load().rev, 1);
-
-        set_pod_state(&mut world, 0, st(Severity::Err));
-        schedule.run(&mut world);
-        let snap = scene.load();
-        assert_eq!(snap.rev, 2);
-        assert_eq!(snap.cells[0].ext.state.severity, Severity::Err);
-        let pod_rect = snap.cells[0].rect;
-        let owner = &snap.blocks[world.resource::<Topology>().pod_wl[0] as usize];
-        assert_eq!(owner.ext.rollup, Severity::Err);
-        assert!(owner.rect.intersects(&pod_rect));
-    }
-
-    #[test]
-    fn incremental_publish_matches_full_materialize() {
-        let spec = input_of(3, 5_000, Scenario::Platform);
-        let scene = k10s_core::new_shared_scene();
-        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
-        schedule.run(&mut world);
-
-        let flip = |world: &mut World, pod: usize, h: Severity| {
-            set_pod_state(world, pod as u32, st(h));
-        };
-
-        flip(&mut world, 0, Severity::Err);
-        schedule.run(&mut world);
-        flip(&mut world, 1, Severity::Warn);
-        schedule.run(&mut world);
-        flip(&mut world, 2, Severity::Unknown);
-        schedule.run(&mut world);
-
-        let snap = scene.load_full();
-        assert_eq!(snap.rev, 4);
-        let full = {
-            let topo = world.resource::<Topology>();
-            let agg = world.resource::<Aggregates>();
-            materialize_snapshot(topo, agg, 4)
-        };
-        assert_eq!(snap.cells.len(), full.cells.len());
-        for (a, b) in snap.cells.iter().zip(full.cells.iter()) {
-            assert_eq!(a.ext.state, b.ext.state);
-        }
-        for (a, b) in snap.blocks.iter().zip(full.blocks.iter()) {
-            assert_eq!(a.ext.rollup, b.ext.rollup);
-        }
-        for (a, b) in snap.regions.iter().zip(full.regions.iter()) {
-            assert_eq!(a.ext.unhealthy_frac, b.ext.unhealthy_frac);
-        }
-        assert_eq!(snap.region_edges.len(), snap.regions.len());
-        assert_eq!(snap.cells[0].ext.state.severity, Severity::Err);
-        assert_eq!(snap.cells[1].ext.state.severity, Severity::Warn);
-        assert_eq!(snap.cells[2].ext.state.severity, Severity::Unknown);
-    }
-
-    #[test]
-    fn a_reason_only_change_publishes_instead_of_piling_up() {
-        let spec = platform(21, 2_000);
-        let scene = k10s_core::new_shared_scene();
-        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
-        schedule.run(&mut world);
-        assert_eq!(scene.load().rev, 1);
-
-        let warn = [ReasonId::PENDING, ReasonId::NOT_READY];
-        set_pod_state(&mut world, 0, State::of(warn[0]));
-        schedule.run(&mut world);
-        let base = scene.load().rev;
-
-        for round in 0..8u64 {
-            let want = State::of(warn[(round as usize + 1) % 2]);
-            set_pod_state(&mut world, 0, want);
-            schedule.run(&mut world);
-
-            let snap = scene.load_full();
-            assert_eq!(
-                snap.rev,
-                base + round + 1,
-                "a reason-only change must publish"
-            );
-            assert_eq!(snap.cells[0].ext.state, want);
-            assert_published_matches_full(&world, &snap);
-            for (slot, p) in world.resource::<SnapshotPool>().pending.iter().enumerate() {
-                assert!(
-                    p.pods.len() <= SNAPSHOT_POOL_DEPTH,
-                    "pool slot {slot} holds {} pending pods after {} reason-only ticks",
-                    p.pods.len(),
-                    round + 1
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn held_buffer_is_never_mutated_under_reader() {
-        let spec = input_of(4, 2_000, Scenario::Platform);
-        let scene = k10s_core::new_shared_scene();
-        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
-        schedule.run(&mut world);
-
-        let held = scene.load_full();
-        let held_health: Vec<Severity> = held.cells.iter().map(|c| c.ext.state.severity).collect();
-
-        let flip = |world: &mut World, pod: usize, h: Severity| {
-            set_pod_state(world, pod as u32, st(h));
-        };
-        let target = held_health
-            .iter()
-            .position(|&h| h != Severity::Err)
-            .expect("some pod not already Err");
-        flip(&mut world, target, Severity::Err);
-        schedule.run(&mut world);
-        flip(&mut world, target, Severity::Warn);
-        schedule.run(&mut world);
-
-        assert_eq!(held.rev, 1, "reader's snapshot changed under it");
-        for (cell, &h) in held.cells.iter().zip(&held_health) {
-            assert_eq!(
-                cell.ext.state.severity, h,
-                "reader's snapshot changed under it"
-            );
-        }
-        let fresh = scene.load_full();
-        assert_eq!(fresh.rev, 3);
-        assert_eq!(fresh.cells[target].ext.state.severity, Severity::Warn);
-    }
-
-    #[test]
-    fn a_reader_lapped_twice_costs_no_deep_clone() {
-        const LAPPED_PUBLISHES_ABSORBED: usize = 2;
-        const { assert!(SNAPSHOT_POOL_DEPTH > LAPPED_PUBLISHES_ABSORBED) };
-
-        let spec = platform(9, 3_000);
-        let scene = k10s_core::new_shared_scene();
-        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
-        schedule.run(&mut world);
-
-        let held = scene.load_full();
-        for pod in 0..LAPPED_PUBLISHES_ABSORBED {
-            flip_to_other(&mut world, pod);
-            schedule.run(&mut world);
-        }
-
-        let stats = *world.resource::<PublishStats>();
-        assert_eq!(stats.publishes as usize, LAPPED_PUBLISHES_ABSORBED + 1);
-        assert_eq!(
-            stats.deep_clones, 0,
-            "one reader lapped {LAPPED_PUBLISHES_ABSORBED} times forced {} deep clones at pool \
-             depth {SNAPSHOT_POOL_DEPTH}",
-            stats.deep_clones
-        );
-        assert_eq!(held.rev, 1);
-        assert_eq!(scene.load().rev as usize, LAPPED_PUBLISHES_ABSORBED + 1);
-        assert_published_matches_full(&world, &scene.load_full());
-    }
-
-    #[test]
-    fn publish_under_a_lapped_reader_stays_correct() {
-        let spec = platform(11, 4_000);
-        let scene = k10s_core::new_shared_scene();
-        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
-        schedule.run(&mut world);
-
-        let pinned = scene.load_full();
-        let pinned_health: Vec<Severity> =
-            pinned.cells.iter().map(|c| c.ext.state.severity).collect();
-        let mut recent: VecDeque<Arc<SceneSnapshot>> = VecDeque::new();
-        recent.push_back(scene.load_full());
-
-        let pods = world.resource::<Topology>().pod_labels.len();
-        for round in 0..SNAPSHOT_POOL_DEPTH * 4 {
-            flip_to_other(&mut world, (round * 37) % pods);
-            flip_to_other(&mut world, (round * 101 + 5) % pods);
-            schedule.run(&mut world);
-
-            let published = scene.load_full();
-            assert_eq!(published.rev as usize, round + 2);
-            assert_published_matches_full(&world, &published);
-            recent.push_back(published);
-            if recent.len() > SNAPSHOT_POOL_DEPTH {
-                recent.pop_front();
-            }
-        }
-
-        let stats = *world.resource::<PublishStats>();
-        assert!(
-            stats.deep_clones > 0,
-            "lapped reader never forced the clone path: {stats:?}"
-        );
-        assert_eq!(stats.full_materializes as usize, SNAPSHOT_POOL_DEPTH);
-        assert_eq!(pinned.rev, 1);
-        for (i, (cell, &h)) in pinned.cells.iter().zip(&pinned_health).enumerate() {
-            assert_eq!(
-                cell.ext.state.severity, h,
-                "pinned snapshot cell {i} changed"
-            );
-        }
-    }
-
-    #[test]
-    fn rollup_arithmetic_survives_adversarial_dirty_streams() {
-        let spec = platform(13, 3_000);
-        let scene = k10s_core::new_shared_scene();
-        let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
-        schedule.run(&mut world);
-        assert_rollup_arithmetic(&world);
-
-        let wl = world
-            .resource::<Topology>()
-            .wl_pod_range
-            .iter()
-            .position(|r| r.end - r.start >= 4)
-            .expect("a workload with four or more pods");
-        let pods: Vec<u32> = world.resource::<Topology>().wl_pod_range[wl]
-            .clone()
-            .collect();
-        let originals: Vec<State> = pods
-            .iter()
-            .map(|&i| world.resource::<Aggregates>().pod_state[i as usize])
-            .collect();
-
-        for h in [
-            Severity::Err,
-            Severity::Warn,
-            Severity::Ok,
-            Severity::Unknown,
-            Severity::Err,
-        ] {
-            set_pod_state(&mut world, pods[0], st(h));
-        }
-        set_pod_state(&mut world, pods[0], originals[0]);
-        set_pod_state(&mut world, pods[1], st(Severity::Err));
-        set_pod_state(&mut world, pods[1], st(Severity::Warn));
-        set_pod_state(&mut world, pods[2], st(Severity::Unknown));
-        schedule.run(&mut world);
-
-        assert_rollup_arithmetic(&world);
-        assert_eq!(
-            world.resource::<Aggregates>().pod_state[pods[0] as usize],
-            originals[0]
-        );
-        assert_eq!(
-            world.resource::<Aggregates>().pod_state[pods[1] as usize],
-            st(Severity::Warn)
-        );
-        assert_published_matches_full(&world, &scene.load_full());
-
-        for round in 0..4u32 {
-            for (slot, &pod) in pods.iter().enumerate() {
-                for h in [
-                    Severity::Err,
-                    Severity::Ok,
-                    Severity::Warn,
-                    Severity::Unknown,
-                ] {
-                    set_pod_state(&mut world, pod, st(h));
-                }
-                set_pod_state(&mut world, pod, originals[slot]);
-                if (slot as u32).is_multiple_of(round + 1) {
-                    set_pod_state(&mut world, pod, st(Severity::Err));
-                }
-            }
-            schedule.run(&mut world);
-            assert_rollup_arithmetic(&world);
-            assert_published_matches_full(&world, &scene.load_full());
-        }
-
-        for (slot, &pod) in pods.iter().enumerate() {
-            set_pod_state(&mut world, pod, originals[slot]);
-        }
-        schedule.run(&mut world);
-        assert_rollup_arithmetic(&world);
-        for (slot, &pod) in pods.iter().enumerate() {
-            assert_eq!(
-                world.resource::<Aggregates>().pod_state[pod as usize],
-                originals[slot]
-            );
-        }
-    }
-
-    #[test]
-    fn scene_ranges_partition_every_array() {
-        let spec = platform(17, 8_000);
-        for mode in [LayoutMode::Spread, LayoutMode::Dense] {
-            let scene = k10s_core::new_shared_scene();
-            let (mut world, mut schedule) = build_world(&spec, scene.clone(), mode);
-            schedule.run(&mut world);
-            let snap = scene.load_full();
-
-            assert_eq!(snap.totals.regions as usize, snap.regions.len(), "{mode:?}");
-            assert_eq!(snap.totals.blocks as usize, snap.blocks.len(), "{mode:?}");
-            assert_eq!(snap.totals.cells as usize, snap.cells.len(), "{mode:?}");
-            assert_eq!(snap.totals.sats as usize, snap.sats.len(), "{mode:?}");
-            assert_eq!(snap.totals.edges as usize, snap.edges.len(), "{mode:?}");
-            assert!(snap.totals.cells > 0 && snap.totals.blocks > 0);
-            assert_eq!(
-                snap.sats.is_empty(),
-                !mode.emits_attachments(),
-                "{mode:?} snapshot disagrees with emits_attachments"
-            );
-
-            let mut next_block = 0u32;
-            for (i, region) in snap.regions.iter().enumerate() {
-                assert_eq!(
-                    region.children.start, next_block,
-                    "{mode:?} region {i} children not contiguous"
-                );
-                assert!(region.children.end >= region.children.start);
-                next_block = region.children.end;
-            }
-            assert_eq!(next_block as usize, snap.blocks.len(), "{mode:?}");
-
-            let mut next_cell = 0u32;
-            let mut next_sat = 0u32;
-            for (i, block) in snap.blocks.iter().enumerate() {
-                assert_eq!(
-                    block.children.start, next_cell,
-                    "{mode:?} block {i} children not contiguous"
-                );
-                assert!(block.children.end >= block.children.start);
-                next_cell = block.children.end;
-                assert_eq!(
-                    block.sats.start, next_sat,
-                    "{mode:?} block {i} sats not contiguous"
-                );
-                assert!(block.sats.end >= block.sats.start);
-                next_sat = block.sats.end;
-                assert!(
-                    snap.regions[block.ext.ns as usize]
-                        .children
-                        .contains(&(i as u32)),
-                    "{mode:?} block {i} claims region {} which does not own it",
-                    block.ext.ns
-                );
-            }
-            assert_eq!(next_cell as usize, snap.cells.len(), "{mode:?}");
-            assert_eq!(next_sat as usize, snap.sats.len(), "{mode:?}");
-
-            assert_eq!(snap.region_edges.len(), snap.regions.len(), "{mode:?}");
-            let mut next_edge = 0u32;
-            for (i, range) in snap.region_edges.iter().enumerate() {
-                assert_eq!(
-                    range.start, next_edge,
-                    "{mode:?} region {i} edges not contiguous"
-                );
-                assert!(range.end >= range.start);
-                next_edge = range.end;
-            }
-            assert_eq!(
-                next_edge, snap.cross_edges.start,
-                "{mode:?} region ranges must end where the cross tail begins"
-            );
-            assert_eq!(
-                snap.cross_edges.end as usize,
-                snap.edges.len(),
-                "{mode:?} cross tail must run to the end of edges"
-            );
-            assert!(snap.cross_edges.start <= snap.cross_edges.end, "{mode:?}");
-            assert!(
-                snap.cross_edges.end as usize <= snap.edges.len(),
-                "{mode:?} cross_edges {:?} outside edges of {}",
-                snap.cross_edges,
-                snap.edges.len()
-            );
-
-            for (i, region) in snap.regions.iter().enumerate() {
-                let cells: u32 = region
-                    .children
-                    .clone()
-                    .map(|b| {
-                        let block = &snap.blocks[b as usize];
-                        block.children.end - block.children.start
-                    })
-                    .sum();
-                assert_eq!(region.weight, cells, "{mode:?} region {i} weight");
-            }
-            for edge in &snap.edges {
-                for end in [edge.a, edge.b] {
-                    let limit = match end.level() {
-                        Level::Region => snap.regions.len(),
-                        Level::Block => snap.blocks.len(),
-                        Level::Cell => snap.cells.len(),
-                        Level::Sat => snap.sats.len(),
-                    };
-                    assert!(
-                        (end.index() as usize) < limit,
-                        "{mode:?} edge endpoint {end:?} outside its {:?} array of {limit}",
-                        end.level()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn cross_namespace_edges_land_in_the_cross_range() {
-        let spec = platform(55, 20_000);
-        let owner_index = spec.owner_indices();
-        let ns_of_block: Vec<u32> = spec
-            .namespaces
-            .iter()
-            .enumerate()
-            .flat_map(|(ni, ns)| ns.workloads.iter().map(move |_| ni as u32))
-            .collect();
-        let crossing = spec
-            .namespaces
-            .iter()
-            .enumerate()
-            .flat_map(|(ni, ns)| ns.workloads.iter().map(move |wl| (ni as u32, wl)))
-            .filter(|(ni, wl)| {
-                wl.depends_on.iter().any(|t| {
-                    owner_index
-                        .get(t)
-                        .is_some_and(|&to| ns_of_block[to as usize] != *ni)
-                })
-            })
-            .count();
-        assert!(
-            crossing > 0,
-            "the generator produced no cross-namespace links"
-        );
-        for mode in [LayoutMode::Dense, LayoutMode::Spread] {
-            let scene = k10s_core::new_shared_scene();
-            let (mut world, mut schedule) = build_world(&spec, scene.clone(), mode);
-            schedule.run(&mut world);
-            let snap = scene.load_full();
-
-            let cross = &snap.cross_edges;
-            assert!(!cross.is_empty(), "{mode:?}: cross range still empty");
-            assert_eq!(
-                cross.end as usize,
-                snap.edges.len(),
-                "{mode:?}: cross links must be the tail of edges"
-            );
-
-            for (i, r) in snap.region_edges.iter().enumerate() {
-                assert!(
-                    r.end <= cross.start,
-                    "{mode:?}: region {i} range {r:?} overlaps the cross tail at {}",
-                    cross.start
-                );
-            }
-
-            let ns_of = |block: u32| snap.blocks[block as usize].ext.ns;
-            for e in &snap.edges[cross.start as usize..cross.end as usize] {
-                assert_eq!(e.a.level(), Level::Block, "{mode:?}");
-                assert_eq!(e.b.level(), Level::Block, "{mode:?}");
-                assert_ne!(
-                    ns_of(e.a.index()),
-                    ns_of(e.b.index()),
-                    "{mode:?}: cross edge {e:?} has both ends in one namespace"
-                );
-            }
-
-            let drawn = k10s_atlas::walk_edges(&snap, &snap.bounds, usize::MAX, |_, _| {});
-            assert!(
-                drawn >= cross.len(),
-                "{mode:?}: culler drew {drawn} edges, fewer than the {} cross links",
-                cross.len()
-            );
-        }
-    }
-
-    #[test]
-    fn selective_rebuilds_match_a_full_rebuild_after_every_batch_shape() {
-        use k10s_core::{Payload, ResourceEvent};
-        let sat = |uid: &str, parent: &str, op: Op| {
-            IngestEvent::Resource(ResourceEvent {
-                kind: KindId::SERVICE,
-                uid: uid.into(),
-                namespace: "prod".into(),
-                name: uid.into(),
-                resource_version: 0,
-                parent: Some(parent.into()),
-                op,
-                payload: Payload::Attached {
-                    kind: KindId::SERVICE,
-                    detail: Arc::from("80/TCP"),
-                },
-            })
-        };
-        let owner_with_deps = |uid: &str, name: &str, deps: &[&str], op: Op| {
-            IngestEvent::Resource(ResourceEvent {
-                kind: KindId::DEPLOYMENT,
-                uid: uid.into(),
-                namespace: "prod".into(),
-                name: name.into(),
-                resource_version: 0,
-                parent: Some("ns-prod".into()),
-                op,
-                payload: Payload::Owner {
-                    kind: KindId::DEPLOYMENT,
-                    tool: ToolId::NONE,
-                    depends_on: deps.iter().map(|dep| Arc::from(*dep)).collect(),
-                },
-            })
-        };
-        let renamed_pod = |uid: &str, name: &str, state: State| {
-            IngestEvent::Resource(ResourceEvent {
-                kind: KindId::POD,
-                uid: uid.into(),
-                namespace: "prod".into(),
-                name: name.into(),
-                resource_version: 0,
-                parent: Some("wl-api".into()),
-                op: Op::Modified,
-                payload: Payload::Instance { state },
-            })
-        };
-
-        let batches: Vec<Vec<IngestEvent>> = vec![
-            // The rolling-update hot path: pods only.
-            vec![replay::instance(
-                "pod-3",
-                "prod",
-                "wl-api",
-                State::of(ReasonId::CRASH_LOOP_BACK_OFF),
-                Op::Added,
-            )],
-            // A rename forces a pod state change through the structural path.
-            vec![renamed_pod(
-                "pod-3",
-                "pod-3-renamed",
-                State::of(ReasonId::NOT_READY),
-            )],
-            vec![replay::instance(
-                "pod-2",
-                "prod",
-                "wl-api",
-                State::OK,
-                Op::Deleted,
-            )],
-            // A new workload with edges, then its pod, parent-first.
-            vec![
-                owner_with_deps("wl-edge", "edge", &["wl-api"], Op::Added),
-                replay::instance("pod-e1", "prod", "wl-edge", State::OK, Op::Added),
-            ],
-            // Dependency change on an existing workload without a move.
-            vec![owner_with_deps("wl-edge", "edge", &[], Op::Modified)],
-            vec![sat("svc-api", "wl-api", Op::Added)],
-            vec![sat("svc-api", "wl-api", Op::Deleted)],
-            // A whole new namespace, then its content.
-            vec![
-                replay::scope("ns-canary", "canary", Op::Added),
-                replay::owner("wl-canary", "canary", "canary", KindId::JOB, Op::Added),
-                replay::instance(
-                    "pod-c1",
-                    "canary",
-                    "wl-canary",
-                    State::of(ReasonId::PENDING),
-                    Op::Added,
-                ),
-            ],
-            // A workload delete cascades its pod before the slot clears.
-            vec![replay::owner(
-                "wl-canary",
-                "canary",
-                "canary",
-                KindId::JOB,
-                Op::Deleted,
-            )],
-            vec![replay::scope("ns-canary", "canary", Op::Deleted)],
-            // Slot reuse after the tombstones above: the reused slot's
-            // identity vector entry must change with it, which is the whole
-            // reason the snapshot carries ids.
-            vec![replay::instance(
-                "pod-4",
-                "prod",
-                "wl-api",
-                State::OK,
-                Op::Added,
-            )],
-        ];
-
-        let initial = replay::initial_sync();
-        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
-        topology::verify_derived_state(&mut bench.world);
-
-        let held = bench.snapshot();
-        let held_before = (*held).clone();
-
-        for (index, batch) in batches.iter().enumerate() {
-            let before = placement(&bench.snapshot());
-            bench.apply_events(batch);
-            bench.run_publish();
-            topology::verify_derived_state(&mut bench.world);
-            assert_published_matches_full(&bench.world, &bench.snapshot());
-            let snapshot = bench.snapshot();
-            assert!(
-                snapshot.rev > index as u64,
-                "each structural batch must publish"
-            );
-            // The two assertions above are equivalence oracles: they compare this
-            // snapshot to a fresh materialize of the same state. Neither compares
-            // it to the snapshot *before* the batch, which is the only comparison
-            // that can see the map reshuffle.
-            assert_only_ancestors_moved(
-                &before,
-                &placement(&snapshot),
-                &touched_uids(batch),
-                &format!("batch {index}"),
-            );
-        }
-
-        let stats = bench.stats();
-        assert!(
-            stats.structural_patches > 0,
-            "the small batches must exercise the patch path: {stats:?}"
-        );
-        assert!(
-            stats.full_materializes > 0,
-            "batches touching most of a tiny scene must fall back to full: {stats:?}"
-        );
-        assert_eq!(
-            held.regions, held_before.regions,
-            "a held snapshot must never change under its reader"
-        );
-        assert_eq!(held.cells, held_before.cells);
-        assert_eq!(held.totals, held_before.totals);
-        assert_eq!(held.rev, held_before.rev);
-    }
-
-    #[test]
-    fn snapshot_ids_name_slots_and_survive_reuse() {
-        let initial = replay::initial_sync();
-        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
-
-        let snap = bench.snapshot();
-        let slot = snap
-            .cells
-            .iter()
-            .position(|cell| cell.label.as_ref() == "pod-1")
-            .expect("pod-1 is in the initial sync");
-        assert_eq!(
-            snap.ids.cells[slot].as_ref(),
-            "pod-1",
-            "a slot's identity entry names the object living in it"
-        );
-        drop(snap);
-
-        bench.apply_events(&[replay::instance(
-            "pod-1",
-            "prod",
-            "wl-api",
-            State::OK,
-            Op::Deleted,
-        )]);
-        bench.run_publish();
-        let snap = bench.snapshot();
-        assert_eq!(
-            snap.ids.cells[slot].as_ref(),
-            "",
-            "a tombstoned slot's identity must empty, not linger"
-        );
-        drop(snap);
-
-        bench.apply_events(&[replay::instance(
-            "pod-replacement",
-            "prod",
-            "wl-api",
-            State::OK,
-            Op::Added,
-        )]);
-        bench.run_publish();
-        let snap = bench.snapshot();
-        assert_eq!(
-            snap.ids.cells[slot].as_ref(),
-            "pod-replacement",
-            "a reused slot must carry the new identity; a selection keyed by \
-             uid sees the swap where one keyed by slot would silently follow it"
-        );
-    }
-
-    // The stability invariant at a scale where the answer is not obvious by
-    // inspection, and across every structural shape rather than only the
-    // rolling-update one. A cluster of twelve thousand objects is where a reflow
-    // would be catastrophic and also where it would be hardest to notice: three
-    // named rects at three objects cannot tell you that the nine thousandth pod
-    // stayed put.
-    //
-    // Each shape is checked on its own, because they fail differently. A pod
-    // arriving grows one card; a workload arriving grows one namespace; a
-    // namespace arriving grows the world and must move no namespace already in
-    // it; and a delete must not close the gap it leaves by pulling its siblings
-    // across.
-    // Scaling a workload up and back down leaves the card the size its contents
-    // need, not the size they once needed.
-    //
-    // Found on a real cluster rather than here: a Deployment taken to eighty
-    // replicas and back to eight kept the card it had at eighty. Growing was the
-    // only half that existed, which is correct for arrivals -- a pod must be
-    // visible the frame it appears -- and left departures with nothing to undo
-    // it.
-    //
-    // The three things this pins are the three that make shrinking safe rather
-    // than merely tidy: the card comes back down, it never comes down past what
-    // it still holds, and the workload beside it does not move while that
-    // happens. The last is the whole layout's reason for existing, and a fit that
-    // repacked to close the gap would break it.
-    #[test]
-    fn a_card_that_grew_for_pods_comes_back_down_when_they_leave() {
-        let initial = replay::initial_sync();
-        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
-
-        // A second workload beside the one that will grow, to have something that
-        // must not move.
-        bench.apply_events(&[replay::owner(
-            "wl-side",
-            "prod",
-            "side",
-            KindId::DEPLOYMENT,
-            Op::Added,
-        )]);
-        bench.run_publish();
-        let neighbour = workload_named(&bench.snapshot(), "side").1.rect;
-
-        let grown: Vec<IngestEvent> = (0..40)
-            .map(|i| {
-                replay::instance(
-                    &format!("pod-burst-{i}"),
-                    "prod",
-                    "wl-api",
-                    State::OK,
-                    Op::Added,
-                )
-            })
-            .collect();
-        bench.apply_events(&grown);
-        bench.run_publish();
-        let big = workload_named(&bench.snapshot(), "api").1.inner;
-
-        // The *last* ones, which is what fitting can act on: a pod keeps the grid
-        // position it was given, so the card can only come down as far as the
-        // furthest survivor. Deleting from the front leaves one at the bottom and
-        // the card stays tall -- correctly, and uselessly, which is the limitation
-        // recorded below.
-        let gone: Vec<IngestEvent> = (4..40)
-            .map(|i| {
-                replay::instance(
-                    &format!("pod-burst-{i}"),
-                    "prod",
-                    "wl-api",
-                    State::OK,
-                    Op::Deleted,
-                )
-            })
-            .collect();
-        bench.apply_events(&gone);
-        bench.run_publish();
-        let after = bench.snapshot();
-        let (api_slot, api) = workload_named(&after, "api");
-        let small = api.inner;
-
-        assert!(
-            small.h < big.h,
-            "the card kept the height it needed at forty pods: {big:?} -> {small:?}"
-        );
-
-        // Never smaller than what is still in it, or a pod that kept its place is
-        // clipped by its own card.
-        let mut held = 0usize;
-        after.for_each_block_cell(api_slot, |_, pod| {
-            held += 1;
-            assert!(
-                small.contains(&pod.rect),
-                "a pod that stayed put is outside the shrunk card: {:?} not in {small:?}",
-                pod.rect
-            );
-        });
-        assert_eq!(held, 6, "two from the initial sync and four of the burst");
-
-        // The limitation, pinned so it is a decision rather than a surprise: the
-        // card fits what is there and never moves it, so a survivor low in the
-        // grid holds the card open above itself. Closing that gap means repacking
-        // pods inside their own card -- cheaper than it sounds, and still a change
-        // of policy about what may move, which belongs with the layout work rather
-        // than with this fix.
-        let mut sparse = PublishBench::new(&initial.events, LayoutMode::Spread);
-        sparse.apply_events(&grown);
-        sparse.run_publish();
-        let tall = workload_named(&sparse.snapshot(), "api").1.inner;
-        let front: Vec<IngestEvent> = (0..36)
-            .map(|i| {
-                replay::instance(
-                    &format!("pod-burst-{i}"),
-                    "prod",
-                    "wl-api",
-                    State::OK,
-                    Op::Deleted,
-                )
-            })
-            .collect();
-        sparse.apply_events(&front);
-        sparse.run_publish();
-        assert_eq!(
-            workload_named(&sparse.snapshot(), "api").1.inner,
-            tall,
-            "deleting from the front leaves a survivor at the bottom, and the card \
-             stays as tall as that survivor needs"
-        );
-
-        assert_eq!(
-            workload_named(&after, "side").1.rect,
-            neighbour,
-            "the workload beside it did not move to close the gap"
-        );
-        topology::verify_derived_state(&mut bench.world);
-    }
-
-    #[test]
-    fn an_incremental_change_at_scale_moves_only_what_is_above_it() {
-        let spec = generate(&GenConfig {
-            seed: 55,
-            target_objects: 12_000,
-            scenario: Scenario::Platform,
-        });
-        let events =
-            k10s_clustergen::stream::snapshot(&spec, LayoutMode::Spread.emits_attachments());
-        // The busiest namespace, not the first one, and keyed by the namespace
-        // *uid* the generator really used rather than by its name. Both halves
-        // were wrong in the first draft and both made this pass by leaving it
-        // nothing to be wrong about: a namespace holding one workload has no
-        // sibling for an arrival to disturb, and `replay::owner` spells a parent
-        // as `ns-{name}`, a convention this generator does not follow -- so the
-        // arriving workload landed in a fresh namespace of its own, where moving
-        // the neighbours it did not have was not observable.
-        let mut owners: OwnersByScope = std::collections::HashMap::new();
-        for event in &events {
-            if let IngestEvent::Resource(resource) = event
-                && matches!(resource.payload, k10s_core::Payload::Owner { .. })
-                && let Some(scope) = resource.parent.clone()
-            {
-                owners
-                    .entry((scope, resource.namespace.clone()))
-                    .or_default()
-                    .push(resource.uid.clone());
-            }
-        }
-        let ((scope, namespace), in_namespace) = owners
-            .into_iter()
-            .max_by_key(|((scope, _), uids)| (uids.len(), scope.clone()))
-            .expect("the generated stream has an owner");
-        assert!(
-            in_namespace.len() > 1,
-            "the busiest namespace holds one workload, so an arrival there disturbs nobody"
-        );
-        let owner = in_namespace[0].clone();
-        // Built here rather than through `replay::owner`, because the parent has
-        // to be the namespace this stream actually used.
-        let arriving_workload = IngestEvent::Resource(k10s_core::ResourceEvent {
-            kind: KindId::DEPLOYMENT,
-            uid: "wl-scale".into(),
-            namespace: namespace.clone(),
-            name: "scale".into(),
-            resource_version: 0,
-            parent: Some(scope),
-            op: Op::Added,
-            payload: k10s_core::Payload::Owner {
-                kind: KindId::DEPLOYMENT,
-                tool: k10s_core::ToolId::NONE,
-                depends_on: Vec::new(),
-            },
-        });
-        let mut bench = PublishBench::new(&events, LayoutMode::Spread);
-        let namespaces_before = bench.snapshot().regions.len();
-
-        let batches: Vec<(&str, Vec<IngestEvent>)> = vec![
-            (
-                "a pod arrives",
-                vec![replay::instance(
-                    "pod-scale-1",
-                    &namespace,
-                    &owner,
-                    State::OK,
-                    Op::Added,
-                )],
-            ),
-            ("a workload arrives", vec![arriving_workload]),
-            (
-                "a namespace arrives with content",
-                vec![
-                    replay::scope("ns-scale", "scale", Op::Added),
-                    replay::owner(
-                        "wl-scale-2",
-                        "scale",
-                        "scale-2",
-                        KindId::DEPLOYMENT,
-                        Op::Added,
-                    ),
-                    replay::instance("pod-scale-2", "scale", "wl-scale-2", State::OK, Op::Added),
-                ],
-            ),
-            (
-                "a pod leaves",
-                vec![replay::instance(
-                    "pod-scale-1",
-                    &namespace,
-                    &owner,
-                    State::OK,
-                    Op::Deleted,
-                )],
-            ),
-        ];
-
-        for (what, batch) in &batches {
-            let before = placement(&bench.snapshot());
-            bench.apply_events(batch);
-            bench.run_publish();
-            // Paired with the equivalence oracle on purpose, and the pairing is
-            // load-bearing rather than belt-and-braces. A stability oracle can
-            // only see what was published, and at this scale a structural patch
-            // rewrites the slots the batch touched and nothing else -- so a
-            // layout that moved an untouched sibling *in the topology* would
-            // leave the snapshot innocent and this assertion green. That
-            // divergence is precisely what comparing the patch to a fresh
-            // materialize catches, and neither question covers the other.
-            assert_published_matches_full(&bench.world, &bench.snapshot());
-            assert_only_ancestors_moved(
-                &before,
-                &placement(&bench.snapshot()),
-                &touched_uids(batch),
-                what,
-            );
-        }
-        // Exactly one of those four batches introduces a namespace. If the
-        // arriving workload had made one of its own -- which is how this test
-        // passed for the wrong reason once already -- it would have arrived
-        // somewhere with no neighbours to leave alone.
-        assert_eq!(
-            bench.snapshot().regions.len(),
-            namespaces_before + 1,
-            "only the namespace batch may add a namespace"
-        );
-        topology::verify_derived_state(&mut bench.world);
-    }
-
-    #[test]
-    fn a_structural_patch_deep_clones_around_a_held_reader_at_scale() {
-        let spec = generate(&GenConfig {
-            seed: 55,
-            target_objects: 12_000,
-            scenario: Scenario::Platform,
-        });
-        let events =
-            k10s_clustergen::stream::snapshot(&spec, LayoutMode::Spread.emits_attachments());
-        let parent = events
-            .iter()
-            .find_map(|event| match event {
-                IngestEvent::Resource(r)
-                    if matches!(r.payload, k10s_core::Payload::Owner { .. }) =>
-                {
-                    Some((r.uid.clone(), r.namespace.clone()))
-                }
-                _ => None,
-            })
-            .expect("the generated stream has an owner");
-        let mut bench = PublishBench::new(&events, LayoutMode::Spread);
-        // The pool is three deep and each buffer's first publish is a full
-        // materialize by construction; warm the last one so the measured
-        // rounds prove the steady state.
-        let warmup = [replay::instance(
-            "pod-live-warmup",
-            &parent.1,
-            &parent.0,
-            State::OK,
-            Op::Added,
-        )];
-        bench.apply_events(&warmup);
-        bench.run_publish();
-        let before = bench.stats();
-
-        let held = bench.snapshot();
-        let held_rev = held.rev;
-        let held_cells = held.cells.len();
-
-        for round in 0..4 {
-            let uid = format!("pod-live-{round}");
-            let batch = [replay::instance(
-                &uid,
-                &parent.1,
-                &parent.0,
-                State::of(ReasonId::NOT_READY),
-                Op::Added,
-            )];
-            let placed = placement(&bench.snapshot());
-            bench.apply_events(&batch);
-            bench.run_publish();
-            assert_published_matches_full(&bench.world, &bench.snapshot());
-            // The same stability question the batch-shape test asks, asked at a
-            // scale where the answer is not obvious by inspection: one pod
-            // arriving in a twelve-thousand-object cluster moves its own card and
-            // the namespace holding it, and leaves every other object in the
-            // cluster exactly where it was.
-            assert_only_ancestors_moved(
-                &placed,
-                &placement(&bench.snapshot()),
-                &touched_uids(&batch),
-                &format!("round {round} at 12k"),
-            );
-        }
-        topology::verify_derived_state(&mut bench.world);
-
-        let stats = bench.stats();
-        let delta_patches = stats.structural_patches - before.structural_patches;
-        let delta_fulls = stats.full_materializes - before.full_materializes;
-        assert_eq!(
-            (delta_patches, delta_fulls),
-            (4, 0),
-            "a one-pod change at scale must patch, never fall back: {stats:?}"
-        );
-        assert!(
-            stats.deep_clones > before.deep_clones,
-            "the held reader's buffer must be cloned around, not mutated: {stats:?}"
-        );
-        assert_eq!(held.rev, held_rev, "the held snapshot must not move");
-        assert_eq!(held.cells.len(), held_cells);
-    }
-
-    #[test]
-    fn live_topology_uses_stable_slots_without_moving_existing_nodes() {
-        let initial = replay::initial_sync();
-        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
-        let before = bench.snapshot();
-        let (prod_slot, prod) = region_named(&before, "prod");
-        let (api_slot, api) = workload_named(&before, "api");
-        let (pod_slot, pod) = pod_named(&before, "pod-1");
-        let (prod_rect, api_rect, pod_rect) = (prod.rect, api.inner, pod.rect);
-        drop(before);
-
-        let added = [
-            replay::scope("ns-canary", "canary", Op::Added),
-            replay::owner("wl-canary", "canary", "edge", KindId::DEPLOYMENT, Op::Added),
-            replay::instance("pod-canary", "canary", "wl-canary", State::OK, Op::Added),
-        ];
-        bench.apply_events(&added);
-        bench.run_publish();
-        let grown = bench.snapshot();
-        assert_eq!(grown.totals.regions, 2);
-        assert_eq!(grown.totals.blocks, 2);
-        assert_eq!(grown.totals.cells, 3);
-        assert_eq!(region_named(&grown, "prod").0, prod_slot);
-        assert_eq!(workload_named(&grown, "api").0, api_slot);
-        assert_eq!(pod_named(&grown, "pod-1").0, pod_slot);
-        assert_eq!(grown.regions[prod_slot].rect, prod_rect);
-        assert_eq!(grown.blocks[api_slot].inner, api_rect);
-        assert_eq!(grown.cells[pod_slot].rect, pod_rect);
-
-        let (canary_slot, _) = region_named(&grown, "canary");
-        let (edge_slot, _) = workload_named(&grown, "edge");
-        let (canary_pod_slot, _) = pod_named(&grown, "pod-canary");
-        assert_eq!(
-            grown.region_block_indices(canary_slot).collect::<Vec<_>>(),
-            [edge_slot]
-        );
-        assert_eq!(
-            grown.block_cell_indices(edge_slot).collect::<Vec<_>>(),
-            [canary_pod_slot]
-        );
-        drop(grown);
-
-        let deleted = [
-            replay::instance("pod-canary", "canary", "wl-canary", State::OK, Op::Deleted),
-            replay::owner(
-                "wl-canary",
-                "canary",
-                "edge",
-                KindId::DEPLOYMENT,
-                Op::Deleted,
-            ),
-            replay::scope("ns-canary", "canary", Op::Deleted),
-        ];
-        bench.apply_events(&deleted);
-        bench.run_publish();
-        let shrunk = bench.snapshot();
-        assert_eq!(shrunk.totals.regions, 1);
-        assert_eq!(shrunk.totals.blocks, 1);
-        assert_eq!(shrunk.totals.cells, 2);
-        assert_eq!(shrunk.regions[prod_slot].rect, prod_rect);
-        assert_eq!(shrunk.blocks[api_slot].inner, api_rect);
-        assert_eq!(shrunk.cells[pod_slot].rect, pod_rect);
-        assert!(
-            shrunk
-                .regions
-                .iter()
-                .all(|node| node.label.as_ref() != "canary")
-        );
-        drop(shrunk);
-
-        bench.apply_events(&added);
-        bench.run_publish();
-        let readded = bench.snapshot();
-        assert_eq!(region_named(&readded, "canary").0, canary_slot);
-        assert_eq!(workload_named(&readded, "edge").0, edge_slot);
-        assert_eq!(pod_named(&readded, "pod-canary").0, canary_pod_slot);
-    }
-
-    #[test]
-    fn an_initial_stream_replays_changes_before_its_first_snapshot() {
-        let mut events = replay::initial_sync().events;
-        events.push(replay::instance(
-            "pod-1",
-            "prod",
-            "wl-api",
-            State::of(ReasonId::CRASH_LOOP_BACK_OFF),
-            Op::Modified,
-        ));
-        events.push(replay::instance(
-            "pod-2",
-            "prod",
-            "wl-api",
-            State::OK,
-            Op::Deleted,
-        ));
-
-        let bench = PublishBench::new(&events, LayoutMode::Spread);
-        let snapshot = bench.snapshot();
-        assert_eq!(snapshot.totals.cells, 1);
-        assert_eq!(
-            pod_named(&snapshot, "pod-1").1.ext.state.severity,
-            Severity::Err
-        );
-        assert!(
-            snapshot
-                .cells
-                .iter()
-                .all(|pod| pod.label.as_ref() != "pod-2")
-        );
-    }
-
-    #[test]
-    fn live_pod_health_keeps_the_incremental_publish_fast_path() {
-        let initial = replay::initial_sync();
-        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
-        let before = bench.snapshot();
-        let (slot, pod) = pod_named(&before, "pod-1");
-        let rect = pod.rect;
-        drop(before);
-
-        let warm = replay::instance(
-            "pod-1",
-            "prod",
-            "wl-api",
-            State::of(ReasonId::NOT_READY),
-            Op::Modified,
-        );
-        bench.apply_events(&[warm]);
-        bench.run_publish();
-        let before_stats = bench.stats();
-
-        let modified = replay::instance(
-            "pod-1",
-            "prod",
-            "wl-api",
-            State::of(ReasonId::CRASH_LOOP_BACK_OFF),
-            Op::Modified,
-        );
-        bench.apply_events(&[modified]);
-        bench.run_publish();
-        let after_stats = bench.stats();
-        let after = bench.snapshot();
-        assert_eq!(after.cells[slot].rect, rect);
-        assert_eq!(after.cells[slot].ext.state.severity, Severity::Err);
-        assert_eq!(
-            after_stats.full_materializes, before_stats.full_materializes,
-            "state-only changes must retain patch-in-place publication"
-        );
-    }
-
-    #[test]
-    fn adding_a_pod_grows_its_card_without_moving_occupied_slots() {
-        let initial = replay::initial_sync();
-        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
-        let before = bench.snapshot();
-        let (api_slot, api) = workload_named(&before, "api");
-        let first = pod_named(&before, "pod-1").1.rect;
-        let second = pod_named(&before, "pod-2").1.rect;
-        let card = api.inner;
-        drop(before);
-
-        bench.apply_events(&[replay::instance(
-            "pod-3",
-            "prod",
-            "wl-api",
-            State::OK,
-            Op::Added,
-        )]);
-        bench.run_publish();
-        let after = bench.snapshot();
-        assert_eq!(pod_named(&after, "pod-1").1.rect, first);
-        assert_eq!(pod_named(&after, "pod-2").1.rect, second);
-        assert!(after.blocks[api_slot].inner.h >= card.h);
-        assert_eq!(after.totals.cells, 3);
-    }
-
-    #[test]
-    fn publish_hook_fires_per_snapshot_not_per_tick() {
-        let scene = k10s_core::new_shared_scene();
-        let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
-        let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
-        let world = spawn_world(
-            stream_of(2, 500, Scenario::Platform),
-            crossbeam_channel::never(),
-            scene.clone(),
-            ctrl_rx,
-            2,
-            0.0,
-            LayoutMode::Spread,
-            move || {
-                let _ = wake_tx.send(());
-            },
-        );
-
-        wake_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("initial publish must fire the hook");
-        assert_eq!(scene.load().rev, 1);
-        assert!(
-            wake_rx.recv_timeout(Duration::from_millis(400)).is_err(),
-            "no rev bump -> no wake"
-        );
-
-        ctrl_tx.send(WorldCtrl::Shutdown).unwrap();
-        world.join().unwrap();
-    }
-
-    // The seam the launch screen stands on: a window opens on an empty world and a
-    // scene chosen afterwards replaces it wholesale, laid out by the same batch
-    // layout the command line's scenes use. The events that were queued for the
-    // scene being replaced are dropped rather than applied on top of the new one,
-    // which is what makes the replacement one act instead of a race.
-    #[test]
-    fn a_scene_chosen_after_spawn_replaces_an_empty_world_and_then_replaces_itself() {
-        let scene = k10s_core::new_shared_scene();
-        let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
-        let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
-        let (live_tx, live_rx) = crossbeam_channel::unbounded();
-        let world = spawn_world(
-            Vec::new(),
-            live_rx,
-            scene.clone(),
-            ctrl_rx,
-            2,
-            0.0,
-            LayoutMode::Spread,
-            move || {
-                let _ = wake_tx.send(());
-            },
-        );
-        let settle = |rx: &crossbeam_channel::Receiver<()>| {
-            rx.recv_timeout(Duration::from_secs(5))
-                .expect("a publish arrives");
-            while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
-        };
-        settle(&wake_rx);
-        assert_eq!(
-            scene.load().totals,
-            Default::default(),
-            "an empty world publishes an empty scene rather than nothing at all"
-        );
-
-        // Something from a scene that is being replaced, queued and never wanted.
-        live_tx
-            .send(replay::scope("ns-stale", "stale", Op::Added))
-            .expect("queued");
-        ctrl_tx
-            .send(WorldCtrl::Rebuild(replay::initial_sync().events))
-            .expect("sent");
-        settle(&wake_rx);
-        let filled = scene.load_full();
-        assert_eq!(filled.totals.cells, 2);
-        assert_eq!(region_named(&filled, "prod").1.label.as_ref(), "prod");
-        assert!(
-            filled.regions.iter().all(|ns| ns.label.as_ref() != "stale"),
-            "what was queued for the old scene must not survive into the new one"
-        );
-        let built =
-            PublishBench::new(&replay::initial_sync().events, LayoutMode::Spread).snapshot();
-        assert_eq!(
-            filled.regions[0].rect, built.regions[0].rect,
-            "and it is laid out exactly as the same stream is at startup"
-        );
-        drop(filled);
-
-        ctrl_tx
-            .send(WorldCtrl::Rebuild(vec![
-                replay::scope("ns-edge", "edge", Op::Added),
-                replay::owner("wl-cdn", "edge", "cdn", KindId::DEPLOYMENT, Op::Added),
-                replay::instance("pod-cdn", "edge", "wl-cdn", State::OK, Op::Added),
-            ]))
-            .expect("sent");
-        settle(&wake_rx);
-        let second = scene.load_full();
-        assert_eq!(second.totals.regions, 1);
-        assert_eq!(second.totals.cells, 1);
-        assert_eq!(region_named(&second, "edge").1.label.as_ref(), "edge");
-        assert!(
-            second.regions.iter().all(|ns| ns.label.as_ref() != "prod"),
-            "nothing of the first scene survives into the second"
-        );
-        drop(second);
-
-        // And the live channel still belongs to whatever is attached now.
-        live_tx
-            .send(replay::instance(
-                "pod-cdn",
-                "edge",
-                "wl-cdn",
-                State::of(ReasonId::CRASH_LOOP_BACK_OFF),
-                Op::Modified,
-            ))
-            .expect("queued");
-        settle(&wake_rx);
-        assert_eq!(
-            pod_named(&scene.load_full(), "pod-cdn")
-                .1
-                .ext
-                .state
-                .severity,
-            Severity::Err,
-            "a rebuilt world still reads its live deltas"
-        );
-
-        ctrl_tx.send(WorldCtrl::Shutdown).expect("sent");
-        world.join().expect("the world thread ends cleanly");
-    }
-
-    // A world spawned before anything has been chosen starts with no churn, so
-    // whichever choice arrives has to be able to set the rate it needs. Asserted
-    // in the direction that cannot be flaky: a rate that arrives makes something
-    // happen, waited for with a generous bound, rather than a rate of zero making
-    // nothing happen inside an arbitrary window.
-    #[test]
-    fn a_churn_rate_set_after_spawn_is_what_the_world_spends() {
-        let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
-        let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
-        let world = spawn_world(
-            stream_of(2, 500, Scenario::Platform),
-            crossbeam_channel::never(),
-            k10s_core::new_shared_scene(),
-            ctrl_rx,
-            2,
-            0.0,
-            LayoutMode::Spread,
-            move || {
-                let _ = wake_tx.send(());
-            },
-        );
-        wake_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the initial publish");
-        assert!(
-            wake_rx.recv_timeout(Duration::from_millis(400)).is_err(),
-            "a world spawned at rate zero invents nothing"
-        );
-
-        ctrl_tx.send(WorldCtrl::SetChurnRate(600.0)).unwrap();
-        wake_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("a rate set after spawn moves pods");
-
-        ctrl_tx.send(WorldCtrl::Shutdown).unwrap();
-        world.join().unwrap();
-    }
 }

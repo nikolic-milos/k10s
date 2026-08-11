@@ -3581,6 +3581,8 @@ dependencies = [
  "k10s-shell",
  "k10s-theme",
  "k10s-world",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3723,6 +3725,7 @@ dependencies = [
  "k10s-core",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
+ "rustc-hash 2.1.3",
 ]
 
 [[package]]

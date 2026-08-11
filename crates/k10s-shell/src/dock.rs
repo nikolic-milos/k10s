@@ -1,30 +1,33 @@
 //! Dock state: an openable side container of tabbed panels.
 //!
-//! A dock is layout policy, not rendering: which panels it holds, which one
-//! is active, whether it is open. Opening a panel opens the dock; closing the
-//! active panel keeps the neighbour selected instead of snapping to zero;
-//! toggling remembers its contents. Generic over the panel type so every rule
-//! here is a unit test -- the workspace instantiates it with entity-backed
-//! panels and only does gpui on top.
+//! A dock is layout policy, not rendering: which panels it holds, which one is
+//! active, whether it is open. The tab arithmetic underneath is [`Pane`], shared
+//! with the centre row; what a dock adds is the open flag and the two rules that
+//! depend on it -- being handed work shows the dock, and running out of panels
+//! shuts it. Generic over the panel type so every rule here is a unit test: the
+//! workspace instantiates it with entity-backed panels and only does gpui on top.
+
+use crate::pane::Pane;
 
 #[derive(Debug)]
 pub struct Dock<T> {
     open: bool,
-    active: usize,
-    panels: Vec<T>,
+    panels: Pane<T>,
 }
 
 impl<T> Default for Dock<T> {
     fn default() -> Self {
         Dock {
             open: false,
-            active: 0,
-            panels: Vec::new(),
+            panels: Pane::default(),
         }
     }
 }
 
 impl<T> Dock<T> {
+    /// Open *and* holding something. A dock with nothing in it has nothing to
+    /// show, whatever the flag says, so this is the question the chrome asks
+    /// rather than the flag itself.
     pub fn is_open(&self) -> bool {
         self.open && !self.panels.is_empty()
     }
@@ -46,73 +49,53 @@ impl<T> Dock<T> {
     }
 
     pub fn panels(&self) -> impl Iterator<Item = (usize, &T)> {
-        self.panels.iter().enumerate()
+        self.panels.iter()
     }
 
     pub fn active_index(&self) -> usize {
-        self.active
+        self.panels.active_index()
     }
 
     pub fn active(&self) -> Option<&T> {
-        self.panels.get(self.active)
+        self.panels.active()
     }
 
     // Adding a panel shows it: a dock that stays shut after being handed
     // work would read as a command that did nothing.
     pub fn push(&mut self, panel: T) -> usize {
-        self.panels.push(panel);
-        self.active = self.panels.len() - 1;
+        let index = self.panels.push(panel);
         self.open = true;
-        self.active
+        index
     }
 
     pub fn activate(&mut self, index: usize) {
-        if index < self.panels.len() {
-            self.active = index;
+        if self.panels.activate(index) {
             self.open = true;
         }
     }
 
     pub fn find(&self, matches: impl Fn(&T) -> bool) -> Option<usize> {
-        self.panels.iter().position(matches)
+        self.panels.find(matches)
     }
 
-    /// Drop every panel a predicate rejects and return how many went, keeping
-    /// the selection on a panel that survived. One act rather than a sequence of
-    /// removals whose indices shift under each other -- which is what a whole
-    /// class of panel ceasing to be true is: a cluster leaving takes its tables
-    /// with it, all at once.
+    /// Drop every panel a predicate rejects, keeping the selection on a
+    /// survivor, and shut the dock if that emptied it. Answers how many went.
+    ///
+    /// Clearing the flag is belt-and-braces rather than the thing that hides an
+    /// emptied dock: [`Dock::is_open`] already answers false while there is
+    /// nothing to show, so no test can tell this line from its absence. What it
+    /// buys is a flag that never claims a dock is open while it holds nothing,
+    /// which is the state `toggle` would otherwise flip *away* from.
     pub fn retain(&mut self, keep: impl Fn(&T) -> bool) -> usize {
-        let before = self.panels.len();
-        let active_survives = self.active().is_some_and(&keep);
-        // Where the active panel lands: however many survivors sit in front of
-        // it. When it is one of the casualties, that index is the neighbour
-        // that took its place, which is the same rule `remove` follows.
-        let ahead = self.panels[..self.active.min(before)]
-            .iter()
-            .filter(|panel| keep(panel))
-            .count();
-        self.panels.retain(&keep);
-        self.active = if active_survives {
-            ahead
-        } else {
-            ahead.min(self.panels.len().saturating_sub(1))
-        };
+        let dropped = self.panels.retain(keep);
         if self.panels.is_empty() {
-            self.active = 0;
             self.open = false;
         }
-        before - self.panels.len()
+        dropped
     }
 
     pub fn remove(&mut self, index: usize) -> Option<T> {
-        if index >= self.panels.len() {
-            return None;
-        }
-        let removed = self.panels.remove(index);
-        if self.active >= index && self.active > 0 {
-            self.active -= 1;
-        }
+        let removed = self.panels.remove(index)?;
         if self.panels.is_empty() {
             self.open = false;
         }
@@ -212,5 +195,16 @@ mod tests {
         assert_eq!(dock.active(), Some(&"a"));
         assert_eq!(dock.find(|p| *p == "b"), Some(1));
         assert_eq!(dock.len(), 2);
+    }
+
+    #[test]
+    fn a_removal_that_names_no_panel_leaves_the_dock_alone() {
+        // `remove` shuts an emptied dock, so the early return for a bad index
+        // has to happen before that rule and not after it.
+        let mut dock: Dock<&str> = Dock::default();
+        dock.push("only");
+        assert!(dock.remove(4).is_none());
+        assert!(dock.is_open(), "a no-op removal must not shut the dock");
+        assert_eq!(dock.len(), 1);
     }
 }

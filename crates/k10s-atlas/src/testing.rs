@@ -103,7 +103,7 @@ pub fn lod_policy() -> LodPolicy {
         stage_cell: 0.55,
         stage_cell_label: 3.0,
         block_min_px: 4.0,
-        block_icon_min_px: 14.0,
+        block_icon_min_px: 4.0,
         region_label_min_px: 70.0,
         block_label_min_px: 60.0,
         block_label_min_zoom: 0.22,
@@ -233,6 +233,8 @@ pub fn scene(spec: SceneSpec) -> Scene {
     let mut scene = Scene {
         rev: 1,
         bounds,
+        // The bench fixtures are the Spread layout, which is the shipping one.
+        card_header: 26.0,
         totals: Totals {
             regions: regions.len() as u32,
             blocks: blocks.len() as u32,

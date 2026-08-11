@@ -51,6 +51,7 @@ fn opts(policy: &LodPolicy) -> FrameOpts<'_> {
     FrameOpts {
         theme: &k10s_theme::K10S_DARK.map,
         policy,
+        type_: k10s_theme::Typography::default().map(),
         edges_on: true,
         skip_blocks: false,
         hex: true,
@@ -158,6 +159,7 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
     SceneSnapshot {
         ids: Default::default(),
         scene: SceneData {
+            card_header: 26.0,
             rev: base.rev,
             bounds: base.bounds,
             regions: base

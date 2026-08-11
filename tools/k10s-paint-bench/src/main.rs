@@ -77,7 +77,10 @@ fn main() {
     let mut app = HeadlessAppContext::new(Arc::new(NoopTextSystem::new()));
     let window = app
         .open_window(size(px(VW), px(VH)), move |_, cx| {
-            cx.new(|cx| MapView::new(shared, ctrl, None, damage_rx, cx))
+            // No flight runs here -- `bench` is `None` -- so nothing ever sets
+            // this, and it is constructed once outside the measured region.
+            let bench_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            cx.new(|cx| MapView::new(shared, ctrl, None, bench_failed, damage_rx, cx))
         })
         .expect("create a headless map window");
     window

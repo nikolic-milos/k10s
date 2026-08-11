@@ -68,9 +68,24 @@ impl LodPolicy {
         block_w * zoom >= self.block_min_px || self.stress
     }
 
+    /// Whether a workload shows its glyph.
+    ///
+    /// The threshold means "this workload is more than a speck", not "this card
+    /// is big enough to hold an icon" -- how big the glyph is, is decided by the
+    /// space the workload owns, and is not this gate's business. The old
+    /// threshold asked the second question and is why an icon set of thirty-five
+    /// vendor marks was invisible at the one zoom -- namespaces in view, cards
+    /// too small to read -- where recognising a workload at a glance is the
+    /// entire job.
+    ///
+    /// It takes the CARD's width rather than the halo's for a measured reason:
+    /// every caller has already loaded `inner.w` for `block_painted`, and asking
+    /// this question about `rect.w` instead adds a second load to a loop that
+    /// runs once per block. That cost 1.13-1.17x across the `Z3 deepest wl` and
+    /// `Z2 widest ns` cull cases with the icon count held identical.
     #[inline]
     pub fn block_icon_shown(&self, block_w: f32, zoom: f32) -> bool {
-        block_w * zoom >= self.block_icon_min_px && !self.stress
+        block_w * zoom >= self.block_icon_min_px && !self.stress && !self.stress_curves
     }
 
     #[inline]

@@ -42,6 +42,27 @@ impl PickPath {
     }
 }
 
+/// Where a picked path is on the map, in world units.
+///
+/// A block answers with its CARD, not its halo: the halo is spacing that the
+/// painter never draws and `pick` never hit-tests, so a ring drawn round it
+/// would sit in empty space well outside the thing it is pointing at.
+pub fn path_rect<R, B, C, S>(scene: &Scene<R, B, C, S>, path: &PickPath) -> Option<Rect> {
+    if let Some(cell) = path.cell {
+        return scene.cells.get(cell as usize).map(|node| node.rect);
+    }
+    if let Some(sat) = path.sat {
+        return scene.sats.get(sat as usize).map(|node| node.rect);
+    }
+    if let Some(block) = path.block {
+        return scene.blocks.get(block as usize).map(|node| node.inner);
+    }
+    scene
+        .regions
+        .get(path.region as usize)
+        .map(|node| node.rect)
+}
+
 #[expect(clippy::too_many_arguments)]
 pub fn pick<R, B, C, S>(
     scene: &Scene<R, B, C, S>,
@@ -94,7 +115,11 @@ pub fn pick<R, B, C, S>(
     // must not capture clicks. Satellites orbit outside every card, so each
     // painted block's ring is probed whether or not the point is on its card.
     let mut sat_hit: Option<u32> = None;
-    scene.for_each_region_block(region as usize, |block_index, block| {
+    // The halo rect indexed for a block encloses its card and satellites, so a
+    // point probe can narrow both hit classes together. Large fan-out regions
+    // stay O(log n + leaf) under pointer motion; small regions deliberately
+    // retain the cheaper direct scan selected by the scene index.
+    scene.for_each_region_block_candidate(region as usize, &probe, |block_index, block| {
         let painted = policy.block_painted(block.inner.w, zoom);
         if !painted {
             return;
@@ -107,7 +132,7 @@ pub fn pick<R, B, C, S>(
                 let aggregated = cells > policy.max_cells_per_block
                     && policy.cells_aggregated(cells, block.inner.intersection_fraction(&visible));
                 if !aggregated {
-                    scene.for_each_block_cell(block_index, |cell_index, cell| {
+                    scene.for_each_block_cell_candidate(block_index, &probe, |cell_index, cell| {
                         if path.cell.is_none() && inside(&cell.rect, wx, wy) {
                             path.cell = Some(cell_index as u32);
                         }
@@ -327,5 +352,63 @@ mod tests {
             (Level::Block, None),
             "an aggregated card is one click target, not a thousand"
         );
+    }
+
+    #[test]
+    fn a_point_pick_in_a_50k_workload_namespace_visits_one_index_leaf() {
+        let (vw, vh) = (1600.0, 1000.0);
+        let policy = lod_policy();
+        let s = scene(SceneSpec::fan_out(50_000));
+        let target = 25_000usize;
+        let (wx, wy) = s.blocks[target].inner.center();
+        let probe = Rect::new(wx, wy, 1e-3, 1e-3);
+        assert!(s.region_block_index_is_selective(0, &probe));
+
+        let mut candidates = 0usize;
+        s.for_each_region_block_candidate(0, &probe, |_, _| candidates += 1);
+        assert!(
+            candidates <= 64,
+            "a point probe visited {candidates} of 50,000 workloads"
+        );
+
+        let camera = Camera {
+            cx: wx,
+            cy: wy,
+            zoom: 4.5,
+        };
+        let blend = StageBlend::settled(policy.stage_for_zoom(camera.zoom));
+        let path = pick(&s, &camera, &policy, blend, vw, vh, vw * 0.5, vh * 0.5)
+            .expect("a workload center is pickable");
+        assert_eq!(path.block, Some(target as u32));
+    }
+
+    #[test]
+    fn a_point_pick_in_a_50k_pod_workload_visits_one_index_leaf() {
+        let (vw, vh) = (1600.0, 1000.0);
+        let policy = lod_policy();
+        let mut spec = SceneSpec::fan_out(1);
+        spec.cells_per_block = 50_000;
+        let s = scene(spec);
+        let target = 25_000usize;
+        let (wx, wy) = s.cells[target].rect.center();
+        let probe = Rect::new(wx, wy, 1e-3, 1e-3);
+        assert!(s.block_cell_index_is_selective(0, &probe));
+
+        let mut candidates = 0usize;
+        s.for_each_block_cell_candidate(0, &probe, |_, _| candidates += 1);
+        assert!(
+            candidates <= 64,
+            "a point probe visited {candidates} of 50,000 pods"
+        );
+
+        let camera = Camera {
+            cx: wx,
+            cy: wy,
+            zoom: 24.0,
+        };
+        let blend = StageBlend::settled(policy.stage_for_zoom(camera.zoom));
+        let path = pick(&s, &camera, &policy, blend, vw, vh, vw * 0.5, vh * 0.5)
+            .expect("a pod center is pickable");
+        assert_eq!(path.cell, Some(target as u32));
     }
 }

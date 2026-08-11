@@ -1,49 +1,12 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use k10s_core::{IngestEvent, KindId, Op, Payload, ResourceEvent, State, ToolId};
+use k10s_core::{IngestEvent, Op, Payload, ResourceEvent};
+use rustc_hash::FxHashMap as HashMap;
 
-#[derive(Debug, Clone)]
-pub struct PodInput {
-    pub uid: Arc<str>,
-    pub name: Arc<str>,
-    pub state: State,
-}
-
-#[derive(Debug, Clone)]
-pub struct SatInput {
-    pub uid: Arc<str>,
-    pub name: Arc<str>,
-    pub kind: KindId,
-    pub detail: Arc<str>,
-}
-
-#[derive(Debug, Clone)]
-pub struct WlInput {
-    pub uid: Arc<str>,
-    pub name: Arc<str>,
-    pub kind: KindId,
-    pub tool: ToolId,
-    pub pods: Vec<PodInput>,
-    pub sats: Vec<SatInput>,
-    pub depends_on: Vec<Arc<str>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct NsInput {
-    pub uid: Arc<str>,
-    pub name: Arc<str>,
-    pub workloads: Vec<WlInput>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct ClusterInput {
-    pub namespaces: Vec<NsInput>,
-    pub total_workloads: u32,
-    pub total_pods: u32,
-    pub total_sats: u32,
-    pub total_edges: u32,
-}
+pub use k10s_core::{
+    PreparedNamespace as NsInput, PreparedPod as PodInput, PreparedSat as SatInput,
+    PreparedScene as ClusterInput, PreparedWorkload as WlInput,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FoldStats {
@@ -67,8 +30,8 @@ pub fn fold(events: &[IngestEvent]) -> (ClusterInput, FoldStats) {
 fn fold_snapshot(events: &[IngestEvent]) -> (ClusterInput, FoldStats) {
     let mut input = ClusterInput::default();
     let mut stats = FoldStats::default();
-    let mut scope_of: HashMap<Arc<str>, usize> = HashMap::new();
-    let mut owner_of: HashMap<Arc<str>, (usize, usize)> = HashMap::new();
+    let mut scope_of: HashMap<Arc<str>, usize> = HashMap::default();
+    let mut owner_of: HashMap<Arc<str>, (usize, usize)> = HashMap::default();
 
     for event in events {
         let IngestEvent::Resource(r) = event else {
@@ -141,7 +104,7 @@ fn fold_snapshot(events: &[IngestEvent]) -> (ClusterInput, FoldStats) {
 }
 
 fn normalize(events: &[IngestEvent]) -> Vec<IngestEvent> {
-    let mut resources: HashMap<Arc<str>, (usize, ResourceEvent)> = HashMap::new();
+    let mut resources: HashMap<Arc<str>, (usize, ResourceEvent)> = HashMap::default();
     let mut next_order = 0usize;
     for event in events {
         let IngestEvent::Resource(resource) = event else {
@@ -186,24 +149,24 @@ fn role_rank(payload: &Payload) -> u8 {
     }
 }
 
-impl ClusterInput {
-    pub fn owner_indices(&self) -> HashMap<Arc<str>, u32> {
-        let mut out = HashMap::with_capacity(self.total_workloads as usize);
-        let mut i = 0u32;
-        for ns in &self.namespaces {
-            for wl in &ns.workloads {
-                out.insert(wl.uid.clone(), i);
-                i += 1;
-            }
+#[cfg(test)]
+pub(crate) fn owner_indices(input: &ClusterInput) -> HashMap<Arc<str>, u32> {
+    let mut out =
+        HashMap::with_capacity_and_hasher(input.total_workloads as usize, Default::default());
+    let mut i = 0u32;
+    for ns in &input.namespaces {
+        for wl in &ns.workloads {
+            out.insert(wl.uid.clone(), i);
+            i += 1;
         }
-        out
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k10s_core::replay;
+    use k10s_core::{KindId, State, replay};
 
     #[test]
     fn a_small_initial_sync_folds_into_the_shape_it_described() {
@@ -270,9 +233,24 @@ mod tests {
             Op::Added,
         ));
         let (input, _) = fold(&s.events);
-        let idx = input.owner_indices();
+        let idx = owner_indices(&input);
         assert_eq!(idx.get(&Arc::<str>::from("wl-api")).copied(), Some(0));
         assert_eq!(idx.get(&Arc::<str>::from("wl-two")).copied(), Some(1));
         assert_eq!(idx.len(), input.total_workloads as usize);
+    }
+
+    #[test]
+    fn prepared_generator_input_matches_the_event_contract_exactly() {
+        let spec = k10s_clustergen::generate(&k10s_clustergen::GenConfig {
+            seed: 55,
+            target_objects: 8_000,
+            scenario: k10s_clustergen::Scenario::Platform,
+        });
+        let events = k10s_clustergen::stream::snapshot(&spec, true);
+        let (folded, stats) = fold(&events);
+        let prepared = k10s_clustergen::stream::prepared(spec, true);
+
+        assert_eq!(stats, FoldStats::default());
+        assert_eq!(prepared, folded);
     }
 }

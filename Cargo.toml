@@ -64,6 +64,7 @@ regex = "1"
 alacritty_terminal = { version = "0.26", default-features = false }
 rand = "0.10"
 rand_chacha = "0.10"
+rustc-hash = "2.1"
 serde = "1"
 serde_json = "1"
 # param serves the atlas; fs carries the one fcntl the local terminal needs
