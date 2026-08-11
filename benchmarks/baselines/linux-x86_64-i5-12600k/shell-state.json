@@ -10,9 +10,9 @@
       "iters": 314,
       "samples": 314,
       "batch_size": 1,
-      "p50_rmad": 0.009732,
-      "p50_ns": 955958.0,
-      "p99_ns": 1021836.0
+      "p50_rmad": 0.009062,
+      "p50_ns": 955492.000,
+      "p99_ns": 989190.000
     },
     {
       "scenario": "tree-5k",
@@ -22,21 +22,21 @@
       "iters": 126,
       "samples": 126,
       "batch_size": 1,
-      "p50_rmad": 0.007612,
-      "p50_ns": 958559.0,
-      "p99_ns": 982518.0
+      "p50_rmad": 0.007173,
+      "p50_ns": 958640.000,
+      "p99_ns": 983263.000
     },
     {
       "scenario": "dir-2k",
       "op": "keystroke",
       "entries": 2000,
       "result": 299,
-      "iters": 378,
-      "samples": 378,
+      "iters": 377,
+      "samples": 377,
       "batch_size": 1,
-      "p50_rmad": 0.007556,
-      "p50_ns": 317781.0,
-      "p99_ns": 333946.0
+      "p50_rmad": 0.007363,
+      "p50_ns": 318086.000,
+      "p99_ns": 335215.000
     },
     {
       "scenario": "scan-5k",
@@ -46,33 +46,33 @@
       "iters": 20,
       "samples": 20,
       "batch_size": 1,
-      "p50_rmad": 0.001276,
-      "p50_ns": 41320991.0,
-      "p99_ns": 41484998.0
+      "p50_rmad": 0.001722,
+      "p50_ns": 41092591.000,
+      "p99_ns": 41365447.000
     },
     {
       "scenario": "scan-5k",
       "op": "keystroke",
       "entries": 1576,
       "result": 256,
-      "iters": 362,
-      "samples": 362,
+      "iters": 388,
+      "samples": 388,
       "batch_size": 1,
-      "p50_rmad": 0.00414,
-      "p50_ns": 329943.0,
-      "p99_ns": 350540.0
+      "p50_rmad": 0.018046,
+      "p50_ns": 306166.000,
+      "p99_ns": 334176.000
     },
     {
       "scenario": "map-50k",
       "op": "index",
       "entries": 51600,
       "result": 51600,
-      "iters": 195,
-      "samples": 195,
+      "iters": 191,
+      "samples": 191,
       "batch_size": 1,
-      "p50_rmad": 0.004848,
-      "p50_ns": 3077128.0,
-      "p99_ns": 3178688.0
+      "p50_rmad": 0.006596,
+      "p50_ns": 3130212.000,
+      "p99_ns": 3278333.000
     },
     {
       "scenario": "map-50k",
@@ -82,57 +82,57 @@
       "iters": 100,
       "samples": 100,
       "batch_size": 1,
-      "p50_rmad": 0.018531,
-      "p50_ns": 1573305.0,
-      "p99_ns": 1663544.0
+      "p50_rmad": 0.016295,
+      "p50_ns": 1553796.000,
+      "p99_ns": 1705807.000
     },
     {
       "scenario": "viewport-60",
       "op": "layers",
       "entries": 4518,
       "result": 200,
-      "iters": 1901,
-      "samples": 1901,
+      "iters": 2036,
+      "samples": 2036,
       "batch_size": 1,
-      "p50_rmad": 0.006027,
-      "p50_ns": 60398.0,
-      "p99_ns": 73087.0
+      "p50_rmad": 0.002280,
+      "p50_ns": 58784.000,
+      "p99_ns": 60850.000
     },
     {
       "scenario": "viewport-60",
       "op": "query-and-compose",
       "entries": 30,
       "result": 585,
-      "iters": 590,
-      "samples": 590,
+      "iters": 622,
+      "samples": 622,
       "batch_size": 1,
-      "p50_rmad": 0.032668,
-      "p50_ns": 200532.0,
-      "p99_ns": 224048.0
+      "p50_rmad": 0.006603,
+      "p50_ns": 192035.000,
+      "p99_ns": 200939.000
     },
     {
       "scenario": "diff-256k",
       "op": "diff-paint",
       "entries": 6787,
       "result": 2260,
-      "iters": 40222,
-      "samples": 5746,
-      "batch_size": 7,
-      "p50_rmad": 0.00514,
-      "p50_ns": 2974.0,
-      "p99_ns": 3178.429
+      "iters": 42798,
+      "samples": 3057,
+      "batch_size": 14,
+      "p50_rmad": 0.006292,
+      "p50_ns": 2792.857,
+      "p99_ns": 2982.500
     },
     {
       "scenario": "diff-256k",
       "op": "diff-fold",
       "entries": 6787,
       "result": 6787,
-      "iters": 116864,
-      "samples": 1826,
+      "iters": 118528,
+      "samples": 1852,
       "batch_size": 64,
-      "p50_rmad": 0.007243,
-      "p50_ns": 1024.75,
-      "p99_ns": 1062.5
+      "p50_rmad": 0.002947,
+      "p50_ns": 1007.344,
+      "p99_ns": 1045.391
     }
   ]
 }

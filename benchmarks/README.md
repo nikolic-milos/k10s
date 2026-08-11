@@ -174,7 +174,7 @@ regression again.
 
 The note above ends by saying re-record these before trusting the `editor edit` suite again. That is
 what this is. The change set it was measuring is now three commits — the G2 follow-ons, the Helm read
-path, and the seam work — and the tree was clean at `71fabb3` when both collections were taken, which
+path, and the seam work — and the tree was clean at `08ca95f` when both collections were taken, which
 is the provenance the previous recording lacked and the whole reason it was withheld.
 
 Ten cases move. Six are the diff, and the numbers land where the working-tree measurement said they
@@ -581,3 +581,27 @@ These are working-tree observations, not a committed baseline. No baseline was
 refreshed; a real-cluster three-size recording still belongs on a clean,
 committed tree with the machine manifest and repetition discipline described at
 the top of this file.
+
+## 2026-08-11 — re-recorded from a clean commit, now that the map draws what it means
+
+The 2026-08-05 recording predates the icon gate, so it held icon counts of
+zero at zooms the map now marks: 27 structural `icons` diffs across the cull,
+fan-out, world and walk suites (0 → 476 on the uniform scenes, 0 → 1024 on
+the fan-outs), plus the timing that follows from drawing what those counts
+count. A gate that rejects the shipped behaviour on every honest collection
+is a gate rejecting the wrong thing, so every suite was re-recorded — which
+also retires the known conservatism on the six `editor edit` diff cases,
+faster than their recording since the alignment-loop change and re-measured
+here from a commit as the procedure demands.
+
+Provenance: nine suites recorded from a clean build of 65c9fa6, twice, on an
+idle machine pinned to CPU 4. The run that was not installed gates against
+the one that was at one flag in 5,000+ checks: `map walk` `uniform r400 b15`
+`Z1 region` `walk_count_p50_ns`, 7,818 → 9,261 ns (1.18x). A third targeted
+sample answered 7,790 ns — 0.4% from the installed number — so the odd run
+out was the second collection's one-case wobble, the same class this file has
+recorded twice before, and the installed number is the one two of three
+samples agree on. `map-paint.json` alone was recorded at 4cb8f1c, because the
+excluded tool would not build before that commit handed its lockfile the
+`rustc-hash` line k10s-world was owed — nothing in any suite's dependency
+graph differs between the two commits.
