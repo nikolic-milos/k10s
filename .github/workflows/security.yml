@@ -106,7 +106,7 @@ jobs:
           --all-features
           --target all
           --spec-version 1.5
-          --override-filename k10s
+          --override-filename k10s.cdx
 
       - name: Upload SBOM
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
