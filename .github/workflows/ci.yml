@@ -20,9 +20,15 @@ jobs:
       fail-fast: false
       matrix:
         os:
+          # Both architectures on all three platforms: ubuntu-24.04 and
+          # windows-2025 are x86_64, their -arm partners are aarch64, and
+          # macos-15 is Apple silicon with macos-15-intel as the x86_64 half.
           - ubuntu-24.04
+          - ubuntu-24.04-arm
           - macos-15
+          - macos-15-intel
           - windows-2025
+          - windows-11-arm
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
