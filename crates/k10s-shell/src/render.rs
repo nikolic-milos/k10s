@@ -347,6 +347,8 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
                 this.inspector_open = !this.inspector_open;
+                // A closed inspector must not keep a usage poll alive under it.
+                this.sync_usage_poll(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleLeftDock, _, cx| {
@@ -355,6 +357,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleRightDock, _, cx| {
                 this.inspector_open = !this.inspector_open;
+                this.sync_usage_poll(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleBottomDock, _, cx| {

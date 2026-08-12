@@ -14,7 +14,7 @@ use std::sync::Arc;
 use k10s_core::{KindId, Level, SceneSnapshot, SlotIds, kind_short};
 use k10s_map::PickPath;
 
-use crate::provider::{DescribeRequest, WorkloadLogRequest};
+use crate::provider::{DescribeRequest, UsageRequest, UsageTarget, WorkloadLogRequest};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Selection {
@@ -121,6 +121,28 @@ impl Selection {
             })),
             Level::Region | Level::Sat => None,
         }
+    }
+
+    // Which usage poll this selection names, if any: a pod is one set of
+    // numbers, a workload is the sum over the pods its selector matches.
+    // Usage on a namespace or an attachment answers None -- doing nothing
+    // there is a decision this function owns, exactly like `log_target`.
+    pub fn usage_target(&self) -> Option<UsageRequest> {
+        let namespace = self.namespace.as_deref()?;
+        let target = match self.level {
+            Level::Cell => UsageTarget::Pod {
+                name: self.name.to_string(),
+            },
+            Level::Block => UsageTarget::Workload {
+                kind: self.kind_id,
+                name: self.name.to_string(),
+            },
+            Level::Region | Level::Sat => return None,
+        };
+        Some(UsageRequest {
+            namespace: namespace.to_string(),
+            target,
+        })
     }
 
     // The pod this selection is, if it is one: what an exec needs before any

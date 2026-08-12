@@ -19,7 +19,7 @@ use k10s_theme::{Theme, Typography};
 
 use crate::dock::Dock;
 use crate::hosting::Tab;
-use crate::provider::Detail;
+use crate::provider::{Bytes, Detail, Millicores, UsageOutcome, UsageSample, UsageSource};
 use crate::selection::Selection;
 use crate::settings;
 use crate::ui::{
@@ -118,6 +118,9 @@ impl Workspace {
                 }
                 if !selection.uid.is_empty() {
                     body = body.child(Self::row(theme, &fonts, "UID", selection.uid.to_string()));
+                }
+                if selection.usage_target().is_some() {
+                    body = body.child(Self::usage_section(theme, &fonts, self.usage.as_ref()));
                 }
                 body = body.child(Self::detail_section(
                     theme,
@@ -238,6 +241,56 @@ impl Workspace {
             }
         };
         section
+    }
+
+    // The usage panel's labelled states, in `detail_section`'s manner but
+    // over its own outcome: absence renders muted like loading -- it is a
+    // fact about the cluster, not an alarm -- while a denial or a failure
+    // keeps the text colour a person reads first.
+    pub(crate) fn usage_section(
+        theme: &Theme,
+        fonts: &Typography,
+        usage: Option<&UsageOutcome>,
+    ) -> impl IntoElement {
+        let section = div().flex().flex_col().gap(px(4.0)).child(
+            div()
+                .text_size(px(fonts.small()))
+                .text_color(rgb(theme.shell.text_muted))
+                .child("Usage"),
+        );
+        let muted = |section: gpui::Div, text: String| {
+            section.child(
+                div()
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text_muted))
+                    .child(text),
+            )
+        };
+        let plain = |section: gpui::Div, text: String| {
+            section.child(
+                div()
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text))
+                    .child(text),
+            )
+        };
+        match usage {
+            None => muted(section, "Loading…".to_string()),
+            Some(UsageOutcome::Denied(what)) => {
+                plain(section, format!("{what}: access denied for this account"))
+            }
+            Some(UsageOutcome::Failed(why)) => plain(section, why.clone()),
+            Some(UsageOutcome::Absent(why)) => muted(section, why.clone()),
+            Some(UsageOutcome::Usage(sample)) => {
+                section.children(usage_lines(sample).into_iter().map(|line| {
+                    div()
+                        .text_size(px(fonts.small()))
+                        .line_height(px(18.0))
+                        .text_color(rgb(theme.shell.text))
+                        .child(line)
+                }))
+            }
+        }
     }
 
     pub(crate) fn status_line(&self) -> String {
@@ -885,6 +938,90 @@ pub(crate) fn status_line(status: Status<'_>) -> String {
         parts.push(note.to_string());
     }
     parts.join("  ·  ")
+}
+
+/// The usage sample as the lines the inspector shows, pure so the sentences
+/// can be checked without a window. Percentages are computed here, at display
+/// time, from the two typed values -- nothing upstream stores one -- and every
+/// absence keeps its meaning: an unmeasured value says "sampling", a missing
+/// request says nothing, and a missing limit says "no limit" rather than a
+/// number that was never set.
+pub(crate) fn usage_lines(sample: &UsageSample) -> Vec<String> {
+    let cpu = |value: Millicores| (value.0, value.to_string());
+    let memory = |value: Bytes| (value.0, value.to_string());
+    let mut lines = vec![
+        gauge(
+            "CPU",
+            sample.cpu.map(cpu),
+            sample.cpu_request.map(cpu),
+            sample.cpu_limit.map(cpu),
+        ),
+        gauge(
+            "Memory",
+            sample.memory.map(memory),
+            sample.memory_request.map(memory),
+            sample.memory_limit.map(memory),
+        ),
+    ];
+    // A single fully-measured pod needs no coverage sentence; everything else
+    // must say how much of the target the numbers describe.
+    if sample.pods_total != 1 || sample.pods_measured != sample.pods_total {
+        let mut coverage = format!(
+            "{} of {} pods measured",
+            sample.pods_measured, sample.pods_total
+        );
+        if sample.truncated {
+            coverage.push_str("; more match than are polled");
+        }
+        lines.push(coverage);
+    }
+    if sample.source == UsageSource::Kubelet {
+        lines.push("via the kubelet; metrics-server is not installed".to_string());
+    }
+    lines
+}
+
+// One resource's sentence: what is used, against what was asked for and what
+// is allowed. Values arrive as (raw, rendered) pairs so the percentage and
+// the text always describe the same number.
+fn gauge(
+    label: &str,
+    used: Option<(u64, String)>,
+    request: Option<(u64, String)>,
+    limit: Option<(u64, String)>,
+) -> String {
+    let mut parts = vec![match &used {
+        Some((_, text)) => format!("{label} {text}"),
+        None => format!("{label} sampling…"),
+    }];
+    if let Some((base, text)) = &request {
+        parts.push(format!(
+            "request {text}{}",
+            percent(used.as_ref().map(|(value, _)| *value), *base)
+        ));
+    }
+    match &limit {
+        Some((base, text)) => parts.push(format!(
+            "limit {text}{}",
+            percent(used.as_ref().map(|(value, _)| *value), *base)
+        )),
+        None => parts.push("no limit".to_string()),
+    }
+    parts.join(" · ")
+}
+
+// Rendered with the trailing space built in so an unmeasured or zero base
+// simply contributes nothing to the sentence.
+fn percent(used: Option<u64>, base: u64) -> String {
+    match used {
+        Some(value) if base > 0 => {
+            format!(
+                " ({}%)",
+                (value as u128 * 100 + base as u128 / 2) / base as u128
+            )
+        }
+        _ => String::new(),
+    }
 }
 
 /// Where a dock edge lands when it is dragged to a point. Pure, because the
