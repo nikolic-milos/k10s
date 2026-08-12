@@ -121,6 +121,61 @@ spec:
         - containerPort: 18081
 YAML
 
+# The usage tests' subject: a pod that declares both requests and limits, so
+# "usage against its requests and limits" has four declared numbers to land
+# on. The workload does close to nothing on purpose -- the assertions are
+# about presence and provenance, not about magnitude.
+echo "deployment usage-probe (declared requests and limits, for the usage tests)"
+"${KUBECTL[@]}" apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: usage-probe, namespace: $NS }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: usage-probe } }
+  template:
+    metadata: { labels: { app: usage-probe } }
+    spec:
+      containers:
+      - name: probe
+        image: busybox:1.36
+        command: ["sh", "-c", "while true; do sleep 3600; done"]
+        resources:
+          requests: { cpu: 10m, memory: 16Mi }
+          limits: { cpu: 100m, memory: 64Mi }
+YAML
+
+# The identity the metrics-denial test needs: it may read everything the
+# reader may EXCEPT metrics.k8s.io, so a usage poll under it gets the
+# server's own 403 on pod metrics and nothing else is different. Bound to a
+# ServiceAccount rather than a group so a lab can mint a token for it without
+# certificate ceremony; the kubeconfig context wiring stays outside this
+# script, exactly like reader@k10s-lab's.
+echo "no-metrics RBAC (ClusterRole k10s-reader-nometrics, ServiceAccount $NS/nometrics)"
+"${KUBECTL[@]}" apply -f - >/dev/null <<YAML
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: k10s-reader-nometrics }
+rules:
+- apiGroups: ["", "apps", "apiextensions.k8s.io", "policy", "k10s.test"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["authorization.k8s.io"]
+  resources: ["selfsubjectaccessreviews", "selfsubjectrulesreviews"]
+  verbs: ["create"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: nometrics, namespace: $NS }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: k10s-reader-nometrics }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: k10s-reader-nometrics }
+subjects:
+- { kind: ServiceAccount, name: nometrics, namespace: $NS }
+YAML
+
 # Route one of the Secret rule: a value in the object itself.
 echo "secret api-token"
 "${KUBECTL[@]}" -n "$NS" create secret generic api-token \

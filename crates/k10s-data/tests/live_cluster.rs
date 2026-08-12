@@ -53,10 +53,16 @@
 //!   annotation is `ObjectMeta`, so the declared value survives the
 //!   metadata-only fetch that makes the first route safe;
 //! - a CRD `widgets.k10s.test` with `additionalPrinterColumns`, and one
-//!   `Widget` named `sprocket` with `size: 7` and `flavour: vanilla`.
+//!   `Widget` named `sprocket` with `size: 7` and `flavour: vanilla`;
+//! - a Deployment `usage-probe` whose container declares requests (10m/16Mi)
+//!   and limits (100m/64Mi), the four numbers the usage tests assert against;
+//! - a ClusterRole `k10s-reader-nometrics` bound to ServiceAccount
+//!   `nometrics` -- everything the reader may read except `metrics.k8s.io`,
+//!   for the denial that must arrive as a label.
 //!
 //! `K10S_LIVE_READER_CONTEXT` (default `reader@k10s-lab`) must name a context
-//! whose account can read and cannot patch.
+//! whose account can read and cannot patch. `K10S_LIVE_NOMETRICS_CONTEXT`
+//! (default `nometrics@k10s-lab`) must name one wired to that ServiceAccount.
 //!
 //! Two of these tests need a cluster with a *kubelet*, and are skipped rather
 //! than failed where there is none: a standalone API server can serve every
@@ -64,6 +70,14 @@
 //! a node. Set `K10S_LIVE_KUBELET=1` when the cluster has one, and make sure the
 //! `web` Deployment's pod is actually Running -- a Deployment that no kubelet
 //! ever scheduled satisfies the other tests and neither of those.
+//!
+//! The usage tests also need a kubelet, and split on one more axis:
+//! `K10S_LIVE_METRICS_SERVER=1` runs the metrics-server row, `=0` runs the
+//! kubelet-fallback row (kill metrics-server first -- on k3s,
+//! `kubectl -n kube-system scale deploy/metrics-server --replicas=0` leaves
+//! the APIService registered and unanswering, which is the 503 half of the
+//! fallback decision; the scripted suite covers the 404 half), and unset
+//! skips both. Run the suite once per side to close the matrix.
 //!
 //! Both client-side applies must stay client-side. Server-side apply writes no
 //! `last-applied-configuration`, so a fixture created with `--server-side`
@@ -74,6 +88,9 @@ use std::time::Duration;
 use k10s_core::KindId;
 use k10s_data::apply::{ApplyOutcome, ApplyRequest};
 use k10s_data::describe::DescribeRequest;
+use k10s_data::metrics::{
+    Bytes, Millicores, UsageOutcome, UsageRequest, UsageSample, UsageSource, UsageStop, UsageTarget,
+};
 use k10s_data::read::{Fetched, KindRow, Reader};
 use k10s_data::{DEFAULT_EVENT_SINK_CAPACITY, Options, Sync};
 
@@ -968,5 +985,184 @@ fn a_port_forward_carries_real_bytes_from_the_pod() {
             .iter()
             .any(|open| open.id == row.id),
         "and is gone from the registry afterwards"
+    );
+}
+
+// Which half of the usage matrix this cluster is: Some(true) has
+// metrics-server, Some(false) had it killed, None skips both rows.
+fn metrics_server() -> Option<bool> {
+    std::env::var("K10S_LIVE_METRICS_SERVER")
+        .ok()
+        .map(|value| value == "1")
+}
+
+fn nometrics_context() -> String {
+    std::env::var("K10S_LIVE_NOMETRICS_CONTEXT")
+        .unwrap_or_else(|_| "nometrics@k10s-lab".to_string())
+}
+
+fn poll_usage(
+    reader: &Reader,
+    target: UsageTarget,
+) -> (UsageStop, std::sync::mpsc::Receiver<UsageOutcome>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = reader.poll_usage(
+        UsageRequest {
+            namespace: namespace(),
+            target,
+            interval: Duration::from_secs(2),
+        },
+        Box::new(move |outcome| {
+            let _ = tx.send(outcome);
+        }),
+    );
+    (stop, rx)
+}
+
+// Wait out the scrape lag: metrics-server takes tens of seconds to first
+// serve a fresh pod, and the kubelet's counters advance on their own clock.
+// Outcomes that do not match yet are kept for the panic message, because
+// "which wrong thing kept arriving" is the diagnosis.
+fn await_sample(
+    rx: &std::sync::mpsc::Receiver<UsageOutcome>,
+    budget: Duration,
+    what: &str,
+    accept: impl Fn(&UsageSample) -> bool,
+) -> UsageSample {
+    let deadline = std::time::Instant::now() + budget;
+    let mut last: Option<UsageOutcome> = None;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(UsageOutcome::Usage(sample)) if accept(&sample) => return sample,
+            Ok(outcome) => last = Some(outcome),
+            Err(_) => {}
+        }
+    }
+    panic!("{what} never arrived within the budget; last outcome: {last:?}");
+}
+
+// The four declared numbers on the usage-probe fixture, asserted exactly:
+// they come from the pod spec, whichever source carried the usage.
+fn assert_probe_bounds(sample: &UsageSample) {
+    assert_eq!(sample.cpu_request, Some(Millicores(10)));
+    assert_eq!(sample.cpu_limit, Some(Millicores(100)));
+    assert_eq!(sample.memory_request, Some(Bytes(16 * 1024 * 1024)));
+    assert_eq!(sample.memory_limit, Some(Bytes(64 * 1024 * 1024)));
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn pod_usage_renders_from_metrics_server_with_its_requests_and_limits() {
+    if !has_kubelet() || metrics_server() != Some(true) {
+        eprintln!(
+            "skipped: set K10S_LIVE_KUBELET=1 and K10S_LIVE_METRICS_SERVER=1 \
+             on a cluster that runs metrics-server"
+        );
+        return;
+    }
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "usage-probe-");
+
+    let (_stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod });
+    let sample = await_sample(
+        &rx,
+        Duration::from_secs(180),
+        "a metrics-server sample",
+        |sample| sample.source == UsageSource::MetricsServer && sample.memory.is_some(),
+    );
+    println!("live metrics-server sample: {sample:?}");
+    assert!(
+        sample.cpu.is_some(),
+        "metrics-server reports both quantities for a running pod: {sample:?}"
+    );
+    assert_probe_bounds(&sample);
+    assert_eq!((sample.pods_measured, sample.pods_total), (1, 1));
+    assert!(!sample.truncated);
+
+    // The same numbers through the workload door: the deployment's own
+    // selector resolves the pod and the sums land on the same bounds.
+    let deployments = kind(&sync.reader, "deployments.apps");
+    let (_stop, rx) = poll_usage(
+        &sync.reader,
+        UsageTarget::Workload {
+            kind: deployments.id,
+            name: "usage-probe".to_string(),
+        },
+    );
+    let sample = await_sample(
+        &rx,
+        Duration::from_secs(60),
+        "a workload sample",
+        |sample| sample.source == UsageSource::MetricsServer && sample.memory.is_some(),
+    );
+    println!("live workload sample: {sample:?}");
+    assert_probe_bounds(&sample);
+    assert_eq!((sample.pods_measured, sample.pods_total), (1, 1));
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn pod_usage_is_carried_by_the_kubelet_when_metrics_server_is_gone() {
+    if !has_kubelet() || metrics_server() != Some(false) {
+        eprintln!(
+            "skipped: set K10S_LIVE_KUBELET=1 and K10S_LIVE_METRICS_SERVER=0 \
+             on a cluster whose metrics-server was scaled away"
+        );
+        return;
+    }
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "usage-probe-");
+
+    let (_stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod });
+    let first = await_sample(
+        &rx,
+        Duration::from_secs(60),
+        "a kubelet-carried sample",
+        |sample| sample.source == UsageSource::Kubelet && sample.memory.is_some(),
+    );
+    println!("live kubelet sample (memory first): {first:?}");
+    assert_probe_bounds(&first);
+
+    // CPU needs the counter to advance under the kubelet's own timestamps;
+    // one more scrape interval is enough, and the rate must arrive without
+    // metrics-server ever answering.
+    let with_rate = await_sample(
+        &rx,
+        Duration::from_secs(120),
+        "a kubelet CPU rate",
+        |sample| sample.source == UsageSource::Kubelet && sample.cpu.is_some(),
+    );
+    println!("live kubelet sample (with rate): {with_rate:?}");
+    assert_probe_bounds(&with_rate);
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn denied_pod_metrics_is_a_labelled_denial_not_an_error_string() {
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    let context = nometrics_context();
+    let (_plane, sync) = connect(Some(&context));
+    let pod = running_pod(&sync.reader, "usage-probe-");
+
+    let (_stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod });
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the poll answers");
+    assert_eq!(
+        outcome,
+        UsageOutcome::Denied {
+            what: "pod metrics"
+        },
+        "a 403 on pod metrics is a labelled state, and the kubelet is not \
+         asked to route around it"
+    );
+    // Denied ends the poll itself: the sender is gone, so the channel closes
+    // instead of carrying a retry.
+    assert!(
+        rx.recv_timeout(Duration::from_secs(10)).is_err(),
+        "a denial is not retried"
     );
 }
