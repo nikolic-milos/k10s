@@ -2,9 +2,13 @@
 name = "k10s-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 k10s-atlas.workspace = true
 arc-swap.workspace = true
-crossbeam-channel.workspace = true

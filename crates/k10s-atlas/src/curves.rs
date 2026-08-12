@@ -1,3 +1,7 @@
+const MIN_DASH: f32 = 1e-3;
+
+const MAX_PERIODS: f32 = 65_536.0;
+
 pub fn flatten_quadratic(
     p0: (f32, f32),
     ctrl: (f32, f32),
@@ -27,42 +31,53 @@ pub fn dash_polyline(
     off: f32,
     mut emit: impl FnMut(bool, (f32, f32)),
 ) {
-    debug_assert!(on > 0.0 && off > 0.0);
+    let mut total = 0.0;
+    let mut prev = start;
+    for &p in points {
+        total += seg_len(prev, p).unwrap_or(0.0);
+        prev = p;
+    }
+    let floor = (total / MAX_PERIODS).max(MIN_DASH);
+    let on = on.max(floor);
+    let off = off.max(floor);
+
     let mut prev = start;
     let mut drawing = true;
     let mut remain = on;
     let mut pen_down = false;
     for &p in points {
-        let (dx, dy) = (p.0 - prev.0, p.1 - prev.1);
-        let full = (dx * dx + dy * dy).sqrt();
-        if full <= f32::EPSILON {
+        let Some(full) = seg_len(prev, p) else {
             prev = p;
             continue;
-        }
-        let (ux, uy) = (dx / full, dy / full);
-        let mut pos = prev;
-        let mut seg = full;
-        while seg > 0.0 {
-            let step = seg.min(remain);
-            let next = (pos.0 + ux * step, pos.1 + uy * step);
+        };
+        let (ux, uy) = ((p.0 - prev.0) / full, (p.1 - prev.1) / full);
+        let mut walked = 0.0f32;
+        while walked < full {
+            let step = remain.min(full - walked);
+            let end = walked + step;
             if drawing {
                 if !pen_down {
-                    emit(true, pos);
+                    emit(true, (prev.0 + ux * walked, prev.1 + uy * walked));
                     pen_down = true;
                 }
-                emit(false, next);
+                emit(false, (prev.0 + ux * end, prev.1 + uy * end));
             }
-            pos = next;
-            seg -= step;
             remain -= step;
             if remain <= 0.0 {
                 drawing = !drawing;
                 remain = if drawing { on } else { off };
                 pen_down = false;
             }
+            walked = end;
         }
         prev = p;
     }
+}
+
+fn seg_len(a: (f32, f32), b: (f32, f32)) -> Option<f32> {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    (len.is_finite() && len > f32::EPSILON).then_some(len)
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -171,6 +186,89 @@ mod tests {
             |m, _| bent += m as usize,
         );
         assert_eq!(straight, bent);
+    }
+
+    #[test]
+    fn degenerate_dash_lengths_terminate() {
+        for (on, off) in [
+            (0.0, 0.0),
+            (0.0, 5.0),
+            (6.0, 0.0),
+            (-1.0, -1.0),
+            (-3.0, 4.0),
+            (f32::MIN_POSITIVE, f32::MIN_POSITIVE),
+        ] {
+            let mut emitted = 0usize;
+            dash_polyline((0.0, 0.0), &[(40.0, 0.0)], on, off, |_, _| emitted += 1);
+            let bound = 2 * (40.0 / (2.0 * MIN_DASH)) as usize;
+            assert!(
+                emitted <= bound + bound / 100,
+                "on {on} off {off} emitted {emitted}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_lines_keep_the_pitch_they_asked_for() {
+        for len in [4_000.0f32, 8_000.0, 40_000.0] {
+            let mut starts = Vec::new();
+            dash_polyline((0.0, 0.0), &[(len, 0.0)], 6.0, 5.0, |is_move, p| {
+                if is_move {
+                    starts.push(p.0);
+                }
+            });
+            assert_eq!(
+                starts.len(),
+                (len / 11.0).ceil() as usize,
+                "{len} px: {} dashes",
+                starts.len()
+            );
+            let worst = starts
+                .windows(2)
+                .map(|w| (w[1] - w[0] - 11.0).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 0.01, "{len} px: pitch off by {worst}");
+        }
+    }
+
+    #[test]
+    fn long_lines_bound_the_dash_count() {
+        let mut subpaths = 0usize;
+        let mut emitted = 0usize;
+        let mut last = (0.0f32, 0.0f32);
+        dash_polyline((0.0, 0.0), &[(1e8, 0.0)], 6.0, 5.0, |is_move, p| {
+            subpaths += is_move as usize;
+            emitted += 1;
+            last = p;
+        });
+        assert!(emitted <= 2 * MAX_PERIODS as usize, "emitted {emitted}");
+        assert!(subpaths > 1, "a coarser pattern is still a pattern");
+        assert!(last.0 >= 0.99 * 1e8, "pattern ran out at {last:?}");
+    }
+
+    #[test]
+    fn dash_walk_cannot_stall() {
+        for (case, points, on, off) in [
+            (
+                "pattern below the arithmetic",
+                vec![(4e4f32, 0.0f32)],
+                0.0f32,
+                0.0f32,
+            ),
+            (
+                "non-finite vertex",
+                vec![(f32::INFINITY, 0.0), (40.0, 0.0)],
+                6.0,
+                5.0,
+            ),
+        ] {
+            let mut emitted = 0usize;
+            dash_polyline((0.0, 0.0), &points, on, off, |_, _| emitted += 1);
+            assert!(
+                emitted <= 2 * MAX_PERIODS as usize,
+                "{case}: emitted {emitted}"
+            );
+        }
     }
 
     #[test]

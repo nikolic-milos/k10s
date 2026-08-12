@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=k10s
+GenericName=Kubernetes Starmap
+Comment=Navigate a Kubernetes cluster as a map
+Exec=k10s %U
+Icon=k10s
+Terminal=false
+Categories=Development;System;Monitor;
+Keywords=kubernetes;k8s;cluster;kubectl;devops;
+StartupNotify=true
+StartupWMClass=k10s

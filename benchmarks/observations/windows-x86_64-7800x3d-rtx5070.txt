@@ -1,0 +1,32 @@
+k10s bench [spread] - 197 ns / 2964 wl / 14952 pods / 7023 sats / 1763 edges - viewport 1600x1000
+  Z0 static (island overview)  quads    198  lines    0  glyphs      0  icons    0  sats    0  curves    0  edges    0  hex  504  drawn ns/wl/pods 197/0/0  dropped 0L/0I/0C  text cache 0H/0M/0E
+                               spans us  walk     17  quads     6  paths    702  icons     0  text      0  hud    46
+                               cpu p50  0.73  p99  1.09 ms (hud excluded)  |  frame p50   5.6  p95   6.0  p99   6.3 ms (informational, vsync-bound)
+  Z0->Z1 fly-in                quads     69  lines    4  glyphs     66  icons    3  sats    0  curves    0  edges    0  hex  459  drawn ns/wl/pods 4/64/0  dropped 0L/0I/0C  text cache 4H/0M/0E
+                               spans us  walk     15  quads     4  paths    738  icons     1  text     12  hud    89
+                               cpu p50  0.77  p99  1.36 ms (hud excluded)  |  frame p50   5.5  p95   6.0  p99   6.2 ms (informational, vsync-bound)
+  Z1 static (workload cards)   quads     69  lines    4  glyphs     66  icons    3  sats    0  curves    0  edges    0  hex  459  drawn ns/wl/pods 4/64/0  dropped 0L/0I/0C  text cache 4H/0M/0E
+                               spans us  walk     15  quads     4  paths    648  icons     1  text      6  hud    46
+                               cpu p50  0.67  p99  0.99 ms (hud excluded)  |  frame p50   5.5  p95   6.0  p99   6.1 ms (informational, vsync-bound)
+  Z1 cross-map pan             quads     33  lines    6  glyphs     72  icons    0  sats    0  curves    0  edges    0  hex  459  drawn ns/wl/pods 8/24/0  dropped 0L/0I/0C  text cache 6H/0M/0E
+                               spans us  walk     15  quads     4  paths    592  icons     0  text     10  hud   104
+                               cpu p50  0.62  p99  1.09 ms (hud excluded)  |  frame p50   5.6  p95   6.0  p99   6.1 ms (informational, vsync-bound)
+  Z1->Z2 fly-in (hub)          quads    205  lines  162  glyphs   2269  icons   81  sats   80  curves   80  edges   23  hex  360  drawn ns/wl/pods 1/1/200  dropped 0L/0I/0C  text cache 162H/0M/0E
+                               spans us  walk     21  quads     2  paths    987  icons     2  text      4  hud   116
+                               cpu p50  1.03  p99  3.76 ms (hud excluded)  |  frame p50   5.6  p95   8.8  p99  16.5 ms (informational, vsync-bound)
+  Z2 static (hub + satellites) quads    205  lines  162  glyphs   2269  icons   81  sats   80  curves   80  edges   23  hex  360  drawn ns/wl/pods 1/1/200  dropped 0L/0I/0C  text cache 162H/0M/0E
+                               spans us  walk     88  quads     8  paths   2306  icons     7  text    231  hud    49
+                               cpu p50  2.65  p99  3.73 ms (hud excluded)  |  frame p50   7.9  p95   9.6  p99  10.4 ms (informational, vsync-bound)
+  Z2 hub pan                   quads    112  lines  113  glyphs   1588  icons   57  sats   55  curves   55  edges   21  hex  360  drawn ns/wl/pods 1/2/104  dropped 0L/0I/0C  text cache 113H/0M/0E
+                               spans us  walk    103  quads     8  paths   2664  icons     7  text    256  hud   134
+                               cpu p50  3.05  p99  4.33 ms (hud excluded)  |  frame p50   8.5  p95  11.6  p99  12.7 ms (informational, vsync-bound)
+  Z2->Z3 fly-in                quads    205  lines  202  glyphs   3316  icons    1  sats    0  curves    0  edges   21  hex  345  drawn ns/wl/pods 1/1/200  dropped 0L/0I/0C  text cache 202H/0M/0E
+                               spans us  walk     30  quads     6  paths   1418  icons     1  text    348  hud   114
+                               cpu p50  1.80  p99  2.89 ms (hud excluded)  |  frame p50   5.6  p95   6.3  p99   7.3 ms (informational, vsync-bound)
+  Z3 static (pod detail)       quads    205  lines  202  glyphs   3316  icons    1  sats    0  curves    0  edges   21  hex  345  drawn ns/wl/pods 1/1/200  dropped 0L/0I/0C  text cache 202H/0M/0E
+                               spans us  walk     28  quads     6  paths   1152  icons     1  text    332  hud    50
+                               cpu p50  1.53  p99  2.08 ms (hud excluded)  |  frame p50   5.5  p95   5.9  p99   6.2 ms (informational, vsync-bound)
+  Z3->Z0 fly-out               quads    198  lines    0  glyphs      0  icons    0  sats    0  curves    0  edges    0  hex  504  drawn ns/wl/pods 197/0/0  dropped 0L/0I/0C  text cache 0H/0M/0E
+                               spans us  walk     17  quads     5  paths    414  icons     0  text     20  hud   124
+                               cpu p50  0.47  p99  1.33 ms (hud excluded)  |  frame p50   5.6  p95   5.9  p99   6.0 ms (informational, vsync-bound)
+  Z0 idle (no damage)          idle 5 s: 66 paints, 0.0 ms process cpu

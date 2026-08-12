@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "mode": "full-paint-alloc",
+  "objects": 4000,
+  "viewport": [1600, 1000],
+  "warmup": 64,
+  "iters": 256,
+  "cases": [
+    {
+      "cache": "cached",
+      "allocations_per_paint": 71.000,
+      "reallocations_per_paint": 79.000,
+      "bytes_per_paint": 1627124,
+      "text_cache_hits": 11,
+      "text_cache_misses": 0,
+      "text_cache_evictions": 0
+    },
+    {
+      "cache": "uncached-control",
+      "allocations_per_paint": 74.000,
+      "reallocations_per_paint": 79.000,
+      "bytes_per_paint": 1627268,
+      "text_cache_hits": 0,
+      "text_cache_misses": 11,
+      "text_cache_evictions": 0
+    }
+  ]
+}

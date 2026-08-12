@@ -2,14 +2,34 @@
 name = "k10s-world"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 k10s-core.workspace = true
-k10s-clustergen.workspace = true
 bevy_ecs.workspace = true
-arc-swap.workspace = true
 crossbeam-channel.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+rustc-hash.workspace = true
 
+[dev-dependencies]
+k10s-bench.workspace = true
+k10s-atlas = { workspace = true, features = ["testing"] }
+k10s-clustergen.workspace = true
+
+[[bench]]
+name = "publish"
+harness = false
+
+[[bench]]
+name = "fanout_cull"
+harness = false
+
+[[bench]]
+name = "build"
+harness = false

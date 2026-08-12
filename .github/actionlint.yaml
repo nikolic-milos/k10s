@@ -1,0 +1,3 @@
+self-hosted-runner:
+  labels:
+    - k10s-perf-i5-12600k

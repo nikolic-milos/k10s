@@ -4,12 +4,14 @@ use serde::Serialize;
 
 use crate::camera::Camera;
 use crate::scene::{Scene, Totals};
-use crate::stats::FrameStats;
+use crate::stats::{DrawnCounts, FrameSpans, FrameStats, SegmentCounters, TextCacheCounts};
 
 const VIEWPORT_STABLE_SECS: f32 = 0.75;
 const MAX_RESTARTS: u32 = 5;
 
 const IDLE_WAKE_PAD_SECS: f32 = 0.05;
+
+pub const FLIGHT_VIEWPORT: [f32; 2] = [1600.0, 1000.0];
 
 pub struct Segment {
     pub name: &'static str,
@@ -17,7 +19,6 @@ pub struct Segment {
     pub to: Camera,
     pub dur: f32,
     pub measure: bool,
-    pub gate_frame: bool,
     pub idle: bool,
 }
 
@@ -38,20 +39,29 @@ pub struct CpuPercentiles {
 pub struct IdleResult {
     pub dur_s: f32,
     pub paints: u64,
-    pub proc_cpu_ms: f32,
+    pub proc_cpu_ms: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SegmentResult {
     pub name: String,
-    pub gate_frame: bool,
-    pub frame_ms: Percentiles,
-    pub cpu_ms: CpuPercentiles,
     pub quads: usize,
+    pub lines: usize,
     pub glyphs: usize,
-    pub edges: usize,
+    pub icons: usize,
     pub sats: usize,
     pub curves: usize,
+    pub edges: usize,
+    pub bg_cells: usize,
+    pub drawn: DrawnCounts,
+    pub labels_dropped: usize,
+    pub icons_dropped: usize,
+    pub curves_dropped: usize,
+    pub counters: SegmentCounters,
+    pub text_cache: TextCacheCounts,
+    pub spans: FrameSpans,
+    pub cpu_ms: CpuPercentiles,
+    pub frame_ms: Percentiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle: Option<IdleResult>,
 }
@@ -59,6 +69,8 @@ pub struct SegmentResult {
 #[derive(Debug, Clone)]
 pub struct FlightResult {
     pub viewport: [f32; 2],
+    pub window: [f32; 2],
+    pub resizes: u32,
     pub totals: Totals,
     pub segments: Vec<SegmentResult>,
     pub restarts: u32,
@@ -93,7 +105,7 @@ impl FlightFrame {
 
 struct IdleEntry {
     frames: u64,
-    cpu_ms: f64,
+    cpu_ms: Option<f64>,
 }
 
 pub struct Flight {
@@ -103,12 +115,14 @@ pub struct Flight {
     seg_start: Instant,
     results: Vec<SegmentResult>,
     viewport: (f32, f32),
+    window: (f32, f32),
+    resizes: u32,
     totals: Totals,
     last_seen: (f32, f32),
     stable_since: Option<Instant>,
     restarts: u32,
     idle_entry: Option<IdleEntry>,
-    cpu_clock: Box<dyn Fn() -> f64>,
+    cpu_clock: Box<dyn Fn() -> Option<f64>>,
 }
 
 impl Flight {
@@ -120,6 +134,8 @@ impl Flight {
             seg_start: Instant::now(),
             results: Vec::new(),
             viewport: (0.0, 0.0),
+            window: (0.0, 0.0),
+            resizes: 0,
             totals: Totals::default(),
             last_seen: (0.0, 0.0),
             stable_since: None,
@@ -138,16 +154,30 @@ impl Flight {
         scene: &Scene<R, B, C, S>,
         stats: &mut FrameStats,
     ) -> FlightFrame {
+        if let Some(camera) = self.at_rest() {
+            return FlightFrame::Idle {
+                camera,
+                arm_timer: None,
+            };
+        }
+
         if scene.rev == 0 || vw <= 0.0 || vh <= 0.0 {
             return FlightFrame::Waiting;
         }
+
+        if !self.segments.is_empty() && self.window != (vw, vh) {
+            self.resizes += 1;
+        }
+        self.window = (vw, vh);
+
+        let (lvw, lvh) = (FLIGHT_VIEWPORT[0], FLIGHT_VIEWPORT[1]);
 
         if self.segments.is_empty() {
             if (vw, vh) != self.last_seen || !active {
                 self.last_seen = if active { (vw, vh) } else { (0.0, 0.0) };
                 self.stable_since = Some(now);
                 let mut cam = Camera::default();
-                cam.fit(scene.bounds, vw, vh);
+                cam.fit(scene.bounds, lvw, lvh);
                 return FlightFrame::Camera(cam);
             }
             let stable = self
@@ -155,28 +185,25 @@ impl Flight {
                 .is_some_and(|t| (now - t).as_secs_f32() >= VIEWPORT_STABLE_SECS);
             if !stable {
                 let mut cam = Camera::default();
-                cam.fit(scene.bounds, vw, vh);
+                cam.fit(scene.bounds, lvw, lvh);
                 return FlightFrame::Camera(cam);
             }
-            self.build(scene, vw, vh, now);
+            if !self.build(scene, lvw, lvh, now) {
+                return FlightFrame::Aborted;
+            }
             stats.reset();
-        } else if (vw, vh) != self.viewport || !active {
+        } else if !active {
             self.restarts += 1;
-            let why = if active {
-                "viewport changed"
-            } else {
-                "window lost focus"
-            };
-            eprintln!(
-                "bench: {why} ({:.0}x{:.0} -> {vw:.0}x{vh:.0}, active={active}); restarting flight ({}/{MAX_RESTARTS})",
-                self.viewport.0, self.viewport.1, self.restarts
-            );
             if self.restarts >= MAX_RESTARTS {
                 eprintln!(
-                    "bench: conditions keep changing; aborting. Keep the bench window focused and at a fixed size, then re-run."
+                    "bench: window lost focus {MAX_RESTARTS} times; aborting. Keep the bench window focused, then re-run."
                 );
                 return FlightFrame::Aborted;
             }
+            eprintln!(
+                "bench: window lost focus; restarting flight ({}/{MAX_RESTARTS})",
+                self.restarts
+            );
             self.results.clear();
             self.segments.clear();
             self.current = 0;
@@ -189,18 +216,39 @@ impl Flight {
         self.step(now, stats)
     }
 
-    fn build<R, B, C, S>(&mut self, scene: &Scene<R, B, C, S>, vw: f32, vh: f32, now: Instant) {
+    fn build<R, B, C, S>(
+        &mut self,
+        scene: &Scene<R, B, C, S>,
+        vw: f32,
+        vh: f32,
+        now: Instant,
+    ) -> bool {
         self.viewport = (vw, vh);
+        self.resizes = 0;
         self.totals = scene.totals;
 
         let mut fit = Camera::default();
         fit.fit(scene.bounds, vw, vh);
-        let big = scene
+        let Some((region_index, region)) = scene
             .regions
             .iter()
-            .max_by_key(|r| r.weight)
-            .expect("flight needs a non-empty scene");
-        let block = &scene.blocks[big.children.start as usize];
+            .enumerate()
+            .filter(|(_, region)| !region.children.is_empty())
+            .max_by_key(|(_, r)| r.weight)
+        else {
+            eprintln!(
+                "bench: no region in the scene has a block to fly to; aborting. Raise --objects until one does, then re-run."
+            );
+            return false;
+        };
+        let Some(block) = scene
+            .region_block_indices(region_index)
+            .next()
+            .map(|index| &scene.blocks[index])
+        else {
+            eprintln!("bench: the selected region has no addressable workload; aborting flight");
+            return false;
+        };
 
         let mut hub: Option<&crate::scene::BlockNode<B>> = None;
         for b in &scene.blocks {
@@ -211,7 +259,7 @@ impl Flight {
         }
         let anchors = FlightAnchors {
             fit,
-            region_center: big.rect.center(),
+            region_center: region.rect.center(),
             block_center: block.inner.center(),
             hub_center: hub.unwrap_or(block).inner.center(),
         };
@@ -222,6 +270,7 @@ impl Flight {
             "planner returned an empty flight"
         );
         self.seg_start = now;
+        true
     }
 
     fn step(&mut self, now: Instant, stats: &mut FrameStats) -> FlightFrame {
@@ -253,21 +302,36 @@ impl Flight {
                 let (p50, p95, p99) = stats.frame_percentiles();
                 let (c50, c99) = stats.cpu_percentiles();
 
-                let idle = self.idle_entry.take().map(|e| IdleResult {
-                    dur_s: seg.dur,
-                    paints: stats.frames().saturating_sub(e.frames + 1),
-                    proc_cpu_ms: ((self.cpu_clock)() - e.cpu_ms) as f32,
+                let idle = self.idle_entry.take().map(|e| {
+                    let exit = (self.cpu_clock)();
+                    IdleResult {
+                        dur_s: seg.dur,
+                        paints: stats.frames().saturating_sub(e.frames + 1),
+                        proc_cpu_ms: match (e.cpu_ms, exit) {
+                            (Some(enter), Some(exit)) => Some((exit - enter) as f32),
+                            _ => None,
+                        },
+                    }
                 });
                 self.results.push(SegmentResult {
                     name: seg.name.to_string(),
-                    gate_frame: seg.gate_frame,
-                    frame_ms: Percentiles { p50, p95, p99 },
-                    cpu_ms: CpuPercentiles { p50: c50, p99: c99 },
                     quads: stats.quads,
+                    lines: stats.lines,
                     glyphs: stats.glyphs,
-                    edges: stats.edges,
+                    icons: stats.icons,
                     sats: stats.sats,
                     curves: stats.curves,
+                    edges: stats.edges,
+                    bg_cells: stats.bg_cells,
+                    drawn: stats.drawn,
+                    labels_dropped: stats.labels_dropped,
+                    icons_dropped: stats.icons_dropped,
+                    curves_dropped: stats.curves_dropped,
+                    counters: stats.segment_counters(),
+                    text_cache: stats.text_cache,
+                    spans: stats.span_p50(),
+                    cpu_ms: CpuPercentiles { p50: c50, p99: c99 },
+                    frame_ms: Percentiles { p50, p95, p99 },
                     idle,
                 });
             }
@@ -276,37 +340,52 @@ impl Flight {
             self.current += 1;
             self.seg_start = now;
             if self.current == self.segments.len() {
-                return FlightFrame::Done(FlightResult {
-                    viewport: [self.viewport.0, self.viewport.1],
-                    totals: self.totals,
-                    segments: std::mem::take(&mut self.results),
-                    restarts: self.restarts,
-                });
+                return self.done();
             }
         }
         FlightFrame::Camera(cam)
     }
+
+    fn at_rest(&self) -> Option<Camera> {
+        let last = self.segments.last()?;
+        (self.current == self.segments.len()).then_some(last.to)
+    }
+
+    fn done(&mut self) -> FlightFrame {
+        FlightFrame::Done(FlightResult {
+            viewport: [self.viewport.0, self.viewport.1],
+            window: [self.window.0, self.window.1],
+            resizes: self.resizes,
+            totals: self.totals,
+            segments: std::mem::take(&mut self.results),
+            restarts: self.restarts,
+        })
+    }
 }
 
-fn proc_cpu_ms() -> f64 {
+fn proc_cpu_ms() -> Option<f64> {
     #[cfg(target_os = "linux")]
     {
-        const TICK_MS: f64 = 1000.0 / 100.0;
-
-        if let Ok(stat) = std::fs::read_to_string("/proc/self/stat")
-            && let Some((_, rest)) = stat.rsplit_once(')')
-        {
-            let mut fields = rest.split_ascii_whitespace();
-            let utime: f64 = fields.nth(11).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let stime: f64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            return (utime + stime) * TICK_MS;
-        }
-        0.0
+        std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|stat| proc_stat_cpu_ms(&stat, rustix::param::clock_ticks_per_second()))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        0.0
+        None
     }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_cpu_ms(stat: &str, ticks_per_second: u64) -> Option<f64> {
+    if ticks_per_second == 0 {
+        return None;
+    }
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_ascii_whitespace();
+    let user_ticks: u64 = fields.nth(11)?.parse().ok()?;
+    let system_ticks: u64 = fields.next()?.parse().ok()?;
+    Some((user_ticks + system_ticks) as f64 * 1000.0 / ticks_per_second as f64)
 }
 
 fn smoothstep(t: f32) -> f32 {
@@ -322,199 +401,5 @@ fn lerp_cam(a: Camera, b: Camera, t: f32) -> Camera {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scene::{BlockNode, CellNode, Rect, RegionNode};
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    fn tiny_scene() -> Scene {
-        let block_rect = Rect::new(10.0, 10.0, 50.0, 30.0);
-        Scene {
-            rev: 1,
-            bounds: Rect::new(0.0, 0.0, 200.0, 100.0),
-            regions: vec![RegionNode {
-                rect: Rect::new(0.0, 0.0, 200.0, 100.0),
-                label: "region".into(),
-                weight: 1,
-                children: 0..1,
-                ext: (),
-            }],
-            blocks: vec![BlockNode {
-                rect: block_rect,
-                inner: block_rect,
-                label: "block".into(),
-                children: 0..1,
-                sats: 0..0,
-                ext: (),
-            }],
-            cells: vec![CellNode {
-                rect: Rect::new(12.0, 12.0, 8.0, 8.0),
-                label: "cell".into(),
-                ext: (),
-            }],
-            sats: vec![],
-            edges: vec![],
-            region_edges: vec![],
-            cross_edges: 0..0,
-            totals: Totals {
-                regions: 1,
-                blocks: 1,
-                cells: 1,
-                sats: 0,
-                edges: 0,
-            },
-        }
-    }
-
-    fn test_plan(a: &FlightAnchors, _vw: f32, _vh: f32) -> Vec<Segment> {
-        let seg = |name, measure, idle, dur| Segment {
-            name,
-            from: a.fit,
-            to: a.fit,
-            dur,
-            measure,
-            gate_frame: false,
-            idle,
-        };
-        vec![
-            seg("warmup", false, false, 2.0),
-            seg("static", true, false, 3.0),
-            seg("idle", true, true, 5.0),
-        ]
-    }
-
-    #[test]
-    fn idle_segment_counts_only_window_paints() {
-        let mut flight = Flight::new(test_plan);
-        let cpu = Rc::new(Cell::new(1000.0f64));
-        let cpu_reader = cpu.clone();
-        flight.cpu_clock = Box::new(move || cpu_reader.get());
-
-        let scene = tiny_scene();
-        let mut stats = FrameStats::default();
-        let (vw, vh) = (1600.0, 1000.0);
-        let t0 = Instant::now();
-        let at = |s: f32| t0 + Duration::from_secs_f32(s);
-
-        assert!(matches!(
-            flight.frame(at(0.0), vw, vh, true, &scene, &mut stats),
-            FlightFrame::Camera(_)
-        ));
-        assert!(matches!(
-            flight.frame(at(1.0), vw, vh, true, &scene, &mut stats),
-            FlightFrame::Camera(_)
-        ));
-        let n_segs = flight.segments.len();
-        assert!(
-            flight.segments[n_segs - 1].idle,
-            "flight must end with the idle segment"
-        );
-
-        let mut now_s = 1.0f32;
-        for _ in 0..n_segs - 1 {
-            now_s += flight.segments[flight.current].dur + 0.01;
-            assert!(matches!(
-                flight.frame(at(now_s), vw, vh, true, &scene, &mut stats),
-                FlightFrame::Camera(_)
-            ));
-        }
-
-        let entry_s = now_s + 0.05;
-        let FlightFrame::Idle {
-            arm_timer: Some(arm),
-            ..
-        } = flight.frame(at(entry_s), vw, vh, true, &scene, &mut stats)
-        else {
-            panic!("idle entry must arm the wake timer");
-        };
-        assert!(
-            (arm.as_secs_f32() - 5.0).abs() < 0.2,
-            "wake ~= dur: {arm:?}"
-        );
-        stats.begin_frame(at(entry_s + 0.001), false);
-
-        for dt in [1.0, 2.0] {
-            let f = flight.frame(at(entry_s + dt), vw, vh, true, &scene, &mut stats);
-            assert!(matches!(
-                f,
-                FlightFrame::Idle {
-                    arm_timer: None,
-                    ..
-                }
-            ));
-            assert!(!f.needs_frame(), "idle must not request animation frames");
-            stats.begin_frame(at(entry_s + dt + 0.001), false);
-        }
-        cpu.set(1000.0 + 12.5);
-
-        let FlightFrame::Done(result) =
-            flight.frame(at(entry_s + 5.06), vw, vh, true, &scene, &mut stats)
-        else {
-            panic!("flight must complete");
-        };
-
-        let last = result.segments.last().expect("segments recorded");
-        let idle = last
-            .idle
-            .as_ref()
-            .expect("idle segment must carry an idle result");
-        assert_eq!(
-            idle.paints, 2,
-            "entry + closing frames are not window paints"
-        );
-        assert!(
-            (idle.proc_cpu_ms - 12.5).abs() < 1e-3,
-            "cpu {}",
-            idle.proc_cpu_ms
-        );
-        assert_eq!(idle.dur_s, 5.0);
-        assert!(!last.gate_frame);
-        assert_eq!(
-            result.segments.iter().filter(|s| s.idle.is_some()).count(),
-            1,
-            "exactly one idle segment"
-        );
-        assert_eq!(result.totals.cells, 1);
-        assert_eq!(result.viewport, [vw, vh]);
-        assert_eq!(result.restarts, 0);
-    }
-
-    #[test]
-    fn restart_budget_aborts() {
-        let mut flight = Flight::new(test_plan);
-        let scene = tiny_scene();
-        let mut stats = FrameStats::default();
-        let t0 = Instant::now();
-        let at = |s: f32| t0 + Duration::from_secs_f32(s);
-
-        let mut now_s = 0.0f32;
-        let mut aborted = false;
-        for round in 0..MAX_RESTARTS + 1 {
-            let vw = 1600.0 + round as f32;
-            assert!(matches!(
-                flight.frame(at(now_s), vw, 1000.0, true, &scene, &mut stats),
-                FlightFrame::Camera(_)
-            ));
-            now_s += 1.0;
-            match flight.frame(at(now_s), vw, 1000.0, true, &scene, &mut stats) {
-                FlightFrame::Camera(_) => {}
-                other => panic!(
-                    "expected planned flight, got needs_frame={}",
-                    other.needs_frame()
-                ),
-            }
-            now_s += 0.5;
-            match flight.frame(at(now_s), vw + 100.0, 1000.0, true, &scene, &mut stats) {
-                FlightFrame::Waiting => {}
-                FlightFrame::Aborted => {
-                    aborted = true;
-                    break;
-                }
-                _ => panic!("resize must restart or abort"),
-            }
-            now_s += 0.5;
-        }
-        assert!(aborted, "flight must abort after {MAX_RESTARTS} restarts");
-    }
-}
+#[path = "flight_test.rs"]
+mod tests;

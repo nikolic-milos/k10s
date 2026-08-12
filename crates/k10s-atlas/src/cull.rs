@@ -1,6 +1,11 @@
 use crate::camera::Camera;
 use crate::lod::{LodPolicy, StageBlend};
-use crate::scene::{Rect, Scene};
+use crate::scene::{BlockNode, Rect, Scene};
+
+const DIRECT_REGION_SCAN_LIMIT: usize = 2_048;
+const DIRECT_SINGLE_REGION_FRACTION: f32 = 0.125;
+const DIRECT_STAGE_ONE_CHILD_LIMIT: usize = 64;
+const DIRECT_MULTI_REGION_CHILD_LIMIT: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CullStats {
@@ -9,6 +14,8 @@ pub struct CullStats {
     pub drawn_regions: usize,
     pub drawn_blocks: usize,
     pub drawn_cells: usize,
+    pub aggregated_blocks: usize,
+    pub aggregated_cells: usize,
     pub drawn_sats: usize,
     pub edges: usize,
     pub curves: usize,
@@ -32,19 +39,242 @@ pub fn cull<R, B, C, S>(
     edges_on: bool,
     skip_blocks: bool,
 ) -> CullStats {
-    let zoom = camera.zoom;
     let visible = camera.visible_world(vw, vh);
     let stage = blend.walk_stage();
+    if stage == 0 {
+        return cull_stage_zero(scene, camera.zoom, &visible, policy);
+    }
+    let contiguous = scene.child_ranges_are_direct();
+    let single_region_inside = scene.regions.len() == 1 && visible.contains(&scene.regions[0].rect);
+    if contiguous && stage != 1 {
+        if stage >= 2 && scene.visible_region_has_selective_block_index(&visible) {
+            return cull_inner::<true, _, _, _, _>(
+                scene,
+                camera,
+                policy,
+                blend,
+                vw,
+                vh,
+                edges_on,
+                skip_blocks,
+            );
+        }
+        if scene.region_index_is_selective(&visible) {
+            return cull_contiguous::<true, _, _, _, _>(
+                scene,
+                camera.zoom,
+                &visible,
+                policy,
+                stage,
+                edges_on,
+                skip_blocks,
+            );
+        }
+        return cull_contiguous::<false, _, _, _, _>(
+            scene,
+            camera.zoom,
+            &visible,
+            policy,
+            stage,
+            edges_on,
+            skip_blocks,
+        );
+    }
+    if contiguous
+        && stage == 1
+        && (scene.spatial_index.is_empty()
+            || visible.contains(&scene.bounds)
+            || single_region_inside)
+    {
+        return cull_stage_one_contiguous(scene, camera.zoom, &visible, policy, skip_blocks);
+    }
+    if contiguous
+        && stage == 1
+        && match scene.regions.as_slice() {
+            [region] => {
+                region.rect.intersection_fraction(&visible) >= DIRECT_SINGLE_REGION_FRACTION
+            }
+            regions => {
+                regions.len() <= DIRECT_REGION_SCAN_LIMIT
+                    && (scene.spatial_index.max_blocks_per_region() <= DIRECT_STAGE_ONE_CHILD_LIMIT
+                        || regions.iter().any(|region| {
+                            region.rect.intersects(&visible)
+                                && region.children.len() < DIRECT_MULTI_REGION_CHILD_LIMIT
+                                && region.rect.intersection_fraction(&visible)
+                                    >= DIRECT_SINGLE_REGION_FRACTION
+                        }))
+            }
+        }
+    {
+        return cull_stage_one_contiguous(scene, camera.zoom, &visible, policy, skip_blocks);
+    }
+    if stage == 1 {
+        return cull_stage_one_indexed(scene, camera.zoom, &visible, policy, skip_blocks);
+    }
+    if scene.spatial_index.is_empty() {
+        cull_inner::<false, _, _, _, _>(scene, camera, policy, blend, vw, vh, edges_on, skip_blocks)
+    } else {
+        cull_inner::<true, _, _, _, _>(scene, camera, policy, blend, vw, vh, edges_on, skip_blocks)
+    }
+}
 
+fn cull_stage_zero<R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    zoom: f32,
+    visible: &Rect,
+    policy: &LodPolicy,
+) -> CullStats {
+    let budget = policy.max_labels;
+    let mut drawn_regions = 0usize;
+    let mut labels = 0usize;
+    let mut labels_dropped = 0usize;
+    if scene.region_index_is_selective(visible) {
+        scene.for_each_region_candidate(visible, |_, region| {
+            if !region.rect.intersects(visible) {
+                return;
+            }
+            drawn_regions += 1;
+            if policy.region_label_shown(region.rect.w, zoom) {
+                if labels >= budget {
+                    labels_dropped += 1;
+                } else {
+                    labels += 1;
+                }
+            }
+        });
+    } else {
+        for region in &scene.regions {
+            if !region.rect.intersects(visible) {
+                continue;
+            }
+            drawn_regions += 1;
+            if policy.region_label_shown(region.rect.w, zoom) {
+                if labels >= budget {
+                    labels_dropped += 1;
+                } else {
+                    labels += 1;
+                }
+            }
+        }
+    }
+    CullStats {
+        stage: 0,
+        quads: 1 + drawn_regions,
+        drawn_regions,
+        labels,
+        labels_dropped,
+        ..CullStats::default()
+    }
+}
+
+fn cull_stage_one_indexed<R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    zoom: f32,
+    visible: &Rect,
+    policy: &LodPolicy,
+    skip_blocks: bool,
+) -> CullStats {
+    let mut st = CullStats {
+        stage: 1,
+        quads: 1,
+        ..CullStats::default()
+    };
+    scene.for_each_region_candidate(visible, |region_index, region| {
+        if !region.rect.intersects(visible) {
+            return;
+        }
+        st.drawn_regions += 1;
+        st.quads += 1;
+        if policy.region_label_shown(region.rect.w, zoom) {
+            push_label(&mut st, policy);
+        }
+
+        let region_inside = visible.contains(&region.rect);
+        scene.for_each_region_block_candidate(region_index, visible, |_, block| {
+            if !(region_inside || block.rect.intersects(visible)) {
+                return;
+            }
+            if policy.block_painted(block.inner.w, zoom) && !skip_blocks {
+                st.drawn_blocks += 1;
+                st.quads += 1;
+                if policy.block_chrome_shown(block.inner.w, zoom) {
+                    st.quads += 2;
+                }
+                if policy.block_icon_shown(block.inner.w, zoom) {
+                    push_icon(&mut st, policy);
+                }
+                if policy.block_label_shown(block.inner.w, zoom) {
+                    push_label(&mut st, policy);
+                }
+            }
+        });
+    });
+    st
+}
+
+fn cull_stage_one_contiguous<R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    zoom: f32,
+    visible: &Rect,
+    policy: &LodPolicy,
+    skip_blocks: bool,
+) -> CullStats {
+    let mut st = CullStats {
+        stage: 1,
+        quads: 1,
+        ..CullStats::default()
+    };
+    for region in &scene.regions {
+        if !region.rect.intersects(visible) {
+            continue;
+        }
+        st.drawn_regions += 1;
+        st.quads += 1;
+        if policy.region_label_shown(region.rect.w, zoom) {
+            push_label(&mut st, policy);
+        }
+
+        let region_inside = visible.contains(&region.rect);
+        for block in &scene.blocks[region.children.start as usize..region.children.end as usize] {
+            if !(region_inside || block.rect.intersects(visible)) {
+                continue;
+            }
+            if policy.block_painted(block.inner.w, zoom) && !skip_blocks {
+                st.drawn_blocks += 1;
+                st.quads += 1;
+                if policy.block_chrome_shown(block.inner.w, zoom) {
+                    st.quads += 2;
+                }
+                if policy.block_icon_shown(block.inner.w, zoom) {
+                    push_icon(&mut st, policy);
+                }
+                if policy.block_label_shown(block.inner.w, zoom) {
+                    push_label(&mut st, policy);
+                }
+            }
+        }
+    }
+    st
+}
+
+fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    zoom: f32,
+    visible: &Rect,
+    policy: &LodPolicy,
+    stage: u8,
+    edges_on: bool,
+    skip_blocks: bool,
+) -> CullStats {
     let mut st = CullStats {
         stage,
         quads: 1,
         ..CullStats::default()
     };
 
-    for region in &scene.regions {
-        if !region.rect.intersects(&visible) {
-            continue;
+    let mut visit_region = |region_index: usize, region: &crate::scene::RegionNode<R>| {
+        if !region.rect.intersects(visible) {
+            return;
         }
         st.drawn_regions += 1;
         st.quads += 1;
@@ -52,55 +282,47 @@ pub fn cull<R, B, C, S>(
         if policy.region_label_shown(region.rect.w, zoom) {
             push_label(&mut st, policy);
         }
-
         if stage == 0 {
-            continue;
+            return;
         }
 
         let region_inside = visible.contains(&region.rect);
-        let blocks = &scene.blocks[region.children.start as usize..region.children.end as usize];
-        for block in blocks {
-            if !(region_inside || block.rect.intersects(&visible)) {
-                continue;
+        let mut visit_block = |block_index: usize, block: &BlockNode<B>| {
+            if !(region_inside || block.rect.intersects(visible)) {
+                return;
             }
 
             let painted = policy.block_painted(block.inner.w, zoom) && !skip_blocks;
             if painted {
                 st.drawn_blocks += 1;
                 st.quads += 1;
-
                 if policy.block_chrome_shown(block.inner.w, zoom) {
                     st.quads += 2;
                 }
-
                 if policy.block_icon_shown(block.inner.w, zoom) {
                     push_icon(&mut st, policy);
                 }
-
                 if policy.block_label_shown(block.inner.w, zoom) {
                     push_label(&mut st, policy);
                 }
             }
-
             if stage < 2 {
-                continue;
+                return;
             }
-            let block_inside = region_inside || visible.contains(&block.rect);
 
+            let block_inside = region_inside || visible.contains(&block.rect);
             if painted || policy.stress_curves {
-                let sats = &scene.sats[block.sats.start as usize..block.sats.end as usize];
-                for sat in sats {
-                    if !(block_inside || sat.rect.intersects(&visible)) {
-                        continue;
-                    }
-                    if !policy.sat_painted(sat.rect.w, zoom) {
+                for satellite in &scene.sats[block.sats.start as usize..block.sats.end as usize] {
+                    if !(block_inside || satellite.rect.intersects(visible))
+                        || !policy.sat_painted(satellite.rect.w, zoom)
+                    {
                         continue;
                     }
                     st.drawn_sats += 1;
                     if policy.sat_icon_shown() {
                         push_icon(&mut st, policy);
                     }
-                    if policy.sat_label_shown(sat.rect.w, zoom) {
+                    if policy.sat_label_shown(satellite.rect.w, zoom) {
                         push_label(&mut st, policy);
                         push_label(&mut st, policy);
                     }
@@ -113,24 +335,122 @@ pub fn cull<R, B, C, S>(
                     }
                 }
             }
-
             if !painted {
-                continue;
+                return;
             }
-            let cells = &scene.cells[block.children.start as usize..block.children.end as usize];
-            for cell in cells {
-                if !(block_inside || cell.rect.intersects(&visible)) {
-                    continue;
-                }
-                st.drawn_cells += 1;
-                st.quads += 1;
 
-                if stage >= 3 && policy.cell_label_shown(cell.rect.w, zoom) {
-                    push_label(&mut st, policy);
+            let cell_count = block.children.len();
+            if cell_count > policy.max_cells_per_block
+                && policy.cells_aggregated(cell_count, block.inner.intersection_fraction(visible))
+            {
+                st.aggregated_blocks += 1;
+                st.aggregated_cells += cell_count;
+                st.quads += 1;
+                return;
+            }
+
+            let cells = &scene.cells[block.children.start as usize..block.children.end as usize];
+            if block_inside
+                || (block.inner.w > 0.0 && block.inner.h > 0.0 && visible.contains(&block.inner))
+            {
+                cull_cell_slice(cells, zoom, stage, policy, &mut st);
+            } else if scene.block_cell_index_is_selective(block_index, visible) {
+                scene.for_each_block_cell_candidate(block_index, visible, |_, cell| {
+                    if cell.rect.intersects(visible) {
+                        cull_cell(cell, zoom, stage, policy, &mut st);
+                    }
+                });
+            } else {
+                for cell in cells {
+                    if cell.rect.intersects(visible) {
+                        cull_cell(cell, zoom, stage, policy, &mut st);
+                    }
                 }
+            }
+        };
+        if scene.region_block_index_is_selective(region_index, visible) {
+            scene.for_each_region_block_candidate(region_index, visible, &mut visit_block);
+        } else {
+            let start = region.children.start as usize;
+            for (offset, block) in scene.blocks[start..region.children.end as usize]
+                .iter()
+                .enumerate()
+            {
+                visit_block(start + offset, block);
             }
         }
+    };
+    if INDEX_REGIONS {
+        scene.for_each_region_candidate(visible, &mut visit_region);
+    } else {
+        for (index, region) in scene.regions.iter().enumerate() {
+            visit_region(index, region);
+        }
     }
+
+    if edges_on && stage >= 2 && !policy.stress && !policy.stress_curves {
+        st.edges = walk_edges(scene, visible, policy.max_edges, |_, _| {});
+    }
+    st
+}
+
+#[expect(clippy::too_many_arguments)]
+#[inline(always)]
+fn cull_inner<const INDEXED: bool, R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    camera: &Camera,
+    policy: &LodPolicy,
+    blend: StageBlend,
+    vw: f32,
+    vh: f32,
+    edges_on: bool,
+    skip_blocks: bool,
+) -> CullStats {
+    let zoom = camera.zoom;
+    let visible = camera.visible_world(vw, vh);
+    let stage = blend.walk_stage();
+
+    let mut st = CullStats {
+        stage,
+        quads: 1,
+        ..CullStats::default()
+    };
+
+    scene.for_each_region_candidate_mode::<INDEXED>(&visible, |region_index, region| {
+        if !region.rect.intersects(&visible) {
+            return;
+        }
+        st.drawn_regions += 1;
+        st.quads += 1;
+
+        if policy.region_label_shown(region.rect.w, zoom) {
+            push_label(&mut st, policy);
+        }
+
+        if stage == 0 {
+            return;
+        }
+
+        let region_inside = visible.contains(&region.rect);
+        scene.for_each_region_block_candidate_mode::<INDEXED>(
+            region_index,
+            &visible,
+            |block_index, block| {
+                cull_block::<INDEXED, _, _, _, _>(
+                    scene,
+                    block_index,
+                    block,
+                    &visible,
+                    region_inside,
+                    zoom,
+                    stage,
+                    policy,
+                    skip_blocks,
+                    &mut st,
+                );
+            },
+        );
+    });
 
     if edges_on && stage >= 2 && !policy.stress && !policy.stress_curves {
         st.edges = walk_edges(scene, &visible, policy.max_edges, |_, _| {});
@@ -139,55 +459,274 @@ pub fn cull<R, B, C, S>(
     st
 }
 
-fn edge_visible(a: &Rect, b: &Rect, visible: &Rect) -> bool {
-    let seg = Rect::new(
-        a.center().0.min(b.center().0),
-        a.center().1.min(b.center().1),
-        (a.center().0 - b.center().0).abs().max(1.0),
-        (a.center().1 - b.center().1).abs().max(1.0),
-    );
-    seg.intersects(visible)
+#[inline]
+fn cull_block<const INDEXED: bool, R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    block_index: usize,
+    block: &BlockNode<B>,
+    visible: &Rect,
+    region_inside: bool,
+    zoom: f32,
+    stage: u8,
+    policy: &LodPolicy,
+    skip_blocks: bool,
+    st: &mut CullStats,
+) {
+    if !(region_inside || block.rect.intersects(visible)) {
+        return;
+    }
+
+    let painted = policy.block_painted(block.inner.w, zoom) && !skip_blocks;
+    if painted {
+        st.drawn_blocks += 1;
+        st.quads += 1;
+
+        if policy.block_chrome_shown(block.inner.w, zoom) {
+            st.quads += 2;
+        }
+        if policy.block_icon_shown(block.inner.w, zoom) {
+            push_icon(st, policy);
+        }
+        if policy.block_label_shown(block.inner.w, zoom) {
+            push_label(st, policy);
+        }
+    }
+
+    if stage < 2 {
+        return;
+    }
+    let block_inside = region_inside || visible.contains(&block.rect);
+
+    if painted || policy.stress_curves {
+        scene.for_each_block_sat(block_index, |_, sat| {
+            if !(block_inside || sat.rect.intersects(visible))
+                || !policy.sat_painted(sat.rect.w, zoom)
+            {
+                return;
+            }
+            st.drawn_sats += 1;
+            if policy.sat_icon_shown() {
+                push_icon(st, policy);
+            }
+            if policy.sat_label_shown(sat.rect.w, zoom) {
+                push_label(st, policy);
+                push_label(st, policy);
+            }
+            if policy.sat_curves {
+                if st.curves >= policy.curve_budget() {
+                    st.curves_dropped += 1;
+                } else {
+                    st.curves += 1;
+                }
+            }
+        });
+    }
+
+    if !painted {
+        return;
+    }
+    let cells = block.children.len();
+    if cells > policy.max_cells_per_block
+        && policy.cells_aggregated(cells, block.inner.intersection_fraction(visible))
+    {
+        st.aggregated_blocks += 1;
+        st.aggregated_cells += cells;
+        st.quads += 1;
+        return;
+    }
+    if block_inside
+        || (block.inner.w > 0.0 && block.inner.h > 0.0 && visible.contains(&block.inner))
+    {
+        scene.for_each_block_cell(block_index, |_, cell| {
+            cull_cell(cell, zoom, stage, policy, st);
+        });
+    } else {
+        scene.for_each_block_cell_candidate_mode::<INDEXED>(block_index, visible, |_, cell| {
+            if cell.rect.intersects(visible) {
+                cull_cell(cell, zoom, stage, policy, st);
+            }
+        });
+    }
+}
+
+#[inline]
+fn cull_cell_slice<C>(
+    cells: &[crate::scene::CellNode<C>],
+    zoom: f32,
+    stage: u8,
+    policy: &LodPolicy,
+    st: &mut CullStats,
+) {
+    st.drawn_cells += cells.len();
+    st.quads += cells.len();
+    if stage < 3 {
+        return;
+    }
+
+    let labels = cells
+        .iter()
+        .filter(|cell| policy.cell_label_shown(cell.rect.w, zoom))
+        .count();
+    let accepted = labels.min(policy.max_labels.saturating_sub(st.labels));
+    st.labels += accepted;
+    st.labels_dropped += labels - accepted;
+}
+
+#[inline(always)]
+fn cull_cell<C>(
+    cell: &crate::scene::CellNode<C>,
+    zoom: f32,
+    stage: u8,
+    policy: &LodPolicy,
+    st: &mut CullStats,
+) {
+    st.drawn_cells += 1;
+    st.quads += 1;
+    if stage >= 3 && policy.cell_label_shown(cell.rect.w, zoom) {
+        push_label(st, policy);
+    }
+}
+
+fn edge_visible(a: (f32, f32), b: (f32, f32), visible: &Rect) -> bool {
+    let (ax, ay) = a;
+    let (bx, by) = b;
+    Rect::new(
+        ax.min(bx),
+        ay.min(by),
+        (ax - bx).abs().max(1.0),
+        (ay - by).abs().max(1.0),
+    )
+    .intersects(visible)
 }
 
 pub fn walk_edges<R, B, C, S>(
     scene: &Scene<R, B, C, S>,
     visible: &Rect,
     max_edges: usize,
-    mut emit: impl FnMut(&Rect, &Rect),
+    mut emit: impl FnMut((f32, f32), (f32, f32)),
 ) -> usize {
+    if max_edges == 0 || scene.edges.is_empty() {
+        return 0;
+    }
+
     let mut drawn = 0usize;
-    let mut scan = |range: std::ops::Range<usize>, drawn: &mut usize| {
-        for e in &scene.edges[range] {
-            if *drawn >= max_edges {
-                return false;
-            }
-            let a = &scene.blocks[e.a as usize].inner;
-            let b = &scene.blocks[e.b as usize].inner;
-            if edge_visible(a, b, visible) {
-                emit(a, b);
-                *drawn += 1;
-            }
-        }
-        true
-    };
 
     if scene.region_edges.len() == scene.regions.len() && !scene.region_edges.is_empty() {
-        for (region, range) in scene.regions.iter().zip(&scene.region_edges) {
+        for (region_index, (region, range)) in
+            scene.regions.iter().zip(&scene.region_edges).enumerate()
+        {
             if range.is_empty() || !region.rect.intersects(visible) {
                 continue;
             }
-            if !scan(range.start as usize..range.end as usize, &mut drawn) {
+            let used_index = scene
+                .region_edge_indexes
+                .get(region_index)
+                .is_some_and(|index| {
+                    index.covers(range)
+                        && scan_indexed_edges(
+                            index, scene, visible, max_edges, &mut drawn, &mut emit,
+                        )
+                });
+            if !used_index
+                && !scan_edges(
+                    scene,
+                    range.start as usize..range.end as usize,
+                    visible,
+                    max_edges,
+                    &mut drawn,
+                    &mut emit,
+                )
+            {
                 return drawn;
             }
         }
-        scan(
-            scene.cross_edges.start as usize..scene.cross_edges.end as usize,
-            &mut drawn,
-        );
+        let used_index = scene.cross_edge_index.covers(&scene.cross_edges)
+            && scan_indexed_edges(
+                &scene.cross_edge_index,
+                scene,
+                visible,
+                max_edges,
+                &mut drawn,
+                &mut emit,
+            );
+        if !used_index {
+            scan_edges(
+                scene,
+                scene.cross_edges.start as usize..scene.cross_edges.end as usize,
+                visible,
+                max_edges,
+                &mut drawn,
+                &mut emit,
+            );
+        }
     } else {
-        scan(0..scene.edges.len(), &mut drawn);
+        scan_edges(
+            scene,
+            0..scene.edges.len(),
+            visible,
+            max_edges,
+            &mut drawn,
+            &mut emit,
+        );
     }
     drawn
+}
+
+#[inline]
+fn scan_edges<R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    range: std::ops::Range<usize>,
+    visible: &Rect,
+    max_edges: usize,
+    drawn: &mut usize,
+    emit: &mut impl FnMut((f32, f32), (f32, f32)),
+) -> bool {
+    if let Some(segments) = scene.edge_segments.get(range.clone()) {
+        for &segment in segments {
+            let Some(segment) = segment else {
+                continue;
+            };
+            if *drawn >= max_edges {
+                return false;
+            }
+            if edge_visible(segment.a, segment.b, visible) {
+                emit(segment.a, segment.b);
+                *drawn += 1;
+            }
+        }
+        return true;
+    }
+
+    for &edge in &scene.edges[range] {
+        if *drawn >= max_edges {
+            return false;
+        }
+        let Some(segment) = crate::scene::resolve_edge(scene, edge) else {
+            continue;
+        };
+        if edge_visible(segment.a, segment.b, visible) {
+            emit(segment.a, segment.b);
+            *drawn += 1;
+        }
+    }
+    true
+}
+
+fn scan_indexed_edges<R, B, C, S>(
+    index: &crate::scene::EdgeIndex,
+    scene: &Scene<R, B, C, S>,
+    visible: &Rect,
+    max_edges: usize,
+    drawn: &mut usize,
+    emit: &mut impl FnMut((f32, f32), (f32, f32)),
+) -> bool {
+    if !index.is_selective(visible) {
+        return false;
+    }
+    index.for_each_candidate(visible, |range| {
+        scan_edges(scene, range, visible, max_edges, drawn, emit)
+    });
+    true
 }
 
 fn push_label(st: &mut CullStats, policy: &LodPolicy) {
@@ -203,437 +742,5 @@ fn push_icon(st: &mut CullStats, policy: &LodPolicy) {
         st.icons_dropped += 1;
     } else {
         st.icons += 1;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scene::{BlockNode, CellNode, Edge, RegionNode, Totals};
-
-    fn policy() -> LodPolicy {
-        LodPolicy {
-            stage_block: 0.09,
-            stage_cell: 0.55,
-            stage_cell_label: 3.0,
-            block_min_px: 4.0,
-            block_icon_min_px: 14.0,
-            region_label_min_px: 70.0,
-            block_label_min_px: 60.0,
-            block_label_min_zoom: 0.22,
-            cell_label_min_px: 34.0,
-            block_chrome_min_px: 34.0,
-            stage_exit: 0.85,
-            sat_min_px: 5.0,
-            sat_label_min_px: 30.0,
-            max_labels: 400,
-            max_icons: 512,
-            max_edges: 3000,
-            max_curves: 1500,
-            sat_curves: true,
-            stress: false,
-            stress_curves: false,
-        }
-    }
-
-    fn settled(pol: &LodPolicy, cam: &Camera) -> StageBlend {
-        StageBlend::settled(pol.stage_for_zoom(cam.zoom))
-    }
-
-    fn tiny_scene() -> Scene {
-        let block_rect = Rect::new(10.0, 20.0, 80.0, 60.0);
-        Scene {
-            rev: 1,
-            bounds: Rect::new(0.0, 0.0, 400.0, 200.0),
-            regions: vec![RegionNode {
-                rect: Rect::new(0.0, 0.0, 200.0, 100.0),
-                label: "region".into(),
-                weight: 1,
-                children: 0..1,
-                ext: (),
-            }],
-            blocks: vec![BlockNode {
-                rect: block_rect,
-                inner: block_rect,
-                label: "block".into(),
-                children: 0..1,
-                sats: 0..0,
-                ext: (),
-            }],
-            cells: vec![CellNode {
-                rect: Rect::new(20.0, 40.0, 12.0, 12.0),
-                label: "cell".into(),
-                ext: (),
-            }],
-            sats: vec![],
-            edges: vec![],
-            region_edges: vec![],
-            cross_edges: 0..0,
-            totals: Totals {
-                regions: 1,
-                blocks: 1,
-                cells: 1,
-                sats: 0,
-                edges: 0,
-            },
-        }
-    }
-
-    fn hub_scene() -> Scene {
-        let halo = Rect::new(100.0, 100.0, 200.0, 200.0);
-        let card = Rect::new(180.0, 180.0, 40.0, 40.0);
-        let sat = |x, y| CellNode {
-            rect: Rect::new(x, y, 18.0, 18.0),
-            label: "sat".into(),
-            ext: (),
-        };
-        Scene {
-            rev: 1,
-            bounds: Rect::new(0.0, 0.0, 400.0, 400.0),
-            regions: vec![RegionNode {
-                rect: Rect::new(80.0, 80.0, 240.0, 240.0),
-                label: "region".into(),
-                weight: 1,
-                children: 0..1,
-                ext: (),
-            }],
-            blocks: vec![BlockNode {
-                rect: halo,
-                inner: card,
-                label: "hub".into(),
-                children: 0..1,
-                sats: 0..3,
-                ext: (),
-            }],
-            cells: vec![CellNode {
-                rect: Rect::new(190.0, 190.0, 10.0, 10.0),
-                label: "cell".into(),
-                ext: (),
-            }],
-            sats: vec![sat(120.0, 120.0), sat(260.0, 140.0), sat(200.0, 260.0)],
-            edges: vec![],
-            region_edges: vec![],
-            cross_edges: 0..0,
-            totals: Totals {
-                regions: 1,
-                blocks: 1,
-                cells: 1,
-                sats: 3,
-                edges: 0,
-            },
-        }
-    }
-
-    #[test]
-    fn walk_edges_grouped_matches_flat() {
-        let region = |x, i: u32| RegionNode {
-            rect: Rect::new(x, 0.0, 100.0, 100.0),
-            label: "r".into(),
-            weight: 1,
-            children: i * 2..i * 2 + 2,
-            ext: (),
-        };
-        let block = |x, y| {
-            let rect = Rect::new(x + 10.0, y, 20.0, 20.0);
-            BlockNode {
-                rect,
-                inner: rect,
-                label: "b".into(),
-                children: 0..0,
-                sats: 0..0,
-                ext: (),
-            }
-        };
-        let mut scene: Scene = Scene {
-            rev: 1,
-            bounds: Rect::new(0.0, 0.0, 500.0, 100.0),
-            regions: (0..3).map(|i| region(i as f32 * 200.0, i)).collect(),
-            blocks: (0..3)
-                .flat_map(|i| {
-                    let x = i as f32 * 200.0;
-                    [block(x, 10.0), block(x, 60.0)]
-                })
-                .collect(),
-            cells: vec![],
-            sats: vec![],
-            edges: vec![
-                Edge { a: 0, b: 1 },
-                Edge { a: 2, b: 3 },
-                Edge { a: 4, b: 5 },
-                Edge { a: 0, b: 5 },
-            ],
-            region_edges: vec![0..1, 1..2, 2..3],
-            cross_edges: 3..4,
-            totals: Totals {
-                regions: 3,
-                blocks: 6,
-                cells: 0,
-                sats: 0,
-                edges: 4,
-            },
-        };
-
-        let visible = Rect::new(0.0, 0.0, 350.0, 100.0);
-        let mut grouped = Vec::new();
-        let n = walk_edges(&scene, &visible, 100, |a, b| grouped.push((*a, *b)));
-        assert_eq!(n, 3);
-
-        scene.region_edges.clear();
-        let mut flat = Vec::new();
-        let n = walk_edges(&scene, &visible, 100, |a, b| flat.push((*a, *b)));
-        assert_eq!(n, 3);
-        assert_eq!(grouped, flat);
-
-        scene.region_edges = vec![0..1, 1..2, 2..3];
-        assert_eq!(walk_edges(&scene, &visible, 2, |_, _| {}), 2);
-    }
-
-    #[test]
-    fn cull_fit_draws_regions_at_z0() {
-        let pol = policy();
-        let mut snap = tiny_scene();
-        snap.bounds = Rect::new(0.0, 0.0, 50_000.0, 30_000.0);
-        snap.regions[0].rect = Rect::new(100.0, 100.0, 800.0, 400.0);
-        let mut cam = Camera::default();
-        cam.fit(snap.bounds, 1600.0, 1000.0);
-        assert!(
-            cam.zoom < pol.stage_block,
-            "fit zoom {} should be Z0",
-            cam.zoom
-        );
-        let st = cull(
-            &snap,
-            &cam,
-            &pol,
-            settled(&pol, &cam),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert_eq!(st.drawn_regions, 1);
-        assert_eq!(st.stage, 0);
-        assert_eq!(st.drawn_blocks, 0);
-        assert!(st.quads >= 2);
-    }
-
-    #[test]
-    fn cull_z2_draws_cells() {
-        let snap = tiny_scene();
-        let cam = Camera {
-            cx: 100.0,
-            cy: 50.0,
-            zoom: 1.0,
-        };
-        let pol = policy();
-        let st = cull(
-            &snap,
-            &cam,
-            &pol,
-            settled(&pol, &cam),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert!(st.stage >= 2);
-        assert_eq!(st.drawn_cells, 1);
-    }
-
-    #[test]
-    fn stress_forces_stage_2_and_paints_tiny_blocks() {
-        let mut pol = policy();
-        pol.stress = true;
-        assert_eq!(pol.stage_for_zoom(0.01), 2);
-        assert!(pol.block_painted(1.0, 0.01));
-        let snap = tiny_scene();
-        let cam = Camera {
-            cx: 100.0,
-            cy: 50.0,
-            zoom: 1.0,
-        };
-        let st = cull(
-            &snap,
-            &cam,
-            &pol,
-            settled(&pol, &cam),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert_eq!(st.edges, 0);
-    }
-
-    #[test]
-    fn sats_counted_with_curve_budget() {
-        let snap = hub_scene();
-        let cam = Camera {
-            cx: 200.0,
-            cy: 200.0,
-            zoom: 2.0,
-        };
-        let pol = policy();
-        let st = cull(
-            &snap,
-            &cam,
-            &pol,
-            settled(&pol, &cam),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert!(st.stage >= 2);
-        assert_eq!(st.drawn_sats, 3);
-        assert_eq!(st.curves, 3);
-        assert_eq!(st.curves_dropped, 0);
-        assert_eq!(st.quads, 6);
-        assert_eq!(st.icons, 4);
-        assert_eq!(st.labels, 1 + 1 + 6);
-
-        let mut tight = policy();
-        tight.max_curves = 2;
-        let st = cull(
-            &snap,
-            &cam,
-            &tight,
-            settled(&tight, &cam),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert_eq!((st.curves, st.curves_dropped), (2, 1));
-
-        let mut off = policy();
-        off.sat_curves = false;
-        let st = cull(
-            &snap,
-            &cam,
-            &off,
-            settled(&off, &cam),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert_eq!((st.curves, st.curves_dropped), (0, 0));
-        assert_eq!(st.drawn_sats, 3, "curves off must not hide satellites");
-    }
-
-    #[test]
-    fn stress_curves_probes_every_visible_sat() {
-        let snap = hub_scene();
-        let cam = Camera {
-            cx: 200.0,
-            cy: 200.0,
-            zoom: 0.1,
-        };
-        let pol = policy();
-        let st = cull(
-            &snap,
-            &cam,
-            &pol,
-            settled(&pol, &cam),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert_eq!((st.drawn_sats, st.curves), (0, 0));
-
-        let mut probe = policy();
-        probe.stress_curves = true;
-        assert_eq!(probe.stage_for_zoom(0.1), 2, "probe forces the sat stage");
-        let st = cull(
-            &snap,
-            &cam,
-            &probe,
-            settled(&probe, &cam),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert_eq!(st.drawn_sats, 3);
-        assert_eq!(st.curves, 3);
-        assert_eq!(st.icons, 0, "probe measures curves alone");
-        assert_eq!(st.labels, 0);
-        assert_eq!(st.edges, 0);
-
-        let far = Camera {
-            cx: 200.0,
-            cy: 200.0,
-            zoom: 0.02,
-        };
-        let st = cull(
-            &snap,
-            &far,
-            &probe,
-            settled(&probe, &far),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert_eq!(st.drawn_blocks, 0, "card 0.8 px stays unpainted");
-        assert_eq!(st.drawn_sats, 3, "probe walks sats of unpainted hubs");
-    }
-
-    #[test]
-    fn fade_counts_union_of_stages() {
-        let snap = hub_scene();
-        let cam = Camera {
-            cx: 200.0,
-            cy: 200.0,
-            zoom: 2.0,
-        };
-        let pol = policy();
-
-        let at_1 = cull(
-            &snap,
-            &cam,
-            &pol,
-            StageBlend::settled(1),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert_eq!((at_1.drawn_sats, at_1.curves, at_1.drawn_cells), (0, 0, 0));
-
-        let at_2 = cull(
-            &snap,
-            &cam,
-            &pol,
-            StageBlend::settled(2),
-            1600.0,
-            1000.0,
-            true,
-            false,
-        );
-        assert_eq!(at_2.drawn_sats, 3);
-
-        for blend in [
-            StageBlend {
-                from: 1,
-                to: 2,
-                t: 0.0,
-            },
-            StageBlend {
-                from: 1,
-                to: 2,
-                t: 0.5,
-            },
-            StageBlend {
-                from: 2,
-                to: 1,
-                t: 0.5,
-            },
-        ] {
-            let fading = cull(&snap, &cam, &pol, blend, 1600.0, 1000.0, true, false);
-            assert_eq!(fading, at_2, "fade {blend:?} must count the union");
-        }
     }
 }

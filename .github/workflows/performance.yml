@@ -1,0 +1,120 @@
+name: Performance
+
+# Runs on demand only: the labelled runner is the development desktop, which
+# is off at night and busy by day, so a schedule would either queue into a
+# void or measure the person using the machine rather than the change. A
+# perf-sensitive merge asks for a run with workflow_dispatch and gives the
+# machine thirty quiet minutes.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: i5-12600K baseline
+    runs-on: [self-hosted, Linux, X64, k10s-perf-i5-12600k]
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      RESULT_DIR: target/benchmark-results
+      PERF_CPU: 4
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Verify pinned toolchain
+        run: rustup show
+
+      - name: Verify benchmark core
+        run: |
+          test "$(uname -m)" = x86_64
+          test "$(uname -r)" = 7.1.5-arch1-2
+          test "$(rustc --version)" = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+          grep -Fqx '12th Gen Intel(R) Core(TM) i5-12600K' <(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | sort -u)
+          test "$(cat "/sys/devices/system/cpu/cpu${PERF_CPU}/cpufreq/scaling_governor")" = powersave
+          test "$(cat /sys/devices/system/cpu/intel_pstate/no_turbo)" = 0
+          test "$(cat "/sys/devices/system/cpu/cpu${PERF_CPU}/cpufreq/cpuinfo_max_freq")" -ge 4500000
+          taskset --cpu-list "$PERF_CPU" true
+
+      - name: Create result directory
+        run: mkdir -p "$RESULT_DIR"
+
+      - name: Benchmark atlas culling
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-atlas --bench cull --features testing
+          -- --json > "$RESULT_DIR/atlas-cull.json"
+
+      - name: Benchmark atlas fan-out
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-atlas --bench fanout --features testing
+          -- --json > "$RESULT_DIR/atlas-fanout.json"
+
+      - name: Benchmark world fan-out
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-world --bench fanout_cull
+          -- --json > "$RESULT_DIR/world-fanout-cull.json"
+
+      - name: Benchmark publication
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-world --bench publish
+          -- --json > "$RESULT_DIR/world-publish.json"
+
+      - name: Benchmark editor engine
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-edit --bench edit
+          -- --json > "$RESULT_DIR/editor-edit.json"
+
+      - name: Benchmark shell state machines
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-shell --bench shell --features test-support
+          -- --json > "$RESULT_DIR/shell-state.json"
+
+      - name: Benchmark map walk
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-map --bench walk --features testing
+          -- --json > "$RESULT_DIR/map-walk.json"
+
+      - name: Benchmark map allocations
+        run: >-
+          taskset --cpu-list "$PERF_CPU"
+          cargo bench --locked -p k10s-map --bench walk
+          --features testing,bench-alloc
+          -- --json > "$RESULT_DIR/map-alloc.json"
+
+      - name: Benchmark full GPUI paint allocations
+        env:
+          CARGO_BUILD_JOBS: 1
+          RUST_MIN_STACK: 67108864
+        run: >-
+          taskset --cpu-list "$PERF_CPU" cargo run --release --locked
+          --manifest-path tools/k10s-paint-bench/Cargo.toml
+          -- --json > "$RESULT_DIR/map-paint.json"
+
+      - name: Compare hardware-labelled baseline
+        run: >-
+          cargo run --quiet --locked -p k10s-bench --bin compare --
+          benchmarks/baselines/linux-x86_64-i5-12600k/manifest.json
+          "$RESULT_DIR"
+
+      - name: Upload raw benchmark results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: benchmark-results-i5-12600k
+          path: ${{ env.RESULT_DIR }}/*.json
+          if-no-files-found: warn
+          retention-days: 30

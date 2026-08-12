@@ -10,9 +10,10 @@ hexagon dropped, and remaining paths collapsed to a plain white fill; gpui
 rasterizes SVGs as monochrome alpha masks tinted at paint time, so only the
 hexagon outline + resource glyph survive as the mask.
 
-`pvc.svg`, `svc.svg`, `cm.svg`, `secret.svg` (satellite glyphs) are original
-k10s minimal masks, not derived from the Kubernetes icon set; no attribution
-required.
+`pvc.svg`, `svc.svg`, `cm.svg`, `secret.svg` (satellite glyphs) and
+`unknown.svg` (the fallback drawn for any kind or vendor with no compiled-in
+glyph, including CRDs) are original k10s minimal masks, not derived from the
+Kubernetes icon set; no attribution required.
 
 `tools/*.svg` are unmodified brand icons from the simple-icons project
 (v16.27.0), <https://github.com/simple-icons/simple-icons>, released under
