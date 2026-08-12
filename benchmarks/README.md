@@ -605,3 +605,30 @@ samples agree on. `map-paint.json` alone was recorded at 4cb8f1c, because the
 excluded tool would not build before that commit handed its lockfile the
 `rustc-hash` line k10s-world was owed — nothing in any suite's dependency
 graph differs between the two commits.
+
+## 2026-08-12 — the machine moved, the code did not
+
+The §5.5 slice-1 collection (usage metrics: k10s-data, k10s-shell, k10s-app)
+failed one check in ~5,000: `world fan-out cull` `ns-fanout` `objects=4000
+ns_degree=831 wl_degree=50` `Z3 deepest wl` `p50_no_edges_ns`, 73.453 →
+85.397 ns (1.16x). A targeted idle re-run answered 84.844 — two samples
+agreeing 16% above baseline is not the one-case wobble this file has recorded
+three times, so it was treated as real and traced.
+
+It is not the code. Nothing in the suite's link graph changed: `git diff
+65c9fa6..HEAD` over k10s-world, k10s-atlas, k10s-core, k10s-clustergen,
+k10s-bench and both Cargo manifests is empty, the slice's own diff touches
+none of them, and the toolchain is the recording's own 1.97.1 — the bench
+binary is the code the baseline gated. What did change is the machine: the
+baseline was recorded on kernel 7.1.5-arch1-2 (its manifest says so), and
+pacman.log shows `linux 7.1.5.arch1-2 → 7.1.8.arch1-3` and `intel-ucode
+20260512 → 20260811` installed at 2026-08-11T23:18 — after the recording,
+before this boot. A microcode revision moving a 12-nanosecond loop by a few
+nanoseconds is the expected size of this class.
+
+The baseline was deliberately NOT refreshed: this tree is uncommitted, which
+is the provenance both dirty-baseline incidents had. Until every suite is
+re-recorded from a clean commit on the new kernel and microcode, this one
+case is expected to flag on this machine, and a regression hiding exactly
+there would be masked by the known +16% — one case, one metric, named here
+so the next collection reads this instead of re-deriving it.
