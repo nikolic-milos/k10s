@@ -35,7 +35,7 @@ jobs:
       - name: Verify benchmark core
         run: |
           test "$(uname -m)" = x86_64
-          test "$(uname -r)" = 7.1.5-arch1-2
+          test "$(uname -r)" = 7.1.8-arch1-3
           test "$(rustc --version)" = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
           grep -Fqx '12th Gen Intel(R) Core(TM) i5-12600K' <(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | sort -u)
           test "$(cat "/sys/devices/system/cpu/cpu${PERF_CPU}/cpufreq/scaling_governor")" = powersave

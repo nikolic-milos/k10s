@@ -632,3 +632,30 @@ re-recorded from a clean commit on the new kernel and microcode, this one
 case is expected to flag on this machine, and a regression hiding exactly
 there would be masked by the known +16% — one case, one metric, named here
 so the next collection reads this instead of re-deriving it.
+
+## 2026-08-12 — re-recorded on the kernel the machine now runs
+
+The section above traced the slice-1 collection's one flag to `linux
+7.1.5.arch1-2 → 7.1.8.arch1-3` and `intel-ucode 20260512 → 20260811`,
+installed after the 2026-08-11 recording. The perf gate then confirmed the
+diagnosis in its own way: its environment pin — `uname -r = 7.1.5-arch1-2` —
+failed closed on the first dispatch after the reboot, which is that check
+doing its job.
+
+Every suite was re-recorded from a clean build of 80f4b18 (`cargo clean`
+first, all 40.5 GiB), twice, on an idle machine pinned to CPU 4. The two
+runs gate each other at 5,050 checks with zero flags — cleaner than the
+previous recording's pair, which disagreed on one case. The second run is
+installed; the first is its independent witness and also passes the
+installed gate whole.
+
+What the kernel and microcode actually moved, case-level, old → new:
+`shell state` `tree-5k` `read`/`read-and-apply` p50 955.5/958.6 µs →
+1,111.6/1,113.0 µs (+16% — filesystem walks, the syscall-heavy class a
+mitigation or microcode change taxes first; both remain far inside their
+budgets and are not keystroke-gated). The `world fan-out cull` `ns-fanout`
+`Z3 deepest wl` `p50_no_edges_ns` that flagged the slice-1 collection now
+reads 83.5 installed with 90.8 in the witness run — its home moved from
+73.5 to the mid-80s with more spread than it used to carry. Everything
+else re-recorded within the old gates. The workflow's kernel pin moves to
+7.1.8-arch1-3 with this recording.
