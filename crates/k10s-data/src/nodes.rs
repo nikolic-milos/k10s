@@ -372,7 +372,7 @@ fn roles_text(node: &Node) -> String {
 // The scheduler's effective request: init containers run in sequence (the
 // largest one is the floor), restartable init containers -- sidecars -- keep
 // running and accumulate on top of the app containers.
-fn effective_request(spec: &PodSpec, key: &str, parse: fn(&str) -> Option<i64>) -> i64 {
+pub(crate) fn effective_request(spec: &PodSpec, key: &str, parse: fn(&str) -> Option<i64>) -> i64 {
     let request = |container: &Container| {
         container
             .resources

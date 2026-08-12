@@ -314,7 +314,7 @@ fn terminal_text(chunk: &LogChunk) -> String {
 
 // The pod's `spec.selector` as a label-selector expression the list endpoint
 // accepts. Deterministic: keys sorted within each half.
-fn selector_string(workload: &serde_json::Value) -> Result<String, &'static str> {
+pub(crate) fn selector_string(workload: &serde_json::Value) -> Result<String, &'static str> {
     let Some(selector) = workload.get("spec").and_then(|s| s.get("selector")) else {
         return Err("this workload declares no pod selector, so its pods cannot be found");
     };
