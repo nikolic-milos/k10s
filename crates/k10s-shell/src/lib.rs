@@ -85,13 +85,14 @@ pub use actions::*;
 pub use bindings::{input_suppressors, keybindings};
 pub use item::{Item, ItemHandle};
 pub use provider::{
-    ApplyOutcome, ApplyRequest, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest,
+    ApplyOutcome, ApplyRequest, Bytes, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest,
     Connection, ContainersOutcome, ContextRow, DemoOutcome, DescribeRequest, Detail, DocOutcome,
     EventRow, ExecEvent, ExecRequest, ExecSession, ForwardOutcome, ForwardRequest, ForwardRow,
     ForwardState, KindRow, LaunchProvider, LogChunk, LogRequest, LogStop, ManifestOutcome,
-    NullExecSession, NullLaunchProvider, NullProvider, ProviderFactory, ProviderSlot, ReadProvider,
-    Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome, SchemaSource, SchemaTextOutcome,
-    TableColumn, TableOutcome, TablePage, TableRow, WorkloadLogRequest,
+    Millicores, NullExecSession, NullLaunchProvider, NullProvider, ProviderFactory, ProviderSlot,
+    ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome, SchemaSource,
+    SchemaTextOutcome, TableColumn, TableOutcome, TablePage, TableRow, UsageOutcome, UsageRequest,
+    UsageSample, UsageSource, UsageTarget, WorkloadLogRequest,
 };
 pub use selection::{LogTarget, Selection};
 pub use workspace::{ConfigPaths, Workspace};

@@ -201,6 +201,34 @@ impl k10s_shell::ReadProvider for PlaneProvider {
         k10s_shell::LogStop::new(move || drop(stop))
     }
 
+    fn poll_usage(
+        &self,
+        request: &k10s_shell::UsageRequest,
+        on_update: Box<dyn Fn(k10s_shell::UsageOutcome) + Send + Sync>,
+    ) -> k10s_shell::LogStop {
+        let request = k10s_data::metrics::UsageRequest {
+            namespace: request.namespace.clone(),
+            target: match &request.target {
+                k10s_shell::UsageTarget::Pod { name } => {
+                    k10s_data::metrics::UsageTarget::Pod { name: name.clone() }
+                }
+                k10s_shell::UsageTarget::Workload { kind, name } => {
+                    k10s_data::metrics::UsageTarget::Workload {
+                        kind: *kind,
+                        name: name.clone(),
+                    }
+                }
+            },
+            // The cadence is policy and it lives here, not with the view.
+            interval: k10s_data::metrics::USAGE_POLL_INTERVAL,
+        };
+        let stop = self.reader.poll_usage(
+            request,
+            Box::new(move |outcome| on_update(usage_outcome(outcome))),
+        );
+        k10s_shell::LogStop::new(move || drop(stop))
+    }
+
     fn open_forward(
         &self,
         request: &k10s_shell::ForwardRequest,
@@ -283,6 +311,34 @@ fn adapt_chunk(chunk: k10s_data::logs::LogChunk) -> k10s_shell::LogChunk {
         LogChunk::Ended { why } => k10s_shell::LogChunk::Ended(why.to_string()),
         LogChunk::Denied { what } => k10s_shell::LogChunk::Denied(what),
         LogChunk::Failed { why, .. } => k10s_shell::LogChunk::Failed(why),
+    }
+}
+
+fn usage_outcome(outcome: k10s_data::metrics::UsageOutcome) -> k10s_shell::UsageOutcome {
+    use k10s_data::metrics::{UsageOutcome, UsageSource};
+    match outcome {
+        UsageOutcome::Usage(sample) => k10s_shell::UsageOutcome::Usage(k10s_shell::UsageSample {
+            cpu: sample.cpu.map(|cpu| k10s_shell::Millicores(cpu.0)),
+            memory: sample.memory.map(|memory| k10s_shell::Bytes(memory.0)),
+            cpu_request: sample.cpu_request.map(|cpu| k10s_shell::Millicores(cpu.0)),
+            cpu_limit: sample.cpu_limit.map(|cpu| k10s_shell::Millicores(cpu.0)),
+            memory_request: sample
+                .memory_request
+                .map(|memory| k10s_shell::Bytes(memory.0)),
+            memory_limit: sample
+                .memory_limit
+                .map(|memory| k10s_shell::Bytes(memory.0)),
+            source: match sample.source {
+                UsageSource::MetricsServer => k10s_shell::UsageSource::MetricsServer,
+                UsageSource::Kubelet => k10s_shell::UsageSource::Kubelet,
+            },
+            pods_measured: sample.pods_measured,
+            pods_total: sample.pods_total,
+            truncated: sample.truncated,
+        }),
+        UsageOutcome::Denied { what } => k10s_shell::UsageOutcome::Denied(what),
+        UsageOutcome::Failed { why, .. } => k10s_shell::UsageOutcome::Failed(why),
+        UsageOutcome::Absent { why } => k10s_shell::UsageOutcome::Absent(why),
     }
 }
 
