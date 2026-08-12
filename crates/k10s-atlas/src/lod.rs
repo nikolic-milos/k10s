@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LodPolicy {
     pub stage_block: f32,
     pub stage_cell: f32,
@@ -18,6 +18,7 @@ pub struct LodPolicy {
     pub max_icons: usize,
     pub max_edges: usize,
     pub max_curves: usize,
+    pub max_cells_per_block: usize,
     pub sat_curves: bool,
 
     pub stress: bool,
@@ -26,6 +27,8 @@ pub struct LodPolicy {
 }
 
 impl LodPolicy {
+    const MIN_AGGREGATE_VISIBLE_FRACTION: f32 = 0.125;
+
     pub fn stage_for_zoom(&self, zoom: f32) -> u8 {
         let stage = if zoom >= self.stage_cell {
             2 + (zoom >= self.stage_cell_label) as u8
@@ -65,9 +68,24 @@ impl LodPolicy {
         block_w * zoom >= self.block_min_px || self.stress
     }
 
+    /// Whether a workload shows its glyph.
+    ///
+    /// The threshold means "this workload is more than a speck", not "this card
+    /// is big enough to hold an icon" -- how big the glyph is, is decided by the
+    /// space the workload owns, and is not this gate's business. The old
+    /// threshold asked the second question and is why an icon set of thirty-five
+    /// vendor marks was invisible at the one zoom -- namespaces in view, cards
+    /// too small to read -- where recognising a workload at a glance is the
+    /// entire job.
+    ///
+    /// It takes the CARD's width rather than the halo's for a measured reason:
+    /// every caller has already loaded `inner.w` for `block_painted`, and asking
+    /// this question about `rect.w` instead adds a second load to a loop that
+    /// runs once per block. That cost 1.13-1.17x across the `Z3 deepest wl` and
+    /// `Z2 widest ns` cull cases with the icon count held identical.
     #[inline]
     pub fn block_icon_shown(&self, block_w: f32, zoom: f32) -> bool {
-        block_w * zoom >= self.block_icon_min_px && !self.stress
+        block_w * zoom >= self.block_icon_min_px && !self.stress && !self.stress_curves
     }
 
     #[inline]
@@ -112,6 +130,14 @@ impl LodPolicy {
         } else {
             self.max_curves
         }
+    }
+
+    #[inline]
+    pub fn cells_aggregated(&self, cells: usize, visible_fraction: f32) -> bool {
+        cells > self.max_cells_per_block
+            && visible_fraction >= Self::MIN_AGGREGATE_VISIBLE_FRACTION
+            && !self.stress
+            && !self.stress_curves
     }
 }
 
@@ -236,6 +262,7 @@ mod tests {
             max_icons: 512,
             max_edges: 3000,
             max_curves: 1500,
+            max_cells_per_block: 1024,
             sat_curves: true,
             stress: false,
             stress_curves: false,
@@ -263,6 +290,20 @@ mod tests {
         pol.stress = true;
         assert_eq!(pol.stage_target(0, 0.01), 2);
         assert_eq!(pol.stage_target(3, 0.01), 2);
+    }
+
+    #[test]
+    fn aggregate_lod_requires_both_fan_out_and_visible_area() {
+        let mut pol = policy();
+        assert!(!pol.cells_aggregated(pol.max_cells_per_block, 1.0));
+        assert!(!pol.cells_aggregated(pol.max_cells_per_block + 1, 0.124));
+        assert!(pol.cells_aggregated(pol.max_cells_per_block + 1, 0.125));
+
+        pol.stress = true;
+        assert!(!pol.cells_aggregated(usize::MAX, 1.0));
+        pol.stress = false;
+        pol.stress_curves = true;
+        assert!(!pol.cells_aggregated(usize::MAX, 1.0));
     }
 
     #[test]

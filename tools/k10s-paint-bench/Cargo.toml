@@ -1,0 +1,26 @@
+[package]
+name = "k10s-paint-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+k10s-atlas = { path = "../../crates/k10s-atlas", features = ["testing"] }
+k10s-clustergen = { path = "../../crates/k10s-clustergen" }
+k10s-core = { path = "../../crates/k10s-core" }
+k10s-map = { path = "../../crates/k10s-map", features = ["testing", "bench-alloc"] }
+k10s-world = { path = "../../crates/k10s-world" }
+
+gpui = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306", features = ["test-support"] }
+crossbeam-channel = "0.5"
+futures = "0.3"
+stats_alloc = "0.1.10"
+
+[patch.crates-io]
+stacksafe-macro = { path = "../../third-party/stacksafe-macro" }
+xcb = { git = "https://github.com/rust-x-bindings/rust-xcb", rev = "ae3b2cd080e78173223038ccbebdc644eaf4a9ad" }

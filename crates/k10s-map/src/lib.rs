@@ -1,139 +1,346 @@
+//! The GPUI painter for the Starmap.
+//!
+//! `frame::walk` is the one traversal, shared by the window painter and every
+//! headless sink through `FrameSink`; in debug builds each painted frame is
+//! re-derived by the `k10s-atlas` cull oracle and must agree counter for
+//! counter. Painting is damage-driven -- zero paints at idle under
+//! `--churn 0` is a gated invariant -- and the paint path must not allocate
+//! per frame at steady state: labels come from a bounded shaped-text cache
+//! that only serves settled frames, and the `bench-alloc` ratchet holds the
+//! walk at zero allocations.
+
 mod bench;
-mod colors;
+mod chrome;
+mod frame;
 mod hex;
 mod lod;
+#[cfg(test)]
+mod oracle_test;
+mod pick;
+mod text;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::fmt::Write as _;
 use std::rc::Rc;
+use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use futures::StreamExt as _;
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::Receiver;
 use gpui::{
-    App, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, PathBuilder, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    TextAlign, TextRun, TransformationMatrix, Window, canvas, div, fill, point, prelude::*, px,
-    quad, rgb, size,
+    App, Bounds, Context, FocusHandle, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString, TextAlign,
+    TextRun, TransformationMatrix, Window, canvas, div, fill, point, prelude::*, px, quad, rgb,
+    size,
 };
-use k10s_atlas::curves::{bow_jitter, curve_ctrl, dash_quadratic};
-use k10s_atlas::{FramePacer, FrameStats, StageMachine};
-use k10s_core::layout::CARD_HEADER;
-use k10s_core::{Health, Rect, SatKind, SceneSnapshot, SharedScene, Tool, WorkloadKind, WorldCtrl};
+use k10s_atlas::{
+    DrawnCounts, FLIGHT_VIEWPORT, FlyTo, FramePacer, FrameSpans, FrameStats, Motion, StageMachine,
+};
+use k10s_core::{KindId, SceneSnapshot, SharedScene, ToolId, WorldCtrl};
 
 pub use bench::{BenchMeta, BenchReport};
-pub use k10s_atlas::{Camera, CullStats, StageBlend};
+
+// A click resolved against the snapshot that was on screen when it landed.
+// The snapshot rides along so the consumer names slots from the exact scene
+// the user saw, immune to a publish racing the mouse.
+pub struct Picked {
+    pub snapshot: std::sync::Arc<SceneSnapshot>,
+    pub path: PickPath,
+    mark: Mark,
+}
+
+impl gpui::EventEmitter<Picked> for MapView {}
+
+gpui::actions!(
+    k10s_map,
+    [
+        ToggleChurn,
+        ToggleEdges,
+        ToggleHud,
+        ToggleLegend,
+        FitView,
+        ZoomIn,
+        ZoomOut,
+    ]
+);
+
+// The map's own commands, bound in its own context so the shell's letters
+// never collide with them and a user keymap can rebind them by name.
+pub fn keybindings() -> Vec<gpui::KeyBinding> {
+    let map = Some("Map");
+    vec![
+        gpui::KeyBinding::new("c", ToggleChurn, map),
+        gpui::KeyBinding::new("e", ToggleEdges, map),
+        gpui::KeyBinding::new("g", ToggleLegend, map),
+        gpui::KeyBinding::new("h", ToggleHud, map),
+        gpui::KeyBinding::new("f", FitView, map),
+        gpui::KeyBinding::new("=", ZoomIn, map),
+        gpui::KeyBinding::new("-", ZoomOut, map),
+    ]
+}
+pub use frame::FrameOpts;
+pub use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 pub use lod::{cull, stage_for_zoom};
+pub use pick::{PickPath, path_rect, pick};
 
-use bench::{Bench, BenchFrame};
-use colors::*;
-use lod::lod;
+type PresentCallback = Box<dyn FnOnce(Instant, &mut App)>;
+type SceneReady = Box<dyn Fn(&SceneSnapshot) -> bool>;
 
-const NS_LABEL_PX: f32 = 13.0;
-const WL_LABEL_PX: f32 = 11.0;
-const POD_LABEL_PX: f32 = 10.0;
-const SAT_NAME_PX: f32 = 9.5;
-const SAT_DETAIL_PX: f32 = 8.5;
+/// One-shot observations of frames that crossed GPUI's presentation boundary.
+///
+/// GPUI does not expose the platform renderer's submit callback. A callback
+/// armed during a draw therefore runs at the beginning of the next platform
+/// frame: after the frame that armed it was submitted, and before any later
+/// frame is built. Keeping this seam here lets the application measure startup
+/// without putting clocks, serialization, or process policy in the painter.
+#[derive(Default)]
+pub struct PresentProbe {
+    first: Option<PresentCallback>,
+    scene: Option<PresentCallback>,
+    scene_ready: Option<SceneReady>,
+}
 
-const WL_ICON_PX: f32 = 12.0;
-const SAT_ICON_PX: f32 = 15.0;
+impl PresentProbe {
+    pub fn first(callback: impl FnOnce(Instant, &mut App) + 'static) -> Self {
+        Self {
+            first: Some(Box::new(callback)),
+            scene: None,
+            scene_ready: None,
+        }
+    }
 
-const CURVE_DASH_ON: f32 = 6.0;
-const CURVE_DASH_OFF: f32 = 5.0;
-const CURVE_TOL: f32 = 0.35;
-const CURVE_CORE_W: f32 = 1.5;
-const CURVE_GLOW_W: f32 = 5.0;
+    pub fn on_scene(mut self, callback: impl FnOnce(Instant, &mut App) + 'static) -> Self {
+        self.scene_ready = Some(Box::new(|scene| scene.rev != 0));
+        self.scene = Some(Box::new(callback));
+        self
+    }
 
-fn kind_icon(kind: WorkloadKind) -> (SharedString, &'static [u8]) {
-    match kind {
-        WorkloadKind::Deployment => (
-            SharedString::new_static("icons/deploy.svg"),
-            include_bytes!("../assets/icons/deploy.svg"),
-        ),
-        WorkloadKind::StatefulSet => (
-            SharedString::new_static("icons/sts.svg"),
-            include_bytes!("../assets/icons/sts.svg"),
-        ),
-        WorkloadKind::DaemonSet => (
-            SharedString::new_static("icons/ds.svg"),
-            include_bytes!("../assets/icons/ds.svg"),
-        ),
-        WorkloadKind::Job => (
-            SharedString::new_static("icons/job.svg"),
-            include_bytes!("../assets/icons/job.svg"),
-        ),
+    pub fn on_scene_when(
+        mut self,
+        ready: impl Fn(&SceneSnapshot) -> bool + 'static,
+        callback: impl FnOnce(Instant, &mut App) + 'static,
+    ) -> Self {
+        self.scene_ready = Some(Box::new(ready));
+        self.scene = Some(Box::new(callback));
+        self
+    }
+
+    fn take(&mut self, scene_ready: bool) -> ArmedPresent {
+        if scene_ready {
+            self.scene_ready = None;
+        }
+        ArmedPresent {
+            first: self.first.take(),
+            scene: scene_ready.then(|| self.scene.take()).flatten(),
+        }
+    }
+
+    fn arm(&mut self, scene: &SceneSnapshot, window: &Window) {
+        let scene_ready = self.scene_ready.as_ref().is_some_and(|ready| ready(scene));
+        let callbacks = self.take(scene_ready);
+        if callbacks.is_empty() {
+            return;
+        }
+        window.on_next_frame(move |_, cx| callbacks.fire(Instant::now(), cx));
     }
 }
 
-macro_rules! tool_icons {
-    ($($tool:ident => $file:literal),+ $(,)?) => {
-        fn tool_icon(tool: Tool) -> (SharedString, &'static [u8]) {
-            match tool {
-                $(Tool::$tool => (
-                    SharedString::new_static(concat!("icons/tools/", $file)),
-                    include_bytes!(concat!("../assets/icons/tools/", $file)),
-                ),)+
-                Tool::None => unreachable!("generic workloads use the kind badge"),
+struct ArmedPresent {
+    first: Option<PresentCallback>,
+    scene: Option<PresentCallback>,
+}
+
+impl ArmedPresent {
+    fn is_empty(&self) -> bool {
+        self.first.is_none() && self.scene.is_none()
+    }
+
+    fn fire(self, presented_at: Instant, cx: &mut App) {
+        if let Some(callback) = self.first {
+            callback(presented_at, cx);
+        }
+        if let Some(callback) = self.scene {
+            callback(presented_at, cx);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "present_test.rs"]
+mod present_tests;
+
+#[cfg(feature = "testing")]
+pub mod testing {
+    pub use crate::frame::{FramePaths, FrameSink, IconJob, LabelFace, LabelJob, PaintSink, walk};
+}
+
+use bench::{Bench, BenchOp};
+use frame::{IconJob, LabelFace, LabelJob, PaintSink};
+use k10s_theme::scale_alpha;
+use lod::lod;
+use text::TextCache;
+
+// A highlight is an index path plus the identities which made that path true.
+// World slots are intentionally reused; validating the non-empty ids before a
+// paint prevents a deleted pod's ring from jumping to its replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mark {
+    path: PickPath,
+    rev: u64,
+    ids: [Option<std::sync::Arc<str>>; 4],
+}
+
+impl Mark {
+    fn new(scene: &SceneSnapshot, path: PickPath) -> Option<Mark> {
+        path_rect(scene, &path)?;
+        let id = |ids: &k10s_core::SlotIds, slot: Option<u32>| {
+            slot.and_then(|slot| ids.get(slot as usize))
+                .filter(|id| !id.is_empty())
+                .cloned()
+        };
+        Some(Mark {
+            path,
+            rev: scene.rev,
+            ids: [
+                id(&scene.ids.regions, Some(path.region)),
+                id(&scene.ids.blocks, path.block),
+                id(&scene.ids.cells, path.cell),
+                id(&scene.ids.sats, path.sat),
+            ],
+        })
+    }
+
+    fn resolve(&self, scene: &SceneSnapshot) -> Option<PickPath> {
+        path_rect(scene, &self.path)?;
+        let current = [
+            scene.ids.regions.get(self.path.region as usize),
+            self.path
+                .block
+                .and_then(|slot| scene.ids.blocks.get(slot as usize)),
+            self.path
+                .cell
+                .and_then(|slot| scene.ids.cells.get(slot as usize)),
+            self.path
+                .sat
+                .and_then(|slot| scene.ids.sats.get(slot as usize)),
+        ];
+        let mut identified = false;
+        for (expected, current) in self.ids.iter().zip(current) {
+            if let Some(expected) = expected {
+                identified = true;
+                if current != Some(expected) {
+                    return None;
+                }
             }
         }
+        (identified || scene.rev == self.rev).then_some(self.path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HoverBasis {
+    rev: u64,
+    camera: Camera,
+    viewport: (f32, f32),
+}
+
+type Glyph = (&'static str, &'static [u8]);
+
+macro_rules! glyph {
+    ($file:literal) => {
+        (
+            concat!("icons/", $file),
+            include_bytes!(concat!("../assets/icons/", $file)) as &'static [u8],
+        )
     };
 }
 
-tool_icons! {
-    Airflow => "apacheairflow.svg",
-    ArgoCd => "argo.svg",
-    Cassandra => "apachecassandra.svg",
-    ClickHouse => "clickhouse.svg",
-    Consul => "consul.svg",
-    Elasticsearch => "elasticsearch.svg",
-    Envoy => "envoyproxy.svg",
-    Etcd => "etcd.svg",
-    FluentBit => "fluentbit.svg",
-    Fluentd => "fluentd.svg",
-    Flux => "flux.svg",
-    Grafana => "grafana.svg",
-    Harbor => "harbor.svg",
-    Istio => "istio.svg",
-    Jaeger => "jaeger.svg",
-    Jenkins => "jenkins.svg",
-    Kafka => "apachekafka.svg",
-    Keycloak => "keycloak.svg",
-    Kibana => "kibana.svg",
-    Kubernetes => "kubernetes.svg",
-    MariaDb => "mariadb.svg",
-    Minio => "minio.svg",
-    MongoDb => "mongodb.svg",
-    MySql => "mysql.svg",
-    Nats => "natsdotio.svg",
-    Nginx => "nginx.svg",
-    OpenTelemetry => "opentelemetry.svg",
-    Postgres => "postgresql.svg",
-    Prometheus => "prometheus.svg",
-    RabbitMq => "rabbitmq.svg",
-    Redis => "redis.svg",
-    Temporal => "temporal.svg",
-    Traefik => "traefikproxy.svg",
-    Vault => "vault.svg",
+macro_rules! tool_glyph {
+    ($file:literal) => {
+        (
+            concat!("icons/tools/", $file),
+            include_bytes!(concat!("../assets/icons/tools/", $file)) as &'static [u8],
+        )
+    };
 }
 
-fn sat_icon(kind: SatKind) -> (SharedString, &'static [u8]) {
-    match kind {
-        SatKind::Volume => (
-            SharedString::new_static("icons/pvc.svg"),
-            include_bytes!("../assets/icons/pvc.svg"),
-        ),
-        SatKind::Service => (
-            SharedString::new_static("icons/svc.svg"),
-            include_bytes!("../assets/icons/svc.svg"),
-        ),
-        SatKind::ConfigMap => (
-            SharedString::new_static("icons/cm.svg"),
-            include_bytes!("../assets/icons/cm.svg"),
-        ),
-        SatKind::Secret => (
-            SharedString::new_static("icons/secret.svg"),
-            include_bytes!("../assets/icons/secret.svg"),
-        ),
-    }
+const UNKNOWN_GLYPH: Glyph = glyph!("unknown.svg");
+
+static KIND_GLYPHS: &[Glyph] = &[
+    glyph!("deploy.svg"),
+    glyph!("sts.svg"),
+    glyph!("ds.svg"),
+    glyph!("job.svg"),
+    glyph!("job.svg"),
+    glyph!("unknown.svg"),
+    glyph!("unknown.svg"),
+    glyph!("pvc.svg"),
+    glyph!("svc.svg"),
+    glyph!("cm.svg"),
+    glyph!("secret.svg"),
+    glyph!("svc.svg"),
+    glyph!("unknown.svg"),
+];
+
+const _: () = assert!(
+    KIND_GLYPHS.len() == k10s_core::BUILTIN_KIND_COUNT as usize,
+    "every built-in kind needs a glyph"
+);
+
+static TOOL_GLYPHS: &[Glyph] = &[
+    UNKNOWN_GLYPH,
+    tool_glyph!("apacheairflow.svg"),
+    tool_glyph!("argo.svg"),
+    tool_glyph!("apachecassandra.svg"),
+    tool_glyph!("clickhouse.svg"),
+    tool_glyph!("consul.svg"),
+    tool_glyph!("elasticsearch.svg"),
+    tool_glyph!("envoyproxy.svg"),
+    tool_glyph!("etcd.svg"),
+    tool_glyph!("fluentbit.svg"),
+    tool_glyph!("fluentd.svg"),
+    tool_glyph!("flux.svg"),
+    tool_glyph!("grafana.svg"),
+    tool_glyph!("harbor.svg"),
+    tool_glyph!("istio.svg"),
+    tool_glyph!("jaeger.svg"),
+    tool_glyph!("jenkins.svg"),
+    tool_glyph!("apachekafka.svg"),
+    tool_glyph!("keycloak.svg"),
+    tool_glyph!("kibana.svg"),
+    tool_glyph!("kubernetes.svg"),
+    tool_glyph!("mariadb.svg"),
+    tool_glyph!("minio.svg"),
+    tool_glyph!("mongodb.svg"),
+    tool_glyph!("mysql.svg"),
+    tool_glyph!("natsdotio.svg"),
+    tool_glyph!("nginx.svg"),
+    tool_glyph!("opentelemetry.svg"),
+    tool_glyph!("postgresql.svg"),
+    tool_glyph!("prometheus.svg"),
+    tool_glyph!("rabbitmq.svg"),
+    tool_glyph!("redis.svg"),
+    tool_glyph!("temporal.svg"),
+    tool_glyph!("traefikproxy.svg"),
+    tool_glyph!("vault.svg"),
+];
+
+const _: () = assert!(
+    TOOL_GLYPHS.len() == k10s_core::BUILTIN_TOOL_COUNT as usize,
+    "every built-in vendor needs a glyph"
+);
+
+fn glyph_of(table: &'static [Glyph], idx: usize) -> (SharedString, &'static [u8]) {
+    let (key, data) = table.get(idx).copied().unwrap_or(UNKNOWN_GLYPH);
+    (SharedString::new_static(key), data)
+}
+
+fn kind_icon(kind: KindId) -> (SharedString, &'static [u8]) {
+    glyph_of(KIND_GLYPHS, kind.0 as usize)
+}
+
+fn tool_icon(tool: ToolId) -> (SharedString, &'static [u8]) {
+    glyph_of(TOOL_GLYPHS, tool.0 as usize)
 }
 
 pub struct MapView {
@@ -141,11 +348,25 @@ pub struct MapView {
     ctrl: Sender<WorldCtrl>,
     camera: Camera,
     drag: Option<Point<Pixels>>,
+    drag_total: f32,
+    map_bounds: Rc<Cell<k10s_core::Rect>>,
     churn_on: bool,
     edges_on: bool,
+    hud_on: bool,
+    legend_on: bool,
     fitted: bool,
 
     interacted: bool,
+    // What the pointer is over and what the shell has selected. Both are drawn
+    // OUTSIDE `frame::walk`, from the path and the camera alone, so neither
+    // appears in `CullStats`, neither has to be mirrored in the cull oracle,
+    // and neither can move a benchmark's structural counters. An affordance
+    // that costs the engine nothing is an affordance that can be as generous as
+    // it likes.
+    hovered: Option<Mark>,
+    selected: Option<Mark>,
+    hover_position: Option<Point<Pixels>>,
+    hover_basis: Option<HoverBasis>,
     last_vp: (f32, f32),
     focus_handle: FocusHandle,
     stats: Rc<RefCell<FrameStats>>,
@@ -153,21 +374,63 @@ pub struct MapView {
     fg_buf: Rc<RefCell<Vec<PaintQuad>>>,
     label_buf: Rc<RefCell<Vec<LabelJob>>>,
     icon_buf: Rc<RefCell<Vec<IconJob>>>,
+    text_cache: Rc<RefCell<TextCache>>,
+    summary: chrome::SummaryCache,
+    chrome: gpui::Entity<chrome::Chrome>,
+    chrome_state: Option<chrome::State>,
+    present_probe: PresentProbe,
 
     pacer: FramePacer,
     stage: StageMachine,
     last_stage_tick: Option<std::time::Instant>,
     bench: Option<Bench>,
+    // The flight in progress, if any. `None` is the whole idle case: no flight
+    // means no frame requested on its account, which is what keeps the measured
+    // zero paints at idle true through an animation rather than despite one.
+    fly: Option<FlyTo>,
+    // Set when a bench flight gave up, read by the binary after the app loop
+    // returns. A view cannot choose a process's exit status and should not try.
+    bench_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Advance a flight by one frame: where that leaves the camera, and whether the
+/// caller must ask to be painted again.
+///
+/// Free rather than a method, and holding no gpui type, because it is the only
+/// part of flying that can be wrong. A view that steps its own animation inside
+/// a render body can only be tested by painting, and the property worth testing
+/// -- that a finished flight stops asking for frames -- is exactly the one a
+/// paint-based test is worst at noticing.
+fn advance_flight(fly: &mut Option<FlyTo>, camera: &mut Camera, dt: f32) -> bool {
+    let Some(flight) = fly.as_mut() else {
+        return false;
+    };
+    let step = flight.step(dt);
+    *camera = step.camera();
+    if step.owes_a_frame() {
+        return true;
+    }
+    // Dropped on arrival rather than left finished. A flight nobody is holding
+    // cannot be stepped again by a later change to this function, and `None` is
+    // the same idle state the view starts in.
+    *fly = None;
+    false
 }
 
 impl MapView {
+    /// `bench_failed` is set if a bench flight gives up, and read by the binary
+    /// after the app loop returns: a view is the wrong place to decide a
+    /// process's exit status, and the wrong place to leave from.
     pub fn new(
         scene: SharedScene,
         ctrl: Sender<WorldCtrl>,
         bench: Option<BenchMeta>,
-        damage: UnboundedReceiver<()>,
+        bench_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        damage: Receiver<()>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let measuring = bench.is_some();
+        let map_chrome = cx.new(|_| chrome::Chrome::default());
         cx.spawn(async move |this, cx| {
             let mut damage = damage;
             while damage.next().await.is_some() {
@@ -184,10 +447,21 @@ impl MapView {
             ctrl,
             camera: Camera::default(),
             drag: None,
+            drag_total: 0.0,
+            map_bounds: Rc::new(Cell::new(k10s_core::Rect::ZERO)),
             churn_on: true,
-            edges_on: true,
+            // Dense topology is opt-in for a person: it is useful during an
+            // investigation and visual noise at rest. Scripted flights retain
+            // the historical surface their baselines measure.
+            edges_on: measuring,
+            hud_on: measuring,
+            legend_on: !measuring,
             fitted: false,
             interacted: false,
+            hovered: None,
+            selected: None,
+            hover_position: None,
+            hover_basis: None,
             last_vp: (0.0, 0.0),
             focus_handle: cx.focus_handle(),
             stats: Rc::new(RefCell::new(FrameStats::default())),
@@ -195,7 +469,14 @@ impl MapView {
             fg_buf: Rc::new(RefCell::new(Vec::new())),
             label_buf: Rc::new(RefCell::new(Vec::new())),
             icon_buf: Rc::new(RefCell::new(Vec::new())),
+            text_cache: Rc::new(RefCell::new(TextCache::default())),
+            summary: chrome::SummaryCache::default(),
+            chrome: map_chrome,
+            chrome_state: None,
+            present_probe: PresentProbe::default(),
             pacer: FramePacer::default(),
+            fly: None,
+            bench_failed,
             stage: StageMachine::new(lod::STAGE_FADE_SECS),
             last_stage_tick: None,
             bench: bench.map(Bench::new),
@@ -204,6 +485,328 @@ impl MapView {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    pub fn with_present_probe(mut self, probe: PresentProbe) -> Self {
+        self.present_probe = probe;
+        self
+    }
+
+    /// Fixed map furniture is hosted beside the canvas by the workspace. That
+    /// gives both halves their own reactive boundary: camera frames rebuild the
+    /// map, while a semantic-band or hover change rebuilds this view alone.
+    pub fn chrome_view(&self) -> gpui::AnyView {
+        self.chrome.clone().into()
+    }
+
+    // The map's commands, invoked by the workspace's action handlers: the
+    // handlers live on the workspace element so the map's per-paint element
+    // build stays lean enough for the allocation ratchet to mean something.
+    pub fn toggle_churn(&mut self, cx: &mut Context<Self>) {
+        self.churn_on = !self.churn_on;
+        let _ = self.ctrl.send(WorldCtrl::SetChurn(self.churn_on));
+        cx.notify();
+    }
+
+    pub fn toggle_edges(&mut self, cx: &mut Context<Self>) {
+        self.edges_on = !self.edges_on;
+        cx.notify();
+    }
+
+    pub fn toggle_hud(&mut self, cx: &mut Context<Self>) {
+        self.hud_on = !self.hud_on;
+        cx.notify();
+    }
+
+    pub fn toggle_legend(&mut self, cx: &mut Context<Self>) {
+        self.legend_on = !self.legend_on;
+        cx.notify();
+    }
+
+    pub fn zoom_in(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.zoom_by(1.35, window, cx);
+    }
+
+    pub fn zoom_out(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.zoom_by(1.0 / 1.35, window, cx);
+    }
+
+    fn zoom_by(&mut self, factor: f32, window: &Window, cx: &mut Context<Self>) {
+        let (_, vw, vh) = self.map_viewport(window);
+        self.camera.zoom_around(factor, vw * 0.5, vh * 0.5, vw, vh);
+        self.fly = None;
+        self.suppress_hover();
+        self.interacted = true;
+        cx.notify();
+    }
+
+    /// Stop a camera flight before Escape proceeds to selection dismissal.
+    pub fn cancel_flight(&mut self, cx: &mut Context<Self>) -> bool {
+        let cancelled = self.fly.take().is_some();
+        if cancelled {
+            cx.notify();
+        }
+        cancelled
+    }
+
+    /// Frame the whole scene, flying there rather than arriving there.
+    ///
+    /// A camera that jumps leaves a person to work out for themselves that what
+    /// they were looking at is now somewhere else, and at Z0 on a large cluster
+    /// there is nothing in the new frame to recognise. Under a bench it is still
+    /// a jump: a recording's camera path is the recording, and a flight would
+    /// make the frames after a fit depend on when the fit happened.
+    pub fn fit(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let scene = self.scene.load();
+        let (_, vw, vh) = self.map_viewport(window);
+        let mut target = self.camera;
+        target.fit(scene.bounds, vw, vh);
+        if self.bench.is_some() {
+            self.camera = target;
+            self.fly = None;
+        } else {
+            // Asked of gpui rather than kept here, so the answer a person gave
+            // once reaches every animation in the application instead of
+            // whichever ones remembered to look at a copy of it.
+            self.fly_to(target, Motion::reduced_when(cx.reduce_motion()));
+        }
+        self.suppress_hover();
+        cx.notify();
+    }
+
+    /// Fly to the object with this uid, if the published scene has one.
+    ///
+    /// Answers whether it went, because "that object is not on the map" and "the
+    /// map is now going there" are different sentences and the caller is the one
+    /// with somewhere to say them. A uid the snapshot does not carry is the
+    /// ordinary case rather than an error: a search can outlive the object it
+    /// matched, and a cluster the window has since left has none of them.
+    pub fn reveal(&mut self, uid: &str, window: &Window, cx: &mut Context<Self>) -> bool {
+        let scene = self.scene.load();
+        let Some(found) = scene.locate(uid) else {
+            return false;
+        };
+        let (_, vw, vh) = self.map_viewport(window);
+        let target = self.camera.reveal(found.rect, vw, vh);
+        if self.bench.is_some() {
+            self.camera = target;
+            self.fly = None;
+        } else {
+            self.fly_to(target, Motion::reduced_when(cx.reduce_motion()));
+        }
+        self.suppress_hover();
+        cx.notify();
+        true
+    }
+
+    /// Send the camera somewhere, from wherever it is now.
+    ///
+    /// Retargets an existing flight instead of replacing it, so a second
+    /// destination while the first is still being flown to continues the
+    /// movement rather than snapping back to where the first one began. Marks the
+    /// camera as touched, because a flight is a camera the user chose and the
+    /// automatic fit must not overrule it mid-air.
+    pub fn fly_to(&mut self, target: Camera, motion: Motion) {
+        match self.fly.as_mut() {
+            Some(flight) => flight.retarget(target, motion),
+            None => self.fly = Some(FlyTo::new(self.camera, target, motion)),
+        }
+        self.fitted = true;
+        self.interacted = true;
+    }
+
+    /// What the shell says is selected. The map does not decide this -- a click
+    /// leaves as a `Picked` event and comes back through here -- so selection
+    /// stays one fact held in one place even when it was set by the finder or
+    /// by a panel rather than by the pointer.
+    pub fn set_selection(&mut self, selected: Option<&Picked>, cx: &mut Context<Self>) {
+        let selected = selected.map(|picked| picked.mark.clone());
+        if self.selected != selected {
+            self.selected = selected;
+            cx.notify();
+        }
+    }
+
+    // Resolve what is under the pointer, and ask for a frame only if the answer
+    // changed. Notifying per move event would repaint at pointer rate and turn
+    // "zero paints at idle" into "zero paints unless the mouse is in the
+    // window"; notifying on change is one paint per object crossed.
+    fn hover_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.hover_position = Some(position);
+        let snapshot = self.scene.load_full();
+        let hovered = self.pick_mark_at(&snapshot, position);
+        self.hover_basis = Some(self.hover_basis(&snapshot));
+        if self.hovered != hovered {
+            self.hovered = hovered;
+            cx.notify();
+        }
+    }
+
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        let had_hover = self.hovered.is_some();
+        self.suppress_hover();
+        if had_hover {
+            cx.notify();
+        }
+    }
+
+    fn suppress_hover(&mut self) {
+        self.hover_position = None;
+        self.hover_basis = None;
+        self.hovered = None;
+    }
+
+    fn hover_basis(&self, scene: &SceneSnapshot) -> HoverBasis {
+        let rect = self.map_bounds.get();
+        HoverBasis {
+            rev: scene.rev,
+            camera: self.camera,
+            viewport: (rect.w, rect.h),
+        }
+    }
+
+    fn refresh_hover(&mut self, scene: &SceneSnapshot) {
+        let basis = self.hover_basis(scene);
+        if self.hover_basis == Some(basis) {
+            return;
+        }
+        self.hover_basis = Some(basis);
+        self.hovered = self
+            .hover_position
+            .and_then(|position| self.pick_mark_at(scene, position));
+    }
+
+    fn pick_mark_at(&self, scene: &SceneSnapshot, position: Point<Pixels>) -> Option<Mark> {
+        let rect = self.map_bounds.get();
+        if rect.w <= 0.0 || rect.h <= 0.0 || scene.rev == 0 {
+            return None;
+        }
+        let policy = lod();
+        let blend = StageBlend::settled(policy.stage_for_zoom(self.camera.zoom));
+        let path = pick(
+            scene,
+            &self.camera,
+            policy,
+            blend,
+            rect.w,
+            rect.h,
+            f32::from(position.x) - rect.x,
+            f32::from(position.y) - rect.y,
+        )?;
+        Mark::new(scene, path)
+    }
+
+    /// Forget that the camera was ever framed, so the next scene with anything in
+    /// it is framed again.
+    ///
+    /// A scene chosen on the launch screen is a new subject, not a moved camera:
+    /// the zoom that framed a 200-namespace starmap says nothing about the cluster
+    /// somebody switched to. Deliberately not a fit: the scene it is about has not
+    /// arrived yet.
+    pub fn refit(&mut self, cx: &mut Context<Self>) {
+        self.fitted = false;
+        self.interacted = false;
+        cx.notify();
+    }
+
+    /// Whether this frame frames the whole scene by itself.
+    ///
+    /// The automatic fit happens once, and again on a resize the user has not
+    /// overridden by touching the camera. What it must not do is spend that one
+    /// fit on an *empty* scene: a published revision used to imply content,
+    /// because the world was always built from a stream before the window opened.
+    /// The launch screen made an empty world reachable, and the starmap chosen a
+    /// moment later opened off-camera -- fitted to bounds that had held nothing.
+    fn should_fit_scene(regions: u32, fitted: bool, interacted: bool, resized: bool) -> bool {
+        regions > 0 && (!fitted || (!interacted && resized))
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_set_camera(&mut self, camera: Camera) {
+        self.camera = camera;
+        self.fitted = true;
+        self.interacted = true;
+        self.stage = StageMachine::new(0.0);
+        self.last_stage_tick = None;
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_text_cache(&self) -> k10s_atlas::TextCacheCounts {
+        self.stats.borrow().text_cache
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_enable_text_cache(&mut self, enabled: bool) {
+        self.text_cache.borrow_mut().set_enabled(enabled);
+    }
+
+    // The painted element's rect, falling back to the window before the
+    // first paint. Camera math and picking are element-relative; the window
+    // is only the map when nothing else is docked beside it.
+    fn map_viewport(&self, window: &Window) -> ((f32, f32), f32, f32) {
+        let rect = self.map_bounds.get();
+        if rect.w > 0.0 && rect.h > 0.0 {
+            ((rect.x, rect.y), rect.w, rect.h)
+        } else {
+            let (vw, vh) = Self::viewport(window);
+            ((0.0, 0.0), vw, vh)
+        }
+    }
+
+    fn emit_pick(
+        &mut self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<(std::sync::Arc<SceneSnapshot>, PickPath)> {
+        let rect = self.map_bounds.get();
+        if rect.w <= 0.0 || rect.h <= 0.0 {
+            return None;
+        }
+        let snapshot = self.scene.load_full();
+        if snapshot.rev == 0 {
+            return None;
+        }
+        // A click resolves at the stage the zoom is settling toward; a fade
+        // lasts 180 ms and picking mid-fade should answer for where the user
+        // is going, not where the crossfade happens to be.
+        let policy = lod();
+        let blend = StageBlend::settled(policy.stage_for_zoom(self.camera.zoom));
+        let Some(path) = pick(
+            &snapshot,
+            &self.camera,
+            policy,
+            blend,
+            rect.w,
+            rect.h,
+            f32::from(position.x) - rect.x,
+            f32::from(position.y) - rect.y,
+        ) else {
+            return None;
+        };
+        let mark = Mark::new(&snapshot, path)?;
+        cx.emit(Picked {
+            snapshot: snapshot.clone(),
+            path,
+            mark,
+        });
+        Some((snapshot, path))
+    }
+
+    fn focus_path(
+        &mut self,
+        scene: &SceneSnapshot,
+        path: PickPath,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rect) = path_rect(scene, &path) else {
+            return;
+        };
+        let (_, vw, vh) = self.map_viewport(window);
+        let target = self.camera.reveal(rect, vw, vh);
+        self.fly_to(target, Motion::reduced_when(cx.reduce_motion()));
+        self.suppress_hover();
+        cx.notify();
     }
 
     fn viewport(window: &Window) -> (f32, f32) {
@@ -215,7 +818,14 @@ impl MapView {
 impl Render for MapView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let scene = self.scene.load_full();
-        let (vw, vh) = Self::viewport(window);
+        self.present_probe.arm(&scene, window);
+        let window_viewport = Self::viewport(window);
+        let (_, map_width, map_height) = self.map_viewport(window);
+        let (vw, vh) = if self.bench.is_some() {
+            window_viewport
+        } else {
+            (map_width, map_height)
+        };
 
         let was_continuous = self.pacer.begin_frame();
         if repaint_always() {
@@ -225,27 +835,44 @@ impl Render for MapView {
         let now = std::time::Instant::now();
         if let Some(bench) = self.bench.as_mut() {
             let active = window.is_window_active();
-            let frame = bench.frame(now, vw, vh, active, &scene, &mut self.stats.borrow_mut());
-            if frame.needs_frame() {
-                self.pacer.request_frame();
-            }
-            match frame {
-                BenchFrame::Camera(cam) => self.camera = cam,
-                BenchFrame::Waiting => {}
-                BenchFrame::Idle { camera, arm_timer } => {
-                    self.camera = camera;
-                    if let Some(delay) = arm_timer {
-                        cx.spawn(async move |this, cx| {
-                            cx.background_executor().timer(delay).await;
-                            this.update(cx, |_, cx| cx.notify()).ok();
-                        })
-                        .detach();
-                    }
+            let op = bench.drive(
+                now,
+                vw,
+                vh,
+                active,
+                &scene,
+                &mut self.stats.borrow_mut(),
+                &mut self.camera,
+                &mut self.pacer,
+            );
+            match op {
+                BenchOp::Continue => {}
+                BenchOp::ArmTimer(delay) => {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(delay).await;
+                        this.update(cx, |_, cx| cx.notify()).ok();
+                    })
+                    .detach();
                 }
-                BenchFrame::Done => cx.quit(),
+                BenchOp::Quit => cx.quit(),
+                // Quit the same way a finished flight does, having first said the
+                // run failed. Exiting from inside a render callback -- which this
+                // used to do -- skips the world thread's shutdown and the data
+                // plane's retirement, and the order those happen in is what lets
+                // a watch parked on a full sink see a disconnect instead of a
+                // deadlock.
+                BenchOp::Abort => {
+                    self.bench_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    cx.quit();
+                }
             }
-        } else if scene.rev > 0 && (!self.fitted || (!self.interacted && (vw, vh) != self.last_vp))
-        {
+        } else if Self::should_fit_scene(
+            scene.totals.regions,
+            self.fitted,
+            self.interacted,
+            (vw, vh) != self.last_vp,
+        ) {
             self.camera.fit(scene.bounds, vw, vh);
             self.fitted = true;
             self.last_vp = (vw, vh);
@@ -255,10 +882,14 @@ impl Render for MapView {
             .last_stage_tick
             .map_or(0.0, |t| (now - t).as_secs_f32());
         self.last_stage_tick = Some(now);
+        if advance_flight(&mut self.fly, &mut self.camera, dt) {
+            self.pacer.request_frame();
+        }
         let blend = self.stage.update(lod(), self.camera.zoom, dt);
         if self.stage.animating() {
             self.pacer.request_frame();
         }
+        self.refresh_hover(&scene);
 
         let animating = self.pacer.frame_requested();
         let camera = self.camera;
@@ -267,72 +898,148 @@ impl Render for MapView {
         let fg_buf = self.fg_buf.clone();
         let label_buf = self.label_buf.clone();
         let icon_buf = self.icon_buf.clone();
+        let text_cache = self.text_cache.clone();
         let edges_on = self.edges_on;
         let churn_on = self.churn_on;
+        let hud_on = self.hud_on;
+        let bench_letterbox = self.bench.is_some();
+        let map_bounds = self.map_bounds.clone();
+        let marks = Marks {
+            hovered: self.hovered.as_ref().and_then(|mark| mark.resolve(&scene)),
+            selected: self.selected.as_ref().and_then(|mark| mark.resolve(&scene)),
+        };
+        if !bench_letterbox {
+            let summary = self.summary.line(scene.totals);
+            let state = chrome::State::resolve(chrome::Overlay {
+                scene: &scene,
+                camera,
+                policy: lod(),
+                hovered: marks.hovered,
+                summary,
+                edges_on,
+                legend_on: self.legend_on,
+                viewport: (map_width, map_height),
+            });
+            if self.chrome_state.as_ref() != Some(&state) {
+                self.chrome_state = Some(state.clone());
+                // Keep entity mutation out of the render that discovered it.
+                // The deferred notification refreshes the workspace-hosted
+                // chrome sibling without invalidating this canvas-owning view.
+                let chrome = self.chrome.clone();
+                cx.defer(move |cx| {
+                    chrome.update(cx, |chrome, cx| chrome.sync(state, cx));
+                });
+            }
+        }
+
+        let pointer = if marks.hovered.is_some() {
+            gpui::CursorStyle::PointingHand
+        } else {
+            gpui::CursorStyle::Arrow
+        };
+        let paint_scene = scene.clone();
 
         div()
+            .id("starmap-view")
             .size_full()
-            .bg(rgb(BG))
+            .relative()
+            .cursor(pointer)
+            .role(gpui::Role::Application)
+            .aria_label("Interactive Kubernetes Starmap")
             .track_focus(&self.focus_handle)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, _| {
                     this.drag = Some(ev.position);
+                    this.drag_total = 0.0;
+                    this.fly = None;
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &MouseDownEvent, _, _| {
+                    this.drag = Some(ev.position);
+                    this.drag_total = 4.0;
+                    this.fly = None;
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                cx.listener(|this, ev: &MouseUpEvent, window, cx| {
+                    let clicked = this.drag.take().is_some() && this.drag_total < 4.0;
+                    let mut focused = false;
+                    if clicked
+                        && let Some((scene, path)) = this.emit_pick(ev.position, cx)
+                        && ev.click_count >= 2
+                    {
+                        this.focus_path(&scene, path, window, cx);
+                        focused = true;
+                    }
+                    if !focused {
+                        this.hover_at(ev.position, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &MouseUpEvent, _, cx| {
                     this.drag = None;
+                    this.hover_at(ev.position, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 if let Some(last) = this.drag {
                     let dx = f32::from(ev.position.x - last.x);
                     let dy = f32::from(ev.position.y - last.y);
+                    this.drag_total += dx.abs() + dy.abs();
                     this.camera.pan_px(dx, dy);
                     this.drag = Some(ev.position);
+                    this.suppress_hover();
                     this.interacted = true;
                     cx.notify();
+                } else {
+                    this.hover_at(ev.position, cx);
                 }
+            }))
+            .on_mouse_exit(cx.listener(|this, _: &MouseExitEvent, _, cx| {
+                this.drag = None;
+                this.clear_hover(cx);
             }))
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
                 let dy = f32::from(ev.delta.pixel_delta(px(24.0)).y);
                 let factor = (dy * 0.0035).exp();
-                let (vw, vh) = Self::viewport(window);
+                let (origin, vw, vh) = this.map_viewport(window);
                 this.camera.zoom_around(
                     factor,
-                    f32::from(ev.position.x),
-                    f32::from(ev.position.y),
+                    f32::from(ev.position.x) - origin.0,
+                    f32::from(ev.position.y) - origin.1,
                     vw,
                     vh,
                 );
+                this.fly = None;
+                this.suppress_hover();
                 this.interacted = true;
                 cx.notify();
             }))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                match ev.keystroke.key.as_str() {
-                    "c" => {
-                        this.churn_on = !this.churn_on;
-                        let _ = this.ctrl.send(WorldCtrl::SetChurn(this.churn_on));
-                    }
-                    "e" => this.edges_on = !this.edges_on,
-                    "f" => {
-                        let scene = this.scene.load();
-                        let (vw, vh) = Self::viewport(window);
-                        this.camera.fit(scene.bounds, vw, vh);
-                    }
-                    _ => return,
-                }
-                cx.notify();
-            }))
+            .key_context("Map")
             .child(
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
+                        let next_bounds = k10s_core::Rect::new(
+                            f32::from(bounds.origin.x),
+                            f32::from(bounds.origin.y),
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                        );
+                        if map_bounds.replace(next_bounds) != next_bounds {
+                            // The next render now has the element-relative
+                            // viewport for fit, reveal, picking and chrome.
+                            window.request_animation_frame();
+                        }
                         paint_map(
                             bounds,
-                            &scene,
+                            &paint_scene,
                             camera,
                             blend,
                             &stats,
@@ -340,10 +1047,14 @@ impl Render for MapView {
                             &fg_buf,
                             &label_buf,
                             &icon_buf,
+                            &text_cache,
+                            marks,
                             edges_on,
                             churn_on,
+                            hud_on,
                             was_continuous,
                             animating,
+                            bench_letterbox,
                             window,
                             cx,
                         );
@@ -359,12 +1070,28 @@ impl Render for MapView {
 
 fn skip_workloads() -> bool {
     static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SKIP.get_or_init(|| std::env::var_os("K10S_SKIP_WL").is_some())
+    *SKIP.get_or_init(|| std::env::var_os("K10S_SKIP_WL").is_some_and(|v| v != "0"))
 }
+
+fn letterbox_bounds(canvas: Bounds<Pixels>) -> Bounds<Pixels> {
+    let [lw, lh] = FLIGHT_VIEWPORT;
+    let cw = f32::from(canvas.size.width);
+    let ch = f32::from(canvas.size.height);
+    let ox = f32::from(canvas.origin.x) + (cw - lw) * 0.5;
+    let oy = f32::from(canvas.origin.y) + (ch - lh) * 0.5;
+    Bounds {
+        origin: point(px(ox), px(oy)),
+        size: size(px(lw), px(lh)),
+    }
+}
+
+#[cfg(test)]
+#[path = "letterbox_test.rs"]
+mod letterbox_tests;
 
 fn repaint_always() -> bool {
     static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ALWAYS.get_or_init(|| std::env::var_os("K10S_REPAINT_ALWAYS").is_some())
+    *ALWAYS.get_or_init(|| std::env::var_os("K10S_REPAINT_ALWAYS").is_some_and(|v| v != "0"))
 }
 
 fn glow_on() -> bool {
@@ -372,23 +1099,99 @@ fn glow_on() -> bool {
     *GLOW.get_or_init(|| std::env::var_os("K10S_NO_GLOW").is_none_or(|v| v == "0"))
 }
 
-struct LabelJob {
-    text: SharedString,
-    x: f32,
-    y: f32,
-    size_px: f32,
-    color: gpui::Rgba,
+/// The pointer and selection marks, carried into the paint closure as one
+/// `Copy` value so the closure captures a fact rather than the view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Marks {
+    hovered: Option<PickPath>,
+    selected: Option<PickPath>,
 }
 
-enum IconJob {
-    Wl(WorkloadKind, Bounds<Pixels>),
-    Tool(Tool, Bounds<Pixels>),
-    Sat(SatKind, Bounds<Pixels>),
+impl Marks {
+    fn is_empty(&self) -> bool {
+        self.hovered.is_none() && self.selected.is_none()
+    }
+}
+
+// How far the ring stands off the thing it marks and how thick it is, in screen
+// pixels. Both are constants rather than fractions of the target: a ring is
+// chrome, and chrome that scales with the camera stops reading as chrome. Its
+// CORNERS are not constant -- they follow the target, or a ring round an island
+// reads as a box drawn over a blob.
+const MARK_INSET: f32 = 3.0;
+const MARK_WIDTH: f32 = 2.0;
+const MARK_RADIUS_OF_SHORT: f32 = 0.2;
+const MARK_RADIUS_MAX: f32 = 20.0;
+const MARK_HALO_ALPHA: f32 = 0.16;
+
+// Draw whatever the pointer is on and whatever is selected, from the path and
+// the camera alone.
+//
+// Deliberately outside `frame::walk`: the walk's counters are an exact-gated
+// benchmark surface and are re-derived by an independently written cull oracle
+// on every debug frame, so a ring emitted inside it would have to be reproduced
+// in five cull functions and would move committed baselines. Out here it is two
+// quads, O(1), and it can be as expensive to look at as it likes.
+fn paint_marks(
+    bounds: Bounds<Pixels>,
+    scene: &SceneSnapshot,
+    camera: Camera,
+    marks: Marks,
+    theme: &k10s_theme::MapTheme,
+    window: &mut Window,
+) {
+    let vw = f32::from(bounds.size.width);
+    let vh = f32::from(bounds.size.height);
+    let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+    // Selection under hover: pointing at the selected thing must still show the
+    // pointer's own ring, or the map stops responding to the mouse the moment
+    // the two coincide.
+    for (path, color) in [
+        (marks.selected, theme.selection_ring),
+        (marks.hovered, theme.hover_ring),
+    ] {
+        let Some(path) = path else { continue };
+        let Some(rect) = path_rect(scene, &path) else {
+            continue;
+        };
+        let (x, y) = camera.w2s(rect.x, rect.y, vw, vh);
+        let ring = Bounds {
+            origin: point(px(origin.0 + x - MARK_INSET), px(origin.1 + y - MARK_INSET)),
+            size: size(
+                px(rect.w * camera.zoom + MARK_INSET * 2.0),
+                px(rect.h * camera.zoom + MARK_INSET * 2.0),
+            ),
+        };
+        let short = f32::from(ring.size.width).min(f32::from(ring.size.height));
+        let radius = px((short * MARK_RADIUS_OF_SHORT).min(MARK_RADIUS_MAX));
+        let stroke = rgb(color);
+        window.paint_quad(quad(
+            ring,
+            radius,
+            scale_alpha(stroke, MARK_HALO_ALPHA),
+            px(MARK_WIDTH),
+            stroke,
+            Default::default(),
+        ));
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct LabelCounts {
+    lines: usize,
+    glyphs: usize,
+}
+
+impl LabelCounts {
+    fn count(&mut self, text: &str) {
+        self.lines += 1;
+        self.glyphs += text.chars().count();
+    }
 }
 
 #[expect(clippy::too_many_arguments)]
 fn paint_map(
-    bounds: Bounds<Pixels>,
+    canvas_bounds: Bounds<Pixels>,
     scene: &SceneSnapshot,
     camera: Camera,
     blend: StageBlend,
@@ -397,464 +1200,125 @@ fn paint_map(
     fg_buf: &Rc<RefCell<Vec<PaintQuad>>>,
     label_buf: &Rc<RefCell<Vec<LabelJob>>>,
     icon_buf: &Rc<RefCell<Vec<IconJob>>>,
+    text_cache: &Rc<RefCell<TextCache>>,
+    marks: Marks,
     edges_on: bool,
     churn_on: bool,
+    hud_on: bool,
     was_continuous: bool,
     animating: bool,
+    bench_letterbox: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
     let frame_start = std::time::Instant::now();
     stats.borrow_mut().begin_frame(frame_start, was_continuous);
+    // One refcount bump per frame, at walk setup and never inside it: the
+    // walk itself still reads plain `MapTheme` fields, which is the whole
+    // reason that struct is `Copy` scalars.
+    let theme = k10s_theme::active(cx).clone();
+    let typography = k10s_theme::typography(cx).clone();
     let mut bg = bg_buf.borrow_mut();
-    bg.clear();
     let mut fg = fg_buf.borrow_mut();
-    fg.clear();
+    let mut labels = label_buf.borrow_mut();
+    let mut icons = icon_buf.borrow_mut();
 
-    let vw = f32::from(bounds.size.width);
-    let vh = f32::from(bounds.size.height);
+    let bounds = if bench_letterbox {
+        window.paint_quad(fill(canvas_bounds, rgb(theme.map.bg)));
+        letterbox_bounds(canvas_bounds)
+    } else {
+        canvas_bounds
+    };
+
     let ox = f32::from(bounds.origin.x);
     let oy = f32::from(bounds.origin.y);
     let zoom = camera.zoom;
-    let visible = camera.visible_world(vw, vh);
-
-    let w2b = |r: &Rect| -> Bounds<Pixels> {
-        let (sx, sy) = camera.w2s(r.x, r.y, vw, vh);
-        Bounds {
-            origin: point(px(ox + sx), px(oy + sy)),
-            size: size(px(r.w * zoom), px(r.h * zoom)),
-        }
-    };
-
-    let lod = lod();
-    let stage = blend.walk_stage();
-    let skip_wl = skip_workloads();
-    let stress_any = lod.stress || lod.stress_curves;
-
     let block_alpha = blend.stage_alpha(1);
     let cell_alpha = blend.stage_alpha(2);
-    let cell_label_alpha = blend.stage_alpha(3);
 
-    let z01_t = if stage == 0 {
-        0.0
-    } else if blend.from.min(blend.to) >= 1 {
-        1.0
-    } else {
-        blend.fade_alpha()
+    let opts = FrameOpts {
+        policy: lod(),
+        theme: &theme.map,
+        type_: typography.map(),
+        edges_on,
+        skip_blocks: skip_workloads(),
+        hex: hex::hex_on(),
     };
 
-    let ns_border_hsla: gpui::Hsla = rgb(NS_BORDER).into();
-    let ns_fill_bg: gpui::Background = rgb(NS_FILL).into();
-    let ns_fill_rgba = rgb(NS_FILL);
-    let ns_border_rgba = rgb(NS_BORDER);
-    let header_fill_bg: gpui::Background = scale_alpha(rgb(CARD_HEADER_FILL), block_alpha).into();
-    const HEALTHS: [Health; 4] = [Health::Ok, Health::Warn, Health::Err, Health::Unknown];
-    let health_ix = |h: Health| -> usize {
-        match h {
-            Health::Ok => 0,
-            Health::Warn => 1,
-            Health::Err => 2,
-            Health::Unknown => 3,
-        }
-    };
-    let wl_paint: [(gpui::Background, gpui::Hsla); 4] = HEALTHS.map(|h| {
-        let (fill_c, border_c) = workload_colors(h);
-        (
-            scale_alpha(fill_c, block_alpha).into(),
-            scale_alpha(border_c, block_alpha).into(),
-        )
-    });
-    let pod_paint: [gpui::Background; 4] =
-        HEALTHS.map(|h| scale_alpha(pod_color(h), cell_alpha).into());
-    let strip_paint: [gpui::Background; 4] =
-        HEALTHS.map(|h| scale_alpha(pod_color(h), block_alpha).into());
+    let walk_start = std::time::Instant::now();
+    let mut sink = PaintSink::new(&mut bg, &mut fg, &mut labels, &mut icons, glow_on());
+    let counts = frame::walk(bounds, scene, camera, blend, opts, &mut sink);
+    let paths = sink.into_paths();
 
-    let mut quads = 0usize;
-    let mut drawn_ns = 0usize;
-    let mut drawn_wl = 0usize;
-    let mut drawn_pods = 0usize;
-    let mut drawn_sats = 0usize;
-    let mut curves = 0usize;
-    let mut curves_dropped = 0usize;
-    let mut labels = label_buf.borrow_mut();
-    labels.clear();
-    let mut labels_dropped = 0usize;
-    let mut icons = icon_buf.borrow_mut();
-    icons.clear();
-    let mut icons_dropped = 0usize;
-
-    let push_label = |labels: &mut Vec<LabelJob>,
-                      dropped: &mut usize,
-                      text: &std::sync::Arc<str>,
-                      x: f32,
-                      y: f32,
-                      size_px: f32,
-                      color: gpui::Rgba| {
-        if labels.len() >= lod.max_labels {
-            *dropped += 1;
-        } else {
-            labels.push(LabelJob {
-                text: SharedString::new(&**text),
-                x,
-                y,
-                size_px,
-                color,
-            });
-        }
-    };
-
-    let glow = glow_on();
-    let mut curve_core = PathBuilder::stroke(px(CURVE_CORE_W));
-    let mut curve_glow = PathBuilder::stroke(px(CURVE_GLOW_W));
-    let mut dash_scratch: Vec<(f32, f32)> = Vec::new();
-
-    bg.push(fill(bounds, rgb(BG)));
-    quads += 1;
-
-    for ns in &scene.regions {
-        if !ns.rect.intersects(&visible) {
-            continue;
-        }
-        drawn_ns += 1;
-        let b = w2b(&ns.rect);
-
-        if z01_t <= 0.0 {
-            bg.push(quad(
-                b,
-                px(6.0),
-                heat_color(ns.ext.unhealthy_frac),
-                px(1.0),
-                ns_border_hsla,
-                Default::default(),
-            ));
-        } else if z01_t >= 1.0 {
-            bg.push(quad(
-                b,
-                px(8.0),
-                ns_fill_bg,
-                px(1.0),
-                heat_border(ns.ext.unhealthy_frac),
-                Default::default(),
-            ));
-        } else {
-            bg.push(quad(
-                b,
-                px(6.0 + 2.0 * z01_t),
-                mix(heat_color(ns.ext.unhealthy_frac), ns_fill_rgba, z01_t),
-                px(1.0),
-                mix(ns_border_rgba, heat_border(ns.ext.unhealthy_frac), z01_t),
-                Default::default(),
-            ));
-        }
-        quads += 1;
-
-        if lod.region_label_shown(ns.rect.w, zoom) {
-            let (sx, sy) = camera.w2s(ns.rect.x, ns.rect.y, vw, vh);
-            push_label(
-                &mut labels,
-                &mut labels_dropped,
-                &ns.label,
-                ox + sx + 10.0,
-                oy + sy + 6.0,
-                NS_LABEL_PX,
-                gpui::Rgba {
-                    r: 0.62,
-                    g: 0.58,
-                    b: 0.75,
-                    a: 1.0,
-                },
-            );
-        }
-
-        if stage == 0 {
-            continue;
-        }
-
-        let region_inside = visible.contains(&ns.rect);
-        let ns_blocks = &scene.blocks[ns.children.start as usize..ns.children.end as usize];
-        for wl in ns_blocks {
-            if !(region_inside || wl.rect.intersects(&visible)) {
-                continue;
-            }
-            let painted = lod.block_painted(wl.inner.w, zoom) && !skip_wl;
-            if painted {
-                drawn_wl += 1;
-                let (fill_bg, border_hsla) = wl_paint[health_ix(wl.ext.health)];
-                fg.push(quad(
-                    w2b(&wl.inner),
-                    px(4.0),
-                    fill_bg,
-                    px(1.0),
-                    border_hsla,
-                    Default::default(),
-                ));
-                quads += 1;
-
-                if lod.block_chrome_shown(wl.inner.w, zoom) {
-                    let header_h = CARD_HEADER.min(wl.inner.h * 0.32);
-                    let header = Rect::new(wl.inner.x, wl.inner.y, wl.inner.w, header_h);
-                    fg.push(quad(
-                        w2b(&header),
-                        px(4.0),
-                        header_fill_bg,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        Default::default(),
-                    ));
-                    let strip = Rect::new(
-                        wl.inner.x + wl.inner.w * 0.06,
-                        wl.inner.y + header_h * 0.72,
-                        wl.inner.w * 0.88,
-                        header_h * 0.14,
-                    );
-                    fg.push(fill(w2b(&strip), strip_paint[health_ix(wl.ext.health)]));
-                    quads += 2;
-                }
-
-                if lod.block_icon_shown(wl.inner.w, zoom) {
-                    if icons.len() >= lod.max_icons {
-                        icons_dropped += 1;
-                    } else {
-                        let (sx, sy) = camera.w2s(wl.inner.max_x(), wl.inner.y, vw, vh);
-                        let b = Bounds {
-                            origin: point(px(ox + sx - WL_ICON_PX - 3.0), px(oy + sy + 3.0)),
-                            size: size(px(WL_ICON_PX), px(WL_ICON_PX)),
-                        };
-                        icons.push(if wl.ext.tool != Tool::None {
-                            IconJob::Tool(wl.ext.tool, b)
-                        } else {
-                            IconJob::Wl(wl.ext.kind, b)
-                        });
-                    }
-                }
-
-                if lod.block_label_shown(wl.inner.w, zoom) {
-                    let (sx, sy) = camera.w2s(wl.inner.x, wl.inner.y, vw, vh);
-                    push_label(
-                        &mut labels,
-                        &mut labels_dropped,
-                        &wl.label,
-                        ox + sx + 4.0,
-                        oy + sy + 1.0,
-                        WL_LABEL_PX,
-                        gpui::Rgba {
-                            r: 0.72,
-                            g: 0.68,
-                            b: 0.85,
-                            a: block_alpha,
-                        },
-                    );
-                }
-            }
-
-            if stage < 2 {
-                continue;
-            }
-            let block_inside = region_inside || visible.contains(&wl.rect);
-
-            if painted || lod.stress_curves {
-                let sat_base = wl.sats.start as usize;
-                let sats = &scene.sats[sat_base..wl.sats.end as usize];
-                let (hub_wx, hub_wy) = wl.inner.center();
-                let (hx, hy) = camera.w2s(hub_wx, hub_wy, vw, vh);
-                let hub_pt = (ox + hx, oy + hy);
-                for (j, sat) in sats.iter().enumerate() {
-                    if !(block_inside || sat.rect.intersects(&visible)) {
-                        continue;
-                    }
-                    if !lod.sat_painted(sat.rect.w, zoom) {
-                        continue;
-                    }
-                    drawn_sats += 1;
-                    let (sat_wx, sat_wy) = sat.rect.center();
-                    let (sx, sy) = camera.w2s(sat_wx, sat_wy, vw, vh);
-                    let sat_pt = (ox + sx, oy + sy);
-
-                    if lod.sat_icon_shown() {
-                        if icons.len() >= lod.max_icons {
-                            icons_dropped += 1;
-                        } else {
-                            icons.push(IconJob::Sat(
-                                sat.ext.kind,
-                                Bounds {
-                                    origin: point(
-                                        px(sat_pt.0 - SAT_ICON_PX * 0.5),
-                                        px(sat_pt.1 - SAT_ICON_PX * 0.5),
-                                    ),
-                                    size: size(px(SAT_ICON_PX), px(SAT_ICON_PX)),
-                                },
-                            ));
-                        }
-                    }
-
-                    if lod.sat_label_shown(sat.rect.w, zoom) {
-                        let (lx, ly) = camera.w2s(sat.rect.x, sat.rect.max_y(), vw, vh);
-                        push_label(
-                            &mut labels,
-                            &mut labels_dropped,
-                            &sat.label,
-                            ox + lx - 8.0,
-                            oy + ly + 2.0,
-                            SAT_NAME_PX,
-                            gpui::Rgba {
-                                r: 0.80,
-                                g: 0.75,
-                                b: 0.90,
-                                a: cell_alpha,
-                            },
-                        );
-                        push_label(
-                            &mut labels,
-                            &mut labels_dropped,
-                            &sat.ext.detail,
-                            ox + lx - 8.0,
-                            oy + ly + 2.0 + SAT_NAME_PX * 1.25,
-                            SAT_DETAIL_PX,
-                            gpui::Rgba {
-                                r: 0.62,
-                                g: 0.57,
-                                b: 0.74,
-                                a: cell_alpha,
-                            },
-                        );
-                    }
-
-                    if lod.sat_curves {
-                        if curves >= lod.curve_budget() {
-                            curves_dropped += 1;
-                        } else {
-                            curves += 1;
-                            let bow = bow_jitter((sat_base + j) as u64);
-                            let ctrl = curve_ctrl(hub_pt, sat_pt, bow);
-                            if glow {
-                                curve_glow.move_to(point(px(hub_pt.0), px(hub_pt.1)));
-                                curve_glow.curve_to(
-                                    point(px(sat_pt.0), px(sat_pt.1)),
-                                    point(px(ctrl.0), px(ctrl.1)),
-                                );
-                            }
-                            dash_quadratic(
-                                hub_pt,
-                                ctrl,
-                                sat_pt,
-                                CURVE_TOL,
-                                CURVE_DASH_ON,
-                                CURVE_DASH_OFF,
-                                &mut dash_scratch,
-                                |is_move, p| {
-                                    if is_move {
-                                        curve_core.move_to(point(px(p.0), px(p.1)));
-                                    } else {
-                                        curve_core.line_to(point(px(p.0), px(p.1)));
-                                    }
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-
-            if !painted {
-                continue;
-            }
-            let wl_cells = &scene.cells[wl.children.start as usize..wl.children.end as usize];
-            for pod in wl_cells {
-                if !(block_inside || pod.rect.intersects(&visible)) {
-                    continue;
-                }
-                drawn_pods += 1;
-                fg.push(fill(w2b(&pod.rect), pod_paint[health_ix(pod.ext.health)]));
-                quads += 1;
-
-                if stage >= 3 && lod.cell_label_shown(pod.rect.w, zoom) {
-                    let (sx, sy) = camera.w2s(pod.rect.x, pod.rect.y + pod.rect.h, vw, vh);
-                    push_label(
-                        &mut labels,
-                        &mut labels_dropped,
-                        &pod.label,
-                        ox + sx,
-                        oy + sy + 2.0,
-                        POD_LABEL_PX,
-                        gpui::Rgba {
-                            r: 0.55,
-                            g: 0.51,
-                            b: 0.66,
-                            a: cell_label_alpha,
-                        },
-                    );
-                }
-            }
-        }
+    #[cfg(debug_assertions)]
+    {
+        let vw = f32::from(bounds.size.width);
+        let vh = f32::from(bounds.size.height);
+        debug_assert_eq!(
+            lod::cull(scene, &camera, blend, vw, vh, opts),
+            counts,
+            "cull oracle diverged from painter"
+        );
+        debug_assert_eq!(
+            counts.quads,
+            bg.len() + fg.len(),
+            "quad counter drifted from the quads actually emitted"
+        );
+        debug_assert_eq!(counts.labels, labels.len(), "label counter drifted");
+        debug_assert_eq!(counts.icons, icons.len(), "icon counter drifted");
     }
 
+    let bg_quads_start = std::time::Instant::now();
     window.paint_quads(&bg);
 
-    let mut bg_hexes = 0usize;
-    if !stress_any && hex::hex_on() {
-        let (hex_r, hex_alpha) = hex::level(zoom);
-        let mut builder = PathBuilder::stroke(px(1.0));
-        bg_hexes = hex::for_each_center(&visible, hex_r, |cx_, cy_| {
-            for i in 0..6 {
-                let ang = i as f32 * std::f32::consts::FRAC_PI_3;
-                let (wx, wy) = (cx_ + hex_r * ang.cos(), cy_ + hex_r * ang.sin());
-                let (sx, sy) = camera.w2s(wx, wy, vw, vh);
-                let p = point(px(ox + sx), px(oy + sy));
-                if i == 0 {
-                    builder.move_to(p);
-                } else {
-                    builder.line_to(p);
-                }
+    let paths_start = std::time::Instant::now();
+    if counts.bg_cells > 0 {
+        let hex = paths.hex.build();
+        debug_assert!(hex.is_ok(), "hex layer failed to tessellate");
+        if let Ok(path) = hex {
+            window.paint_path(path, rgb(theme.map.hex_line).alpha(hex::level(zoom).1));
+        }
+    }
+
+    if counts.edges > 0 {
+        let edges = paths.edges.build();
+        debug_assert!(edges.is_ok(), "edge layer failed to tessellate");
+        if let Ok(path) = edges {
+            window.paint_path(path, rgb(theme.map.edge).alpha(0.30 * cell_alpha));
+        }
+    }
+
+    if counts.curves > 0 {
+        if paths.glow {
+            let glow = paths.curve_glow.build();
+            debug_assert!(glow.is_ok(), "curve glow layer failed to tessellate");
+            if let Ok(path) = glow {
+                window.paint_path(
+                    path,
+                    rgb(theme.map.curve_glow).alpha(theme.map.curve_glow_alpha * cell_alpha),
+                );
             }
-            builder.close();
-        });
-        if bg_hexes > 0
-            && let Ok(path) = builder.build()
-        {
-            window.paint_path(path, rgb(HEX_LINE).alpha(hex_alpha));
+        }
+        let core = paths.curve_core.build();
+        debug_assert!(core.is_ok(), "curve core layer failed to tessellate");
+        if let Ok(path) = core {
+            window.paint_path(
+                path,
+                rgb(theme.map.curve_core).alpha(theme.map.curve_core_alpha * cell_alpha),
+            );
         }
     }
 
-    let mut drawn_edges = 0usize;
-    if edges_on && stage >= 2 && !stress_any {
-        let mut builder = PathBuilder::stroke(px(1.0));
-        drawn_edges = k10s_atlas::walk_edges(scene, &visible, lod.max_edges, |a, b| {
-            let (ax, ay) = camera.w2s(a.center().0, a.center().1, vw, vh);
-            let (bx, by) = camera.w2s(b.center().0, b.center().1, vw, vh);
-            let pa = (ox + ax, oy + ay);
-            let pb = (ox + bx, oy + by);
-
-            let h = ((a.x.to_bits() as u64) << 32 ^ a.y.to_bits() as u64)
-                ^ ((b.x.to_bits() as u64) << 16 ^ b.y.to_bits() as u64);
-            let ctrl = curve_ctrl(pa, pb, bow_jitter(h) * 0.6);
-            builder.move_to(point(px(pa.0), px(pa.1)));
-            builder.curve_to(point(px(pb.0), px(pb.1)), point(px(ctrl.0), px(ctrl.1)));
-        });
-        if drawn_edges > 0
-            && let Ok(path) = builder.build()
-        {
-            window.paint_path(path, rgb(EDGE).alpha(0.30 * cell_alpha));
-        }
-    }
-
-    if curves > 0 {
-        if glow && let Ok(path) = curve_glow.build() {
-            window.paint_path(path, rgb(CURVE_GLOW).alpha(CURVE_GLOW_ALPHA * cell_alpha));
-        }
-        if let Ok(path) = curve_core.build() {
-            window.paint_path(path, rgb(CURVE_CORE).alpha(CURVE_CORE_ALPHA * cell_alpha));
-        }
-    }
-
+    let fg_quads_start = std::time::Instant::now();
     window.paint_quads(&fg);
+    if !marks.is_empty() {
+        paint_marks(bounds, scene, camera, marks, &theme.map, window);
+    }
 
+    let icons_start = std::time::Instant::now();
     if !icons.is_empty() {
-        let wl_icon_color: gpui::Hsla = gpui::Rgba {
-            r: 0.62,
-            g: 0.58,
-            b: 0.78,
-            a: 0.9 * block_alpha,
-        }
-        .into();
+        let wl_icon_color: gpui::Hsla =
+            scale_alpha(rgb(theme.map.wl_icon), 0.95 * block_alpha).into();
         window.paint_layer(bounds, |window| {
             for job in icons.iter() {
                 let (key, data, icon_bounds, color) = match job {
@@ -862,22 +1326,22 @@ fn paint_map(
                         let (key, data) = kind_icon(*kind);
                         (key, data, *b, wl_icon_color)
                     }
-                    IconJob::Tool(tool, b) => {
+                    IconJob::ToolId(tool, b) => {
                         let (key, data) = tool_icon(*tool);
                         (
                             key,
                             data,
                             *b,
-                            scale_alpha(tool_color(*tool), 0.95 * block_alpha).into(),
+                            scale_alpha(theme.map.tool_color(*tool), 0.95 * block_alpha).into(),
                         )
                     }
                     IconJob::Sat(kind, b) => {
-                        let (key, data) = sat_icon(*kind);
+                        let (key, data) = kind_icon(*kind);
                         (
                             key,
                             data,
                             *b,
-                            scale_alpha(sat_color(*kind), cell_alpha).into(),
+                            scale_alpha(theme.map.kind_color(*kind), cell_alpha).into(),
                         )
                     }
                 };
@@ -893,197 +1357,257 @@ fn paint_map(
         });
     }
 
-    let font = gpui::font("Noto Sans");
-    let mut glyph_runs = 0usize;
+    let text_start = std::time::Instant::now();
+    let ui_font = gpui::font(typography.ui_family.clone());
+    let display_font = gpui::font(typography.display_family.clone());
+    let line_factor = typography.map().line_height;
+    let mut label_counts = LabelCounts::default();
+    let mut cache = text_cache.borrow_mut();
+    let cache_before = cache.stats();
     for job in labels.iter() {
-        let run = TextRun {
-            len: job.text.len(),
-            font: font.clone(),
-            color: job.color.into(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
+        let font = match job.face {
+            LabelFace::Ui => &ui_font,
+            LabelFace::Display => &display_font,
         };
-        let line = window
-            .text_system()
-            .shape_line(job.text.clone(), px(job.size_px), &[run], None);
-        if line
-            .paint(
-                point(px(job.x), px(job.y)),
-                px(job.size_px * 1.4),
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            )
-            .is_ok()
-        {
-            glyph_runs += 1;
+        let line = cache.shape_label(
+            job.text.clone(),
+            font,
+            job.size_px,
+            job.color.into(),
+            blend.is_settled(),
+            window.text_system(),
+        );
+        let origin = point(px(job.x), px(job.y));
+        let line_height = px(job.size_px * line_factor);
+        // A label with a box is centred in it and clipped to it; one without is
+        // set left and runs, which is what a pod cell's name wants. Clipping is
+        // a content mask rather than an ellipsis because building the elided
+        // string would allocate once per label per frame, and the walk's
+        // zero-allocation ratchet is worth more than three dots.
+        let painted = if job.width > 0.0 {
+            let mask = gpui::ContentMask {
+                bounds: Bounds {
+                    origin: point(origin.x, origin.y - line_height),
+                    size: size(px(job.width), line_height * 3.0),
+                },
+            };
+            // Centred while it fits, set left the moment it does not. Centring
+            // an overlong name clips it at BOTH ends, and a Kubernetes name is
+            // informative from the front: `payments-redis-primary` cut to
+            // `ments-redis-pri` names nothing. The line is already shaped, so
+            // this costs a comparison and no second pass.
+            let align = if line.width() > px(job.width) {
+                TextAlign::Left
+            } else {
+                TextAlign::Center
+            };
+            window.with_content_mask(Some(mask), |window| {
+                line.paint(origin, line_height, align, Some(px(job.width)), window, cx)
+            })
+        } else {
+            line.paint(origin, line_height, TextAlign::Left, None, window, cx)
+        };
+        if painted.is_ok() {
+            label_counts.count(&job.text);
         }
     }
-
-    #[cfg(debug_assertions)]
-    {
-        let oracle = lod::cull(scene, &camera, blend, vw, vh, edges_on, skip_workloads());
-        debug_assert_eq!(
-            oracle.quads, quads,
-            "cull oracle: quads diverged from painter"
-        );
-        debug_assert_eq!(oracle.edges, drawn_edges, "cull oracle: edges diverged");
-        debug_assert_eq!(
-            (oracle.drawn_sats, oracle.curves, oracle.curves_dropped),
-            (drawn_sats, curves, curves_dropped),
-            "cull oracle: satellites/curves diverged"
-        );
-        debug_assert_eq!(oracle.bg_cells, bg_hexes, "cull oracle: hex count diverged");
-        debug_assert_eq!(
-            (oracle.labels, oracle.labels_dropped),
-            (labels.len(), labels_dropped),
-            "cull oracle: labels diverged"
-        );
-        debug_assert_eq!(
-            (oracle.icons, oracle.icons_dropped),
-            (icons.len(), icons_dropped),
-            "cull oracle: icons diverged"
-        );
-        debug_assert_eq!(
-            (
-                oracle.drawn_regions,
-                oracle.drawn_blocks,
-                oracle.drawn_cells
-            ),
-            (drawn_ns, drawn_wl, drawn_pods),
-            "cull oracle: drawn counts diverged"
-        );
-    }
+    let cache_delta = cache.stats().since(cache_before);
+    drop(cache);
+    let text_end = std::time::Instant::now();
 
     {
         let mut st = stats.borrow_mut();
-        st.quads = quads;
-        st.glyphs = glyph_runs;
-        st.edges = drawn_edges;
-        st.icons = icons.len();
-        st.sats = drawn_sats;
-        st.curves = curves;
-        st.curves_dropped = curves_dropped;
-        st.bg_cells = bg_hexes;
-        st.drawn = (drawn_ns, drawn_wl, drawn_pods);
-        st.labels_dropped = labels_dropped;
-        st.icons_dropped = icons_dropped;
+        st.quads = counts.quads;
+        st.lines = label_counts.lines;
+        st.glyphs = label_counts.glyphs;
+        st.edges = counts.edges;
+        st.icons = counts.icons;
+        st.sats = counts.drawn_sats;
+        st.curves = counts.curves;
+        st.curves_dropped = counts.curves_dropped;
+        st.bg_cells = counts.bg_cells;
+        st.drawn = DrawnCounts {
+            regions: counts.drawn_regions,
+            blocks: counts.drawn_blocks,
+            cells: counts.drawn_cells,
+        };
+        st.labels_dropped = counts.labels_dropped;
+        st.icons_dropped = counts.icons_dropped;
+        st.text_cache.hits = cache_delta.hits;
+        st.text_cache.misses = cache_delta.misses;
+        st.text_cache.evictions = cache_delta.evictions;
         st.end_cpu(frame_start);
+        st.commit_counters();
     }
+
+    let hud_start = std::time::Instant::now();
     paint_hud(
         scene,
+        &theme,
+        &typography,
         stats,
         camera.zoom,
         blend,
         edges_on,
         churn_on,
+        hud_on,
         animating,
         ox,
         oy,
+        text_cache,
         window,
         cx,
     );
+    let hud_end = std::time::Instant::now();
+
+    stats.borrow_mut().push_spans(FrameSpans {
+        walk_us: span_us(walk_start, bg_quads_start),
+        quads_us: span_us(bg_quads_start, paths_start) + span_us(fg_quads_start, icons_start),
+        paths_us: span_us(paths_start, fg_quads_start),
+        icons_us: span_us(icons_start, text_start),
+        text_us: span_us(text_start, text_end),
+        hud_us: span_us(hud_start, hud_end),
+    });
+}
+
+fn span_us(from: std::time::Instant, to: std::time::Instant) -> f32 {
+    (to - from).as_secs_f32() * 1_000_000.0
 }
 
 #[expect(clippy::too_many_arguments)]
 fn paint_hud(
     scene: &SceneSnapshot,
+    theme: &k10s_theme::Theme,
+    typography: &k10s_theme::Typography,
     stats: &Rc<RefCell<FrameStats>>,
     zoom: f32,
     blend: StageBlend,
     edges_on: bool,
     churn_on: bool,
+    hud_on: bool,
     animating: bool,
     ox: f32,
     oy: f32,
+    text_cache: &Rc<RefCell<TextCache>>,
     window: &mut Window,
     cx: &mut App,
 ) {
+    if !hud_on {
+        return;
+    }
+
     let st = stats.borrow();
     let (fp50, fp95, fp99) = st.frame_percentiles();
     let (cp50, cp99) = st.cpu_percentiles();
     let t = scene.totals;
-    let lines = [
-        format!(
-            "k10s starmap [rev {}]  {} ns / {} wl / {} pods / {} sats / {} edges",
-            scene.rev,
-            group(t.regions),
-            group(t.blocks),
-            group(t.cells),
-            group(t.sats),
-            group(t.edges),
-        ),
-        format!(
-            "frame  p50 {fp50:.1}  p95 {fp95:.1}  p99 {fp99:.1} ms   (~{:.0} {})",
-            if fp50 > 0.0 { 1000.0 / fp50 } else { 0.0 },
-            if animating { "fps" } else { "paints/s" },
-        ),
-        format!("paint cpu  p50 {cp50:.2}  p99 {cp99:.2} ms"),
-        format!(
-            "zoom {zoom:.3}  stage {}  |  quads {}  glyphs {}  icons {}  edges {}  dropped {}L/{}I",
-            if blend.is_settled() {
-                format!("Z{}", blend.to)
-            } else {
-                format!("Z{}>Z{}", blend.from, blend.to)
-            },
-            group(st.quads as u32),
-            st.glyphs,
-            st.icons,
-            st.edges,
-            st.labels_dropped,
-            st.icons_dropped,
-        ),
-        format!(
-            "sats {}  curves {}{}  hex {}  |  drawn ns {} wl {} pods {}",
-            st.sats,
-            st.curves,
-            if st.curves_dropped > 0 {
-                format!(" (-{})", st.curves_dropped)
-            } else {
-                String::new()
-            },
-            st.bg_cells,
-            st.drawn.0,
-            st.drawn.1,
-            group(st.drawn.2 as u32),
-        ),
-        format!(
-            "[c]hurn {}  [e]dges {}  [f]it",
-            if churn_on { "on" } else { "off" },
-            if edges_on { "on" } else { "off" },
-        ),
-    ];
+    let mut cache = text_cache.borrow_mut();
+    let lines = cache.hud_lines_mut();
+    for line in lines.iter_mut() {
+        line.clear();
+    }
+    write!(
+        lines[0],
+        "k10s starmap [rev {}]  {} ns / {} wl / {} pods / {} sats / {} edges",
+        scene.rev,
+        Grouped(t.regions),
+        Grouped(t.blocks),
+        Grouped(t.cells),
+        Grouped(t.sats),
+        Grouped(t.edges),
+    )
+    .expect("writing to a String is infallible");
+    write!(
+        lines[1],
+        "frame  p50 {fp50:.1}  p95 {fp95:.1}  p99 {fp99:.1} ms   (~{:.0} {})",
+        if fp50 > 0.0 { 1000.0 / fp50 } else { 0.0 },
+        if animating { "fps" } else { "paints/s" },
+    )
+    .expect("writing to a String is infallible");
+    write!(
+        lines[2],
+        "paint cpu  p50 {cp50:.2}  p99 {cp99:.2} ms  |  text cache {}H/{}M",
+        st.text_cache.hits, st.text_cache.misses,
+    )
+    .expect("writing to a String is infallible");
+    if blend.is_settled() {
+        write!(lines[3], "zoom {zoom:.3}  stage Z{}", blend.to)
+    } else {
+        write!(
+            lines[3],
+            "zoom {zoom:.3}  stage Z{}>Z{}",
+            blend.from, blend.to
+        )
+    }
+    .expect("writing to a String is infallible");
+    write!(
+        lines[3],
+        "  |  quads {}  lines {}  glyphs {}  icons {}  edges {}  dropped {}L/{}I",
+        Grouped(st.quads as u32),
+        st.lines,
+        Grouped(st.glyphs as u32),
+        st.icons,
+        st.edges,
+        st.labels_dropped,
+        st.icons_dropped,
+    )
+    .expect("writing to a String is infallible");
+    write!(lines[4], "sats {}  curves {}", st.sats, st.curves)
+        .expect("writing to a String is infallible");
+    if st.curves_dropped > 0 {
+        write!(lines[4], " (-{})", st.curves_dropped).expect("writing to a String is infallible");
+    }
+    write!(
+        lines[4],
+        "  hex {}  |  drawn ns {} wl {} pods {}",
+        st.bg_cells,
+        st.drawn.regions,
+        st.drawn.blocks,
+        Grouped(st.drawn.cells as u32),
+    )
+    .expect("writing to a String is infallible");
+    write!(
+        lines[5],
+        "[c]hurn {}  [e]dges {}  [f]it  [h]ide",
+        if churn_on { "on" } else { "off" },
+        if edges_on { "on" } else { "off" },
+    )
+    .expect("writing to a String is infallible");
     drop(st);
 
     let pad = 10.0;
     let line_h = 16.0;
     let hud_bounds = Bounds {
         origin: point(px(ox + 12.0), px(oy + 12.0)),
-        size: size(px(560.0), px(2.0 * pad + line_h * lines.len() as f32)),
+        size: size(px(600.0), px(2.0 * pad + line_h * lines.len() as f32)),
     };
     window.paint_quad(quad(
         hud_bounds,
         px(6.0),
-        rgb(HUD_BG).alpha(0.88),
+        rgb(theme.map.hud_bg).alpha(0.88),
         px(1.0),
-        rgb(NS_BORDER),
+        rgb(theme.map.ns_border),
         Default::default(),
     ));
 
-    let font = gpui::font("JetBrains Mono");
+    let font = gpui::font(typography.buffer_family.clone());
     for (i, text) in lines.iter().enumerate() {
-        let s = SharedString::from(text.clone());
+        let hash = text::content_hash(text);
         let run = TextRun {
-            len: s.len(),
+            len: text.len(),
             font: font.clone(),
-            color: rgb(HUD_TEXT).into(),
+            color: rgb(theme.map.hud_text).into(),
             background_color: None,
             underline: None,
             strikethrough: None,
         };
-        let line = window.text_system().shape_line(s, px(11.0), &[run], None);
+        let line = window.text_system().shape_line_by_hash(
+            hash,
+            text.len(),
+            px(11.0),
+            &[run],
+            None,
+            || SharedString::from(text.as_str()),
+        );
         let _ = line.paint(
             point(px(ox + 12.0 + pad), px(oy + 12.0 + pad + i as f32 * line_h)),
             px(line_h),
@@ -1095,14 +1619,26 @@ fn paint_hud(
     }
 }
 
-fn group(n: u32) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
+struct Grouped(u32);
+
+impl std::fmt::Display for Grouped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn write_grouped(value: u32, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if value < 1000 {
+                write!(f, "{value}")
+            } else {
+                write_grouped(value / 1000, f)?;
+                write!(f, ",{:03}", value % 1000)
+            }
         }
-        out.push(c);
+        write_grouped(self.0, f)
     }
-    out
 }
+
+#[cfg(test)]
+#[path = "view_test.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "view_flight_test.rs"]
+mod flight_tests;

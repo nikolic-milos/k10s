@@ -1,0 +1,117 @@
+name: Supply chain
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Enforce workspace graph ceiling
+        run: >-
+          cargo run --quiet --locked -p k10s-bench
+          --bin dependency-budget -- benchmarks/dependency-budget.json
+
+      - name: Capture paint-tool metadata
+        run: >-
+          cargo metadata
+          --manifest-path tools/k10s-paint-bench/Cargo.toml
+          --locked
+          --format-version 1
+          > target/paint-metadata.json
+
+      - name: Enforce paint-tool graph ceiling
+        run: >-
+          cargo run --quiet --locked -p k10s-bench
+          --bin dependency-budget --
+          tools/k10s-paint-bench/dependency-budget.json
+          target/paint-metadata.json
+
+      - name: Check workspace advisories, bans, licenses and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          rust-version: "1.97.1"
+          arguments: --locked
+          command: check
+
+      - name: Check paint-tool advisories, bans, licenses and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          rust-version: "1.97.1"
+          manifest-path: tools/k10s-paint-bench/Cargo.toml
+          arguments: --locked --config deny.toml
+          command: check
+
+  audit:
+    name: RustSec audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Audit locked production dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Audit isolated paint-benchmark dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: tools/k10s-paint-bench
+
+  sbom:
+    name: CycloneDX SBOM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx --version 0.5.9
+
+      - name: Generate application SBOM
+        run: >-
+          cargo cyclonedx
+          --manifest-path crates/k10s-app/Cargo.toml
+          --format json
+          --all-features
+          --target all
+          --spec-version 1.5
+          --override-filename k10s.cdx
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: k10s-cyclonedx-sbom
+          path: crates/**/k10s.cdx.json
+          if-no-files-found: error
+          retention-days: 30

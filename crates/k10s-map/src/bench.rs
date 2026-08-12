@@ -20,11 +20,14 @@ pub struct BenchTotals {
 pub struct BenchReport {
     pub schema_version: u32,
     pub machine: String,
+    pub churn: f32,
     pub arch: String,
     pub objects: u32,
     pub seed: u64,
     pub layout: String,
     pub viewport: [f32; 2],
+    pub window: [f32; 2],
+    pub resizes: u32,
     pub totals: BenchTotals,
     pub segments: Vec<SegmentResult>,
 }
@@ -32,6 +35,7 @@ pub struct BenchReport {
 #[derive(Clone)]
 pub struct BenchMeta {
     pub machine: String,
+    pub churn: f32,
     pub arch: String,
     pub objects: u32,
     pub seed: u64,
@@ -47,12 +51,29 @@ pub enum BenchFrame {
         arm_timer: Option<Duration>,
     },
     Done,
+    /// The flight cannot run to completion and has already said why. Kept apart
+    /// from `Done` because a recording that did not happen must not look, to
+    /// whatever is reading the exit code, like one that did.
+    Aborted,
 }
 
 impl BenchFrame {
     pub fn needs_frame(&self) -> bool {
         matches!(self, BenchFrame::Waiting | BenchFrame::Camera(_))
     }
+}
+
+// What the hosting view still owes the driver after a frame: the gpui side
+// effects the driver cannot perform itself. Everything else -- camera,
+// pacing, reporting -- the driver has already applied.
+#[must_use]
+pub enum BenchOp {
+    Continue,
+    ArmTimer(Duration),
+    Quit,
+    /// Leave, and let the caller fail. The reason is already on stderr; what the
+    /// caller owes is an orderly shutdown and a non-zero status, in that order.
+    Abort,
 }
 
 fn plan(a: &FlightAnchors, vw: f32, _vh: f32) -> Vec<Segment> {
@@ -73,13 +94,12 @@ fn plan(a: &FlightAnchors, vw: f32, _vh: f32) -> Vec<Segment> {
     let hub_left = at(hx - pan_w2 * 0.5, hy, 2.2);
     let hub_right = at(hx + pan_w2 * 0.5, hy, 2.2);
 
-    let seg = |name, from, to, gate_frame| Segment {
+    let seg = |name, from, to| Segment {
         name,
         from,
         to,
         dur: 3.0,
         measure: true,
-        gate_frame,
         idle: false,
     };
     vec![
@@ -89,26 +109,24 @@ fn plan(a: &FlightAnchors, vw: f32, _vh: f32) -> Vec<Segment> {
             to: fit,
             dur: 2.0,
             measure: false,
-            gate_frame: false,
             idle: false,
         },
-        seg("Z0 static (island overview)", fit, fit, true),
-        seg("Z0->Z1 fly-in", fit, z1, true),
-        seg("Z1 static (workload cards)", z1, z1, true),
-        seg("Z1 cross-map pan", z1_left, z1_right, true),
-        seg("Z1->Z2 fly-in (hub)", z1, hub, true),
-        seg("Z2 static (hub + satellites)", hub, hub, true),
-        seg("Z2 hub pan", hub_left, hub_right, true),
-        seg("Z2->Z3 fly-in", hub, z3, true),
-        seg("Z3 static (pod detail)", z3, z3, true),
-        seg("Z3->Z0 fly-out", z3, fit, true),
+        seg("Z0 static (island overview)", fit, fit),
+        seg("Z0->Z1 fly-in", fit, z1),
+        seg("Z1 static (workload cards)", z1, z1),
+        seg("Z1 cross-map pan", z1_left, z1_right),
+        seg("Z1->Z2 fly-in (hub)", z1, hub),
+        seg("Z2 static (hub + satellites)", hub, hub),
+        seg("Z2 hub pan", hub_left, hub_right),
+        seg("Z2->Z3 fly-in", hub, z3),
+        seg("Z3 static (pod detail)", z3, z3),
+        seg("Z3->Z0 fly-out", z3, fit),
         Segment {
             name: "Z0 idle (no damage)",
             from: fit,
             to: fit,
             dur: 5.0,
             measure: true,
-            gate_frame: false,
             idle: true,
         },
     ]
@@ -127,7 +145,46 @@ impl Bench {
         }
     }
 
-    pub fn frame(
+    // The whole flight-driving decision, out of the view: apply the frame to
+    // the camera, keep the pacer fed, and hand back only the effects that
+    // need a window context.
+    pub fn drive(
+        &mut self,
+        now: Instant,
+        vw: f32,
+        vh: f32,
+        active: bool,
+        scene: &SceneSnapshot,
+        stats: &mut FrameStats,
+        camera: &mut Camera,
+        pacer: &mut k10s_atlas::FramePacer,
+    ) -> BenchOp {
+        let frame = self.frame(now, vw, vh, active, scene, stats);
+        if frame.needs_frame() {
+            pacer.request_frame();
+        }
+        match frame {
+            BenchFrame::Waiting => BenchOp::Continue,
+            BenchFrame::Camera(cam) => {
+                *camera = cam;
+                BenchOp::Continue
+            }
+            BenchFrame::Idle {
+                camera: cam,
+                arm_timer,
+            } => {
+                *camera = cam;
+                match arm_timer {
+                    Some(delay) => BenchOp::ArmTimer(delay),
+                    None => BenchOp::Continue,
+                }
+            }
+            BenchFrame::Done => BenchOp::Quit,
+            BenchFrame::Aborted => BenchOp::Abort,
+        }
+    }
+
+    fn frame(
         &mut self,
         now: Instant,
         vw: f32,
@@ -144,19 +201,22 @@ impl Bench {
                 self.finish(&result);
                 BenchFrame::Done
             }
-            FlightFrame::Aborted => std::process::exit(3),
+            FlightFrame::Aborted => BenchFrame::Aborted,
         }
     }
 
     fn report(&self, r: &FlightResult) -> BenchReport {
         BenchReport {
-            schema_version: 1,
+            schema_version: 5,
             machine: self.meta.machine.clone(),
+            churn: self.meta.churn,
             arch: self.meta.arch.clone(),
             objects: self.meta.objects,
             seed: self.meta.seed,
             layout: self.meta.layout.clone(),
             viewport: r.viewport,
+            window: r.window,
+            resizes: r.resizes,
             totals: BenchTotals {
                 namespaces: r.totals.regions,
                 workloads: r.totals.blocks,
@@ -188,8 +248,10 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "k10s bench [{}] - {} ns / {} wl / {} pods / {} sats / {} edges - viewport {:.0}x{:.0}{}",
+        "k10s bench [{}] machine={} churn={} - {} ns / {} wl / {} pods / {} sats / {} edges - viewport {:.0}x{:.0}{}",
         report.layout,
+        report.machine,
+        report.churn,
         report.totals.namespaces,
         report.totals.workloads,
         report.totals.pods,
@@ -198,185 +260,90 @@ fn render_table(report: &BenchReport, restarts: u32) -> String {
         report.viewport[0],
         report.viewport[1],
         if restarts > 0 {
-            format!(" ({restarts} restart(s) after resize)")
+            format!(" ({restarts} restart(s) after focus loss)")
         } else {
             String::new()
         },
     );
+    if report.resizes > 0 {
+        let _ = writeln!(
+            out,
+            "  window resized {} time(s) mid-flight (last {:.0}x{:.0}); the letterboxed \
+             counters hold, wall-clock timings may not",
+            report.resizes, report.window[0], report.window[1],
+        );
+    }
     for r in &report.segments {
         if let Some(idle) = &r.idle {
+            let cpu = match idle.proc_cpu_ms {
+                Some(ms) => format!("{ms:.1} ms process cpu"),
+                None => "n/a process cpu".to_string(),
+            };
             let _ = writeln!(
                 out,
-                "  {:<28} idle {:.0} s: {} paints, {:.1} ms process cpu",
-                r.name, idle.dur_s, idle.paints, idle.proc_cpu_ms,
+                "  {:<28} idle {:.0} s @ churn {}: {} paints, {cpu}",
+                r.name, idle.dur_s, report.churn, idle.paints,
             );
             continue;
         }
         let _ = writeln!(
             out,
-            "  {:<28} frame p50 {:5.1}  p95 {:5.1}  p99 {:5.1} ms | cpu p50 {:5.2}  p99 {:5.2} ms | quads {:>6}  glyphs {:>3}  sats {:>4}  curves {:>4}  edges {:>4}",
+            "  {:<28} quads {:>6}  lines {:>4}  glyphs {:>6}  icons {:>4}  sats {:>4}  curves {:>4}  edges {:>4}  hex {:>4}  drawn ns/wl/pods {}/{}/{}  dropped {}L/{}I/{}C  text cache {}H/{}M/{}E",
             r.name,
-            r.frame_ms.p50,
-            r.frame_ms.p95,
-            r.frame_ms.p99,
-            r.cpu_ms.p50,
-            r.cpu_ms.p99,
             r.quads,
+            r.lines,
             r.glyphs,
+            r.icons,
             r.sats,
             r.curves,
             r.edges,
+            r.bg_cells,
+            r.drawn.regions,
+            r.drawn.blocks,
+            r.drawn.cells,
+            r.labels_dropped,
+            r.icons_dropped,
+            r.curves_dropped,
+            r.text_cache.hits,
+            r.text_cache.misses,
+            r.text_cache.evictions,
+        );
+        if !r.counters.is_steady() {
+            let range = |c: &k10s_atlas::CounterStats| format!("{}..{}~{}", c.min, c.max, c.p99);
+            let _ = writeln!(
+                out,
+                "  {:<28} envelope (min..max~p99)  quads {}  lines {}  glyphs {}  icons {}  sats {}  curves {}  edges {}  hex {}",
+                "",
+                range(&r.counters.quads),
+                range(&r.counters.lines),
+                range(&r.counters.glyphs),
+                range(&r.counters.icons),
+                range(&r.counters.sats),
+                range(&r.counters.curves),
+                range(&r.counters.edges),
+                range(&r.counters.bg_cells),
+            );
+        }
+        let _ = writeln!(
+            out,
+            "  {:<28} spans us  walk {:>6.0}  quads {:>5.0}  paths {:>6.0}  icons {:>5.0}  text {:>6.0}  hud {:>5.0}",
+            "",
+            r.spans.walk_us,
+            r.spans.quads_us,
+            r.spans.paths_us,
+            r.spans.icons_us,
+            r.spans.text_us,
+            r.spans.hud_us,
+        );
+        let _ = writeln!(
+            out,
+            "  {:<28} cpu p50 {:5.2}  p99 {:5.2} ms (hud excluded)  |  frame p50 {:5.1}  p95 {:5.1}  p99 {:5.1} ms (informational, vsync-bound)",
+            "", r.cpu_ms.p50, r.cpu_ms.p99, r.frame_ms.p50, r.frame_ms.p95, r.frame_ms.p99,
         );
     }
     out
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use k10s_atlas::flight::{CpuPercentiles, IdleResult, Percentiles};
-
-    fn anchors() -> FlightAnchors {
-        let mut fit = Camera::default();
-        fit.fit(
-            k10s_core::Rect::new(0.0, 0.0, 10_000.0, 6_000.0),
-            1600.0,
-            1000.0,
-        );
-        FlightAnchors {
-            fit,
-            region_center: (1000.0, 800.0),
-            block_center: (1050.0, 830.0),
-            hub_center: (2400.0, 1400.0),
-        }
-    }
-
-    #[test]
-    fn plan_matches_baseline_segment_names() {
-        let segs = plan(&anchors(), 1600.0, 1000.0);
-        let names: Vec<&str> = segs.iter().map(|s| s.name).collect();
-        assert_eq!(
-            names,
-            [
-                "warmup",
-                "Z0 static (island overview)",
-                "Z0->Z1 fly-in",
-                "Z1 static (workload cards)",
-                "Z1 cross-map pan",
-                "Z1->Z2 fly-in (hub)",
-                "Z2 static (hub + satellites)",
-                "Z2 hub pan",
-                "Z2->Z3 fly-in",
-                "Z3 static (pod detail)",
-                "Z3->Z0 fly-out",
-                "Z0 idle (no damage)",
-            ]
-        );
-        assert!(!segs[0].measure, "warmup must not report");
-        assert!(
-            segs.last().unwrap().idle,
-            "flight must end with the idle segment"
-        );
-        assert_eq!(segs.iter().filter(|s| s.idle).count(), 1);
-        assert!(
-            segs.iter()
-                .filter(|s| s.measure && !s.idle)
-                .all(|s| s.gate_frame),
-            "measured segments must be frame-gated"
-        );
-        assert_eq!(segs[3].to.zoom, 0.12);
-        assert_eq!(
-            segs[6].to.zoom, 2.2,
-            "hub zoom must show two-line sat labels"
-        );
-        assert_eq!(segs[9].to.zoom, 4.5);
-        assert_eq!(segs[6].to.cx, 2400.0);
-        assert_eq!(segs[6].to.cy, 1400.0);
-    }
-
-    #[test]
-    fn report_json_keeps_schema_v1_keys() {
-        let meta = BenchMeta {
-            machine: "m".into(),
-            arch: "x".into(),
-            objects: 1,
-            seed: 42,
-            layout: "spread".into(),
-            json: true,
-        };
-        let bench = Bench::new(meta);
-        let seg = |idle| SegmentResult {
-            name: "s".into(),
-            gate_frame: true,
-            frame_ms: Percentiles {
-                p50: 1.0,
-                p95: 2.0,
-                p99: 3.0,
-            },
-            cpu_ms: CpuPercentiles {
-                p50: 0.25,
-                p99: 0.5,
-            },
-            quads: 10,
-            glyphs: 2,
-            edges: 1,
-            sats: 5,
-            curves: 4,
-            idle,
-        };
-        let result = FlightResult {
-            viewport: [1600.0, 1000.0],
-            totals: k10s_atlas::Totals {
-                regions: 3,
-                blocks: 20,
-                cells: 100,
-                sats: 40,
-                edges: 7,
-            },
-            segments: vec![
-                seg(None),
-                seg(Some(IdleResult {
-                    dur_s: 5.0,
-                    paints: 0,
-                    proc_cpu_ms: 1.5,
-                })),
-            ],
-            restarts: 0,
-        };
-        let v = serde_json::to_value(bench.report(&result)).unwrap();
-
-        assert_eq!(v["schema_version"], 1);
-        assert_eq!(v["layout"], "spread");
-        let totals = v["totals"].as_object().unwrap();
-        let mut keys: Vec<_> = totals.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, ["edges", "namespaces", "pods", "sats", "workloads"]);
-        assert_eq!(v["totals"]["namespaces"], 3);
-        assert_eq!(v["totals"]["pods"], 100);
-        assert_eq!(v["totals"]["sats"], 40);
-
-        let s0 = v["segments"][0].as_object().unwrap();
-        for key in [
-            "name",
-            "gate_frame",
-            "frame_ms",
-            "cpu_ms",
-            "quads",
-            "glyphs",
-            "edges",
-            "sats",
-            "curves",
-        ] {
-            assert!(s0.contains_key(key), "segment missing {key}");
-        }
-        assert!(!s0.contains_key("idle"), "idle must be skipped when None");
-        assert_eq!(v["segments"][0]["frame_ms"]["p99"], 3.0);
-        assert_eq!(v["segments"][0]["cpu_ms"]["p50"], 0.25);
-        assert_eq!(v["segments"][0]["sats"], 5);
-        assert_eq!(v["segments"][0]["curves"], 4);
-        let idle = v["segments"][1]["idle"].as_object().unwrap();
-        let mut keys: Vec<_> = idle.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, ["dur_s", "paints", "proc_cpu_ms"]);
-    }
-}
+#[path = "bench_test.rs"]
+mod tests;
