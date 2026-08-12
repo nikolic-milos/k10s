@@ -24,6 +24,8 @@ mod inspector;
 mod logs;
 #[path = "scripted_apiserver/manifest.rs"]
 mod manifest;
+#[path = "scripted_apiserver/metrics.rs"]
+mod metrics;
 #[path = "scripted_apiserver/nodes.rs"]
 mod nodes;
 #[path = "scripted_apiserver/rbac.rs"]

@@ -25,6 +25,7 @@ use crate::forward::{self, ForwardRegistry, ForwardRequest, ForwardRow, KubeForw
 use crate::helm;
 use crate::logs::{self, LogChunk, LogRequest, LogStop};
 use crate::manifest;
+use crate::metrics::{self, UsageOutcome, UsageRequest, UsageStop};
 use crate::nodes;
 use crate::openapi;
 
@@ -325,6 +326,24 @@ impl Reader {
         on_event: Box<dyn Fn(ExecEvent) + Send + Sync>,
     ) -> Box<dyn ExecSession> {
         KubeExecTransport::new(self.client.clone(), self.handle.clone()).start(request, on_event)
+    }
+
+    // Live usage for a pod or a workload, re-fetched on the request's own
+    // cadence until the guard drops; every answer is a labelled
+    // [`UsageOutcome`], and a tick that repeats the last one is not
+    // re-delivered. Denied and Absent end the poll themselves.
+    pub fn poll_usage(
+        &self,
+        request: UsageRequest,
+        on_update: Box<dyn Fn(UsageOutcome) + Send + Sync>,
+    ) -> UsageStop {
+        metrics::poll(
+            &self.handle,
+            self.client.clone(),
+            self.targets.clone(),
+            request,
+            on_update,
+        )
     }
 
     // One merged follow over the pods the workload's selector matches; the

@@ -26,6 +26,7 @@ pub mod manifest;
 #[cfg(test)]
 mod manifest_test;
 pub mod mapping;
+pub mod metrics;
 pub mod nodes;
 pub mod openapi;
 mod projection;
