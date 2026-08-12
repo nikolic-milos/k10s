@@ -102,6 +102,126 @@ fn one_panel_below_is_not_pluralised_and_none_is_not_mentioned() {
     );
 }
 
+fn full_sample() -> UsageSample {
+    UsageSample {
+        cpu: Some(Millicores(250)),
+        memory: Some(Bytes(32 * 1024 * 1024)),
+        cpu_request: Some(Millicores(500)),
+        cpu_limit: Some(Millicores(1000)),
+        memory_request: Some(Bytes(64 * 1024 * 1024)),
+        memory_limit: Some(Bytes(128 * 1024 * 1024)),
+        source: UsageSource::MetricsServer,
+        pods_measured: 1,
+        pods_total: 1,
+        truncated: false,
+    }
+}
+
+#[test]
+fn usage_lines_compute_percentages_at_display_time_from_the_typed_values() {
+    assert_eq!(
+        usage_lines(&full_sample()),
+        [
+            "CPU 250m · request 500m (50%) · limit 1 core (25%)",
+            "Memory 32Mi · request 64Mi (50%) · limit 128Mi (25%)",
+        ],
+        "a single fully-measured pod needs no coverage or provenance clause"
+    );
+}
+
+#[test]
+fn an_unmeasured_value_says_sampling_and_never_renders_as_zero() {
+    let first_kubelet_tick = UsageSample {
+        cpu: None,
+        memory: Some(Bytes(32 * 1024 * 1024)),
+        cpu_limit: None,
+        source: UsageSource::Kubelet,
+        ..full_sample()
+    };
+    assert_eq!(
+        usage_lines(&first_kubelet_tick),
+        [
+            "CPU sampling… · request 500m · no limit",
+            "Memory 32Mi · request 64Mi (50%) · limit 128Mi (25%)",
+            "via the kubelet; metrics-server is not installed",
+        ],
+        "no rate yet means no percentage against the request either"
+    );
+}
+
+#[test]
+fn what_was_never_declared_is_absent_from_the_sentence_not_zero_in_it() {
+    let undeclared = UsageSample {
+        cpu_request: None,
+        cpu_limit: None,
+        memory_request: None,
+        memory_limit: None,
+        ..full_sample()
+    };
+    assert_eq!(
+        usage_lines(&undeclared),
+        ["CPU 250m · no limit", "Memory 32Mi · no limit"],
+        "a missing request contributes nothing; a missing limit is a fact worth a word"
+    );
+}
+
+#[test]
+fn a_workload_says_how_much_of_it_the_numbers_cover() {
+    let partial = UsageSample {
+        pods_measured: 2,
+        pods_total: 3,
+        ..full_sample()
+    };
+    assert!(
+        usage_lines(&partial).contains(&"2 of 3 pods measured".to_string()),
+        "a partial sum must say how partial it is: {:?}",
+        usage_lines(&partial)
+    );
+
+    let clamped = UsageSample {
+        pods_measured: 16,
+        pods_total: 16,
+        truncated: true,
+        ..full_sample()
+    };
+    assert!(
+        usage_lines(&clamped)
+            .contains(&"16 of 16 pods measured; more match than are polled".to_string()),
+        "a clamped workload names the clamp: {:?}",
+        usage_lines(&clamped)
+    );
+
+    let unscraped_pod = UsageSample {
+        cpu: None,
+        memory: None,
+        pods_measured: 0,
+        ..full_sample()
+    };
+    assert!(
+        usage_lines(&unscraped_pod).contains(&"0 of 1 pods measured".to_string()),
+        "even one pod earns the clause when its numbers are missing: {:?}",
+        usage_lines(&unscraped_pod)
+    );
+}
+
+#[test]
+fn the_shell_renders_units_the_same_way_the_data_plane_does() {
+    // The seam mirrors the newtypes, so the rendering is pinned on both
+    // sides; if either drifts, one of the two suites says so.
+    assert_eq!(Millicores(250).to_string(), "250m");
+    assert_eq!(Millicores(1000).to_string(), "1 core");
+    assert_eq!(Millicores(1250).to_string(), "1.25 cores");
+    assert_eq!(Millicores(2000).to_string(), "2 cores");
+    assert_eq!(Bytes(512).to_string(), "512");
+    assert_eq!(Bytes(800 * 1024).to_string(), "800Ki");
+    assert_eq!(Bytes(512 * 1024 * 1024).to_string(), "512Mi");
+    assert_eq!(Bytes(16 * 1024 * 1024 * 1024).to_string(), "16.0Gi");
+    // The rungs themselves, exactly: a boundary byte climbs to the next unit.
+    assert_eq!(Bytes(1024).to_string(), "1Ki");
+    assert_eq!(Bytes(1024 * 1024).to_string(), "1Mi");
+    assert_eq!(Bytes(1024 * 1024 * 1024).to_string(), "1.0Gi");
+}
+
 #[test]
 fn a_dragged_dock_edge_stops_at_its_bounds() {
     let viewport = ui::Viewport {

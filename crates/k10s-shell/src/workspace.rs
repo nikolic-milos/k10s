@@ -31,7 +31,9 @@ use crate::launch::LaunchView;
 use crate::modal::ModalSlot;
 use crate::palette::{PaletteEvent, PaletteView};
 use crate::pane::Pane;
-use crate::provider::{Detail, LaunchProvider, NullLaunchProvider, ProviderSlot, ReadProvider};
+use crate::provider::{
+    Detail, LaunchProvider, LogStop, NullLaunchProvider, ProviderSlot, ReadProvider, UsageOutcome,
+};
 use crate::selection::Selection;
 use crate::tag::ItemTag;
 use crate::ui::{DockSizes, Viewport};
@@ -91,6 +93,12 @@ pub struct Workspace {
     pub(crate) scene_chosen: bool,
     pub(crate) events: Option<Detail>,
     pub(crate) log: Option<Detail>,
+    // Live usage for the inspected pod or workload. The value is the last
+    // labelled outcome the poll delivered; the guard is the poll -- dropping
+    // it ends the fetching, so usage stops costing anything the moment the
+    // inspector stops showing it.
+    pub(crate) usage: Option<UsageOutcome>,
+    pub(crate) usage_stop: Option<LogStop>,
     pub(crate) fetch_generation: u64,
     pub(crate) viewport: Viewport,
     pub(crate) dock_size_override: Option<DockSizes>,
@@ -157,6 +165,8 @@ impl Workspace {
             scene_chosen: scene_chosen || connected || bench,
             events: None,
             log: None,
+            usage: None,
+            usage_stop: None,
             fetch_generation: 0,
             viewport: Viewport {
                 width: 1600.0,
@@ -181,6 +191,7 @@ impl Workspace {
         self.fetch_generation += 1;
         self.events = None;
         self.log = None;
+        self.sync_usage_poll(cx);
         if !self.connected {
             return;
         }
@@ -219,6 +230,49 @@ impl Workspace {
             );
             self.land_detail(rx, generation, |this, detail| this.log = Some(detail), cx);
         }
+    }
+
+    // The usage poll exists exactly while the inspector is looking at
+    // something that has usage; anything else drops the guard, which is what
+    // ends the poll -- there is no other stop signal, exactly like a log
+    // follow. Called on every selection change and on every inspector toggle,
+    // because toggling the panel closed must stop the polling that only
+    // existed to fill it.
+    pub(crate) fn sync_usage_poll(&mut self, cx: &mut Context<Self>) {
+        // Dropping the previous guard first means two polls never overlap.
+        self.usage_stop = None;
+        self.usage = None;
+        if !self.connected || !self.inspector_open {
+            return;
+        }
+        let Some(request) = self.selection.as_ref().and_then(Selection::usage_target) else {
+            return;
+        };
+        let generation = self.fetch_generation;
+        // A slow UI drops ticks rather than queueing them: the next tick
+        // supersedes whatever a full lane would have carried anyway.
+        let (tx, mut rx) = futures::channel::mpsc::channel::<UsageOutcome>(8);
+        let on_update: Box<dyn Fn(UsageOutcome) + Send + Sync> = Box::new(move |outcome| {
+            let _ = tx.clone().try_send(outcome);
+        });
+        self.usage_stop = Some(self.slot.poll_usage(&request, on_update));
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            while let Some(outcome) = rx.next().await {
+                let live = this.update(cx, |this, cx| {
+                    if this.fetch_generation != generation {
+                        return false;
+                    }
+                    this.usage = Some(outcome);
+                    cx.notify();
+                    true
+                });
+                if !matches!(live, Ok(true)) {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Park one detail reply and put it where it goes, unless a newer question
