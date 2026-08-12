@@ -284,6 +284,71 @@ fn a_dead_forward_keeps_the_reason_it_died() {
 }
 
 #[test]
+fn a_usage_sample_crosses_typed_and_every_label_survives() {
+    use k10s_data::metrics as plane;
+
+    let sample = plane::UsageSample {
+        cpu: Some(plane::Millicores(250)),
+        memory: Some(plane::Bytes(32 * 1024 * 1024)),
+        cpu_request: Some(plane::Millicores(500)),
+        cpu_limit: None,
+        memory_request: Some(plane::Bytes(64 * 1024 * 1024)),
+        memory_limit: Some(plane::Bytes(128 * 1024 * 1024)),
+        source: plane::UsageSource::Kubelet,
+        pods_measured: 2,
+        pods_total: 3,
+        truncated: true,
+    };
+    match usage_outcome(plane::UsageOutcome::Usage(sample)) {
+        k10s_shell::UsageOutcome::Usage(sample) => {
+            assert_eq!(sample.cpu, Some(k10s_shell::Millicores(250)));
+            assert_eq!(sample.memory, Some(k10s_shell::Bytes(32 * 1024 * 1024)));
+            assert_eq!(sample.cpu_request, Some(k10s_shell::Millicores(500)));
+            // "No limit" must survive the seam as an absence, never as zero.
+            assert_eq!(sample.cpu_limit, None);
+            assert_eq!(
+                sample.memory_request,
+                Some(k10s_shell::Bytes(64 * 1024 * 1024))
+            );
+            assert_eq!(
+                sample.memory_limit,
+                Some(k10s_shell::Bytes(128 * 1024 * 1024))
+            );
+            assert_eq!(sample.source, k10s_shell::UsageSource::Kubelet);
+            assert_eq!(
+                (sample.pods_measured, sample.pods_total),
+                (2, 3),
+                "a partial sum keeps saying how partial it is"
+            );
+            assert!(sample.truncated);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    assert!(matches!(
+        usage_outcome(plane::UsageOutcome::Denied {
+            what: "pod metrics"
+        }),
+        k10s_shell::UsageOutcome::Denied("pod metrics")
+    ));
+    match usage_outcome(plane::UsageOutcome::Failed {
+        what: "node metrics",
+        why: "did not parse".to_string(),
+    }) {
+        k10s_shell::UsageOutcome::Failed(why) => assert_eq!(why, "did not parse"),
+        other => panic!("{other:?}"),
+    }
+    match usage_outcome(plane::UsageOutcome::Absent {
+        why: "metrics-server is not installed".to_string(),
+    }) {
+        k10s_shell::UsageOutcome::Absent(why) => {
+            assert_eq!(why, "metrics-server is not installed");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn inspect_details_become_event_rows_with_their_counts() {
     let detail = adapt(k10s_data::inspect::InspectDetail::Events(vec![
         k10s_data::inspect::EventLine {
