@@ -33,12 +33,12 @@ pub mod stats;
 pub mod testing;
 
 pub use camera::{Camera, MAX_ZOOM, MIN_ZOOM};
-pub use cull::{CullStats, cull, walk_edges};
+pub use cull::{CullStats, MAX_Z0_REGIONS, cull, walk_edges};
 pub use flight::{
     CpuPercentiles, FLIGHT_VIEWPORT, Flight, FlightAnchors, FlightFrame, FlightResult, IdleResult,
     Percentiles, Segment, SegmentResult,
 };
-pub use lod::{LodPolicy, StageBlend, StageMachine};
+pub use lod::{LodPolicy, StageBlend, StageMachine, WorkloadPresentation};
 pub use motion::{FLY_SECONDS, FlyTo, Motion, Step};
 pub use pacing::FramePacer;
 pub use scene::{
