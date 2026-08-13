@@ -30,6 +30,9 @@ pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_EXPR_CHARS: usize = 8_192;
 /// Provisioned ConfigMaps we will parse. Reaching it is stated, not hidden.
 pub const MAX_PROVISIONED: usize = 256;
+/// Grafana search can list hundreds of titles. Naming overlay PromQL needs
+/// the panel expr, so we fetch this many dashboards and then stop.
+pub const MAX_NAMED_FROM_SEARCH: usize = 16;
 
 const PAGE_LIMIT: u32 = 200;
 const MAX_CONFIGMAPS: usize = 2_000;
@@ -420,6 +423,156 @@ fn collect_from_configmap(cm: &ConfigMap, dashboards: &mut Vec<Dashboard>, trunc
             dashboards.push(dashboard);
         }
     }
+}
+
+/// One PromQL a pod cell can join, copied from Grafana, not rewritten.
+/// Prefers `sum by (namespace, pod)`. An expr that only names those labels
+/// still qualifies. None means the caller keeps [`crate::overlay::CPU_EXPR`].
+/// `$` is Grafana's engine (variables, `$__rate_interval`), not PromQL we
+/// can send.
+pub fn name_overlay_promql(dashboards: &[Dashboard]) -> Option<&str> {
+    let mut best: Option<(&str, u8)> = None;
+    for dashboard in dashboards {
+        for panel in &dashboard.panels {
+            for query in &panel.queries {
+                let Some(score) = overlay_score(query) else {
+                    continue;
+                };
+                match best {
+                    Some((_, have)) if have >= score => {}
+                    _ => best = Some((query.expr.as_str(), score)),
+                }
+                if score == 2 {
+                    return Some(query.expr.as_str());
+                }
+            }
+        }
+    }
+    best.map(|(expr, _)| expr)
+}
+
+fn overlay_score(query: &PanelQuery) -> Option<u8> {
+    if query.dialect != QueryDialect::PromQL {
+        return None;
+    }
+    if query.expr.contains('$') {
+        return None;
+    }
+    if prefers_sum_by_pod_cell(&query.expr) {
+        return Some(2);
+    }
+    if has_ident(&query.expr, "namespace") && has_ident(&query.expr, "pod") {
+        return Some(1);
+    }
+    None
+}
+
+fn prefers_sum_by_pod_cell(expr: &str) -> bool {
+    if !has_keyword(expr, "sum") {
+        return false;
+    }
+    by_groupings(expr)
+        .iter()
+        .any(|grouping| has_ident(grouping, "namespace") && has_ident(grouping, "pod"))
+}
+
+fn by_groupings(expr: &str) -> Vec<&str> {
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        if eq_ignore_ascii_case(&bytes[i..i + 2], b"by") && ident_bounded(bytes, i, 2) {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                if let Some(inner) = grouping_inner(expr, j) {
+                    out.push(inner);
+                    i = j + inner.len() + 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn grouping_inner(expr: &str, open: usize) -> Option<&str> {
+    let bytes = expr.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => quote = Some(c),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&expr[open + 1..i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn has_keyword(expr: &str, word: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let needle = word.as_bytes();
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if eq_ignore_ascii_case(&bytes[i..i + needle.len()], needle)
+            && ident_bounded(bytes, i, needle.len())
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn has_ident(text: &str, ident: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = ident.as_bytes();
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if bytes[i..].starts_with(needle) && ident_bounded(bytes, i, needle.len()) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn ident_bounded(bytes: &[u8], start: usize, len: usize) -> bool {
+    let before = start == 0 || !ident_char(bytes[start - 1]);
+    let after = start + len == bytes.len() || !ident_char(bytes[start + len]);
+    before && after
+}
+
+fn ident_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 fn into_parsed<T>(

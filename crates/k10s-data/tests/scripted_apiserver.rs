@@ -38,6 +38,8 @@ mod metrics;
 mod netpol;
 #[path = "scripted_apiserver/nodes.rs"]
 mod nodes;
+#[path = "scripted_apiserver/overlay.rs"]
+mod overlay;
 #[path = "scripted_apiserver/prom.rs"]
 mod prom;
 #[path = "scripted_apiserver/rbac.rs"]

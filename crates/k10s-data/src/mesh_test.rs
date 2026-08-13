@@ -261,6 +261,23 @@ fn hubble_series_labels_are_observed_reach_not_declared() {
 }
 
 #[test]
+fn linkerd_response_total_is_observed_reach_not_declared() {
+    let series = [SeriesLabels {
+        name: "response_total".into(),
+        labels: vec![
+            ("client".into(), "web".into()),
+            ("dst".into(), "redis.prod.svc.cluster.local:6379".into()),
+        ],
+    }];
+    let edges = observed_from_series(&series);
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].because.exporter, TelemetryExporter::Linkerd);
+    assert_eq!(edges[0].from, "web");
+    assert_eq!(edges[0].to, "redis.prod.svc.cluster.local:6379");
+    assert_eq!(edges[0].because.metric, "response_total");
+}
+
+#[test]
 fn generic_prometheus_series_are_not_observed_traffic() {
     let series = [SeriesLabels {
         name: "up".into(),

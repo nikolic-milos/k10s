@@ -26,6 +26,7 @@ use crate::discover::KindTarget;
 use crate::exec::{ExecEvent, ExecRequest, ExecSession, ExecTransport, KubeExecTransport};
 use crate::flux;
 use crate::forward::{self, ForwardRegistry, ForwardRequest, ForwardRow, KubeForwarder};
+use crate::grafana;
 use crate::helm;
 use crate::logs::{self, LogChunk, LogRequest, LogStop};
 use crate::manifest;
@@ -512,8 +513,20 @@ async fn load_policy(
 }
 
 async fn load_metrics(client: &Client, settings: ReachSettings) -> Fetched<overlay::Frame> {
-    match query_prometheus(client, settings, overlay::CPU_EXPR).await {
-        Fetched::Ok(result) => Fetched::Ok(overlay::from_prometheus(&result)),
+    let named = grafana_named_promql(client, &settings).await;
+    let expr = named.as_deref().unwrap_or(overlay::CPU_EXPR);
+    match query_prometheus(client, &settings, expr).await {
+        Fetched::Ok(result) => {
+            let mut frame = overlay::from_prometheus(&result);
+            if frame.note.is_none() {
+                frame.note = Some(if named.is_some() {
+                    "PromQL named by Grafana".to_string()
+                } else {
+                    "cadvisor CPU; Grafana has not named a PromQL".to_string()
+                });
+            }
+            Fetched::Ok(frame)
+        }
         Fetched::Denied { what } => Fetched::Denied { what },
         Fetched::Failed { why, .. } => Fetched::Ok(overlay::Frame {
             stamps: Vec::new(),
@@ -524,41 +537,108 @@ async fn load_metrics(client: &Client, settings: ReachSettings) -> Fetched<overl
 }
 
 async fn load_mesh_observed(client: &Client, settings: ReachSettings) -> Fetched<overlay::Frame> {
-    match query_prometheus(client, settings, overlay::MESH_EXPR).await {
-        Fetched::Ok(result) => {
-            let labels: Vec<mesh::SeriesLabels> = result
-                .series
-                .iter()
-                .map(|series| mesh::SeriesLabels {
-                    name: series
-                        .labels
-                        .iter()
-                        .find(|(key, _)| key == "__name__")
-                        .map(|(_, value)| value.clone())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| "istio_requests_total".to_string()),
-                    labels: series.labels.clone(),
-                })
-                .collect();
-            Fetched::Ok(overlay::from_mesh_observed(&mesh::observed_from_series(
-                &labels,
-            )))
+    let bound = match bind_prometheus(client, &settings).await {
+        Fetched::Ok(bound) => bound,
+        Fetched::Denied { what } => return Fetched::Denied { what },
+        Fetched::Failed { why, .. } => {
+            return Fetched::Ok(overlay::Frame {
+                stamps: Vec::new(),
+                truncated: false,
+                note: Some(why),
+            });
         }
-        Fetched::Denied { what } => Fetched::Denied { what },
-        Fetched::Failed { why, .. } => Fetched::Ok(overlay::Frame {
+    };
+
+    let (istio, hubble, linkerd) = tokio::join!(
+        query_bound(client, &bound, overlay::MESH_EXPR),
+        query_bound(client, &bound, overlay::HUBBLE_EXPR),
+        query_bound(client, &bound, overlay::LINKERD_EXPR),
+    );
+
+    let mut labels = Vec::new();
+    let mut denied = None;
+    let mut failed = None;
+    let mut ok = false;
+    for (fetched, fallback) in [
+        (istio, "istio_requests_total"),
+        (hubble, "hubble_flows_processed_total"),
+        (linkerd, "response_total"),
+    ] {
+        match fetched {
+            Fetched::Ok(result) => {
+                ok = true;
+                labels.extend(mesh_series(&result, fallback));
+            }
+            Fetched::Denied { what } => denied = Some(what),
+            Fetched::Failed { why, .. } => failed = Some(why),
+        }
+    }
+    if !ok {
+        if let Some(what) = denied {
+            return Fetched::Denied { what };
+        }
+        return Fetched::Ok(overlay::Frame {
             stamps: Vec::new(),
             truncated: false,
-            note: Some(why),
-        }),
+            note: failed,
+        });
     }
+    Fetched::Ok(overlay::from_mesh_observed(&mesh::observed_from_series(
+        &labels,
+    )))
 }
 
-async fn query_prometheus(
-    client: &Client,
-    settings: ReachSettings,
-    expr: &str,
-) -> Fetched<prom::QueryResult> {
-    match reach::bind(client, ToolKind::Prometheus, &settings).await {
+/// Provisioned ConfigMaps first: they are already on the API server, so the
+/// overlay does not wait on a Grafana bind. Live search is the fallback when
+/// those dashboards name nothing joinable.
+async fn grafana_named_promql(client: &Client, settings: &ReachSettings) -> Option<String> {
+    if let Fetched::Ok(provisioned) = grafana::fetch_provisioned_from_configmaps(client).await
+        && let Some(expr) = grafana::name_overlay_promql(&provisioned.dashboards)
+    {
+        return Some(expr.to_string());
+    }
+
+    let ToolReach::Bound(bound) = reach::bind(client, ToolKind::Grafana, settings).await else {
+        return None;
+    };
+    let Fetched::Ok(hits) = grafana::fetch_search(client, &bound, &[]).await else {
+        return None;
+    };
+    let mut dashboards = Vec::new();
+    for hit in hits.into_iter().take(grafana::MAX_NAMED_FROM_SEARCH) {
+        if hit.uid.is_empty() {
+            continue;
+        }
+        let Fetched::Ok(dash) = grafana::fetch_dashboard(client, &bound, &hit.uid).await else {
+            continue;
+        };
+        dashboards.push(dash);
+        if let Some(expr) = grafana::name_overlay_promql(&dashboards) {
+            return Some(expr.to_string());
+        }
+    }
+    None
+}
+
+fn mesh_series(result: &prom::QueryResult, fallback: &str) -> Vec<mesh::SeriesLabels> {
+    result
+        .series
+        .iter()
+        .map(|series| mesh::SeriesLabels {
+            name: series
+                .labels
+                .iter()
+                .find(|(key, _)| key == "__name__")
+                .map(|(_, value)| value.clone())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| fallback.to_string()),
+            labels: series.labels.clone(),
+        })
+        .collect()
+}
+
+async fn bind_prometheus(client: &Client, settings: &ReachSettings) -> Fetched<reach::Bound> {
+    match reach::bind(client, ToolKind::Prometheus, settings).await {
         ToolReach::Absent { .. } => Fetched::Failed {
             what: "prometheus",
             why: "Prometheus is not in this cluster".to_string(),
@@ -567,11 +647,29 @@ async fn query_prometheus(
             what: "prometheus",
             why: unbound.why,
         },
-        ToolReach::Bound(bound) => {
-            let end = unix_secs();
-            let start = end - overlay::RANGE_SECS;
-            prom::query_range(client, &bound, expr, start, end, overlay::STEP).await
-        }
+        ToolReach::Bound(bound) => Fetched::Ok(bound),
+    }
+}
+
+async fn query_bound(
+    client: &Client,
+    bound: &reach::Bound,
+    expr: &str,
+) -> Fetched<prom::QueryResult> {
+    let end = unix_secs();
+    let start = end - overlay::RANGE_SECS;
+    prom::query_range(client, bound, expr, start, end, overlay::STEP).await
+}
+
+async fn query_prometheus(
+    client: &Client,
+    settings: &ReachSettings,
+    expr: &str,
+) -> Fetched<prom::QueryResult> {
+    match bind_prometheus(client, settings).await {
+        Fetched::Ok(bound) => query_bound(client, &bound, expr).await,
+        Fetched::Denied { what } => Fetched::Denied { what },
+        Fetched::Failed { what, why } => Fetched::Failed { what, why },
     }
 }
 
