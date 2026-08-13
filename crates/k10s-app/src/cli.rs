@@ -27,6 +27,7 @@ shared options:
   --startup-bench                         exit after the first useful presented frame
                                           (needs --machine)
   --json                                  benchmark report as JSON on stdout
+  --attribution                           print CC BY icon notices and exit
   -h, --help                              print this message
 
 unrecognized arguments are reported on stderr and ignored";
@@ -71,6 +72,7 @@ pub struct Args {
     pub startup_bench: bool,
     pub json: bool,
     pub help: bool,
+    pub attribution: bool,
     pub cluster: bool,
     pub churn_explicit: bool,
     pub objects_explicit: bool,
@@ -97,6 +99,7 @@ impl Default for Args {
             startup_bench: false,
             json: false,
             help: false,
+            attribution: false,
             cluster: false,
             churn_explicit: false,
             objects_explicit: false,
@@ -311,12 +314,13 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
             "--bench" => args.bench = true,
             "--startup-bench" => args.startup_bench = true,
             "--json" => args.json = true,
+            "--attribution" => args.attribution = true,
             "--help" | "-h" => args.help = true,
             other => args.ignored.push(other.to_string()),
         }
     }
 
-    if args.help {
+    if args.help || args.attribution {
         return Ok(args);
     }
     if args.bench && args.startup_bench {

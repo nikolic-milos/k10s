@@ -272,6 +272,30 @@ impl k10s_shell::ReadProvider for PlaneProvider {
             .start_exec(&request, Box::new(move |event| on_event(exec_event(event))));
         Box::new(ExecSessionAdapter(session))
     }
+
+    fn fetch_overlay(
+        &self,
+        kind: k10s_map::OverlayKind,
+        reply: k10s_shell::Reply<k10s_shell::OverlayOutcome>,
+    ) {
+        self.reader.fetch_overlay(
+            overlay_kind(kind),
+            k10s_data::reach::ReachSettings::default(),
+            move |fetched| reply(overlay_outcome(fetched)),
+        );
+    }
+
+    fn fetch_pod_posture(
+        &self,
+        namespace: &str,
+        name: &str,
+        reply: k10s_shell::Reply<k10s_shell::PostureOutcome>,
+    ) {
+        self.reader
+            .fetch_pod_posture(namespace.to_string(), name.to_string(), move |fetched| {
+                reply(posture_outcome(fetched))
+            });
+    }
 }
 
 // The data plane's session behind the shell's trait: same shape, different
@@ -508,6 +532,109 @@ fn forward_outcome(fetched: Fetched<k10s_data::forward::ForwardRow>) -> k10s_she
         Fetched::Ok(row) => k10s_shell::ForwardOutcome::Opened(adapt_forward(row)),
         Fetched::Denied { what } => k10s_shell::ForwardOutcome::Denied(what),
         Fetched::Failed { why, .. } => k10s_shell::ForwardOutcome::Failed(why),
+    }
+}
+
+fn overlay_kind(kind: k10s_map::OverlayKind) -> k10s_data::overlay::Kind {
+    match kind {
+        k10s_map::OverlayKind::Sync => k10s_data::overlay::Kind::Sync,
+        k10s_map::OverlayKind::Metrics => k10s_data::overlay::Kind::Metrics,
+        k10s_map::OverlayKind::Policy => k10s_data::overlay::Kind::Policy,
+        k10s_map::OverlayKind::MeshDeclared => k10s_data::overlay::Kind::MeshDeclared,
+        k10s_map::OverlayKind::MeshObserved => k10s_data::overlay::Kind::MeshObserved,
+    }
+}
+
+fn overlay_outcome(fetched: Fetched<k10s_data::overlay::Frame>) -> k10s_shell::OverlayOutcome {
+    match fetched {
+        Fetched::Ok(frame) => k10s_shell::OverlayOutcome::Ready {
+            stamps: frame
+                .stamps
+                .into_iter()
+                .map(|stamp| k10s_shell::OverlayStamp {
+                    uid: stamp.uid,
+                    namespace: stamp.namespace,
+                    name: stamp.name,
+                    tint: stamp.tint,
+                    samples: stamp.samples,
+                    label: stamp.label,
+                })
+                .collect(),
+            truncated: frame.truncated,
+            note: frame.note,
+        },
+        Fetched::Denied { what } => k10s_shell::OverlayOutcome::Denied(what),
+        Fetched::Failed { why, .. } => k10s_shell::OverlayOutcome::Failed(why),
+    }
+}
+
+fn posture_outcome(
+    fetched: Fetched<k10s_data::netpol::PodInspection>,
+) -> k10s_shell::PostureOutcome {
+    match fetched {
+        Fetched::Ok(inspection) if !inspection.found => k10s_shell::PostureOutcome::Missing,
+        Fetched::Ok(inspection) => {
+            let Some(posture) = inspection.posture else {
+                return k10s_shell::PostureOutcome::Missing;
+            };
+            k10s_shell::PostureOutcome::Ready(k10s_shell::PodPostureView {
+                ingress_isolated: posture.ingress.isolated,
+                ingress_policies: posture.ingress.selecting_policies,
+                ingress_names: posture.ingress.policies,
+                ingress_truncated: posture.ingress.policies_truncated,
+                egress_isolated: posture.egress.isolated,
+                egress_policies: posture.egress.selecting_policies,
+                egress_names: posture.egress.policies,
+                egress_truncated: posture.egress.policies_truncated,
+                ports: inspection
+                    .ports
+                    .into_iter()
+                    .map(|port| {
+                        format!(
+                            "{} {} {}",
+                            port.name,
+                            match port.protocol {
+                                k10s_data::netpol::Protocol::Tcp => "TCP",
+                                k10s_data::netpol::Protocol::Udp => "UDP",
+                                k10s_data::netpol::Protocol::Sctp => "SCTP",
+                            },
+                            port.port
+                        )
+                    })
+                    .collect(),
+                completeness: completeness_line(posture.completeness),
+            })
+        }
+        Fetched::Denied { what } => k10s_shell::PostureOutcome::Denied(what),
+        Fetched::Failed { why, .. } => k10s_shell::PostureOutcome::Failed(why),
+    }
+}
+
+fn completeness_line(completeness: k10s_data::netpol::Completeness) -> String {
+    use k10s_data::netpol::Completeness;
+    match completeness {
+        Completeness::Complete => String::new(),
+        Completeness::Truncated {
+            evaluated_policies,
+            total_policies,
+        } => format!("policy set truncated; evaluated {evaluated_policies} of {total_policies}"),
+        Completeness::IncompleteInventory {
+            policies,
+            pods,
+            namespaces,
+        } => {
+            let mut parts = Vec::new();
+            if policies {
+                parts.push("policies");
+            }
+            if pods {
+                parts.push("pods");
+            }
+            if namespaces {
+                parts.push("namespaces");
+            }
+            format!("inventory incomplete ({})", parts.join(", "))
+        }
     }
 }
 
