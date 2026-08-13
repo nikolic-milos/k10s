@@ -50,13 +50,22 @@ impl Camera {
     }
 
     pub fn pan_px(&mut self, dx: f32, dy: f32) {
+        // Divide by a zoom that is known to be in range, not by the field: the
+        // field is public, and a zero or a NaN here would send the centre to
+        // infinity and every later `visible_world` to an empty rect.
+        *self = self.clamped();
         self.cx -= dx / self.zoom;
         self.cy -= dy / self.zoom;
     }
 
     pub fn zoom_around(&mut self, factor: f32, sx: f32, sy: f32, vw: f32, vh: f32) {
+        *self = self.clamped();
+        let next = self.zoom * factor;
+        if !next.is_finite() {
+            return;
+        }
         let (wx, wy) = self.s2w(sx, sy, vw, vh);
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom = next.clamp(MIN_ZOOM, MAX_ZOOM);
         self.cx = wx - (sx - vw * 0.5) / self.zoom;
         self.cy = wy - (sy - vh * 0.5) / self.zoom;
     }
@@ -173,6 +182,57 @@ mod tests {
         let after = cam.s2w(sx, sy, 1600.0, 1000.0);
         assert!((before.0 - after.0).abs() < 1e-3);
         assert!((before.1 - after.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_pan_or_zoom_from_an_impossible_zoom_stays_divisible() {
+        for zoom in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let mut panned = Camera {
+                cx: 10.0,
+                cy: 20.0,
+                zoom,
+            };
+            panned.pan_px(8.0, -4.0);
+            assert!(
+                (MIN_ZOOM..=MAX_ZOOM).contains(&panned.zoom),
+                "a pan from {zoom} left zoom {}",
+                panned.zoom
+            );
+            assert!(
+                panned.cx.is_finite() && panned.cy.is_finite(),
+                "a pan from {zoom} sent the centre to {panned:?}"
+            );
+
+            let mut zoomed = Camera {
+                cx: 10.0,
+                cy: 20.0,
+                zoom,
+            };
+            zoomed.zoom_around(1.5, 100.0, 100.0, 1600.0, 1000.0);
+            assert!(
+                (MIN_ZOOM..=MAX_ZOOM).contains(&zoomed.zoom),
+                "a zoom from {zoom} left zoom {}",
+                zoomed.zoom
+            );
+            assert!(
+                zoomed.cx.is_finite() && zoomed.cy.is_finite(),
+                "a zoom from {zoom} sent the centre to {zoomed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_finite_zoom_factor_leaves_a_usable_camera() {
+        let before = Camera {
+            cx: 10.0,
+            cy: 20.0,
+            zoom: 2.0,
+        };
+        let mut cam = before;
+        cam.zoom_around(f32::NAN, 100.0, 100.0, 1600.0, 1000.0);
+        assert_eq!(cam, before, "a NaN wheel step moved a good camera");
+        cam.zoom_around(f32::INFINITY, 100.0, 100.0, 1600.0, 1000.0);
+        assert_eq!(cam, before, "an infinite wheel step moved a good camera");
     }
 
     #[test]
