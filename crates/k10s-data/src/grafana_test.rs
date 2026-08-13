@@ -181,6 +181,99 @@ fn binary_data_is_not_read_as_a_dashboard() {
     assert!(dashboards.is_empty());
 }
 
+fn dash_with(panels: &str) -> Dashboard {
+    let json = format!(r#"{{"uid":"d","title":"d","panels":[{panels}]}}"#);
+    parse_dashboard(json.as_bytes()).expect("dashboard")
+}
+
+fn timeseries_promql(title: &str, expr: &str) -> String {
+    format!(
+        r#"{{"title":"{title}","type":"timeseries","datasource":{{"type":"prometheus","uid":"prom"}},"targets":[{{"refId":"A","expr":{expr}}}]}}"#
+    )
+}
+
+#[test]
+fn a_node_cpu_panel_is_not_joinable_to_a_pod_cell() {
+    let dash = parse_dashboard(dashboard_json().as_bytes()).unwrap();
+    assert_eq!(
+        name_overlay_promql(&[dash]),
+        None,
+        "Grafana's cluster CPU is not a pod-cell join"
+    );
+}
+
+#[test]
+fn sum_by_namespace_pod_is_copied_verbatim_and_preferred() {
+    let mention = timeseries_promql(
+        "by pod",
+        r#""container_cpu_usage_seconds_total{namespace=\"prod\",pod=\"api\"}""#,
+    );
+    let preferred = timeseries_promql(
+        "sum",
+        r#""sum by (namespace, pod) (rate(container_cpu_usage_seconds_total[5m]))""#,
+    );
+    let dashboards = [dash_with(&format!("{mention},{preferred}"))];
+    let named = name_overlay_promql(&dashboards).expect("joinable");
+    assert_eq!(
+        named, "sum by (namespace, pod) (rate(container_cpu_usage_seconds_total[5m]))",
+        "the expr Grafana wrote is the one we run; sum-by wins over a matcher"
+    );
+}
+
+#[test]
+fn an_expr_that_names_namespace_and_pod_still_qualifies() {
+    let dashboards = [dash_with(&timeseries_promql(
+        "cpu",
+        r#""rate(container_cpu_usage_seconds_total{namespace=~\".+\",pod=~\".+\"}[5m])""#,
+    ))];
+    let named = name_overlay_promql(&dashboards).expect("joinable");
+    assert_eq!(
+        named,
+        r#"rate(container_cpu_usage_seconds_total{namespace=~".+",pod=~".+"}[5m])"#
+    );
+}
+
+#[test]
+fn logql_and_grafana_variables_are_not_promql_we_can_run() {
+    let logs = r#"{"title":"logs","type":"logs","datasource":{"type":"loki","uid":"loki"},"targets":[{"refId":"A","expr":"{namespace=\"prod\",pod=\"api\"}"}]}"#;
+    let vars = timeseries_promql(
+        "cpu",
+        r#""sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{namespace=\"$namespace\"}[$__rate_interval]))""#,
+    );
+    let dash = dash_with(&format!("{logs},{vars}"));
+    assert_eq!(
+        name_overlay_promql(&[dash]),
+        None,
+        "LogQL and $variables stay Grafana's; CPU_EXPR remains the fallback"
+    );
+}
+
+#[test]
+fn unknown_dialect_and_up_are_not_a_pod_cell() {
+    let cloudwatch = r#"{"title":"cw","type":"timeseries","datasource":{"type":"cloudwatch","uid":"cw"},"targets":[{"refId":"A","expr":"sum by (namespace, pod) (cpu)"}]}"#;
+    let up = timeseries_promql("up", r#""up""#);
+    let dash = dash_with(&format!("{cloudwatch},{up}"));
+    assert_eq!(name_overlay_promql(&[dash]), None);
+}
+
+#[test]
+fn sum_by_pod_namespace_order_and_postfix_by_both_count() {
+    let postfix = timeseries_promql(
+        "postfix",
+        r#""sum (rate(container_cpu_usage_seconds_total[5m])) by (pod, namespace)""#,
+    );
+    let dashboards = [dash_with(&postfix)];
+    assert_eq!(
+        name_overlay_promql(&dashboards),
+        Some("sum (rate(container_cpu_usage_seconds_total[5m])) by (pod, namespace)")
+    );
+}
+
+#[test]
+fn empty_dashboards_name_nothing() {
+    assert_eq!(name_overlay_promql(&[]), None);
+}
+
 #[test]
 fn provisioned_caps_are_stated_not_silent() {
     use std::collections::BTreeMap;

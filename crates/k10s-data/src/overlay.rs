@@ -71,9 +71,16 @@ pub const SPARK_POINTS: usize = 32;
 pub const CPU_EXPR: &str = r#"sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{container!="",container!="POD"}[5m]))"#;
 
 /// Istio request rate by source and destination. Cadvisor CPU is not a mesh
-/// observation and must not be substituted here; Hubble and Linkerd names are
-/// recognised later if their series are the ones in hand.
+/// observation and must not be substituted here.
 pub const MESH_EXPR: &str = r#"sum by (source_workload, destination_workload, destination_service, namespace) (rate(istio_requests_total[5m]))"#;
+
+/// Hubble flow rate already sitting in Prometheus. Hubble's own API, relay,
+/// and ports are never scraped; this is a PromQL name only.
+pub const HUBBLE_EXPR: &str =
+    r#"sum by (source, destination) (rate(hubble_flows_processed_total[5m]))"#;
+
+/// Linkerd proxy response rate already sitting in Prometheus.
+pub const LINKERD_EXPR: &str = r#"sum by (client, dst, authority) (rate(response_total[5m]))"#;
 
 pub const RANGE_SECS: f64 = 15.0 * 60.0;
 pub const STEP: &str = "30s";
@@ -471,6 +478,25 @@ mod tests {
         let frame = Frame::of(stamps, false, None);
         assert_eq!(frame.stamps.len(), MAX_MARKS);
         assert!(frame.truncated);
+    }
+
+    #[test]
+    fn hubble_and_linkerd_exprs_are_their_own_queries_not_cadvisor() {
+        assert_ne!(MESH_EXPR, HUBBLE_EXPR);
+        assert_ne!(MESH_EXPR, LINKERD_EXPR);
+        assert_ne!(HUBBLE_EXPR, LINKERD_EXPR);
+        assert_ne!(CPU_EXPR, MESH_EXPR);
+        assert_ne!(CPU_EXPR, HUBBLE_EXPR);
+        assert_ne!(CPU_EXPR, LINKERD_EXPR);
+        assert!(MESH_EXPR.contains("istio_requests_total"));
+        assert!(HUBBLE_EXPR.contains("hubble_flows_processed_total"));
+        assert!(LINKERD_EXPR.contains("response_total"));
+        for expr in [MESH_EXPR, HUBBLE_EXPR, LINKERD_EXPR] {
+            assert!(
+                !expr.contains("container_cpu"),
+                "cadvisor CPU is not a mesh observation: {expr}"
+            );
+        }
     }
 
     #[test]
