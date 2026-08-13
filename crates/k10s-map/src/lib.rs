@@ -16,7 +16,9 @@ mod hex;
 mod lod;
 #[cfg(test)]
 mod oracle_test;
+mod overlay;
 mod pick;
+mod primitive;
 mod text;
 
 use std::cell::{Cell, RefCell};
@@ -58,6 +60,7 @@ gpui::actions!(
         ToggleEdges,
         ToggleHud,
         ToggleLegend,
+        CycleOverlay,
         FitView,
         ZoomIn,
         ZoomOut,
@@ -73,6 +76,7 @@ pub fn keybindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("e", ToggleEdges, map),
         gpui::KeyBinding::new("g", ToggleLegend, map),
         gpui::KeyBinding::new("h", ToggleHud, map),
+        gpui::KeyBinding::new("o", CycleOverlay, map),
         gpui::KeyBinding::new("f", FitView, map),
         gpui::KeyBinding::new("=", ZoomIn, map),
         gpui::KeyBinding::new("-", ZoomOut, map),
@@ -81,7 +85,9 @@ pub fn keybindings() -> Vec<gpui::KeyBinding> {
 pub use frame::FrameOpts;
 pub use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 pub use lod::{cull, stage_for_zoom};
+pub use overlay::{OverlayFrame, OverlayKind, OverlayMark};
 pub use pick::{PickPath, path_rect, pick};
+pub use primitive::{MarkPrimitive, mark_primitive};
 
 type PresentCallback = Box<dyn FnOnce(Instant, &mut App)>;
 type SceneReady = Box<dyn Fn(&SceneSnapshot) -> bool>;
@@ -242,6 +248,7 @@ struct HoverBasis {
     rev: u64,
     camera: Camera,
     viewport: (f32, f32),
+    stage: u8,
 }
 
 type Glyph = (&'static str, &'static [u8]);
@@ -378,10 +385,12 @@ pub struct MapView {
     summary: chrome::SummaryCache,
     chrome: gpui::Entity<chrome::Chrome>,
     chrome_state: Option<chrome::State>,
+    overlay: OverlayFrame,
     present_probe: PresentProbe,
 
     pacer: FramePacer,
     stage: StageMachine,
+    displayed_stage: u8,
     last_stage_tick: Option<std::time::Instant>,
     bench: Option<Bench>,
     // The flight in progress, if any. `None` is the whole idle case: no flight
@@ -473,11 +482,13 @@ impl MapView {
             summary: chrome::SummaryCache::default(),
             chrome: map_chrome,
             chrome_state: None,
+            overlay: OverlayFrame::default(),
             present_probe: PresentProbe::default(),
             pacer: FramePacer::default(),
             fly: None,
             bench_failed,
             stage: StageMachine::new(lod::STAGE_FADE_SECS),
+            displayed_stage: lod().stage_for_zoom(Camera::default().zoom),
             last_stage_tick: None,
             bench: bench.map(Bench::new),
         }
@@ -485,6 +496,12 @@ impl MapView {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// The published scene the map is drawing. Search builds an index from
+    /// this, never from a paint walk.
+    pub fn snapshot(&self) -> std::sync::Arc<SceneSnapshot> {
+        self.scene.load_full()
     }
 
     pub fn with_present_probe(mut self, probe: PresentProbe) -> Self {
@@ -497,6 +514,17 @@ impl MapView {
     /// map, while a semantic-band or hover change rebuilds this view alone.
     pub fn chrome_view(&self) -> gpui::AnyView {
         self.chrome.clone().into()
+    }
+
+    /// Stamp overlay marks onto the map. Empty is the first-paint case: no
+    /// overlay, not a hole. Replacing the frame notifies; identical frames do
+    /// not.
+    pub fn set_overlay(&mut self, overlay: OverlayFrame, cx: &mut Context<Self>) {
+        if self.overlay == overlay {
+            return;
+        }
+        self.overlay = overlay;
+        cx.notify();
     }
 
     // The map's commands, invoked by the workspace's action handlers: the
@@ -662,6 +690,7 @@ impl MapView {
             rev: scene.rev,
             camera: self.camera,
             viewport: (rect.w, rect.h),
+            stage: self.displayed_stage,
         }
     }
 
@@ -682,7 +711,7 @@ impl MapView {
             return None;
         }
         let policy = lod();
-        let blend = StageBlend::settled(policy.stage_for_zoom(self.camera.zoom));
+        let blend = StageBlend::settled(self.displayed_stage);
         let path = pick(
             scene,
             &self.camera,
@@ -727,6 +756,7 @@ impl MapView {
         self.fitted = true;
         self.interacted = true;
         self.stage = StageMachine::new(0.0);
+        self.displayed_stage = lod().stage_for_zoom(self.camera.zoom);
         self.last_stage_tick = None;
     }
 
@@ -766,11 +796,8 @@ impl MapView {
         if snapshot.rev == 0 {
             return None;
         }
-        // A click resolves at the stage the zoom is settling toward; a fade
-        // lasts 180 ms and picking mid-fade should answer for where the user
-        // is going, not where the crossfade happens to be.
         let policy = lod();
-        let blend = StageBlend::settled(policy.stage_for_zoom(self.camera.zoom));
+        let blend = StageBlend::settled(self.displayed_stage);
         let Some(path) = pick(
             &snapshot,
             &self.camera,
@@ -890,7 +917,12 @@ impl Render for MapView {
         // be repaired before LOD and paint divide by it, not a million times
         // during them.
         self.camera = self.camera.clamped();
-        let blend = self.stage.update(lod(), self.camera.zoom, dt);
+        let blend = if cx.reduce_motion() {
+            self.stage.settle(lod(), self.camera.zoom)
+        } else {
+            self.stage.update(lod(), self.camera.zoom, dt)
+        };
+        self.displayed_stage = blend.walk_stage();
         if self.stage.animating() {
             self.pacer.request_frame();
         }
@@ -924,6 +956,7 @@ impl Render for MapView {
                 edges_on,
                 legend_on: self.legend_on,
                 viewport: (map_width, map_height),
+                map_overlay: &self.overlay,
             });
             if self.chrome_state.as_ref() != Some(&state) {
                 self.chrome_state = Some(state.clone());
@@ -943,6 +976,7 @@ impl Render for MapView {
             gpui::CursorStyle::Arrow
         };
         let paint_scene = scene.clone();
+        let overlay = self.overlay.clone();
 
         div()
             .id("starmap-view")
@@ -1060,6 +1094,7 @@ impl Render for MapView {
                             &icon_buf,
                             &text_cache,
                             marks,
+                            &overlay,
                             edges_on,
                             churn_on,
                             hud_on,
@@ -1182,8 +1217,6 @@ impl Marks {
 // reads as a box drawn over a blob.
 const MARK_INSET: f32 = 3.0;
 const MARK_WIDTH: f32 = 2.0;
-const MARK_RADIUS_OF_SHORT: f32 = 0.2;
-const MARK_RADIUS_MAX: f32 = 20.0;
 const MARK_HALO_ALPHA: f32 = 0.16;
 
 // Draw whatever the pointer is on and whatever is selected, from the path and
@@ -1198,6 +1231,7 @@ fn paint_marks(
     bounds: Bounds<Pixels>,
     scene: &SceneSnapshot,
     camera: Camera,
+    stage: u8,
     marks: Marks,
     theme: &k10s_theme::MapTheme,
     window: &mut Window,
@@ -1213,23 +1247,15 @@ fn paint_marks(
         (marks.hovered, theme.hover_ring),
     ] {
         let Some(path) = path else { continue };
-        let Some(rect) = path_rect(scene, &path) else {
+        let Some(target) = mark_primitive(scene, path, camera, lod(), stage, (vw, vh), origin)
+        else {
             continue;
         };
-        let (x, y) = camera.w2s(rect.x, rect.y, vw, vh);
-        let ring = Bounds {
-            origin: point(px(origin.0 + x - MARK_INSET), px(origin.1 + y - MARK_INSET)),
-            size: size(
-                px(rect.w * camera.zoom + MARK_INSET * 2.0),
-                px(rect.h * camera.zoom + MARK_INSET * 2.0),
-            ),
-        };
-        let short = f32::from(ring.size.width).min(f32::from(ring.size.height));
-        let radius = px((short * MARK_RADIUS_OF_SHORT).min(MARK_RADIUS_MAX));
+        let ring = target.outset(MARK_INSET);
         let stroke = rgb(color);
         window.paint_quad(quad(
-            ring,
-            radius,
+            ring.bounds,
+            ring.corners,
             scale_alpha(stroke, MARK_HALO_ALPHA),
             px(MARK_WIDTH),
             stroke,
@@ -1264,6 +1290,7 @@ fn paint_map(
     icon_buf: &Rc<RefCell<Vec<IconJob>>>,
     text_cache: &Rc<RefCell<TextCache>>,
     marks: Marks,
+    overlay: &OverlayFrame,
     edges_on: bool,
     churn_on: bool,
     hud_on: bool,
@@ -1373,8 +1400,30 @@ fn paint_map(
 
     let fg_quads_start = std::time::Instant::now();
     window.paint_quads(&fg);
+    // Overlay stamps sit outside `frame::walk`, the same way hover rings do:
+    // a post-pass over the bounded mark table, keyed by uid, only for objects
+    // the camera already has on screen. CullStats does not grow a field.
+    if !overlay.marks.is_empty() {
+        let vw = f32::from(bounds.size.width);
+        let vh = f32::from(bounds.size.height);
+        let stamps = overlay.visible_stamps(scene, camera, lod(), vw, vh);
+        overlay::paint_stamps(
+            &stamps,
+            (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),
+            &theme.map,
+            window,
+        );
+    }
     if !marks.is_empty() {
-        paint_marks(bounds, scene, camera, marks, &theme.map, window);
+        paint_marks(
+            bounds,
+            scene,
+            camera,
+            blend.walk_stage(),
+            marks,
+            &theme.map,
+            window,
+        );
     }
 
     let icons_start = std::time::Instant::now();
@@ -1385,25 +1434,30 @@ fn paint_map(
         window.paint_layer(bounds, |window| {
             for job in icons.iter() {
                 let (key, data, icon_bounds, color) = match job {
-                    IconJob::Wl(kind, b) => {
+                    IconJob::Wl(kind, primitive) => {
                         let (key, data) = kind_icon(*kind);
-                        (key, data, snap_to_device(*b, scale), wl_icon_color)
+                        (
+                            key,
+                            data,
+                            snap_to_device(primitive.bounds, scale),
+                            wl_icon_color,
+                        )
                     }
-                    IconJob::ToolId(tool, b) => {
+                    IconJob::ToolId(tool, primitive) => {
                         let (key, data) = tool_icon(*tool);
                         (
                             key,
                             data,
-                            snap_to_device(*b, scale),
+                            snap_to_device(primitive.bounds, scale),
                             scale_alpha(theme.map.tool_color(*tool), 0.95 * block_alpha).into(),
                         )
                     }
-                    IconJob::Sat(kind, b) => {
+                    IconJob::Sat(kind, primitive) => {
                         let (key, data) = kind_icon(*kind);
                         (
                             key,
                             data,
-                            snap_to_device(*b, scale),
+                            snap_to_device(primitive.bounds, scale),
                             scale_alpha(theme.map.kind_color(*kind), cell_alpha).into(),
                         )
                     }

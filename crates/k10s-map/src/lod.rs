@@ -179,6 +179,7 @@ mod tests {
         let halo = Rect::new(10.0, 20.0, 110.0, 60.0);
         let card = Rect::new(10.0, 20.0, 80.0, 60.0);
         SceneSnapshot {
+            identity_rev: 1,
             ids: Default::default(),
             scene: SceneData {
                 card_header: 26.0,
