@@ -59,6 +59,8 @@ fn the_node_table_measures_allocatable_requests_and_usage() {
             "Status",
             "Roles",
             "Version",
+            "OS",
+            "Address",
             "Pods",
             "CPU req",
             "Memory req",
@@ -78,6 +80,8 @@ fn the_node_table_measures_allocatable_requests_and_usage() {
             "Ready",
             "control-plane",
             "v1.32.3",
+            "",
+            "",
             "2/110 (2%)",
             "1600m/4 (40%)",
             "64Mi/16.0Gi (0%)",
@@ -295,7 +299,12 @@ fn a_cluster_without_metrics_server_hides_usage_rather_than_breaking() {
         "absent metrics-server means invisible, not broken: {:?}",
         page.columns
     );
-    assert_eq!(page.rows[0].cells[4], "0/110 (0%)");
+    let pods_at = page
+        .columns
+        .iter()
+        .position(|column| column.name == "Pods")
+        .expect("the Pods column stays after OS and Address");
+    assert_eq!(page.rows[0].cells[pods_at], "0/110 (0%)");
 
     drop(runtime);
 }

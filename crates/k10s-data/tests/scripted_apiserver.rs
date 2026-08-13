@@ -10,12 +10,20 @@
 //! Cargo builds only the top-level files in `tests/` as binaries, so the suites
 //! below are modules of this one binary and share a single compiled harness.
 
+#[path = "scripted_apiserver/argo.rs"]
+mod argo;
 #[path = "scripted_apiserver/conformance.rs"]
 mod conformance;
+#[path = "scripted_apiserver/day2.rs"]
+mod day2;
 #[path = "scripted_apiserver/describe.rs"]
 mod describe;
+#[path = "scripted_apiserver/flux.rs"]
+mod flux;
 #[path = "scripted_apiserver/forwards.rs"]
 mod forwards;
+#[path = "scripted_apiserver/grafana.rs"]
+mod grafana;
 #[path = "scripted_apiserver/helm.rs"]
 mod helm;
 #[path = "scripted_apiserver/inspector.rs"]
@@ -26,10 +34,16 @@ mod logs;
 mod manifest;
 #[path = "scripted_apiserver/metrics.rs"]
 mod metrics;
+#[path = "scripted_apiserver/netpol.rs"]
+mod netpol;
 #[path = "scripted_apiserver/nodes.rs"]
 mod nodes;
+#[path = "scripted_apiserver/prom.rs"]
+mod prom;
 #[path = "scripted_apiserver/rbac.rs"]
 mod rbac;
+#[path = "scripted_apiserver/reach.rs"]
+mod reach;
 #[path = "scripted_apiserver/schema.rs"]
 mod schema;
 #[path = "scripted_apiserver/tables.rs"]
