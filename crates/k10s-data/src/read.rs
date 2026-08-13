@@ -4,10 +4,11 @@
 //! and the probe's capability verdicts. Every method is fire-and-forget onto
 //! the data plane's runtime with the answer handed to a caller-supplied
 //! callback -- the render thread never blocks on the cluster -- and every
-//! outcome is a labelled [`Fetched`]: a 403 arrives as `Denied`, never as an
-//! empty panel or an error string a person has to diagnose. Errors that reach
-//! text pass through the same redaction filter as everything else in this
-//! crate.
+//! outcome is a labelled [`Fetched`]: an account the cluster refuses -- 401 or
+//! 403, the same pair a watch calls forbidden -- arrives as `Denied`, never as
+//! an empty panel or an error string a person has to diagnose. Errors that
+//! reach text pass through the same redaction filter as everything else in
+//! this crate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ pub enum Fetched<T> {
 
 pub(crate) fn classify<T>(what: &'static str, error: &kube::Error) -> Fetched<T> {
     if let kube::Error::Api(response) = error
-        && response.code == 403
+        && matches!(response.code, 401 | 403)
     {
         return Fetched::Denied { what };
     }
@@ -400,6 +401,30 @@ mod tests {
                 operations: vec!["get".into(), "list".into(), "watch".into()],
             },
         )
+    }
+
+    fn api_error(code: u16) -> kube::Error {
+        kube::Error::Api(Box::new(kube::core::Status {
+            code,
+            reason: "Unauthorized".to_string(),
+            message: "no".to_string(),
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn an_account_the_cluster_refuses_is_denied_whichever_code_it_uses() {
+        for code in [401, 403] {
+            assert_eq!(
+                classify::<()>("pods", &api_error(code)),
+                Fetched::Denied { what: "pods" },
+                "a watch stops on {code} as forbidden: a panel must say the same thing"
+            );
+        }
+        assert!(matches!(
+            classify::<()>("pods", &api_error(500)),
+            Fetched::Failed { what: "pods", .. }
+        ));
     }
 
     #[test]

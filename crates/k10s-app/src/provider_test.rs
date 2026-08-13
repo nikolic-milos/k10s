@@ -158,25 +158,96 @@ fn every_apply_arm_keeps_what_the_review_reads() {
         other => panic!("{other:?}"),
     }
 
+    // The sentences the review shows, asserted as sentences: a swapped or
+    // renamed message is the failure mode a shape-only check cannot see.
+    match apply_outcome(Plane::Stale {
+        message: "newer".to_string(),
+    }) {
+        k10s_shell::ApplyOutcome::Stale { message } => assert_eq!(message, "newer"),
+        other => panic!("{other:?}"),
+    }
+    match apply_outcome(Plane::Denied {
+        what: "apply",
+        why: "forbidden".to_string(),
+    }) {
+        k10s_shell::ApplyOutcome::Denied { what, why } => {
+            assert_eq!((what, why.as_str()), ("apply", "forbidden"));
+        }
+        other => panic!("{other:?}"),
+    }
+    match apply_outcome(Plane::Failed {
+        why: "io".to_string(),
+    }) {
+        k10s_shell::ApplyOutcome::Failed(why) => assert_eq!(why, "io"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_arms_that_only_carry_a_label_still_carry_it() {
+    // Every remaining translator arm that decides UI copy or a row's state.
+    // These are the ones a seam loses silently: nothing fails to compile when
+    // a reason stops crossing, it just stops being on screen.
+    match adapt_chunk(k10s_data::logs::LogChunk::Lines(vec!["one".to_string()])) {
+        k10s_shell::LogChunk::Lines(lines) => assert_eq!(lines, vec!["one".to_string()]),
+        other => panic!("{other:?}"),
+    }
+    match adapt_chunk(k10s_data::logs::LogChunk::Failed {
+        what: "logs",
+        why: "connection reset".to_string(),
+    }) {
+        k10s_shell::LogChunk::Failed(why) => assert_eq!(why, "connection reset"),
+        other => panic!("{other:?}"),
+    }
+
+    let opening = k10s_data::forward::ForwardRow {
+        id: 1,
+        spec: k10s_data::forward::ForwardSpec {
+            namespace: "prod".to_string(),
+            pod: "api-1".to_string(),
+            local_port: 8080,
+            remote_port: 80,
+        },
+        state: k10s_data::forward::ForwardState::Opening,
+    };
+    let active = k10s_data::forward::ForwardRow {
+        state: k10s_data::forward::ForwardState::Active,
+        ..opening.clone()
+    };
     assert!(matches!(
-        apply_outcome(Plane::Stale {
-            message: "newer".to_string()
-        }),
-        k10s_shell::ApplyOutcome::Stale { .. }
+        adapt_forward(opening).state,
+        k10s_shell::ForwardState::Opening
     ));
     assert!(matches!(
-        apply_outcome(Plane::Denied {
-            what: "apply",
-            why: "forbidden".to_string()
-        }),
-        k10s_shell::ApplyOutcome::Denied { what: "apply", .. }
+        adapt_forward(active).state,
+        k10s_shell::ForwardState::Active
     ));
+
+    match table_outcome(Fetched::<k10s_data::browse::TablePage>::Failed {
+        what: "table",
+        why: "the list timed out".to_string(),
+    }) {
+        k10s_shell::TableOutcome::Failed(why) => assert_eq!(why, "the list timed out"),
+        other => panic!("{other:?}"),
+    }
     assert!(matches!(
-        apply_outcome(Plane::Failed {
-            why: "io".to_string()
-        }),
-        k10s_shell::ApplyOutcome::Failed(_)
+        table_outcome(Fetched::<k10s_data::browse::TablePage>::Denied { what: "pods" }),
+        k10s_shell::TableOutcome::Denied("pods")
     ));
+    match schema_text_outcome(Fetched::Failed {
+        what: "schema",
+        why: "not served".to_string(),
+    }) {
+        k10s_shell::SchemaTextOutcome::Failed(why) => assert_eq!(why, "not served"),
+        other => panic!("{other:?}"),
+    }
+    match containers_outcome(Fetched::Failed {
+        what: "containers",
+        why: "gone".to_string(),
+    }) {
+        k10s_shell::ContainersOutcome::Failed(why) => assert_eq!(why, "gone"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

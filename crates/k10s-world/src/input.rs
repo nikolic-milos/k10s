@@ -14,9 +14,15 @@ pub struct FoldStats {
     pub replayed_changes: u64,
 }
 
+/// Fold an event stream into the scene it describes.
+///
+/// One pass places a conforming stream. A stream that replays changes, or that
+/// arrives with a child ahead of its parent, is normalized first: role order is
+/// exactly what the second pass restores, so an out-of-order `Added` resolves
+/// instead of costing the world every object under it.
 pub fn fold(events: &[IngestEvent]) -> (ClusterInput, FoldStats) {
     let (input, stats) = fold_snapshot(events);
-    if stats.replayed_changes == 0 {
+    if stats.replayed_changes == 0 && stats.orphaned == 0 {
         return (input, stats);
     }
 
@@ -192,6 +198,24 @@ mod tests {
         let (input, stats) = fold(&events);
         assert_eq!(stats.orphaned, 1);
         assert_eq!(input.total_pods, 0);
+    }
+
+    #[test]
+    fn an_added_only_stream_that_arrives_child_first_is_reordered_not_lost() {
+        let events = vec![
+            replay::instance("pod-1", "prod", "wl-api", State::OK, Op::Added),
+            replay::owner("wl-api", "prod", "api", KindId::DEPLOYMENT, Op::Added),
+            replay::scope("ns-prod", "prod", Op::Added),
+        ];
+
+        let (input, stats) = fold(&events);
+
+        assert_eq!(stats.orphaned, 0, "role order is what normalize restores");
+        assert_eq!(stats.replayed_changes, 0);
+        assert_eq!(input.namespaces.len(), 1);
+        assert_eq!(input.total_workloads, 1);
+        assert_eq!(input.total_pods, 1);
+        assert_eq!(&*input.namespaces[0].workloads[0].pods[0].uid, "pod-1");
     }
 
     #[test]

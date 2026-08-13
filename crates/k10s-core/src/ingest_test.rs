@@ -1,6 +1,7 @@
 //! Coalescing and its bounds: a flapping object costs one event per tick, a
 //! delete is never downgraded by a late modify, first-touch order survives
-//! compaction, and overflow asks for a resync instead of growing.
+//! compaction, overflow asks for a resync instead of growing, and the one
+//! verdict retrying cannot fix outlives the bound that buried it.
 
 use super::*;
 use crate::model::ReasonId;
@@ -54,6 +55,22 @@ fn added_then_deleted_in_one_tick_is_elided() {
     i.push(res("real", Op::Deleted, 9));
     assert_eq!(uids(&i.drain()), vec![("real".into(), Op::Deleted, 9)]);
     assert_eq!(i.stats().elided, 0);
+}
+
+#[test]
+fn an_object_that_flaps_before_it_dies_is_still_elided() {
+    let mut i = Intake::new();
+    i.push(res("ghost", Op::Added, 1));
+    i.push(res("ghost", Op::Modified, 2));
+    i.push(res("ghost", Op::Modified, 3));
+    i.push(res("ghost", Op::Deleted, 4));
+    assert!(
+        i.is_empty(),
+        "an object born and buried inside one tick was never published, so its \
+         tombstone has nobody to tell"
+    );
+    assert!(i.drain().is_empty());
+    assert_eq!(i.stats().elided, 1);
 }
 
 #[test]
@@ -242,6 +259,41 @@ fn a_control_storm_hits_the_control_bound_and_says_so() {
         )),
         "a bound nobody is told about is a stall"
     );
+}
+
+#[test]
+fn a_forbidden_verdict_outlives_the_control_storm_that_buried_it() {
+    let mut i = Intake::new();
+    for _ in 0..CONTROL_CAPACITY {
+        i.push(IngestEvent::Synced { kind: KindId::POD });
+    }
+    i.push(IngestEvent::Desync {
+        kind: KindId::SECRET,
+        reason: DesyncReason::Forbidden,
+    });
+
+    let out = i.drain();
+    let desyncs: Vec<(usize, KindId, DesyncReason)> = out
+        .iter()
+        .enumerate()
+        .filter_map(|(at, e)| match e {
+            IngestEvent::Desync { kind, reason } => Some((at, *kind, *reason)),
+            _ => None,
+        })
+        .collect();
+    let forbidden = desyncs
+        .iter()
+        .find(|(_, kind, reason)| *kind == KindId::SECRET && *reason == DesyncReason::Forbidden)
+        .expect("a 403 dropped by the control bound looks like a retryable stall");
+    let overflow = desyncs
+        .iter()
+        .find(|(_, _, reason)| *reason == DesyncReason::Overflow)
+        .expect("the bound still has to ask for a resync");
+    assert!(
+        overflow.0 < forbidden.0,
+        "the last word on a kind must be the verdict retrying cannot fix"
+    );
+    assert!(i.is_empty());
 }
 
 #[test]

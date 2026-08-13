@@ -236,7 +236,7 @@ pub(crate) async fn apply(
 fn classify(error: &kube::Error, dry_run: bool) -> ApplyOutcome {
     if let kube::Error::Api(status) = error {
         match status.code {
-            403 => {
+            401 | 403 => {
                 return ApplyOutcome::Denied {
                     what: "apply",
                     why: message_of(status),
@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn a_403_on_a_write_is_a_denial_that_keeps_the_servers_reason() {
+    fn a_refused_write_is_a_denial_that_keeps_the_servers_reason() {
         // An admission webhook's refusal arrives as a 403 whose message is the
         // only thing that says what to change.
         let denied = kube::Error::Api(
@@ -570,6 +570,17 @@ mod tests {
             why.contains("runAsNonRoot"),
             "the reason survives the labelling: {why}"
         );
+
+        let expired = kube::Error::Api(
+            Status::failure("the token has expired", "Unauthorized")
+                .with_code(401)
+                .boxed(),
+        );
+        let ApplyOutcome::Denied { what, why } = classify(&expired, true) else {
+            panic!("a 401 is the same refusal a read calls denied, not a generic failure");
+        };
+        assert_eq!(what, "apply");
+        assert_eq!(why, "the token has expired");
 
         let broken = kube::Error::Api(
             Status::failure("etcdserver: request timed out", "ServiceUnavailable")

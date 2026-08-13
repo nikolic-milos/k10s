@@ -222,6 +222,44 @@ fn an_empty_inventory_says_what_it_looked_at_rather_than_nothing() {
 }
 
 #[test]
+fn the_status_column_is_measured_the_way_the_formatter_pads_it() {
+    let revision = |revision: u32, status: &str| Revision {
+        revision,
+        status: status.to_string(),
+        updated: String::new(),
+        description: String::new(),
+        chart: "chart".to_string(),
+        chart_version: "1.0.0".to_string(),
+        app_version: String::new(),
+    };
+    let lines = render(&Releases {
+        releases: vec![Release {
+            name: "app".to_string(),
+            namespace: "prod".to_string(),
+            revisions: vec![revision(2, "déployé"), revision(1, "ok")],
+        }],
+        truncated: false,
+        unreadable: 0,
+    });
+    let column = |line: &str| {
+        let at = line.find("chart-1.0.0").expect("the chart column");
+        line[..at].chars().count()
+    };
+    let rows: Vec<&String> = lines.iter().filter(|line| line.contains("rev ")).collect();
+    assert_eq!(rows.len(), 2, "{lines:?}");
+    assert!(
+        rows[0].contains("déployé  chart-1.0.0"),
+        "the formatter pads in characters, so measuring the widest status in bytes \
+         opens a gap as wide as its multibyte excess: {rows:?}"
+    );
+    assert_eq!(
+        column(rows[0]),
+        column(rows[1]),
+        "and the narrower one is padded to the same character column: {rows:?}"
+    );
+}
+
+#[test]
 fn a_history_renders_newest_first_with_its_chart_and_status() {
     let revision = |revision: u32, status: &str| Revision {
         revision,

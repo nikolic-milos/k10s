@@ -621,12 +621,13 @@ impl Syntax {
         if self.tree.is_none() {
             return Descent::Absent;
         }
-        let Some(mut node) = self.document_nodes().into_iter().nth(document_index) else {
+        let nodes = self.document_nodes();
+        let Some(mut node) = nodes.get(document_index).copied() else {
             return Descent::Absent;
         };
         // On a bare-ERROR recovery every document shares one node, so the
         // first hop is confined to this document's marker-split range.
-        let mut scope = if self.document_nodes().len() == 1 {
+        let mut scope = if nodes.len() == 1 {
             self.documents(rope).get(document_index).cloned()
         } else {
             None

@@ -1,6 +1,7 @@
 //! Resolving a forward target through the pod or the service that fronts it,
-//! and the two ways it fails: a portless pod is labelled, a denied one is a
-//! denial.
+//! and the three ways it fails: a portless pod is labelled, a nameless
+//! selected pod is labelled before anything binds a socket, and a denied one
+//! is a denial.
 
 use crate::*;
 
@@ -94,6 +95,58 @@ fn a_forward_target_resolves_ports_from_the_pod_or_through_the_service() {
         "the pod scan is bounded: {}",
         pod_scan.path
     );
+
+    drop(runtime);
+}
+#[test]
+fn a_service_selecting_a_nameless_pod_is_labelled_at_resolve() {
+    use k10s_data::forward::ForwardRequest;
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/services/api",
+        200,
+        r#"{"metadata":{"name":"api","namespace":"prod","uid":"uid-svc"},
+            "spec":{"selector":{"app":"api"},"ports":[{"port":80}]}}"#,
+    );
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/pods?",
+        200,
+        r#"{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[
+            {"metadata":{"uid":"uid-ghost","namespace":"prod"},
+             "spec":{"containers":[{"name":"app","ports":[{"containerPort":8080}]}]},
+             "status":{"phase":"Running"}}]}"#,
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.resolve_forward(
+        ForwardRequest {
+            namespace: "prod".to_string(),
+            name: "api".to_string(),
+            service: true,
+        },
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    );
+    let Fetched::Failed { what, why } = wait(&rx) else {
+        panic!(
+            "a resolution answering with an empty pod name would be forwarded to \
+             /pods//portforward, so the failure is named here rather than at the upgrade"
+        );
+    };
+    assert_eq!(what, "port-forward");
+    assert!(why.contains("carries no name"), "{why}");
 
     drop(runtime);
 }

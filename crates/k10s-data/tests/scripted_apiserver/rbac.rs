@@ -9,8 +9,9 @@ const POD_IN_PROD_JSON: &str = r#"{"metadata":{"name":"api-1","uid":"uid-pod-1",
       "ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"api","uid":"uid-dep","controller":true}]},
     "status":{"phase":"Running","containerStatuses":[
       {"name":"app","ready":true,"restartCount":0,"image":"nginx","imageID":"","state":{"running":{}}}]}}"#;
+const REVIEWS_PER_KIND: usize = 2;
 fn script_unavailable_reviews_for_one_kind(script: &Script) {
-    for _ in 0..2 {
+    for _ in 0..REVIEWS_PER_KIND {
         script.route(
             "POST",
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",

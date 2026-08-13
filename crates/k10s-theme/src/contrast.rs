@@ -15,6 +15,13 @@
 //!   decoration, and a 3:1 hairline is not a border, it is a fence; what a
 //!   separator must not be is invisible, which is exactly what this catches.
 //!
+//! Dim is out of that scope on purpose. SGR 2 is defined as recessive, so
+//! `terminal_dim_foreground` and `terminal_ansi_dim` -- like ansi slots 0 and 8
+//! below -- cannot be held to a reading floor without turning them into
+//! something that is not dim. What a theme owes them is that they stay dimmer
+//! than the foreground they recede from, which is a palette relation rather
+//! than a WCAG one.
+//!
 //! `one-dark` is transcribed from Zed and fourteen of its pairs do not clear
 //! their floor. Rather than quietly excluding it, each shortfall is recorded
 //! below with the ratio it actually measures. A waiver that drifts fails, and a
@@ -422,6 +429,43 @@ fn every_shipped_theme_is_readable() {
             "{}: these waivers name pairs the audit no longer produces: {unused:?}",
             theme.name
         );
+    }
+}
+
+#[test]
+fn dim_recedes_from_the_foreground_it_is_dim_of() {
+    // The relation that replaces a reading floor for SGR 2. A "dim" token that
+    // drifted brighter than the text it recedes from would be unaudited by the
+    // pairs above and invisible to review, while being exactly backwards.
+    for theme in ThemeRegistry::builtin().themes() {
+        let shell = &theme.shell;
+        let background = shell.terminal_background;
+        // Measured against the canvas rather than by luminance, because dim on
+        // a light theme means closer to white and on a dark one closer to
+        // black; what it always means is less separated from the background.
+        let recedes =
+            |dim: u32, normal: u32| contrast(dim, background) < contrast(normal, background);
+        assert!(
+            recedes(shell.terminal_dim_foreground, shell.terminal_foreground),
+            "{}: terminal_dim_foreground is not dimmer than terminal_foreground",
+            theme.name
+        );
+        for (index, (dim, normal)) in shell
+            .terminal_ansi_dim
+            .iter()
+            .zip(shell.terminal_ansi.iter())
+            .enumerate()
+            // Slot 0 is the palette's black, which on a dark theme *is* the
+            // background: its dim form has to come up off the canvas to stay a
+            // colour at all, for the same reason the audit above skips it.
+            .skip(1)
+        {
+            assert!(
+                recedes(*dim, *normal),
+                "{}: ansi_dim[{index}] is not dimmer than ansi[{index}]",
+                theme.name
+            );
+        }
     }
 }
 

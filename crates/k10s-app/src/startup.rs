@@ -10,7 +10,16 @@
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long a startup measurement will wait for a useful frame.
+///
+/// Wayland with no outputs -- monitors off, Hyprland DPMS -- may never fire
+/// `wl_surface.frame`, and an inactive window's `on_next_frame` callbacks are
+/// not run. Without a deadline the process hangs until killed. Eight seconds
+/// is well above the measured million-object useful-present (~300 ms) and
+/// short enough that an overnight collection does not stall on a dark GPU.
+pub(crate) const STARTUP_PRESENT_TIMEOUT: Duration = Duration::from_secs(8);
 
 use gpui::App;
 use k10s_core::SceneSnapshot;
@@ -396,30 +405,40 @@ struct Phases {
 fn write_report(report: &StartupReport, json: bool) -> io::Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    if json {
-        serde_json::to_writer(&mut output, report).map_err(io::Error::other)?;
-        writeln!(output)?;
-    } else {
-        let source_prepare = report
-            .phases_ms
-            .content_prepare
-            .unwrap_or(report.phases_ms.source_prepare);
-        writeln!(
-            output,
-            "startup {}: first {:.2} ms, useful {:.2} ms \
-             [source {:.2}, scene {:.2}, platform {:.2}, fonts {:.2}, window {:.2}, present {:.2}]",
-            report.source,
-            report.milestones_ms.first_presented,
-            report.milestones_ms.useful_presented,
-            source_prepare,
-            report.phases_ms.scene_ready_after_content.unwrap_or(0.0),
-            report.phases_ms.platform_launch,
-            report.phases_ms.font_registration,
-            report.phases_ms.window_open,
-            report.phases_ms.first_present,
-        )?;
-    }
+    render_report(report, json, &mut output)?;
     output.flush()
+}
+
+fn render_report(
+    report: &StartupReport,
+    json: bool,
+    output: &mut impl io::Write,
+) -> io::Result<()> {
+    if json {
+        serde_json::to_writer(&mut *output, report).map_err(io::Error::other)?;
+        return writeln!(output);
+    }
+    // The phase this run actually spent preparing, named as what it is: a
+    // generator or a cluster prepares content, a bare launch only prepares its
+    // source, and one line that calls both "source" reads as the wrong number.
+    let (prepared, prepare_ms) = match report.phases_ms.content_prepare {
+        Some(content) => ("content", content),
+        None => ("source", report.phases_ms.source_prepare),
+    };
+    writeln!(
+        output,
+        "startup {}: first {:.2} ms, useful {:.2} ms \
+         [{prepared} {:.2}, scene {:.2}, platform {:.2}, fonts {:.2}, window {:.2}, present {:.2}]",
+        report.source,
+        report.milestones_ms.first_presented,
+        report.milestones_ms.useful_presented,
+        prepare_ms,
+        report.phases_ms.scene_ready_after_content.unwrap_or(0.0),
+        report.phases_ms.platform_launch,
+        report.phases_ms.font_registration,
+        report.phases_ms.window_open,
+        report.phases_ms.first_present,
+    )
 }
 
 #[cfg(test)]

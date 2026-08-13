@@ -461,6 +461,73 @@ mod tests {
     }
 
     #[test]
+    fn compare_reads_a_manifest_beside_its_baselines_and_gates_on_it() {
+        // The entry point CI actually calls: suite files resolve against the
+        // manifest's own directory, results against the directory it was
+        // given, and a schema the comparator does not understand is a refusal
+        // rather than a pass.
+        let root = std::env::temp_dir().join(format!("k10s-bench-compare-{}", std::process::id()));
+        let baselines = root.join("baselines");
+        let results = root.join("results");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&baselines).unwrap();
+        fs::create_dir_all(&results).unwrap();
+
+        let manifest = json!({
+            "schema_version": 1,
+            "profile": {
+                "label": "test", "recorded_at": "2026-08-12", "os": "linux",
+                "kernel": "7.1", "architecture": "x86_64", "cpu": "test",
+                "governor": "performance", "turbo": false, "cpu_affinity": 2,
+                "rustc": "1.97.1"
+            },
+            "suites": [{
+                "name": "test",
+                "file": "test.json",
+                "source_schema": 1,
+                "case_keys": ["name"],
+                "metrics": [{"field": "p50_ns", "maximum_ratio": 1.2}]
+            }]
+        });
+        let manifest_path = baselines.join("manifest.json");
+        fs::write(&manifest_path, manifest.to_string()).unwrap();
+        fs::write(
+            baselines.join("test.json"),
+            json!({"schema_version": 1, "cases": [{"name": "a", "p50_ns": 100.0}]}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            results.join("test.json"),
+            json!({"schema_version": 1, "cases": [{"name": "a", "p50_ns": 118.0}]}).to_string(),
+        )
+        .unwrap();
+
+        let report = compare(&manifest_path, &results).unwrap();
+        assert!(report.passed(), "{:?}", report.regressions);
+        assert_eq!(report.checks, 1);
+        assert_eq!(report.suites[0].cases, 1);
+
+        fs::write(
+            results.join("test.json"),
+            json!({"schema_version": 1, "cases": [{"name": "a", "p50_ns": 130.0}]}).to_string(),
+        )
+        .unwrap();
+        let report = compare(&manifest_path, &results).unwrap();
+        assert_eq!(report.regressions.len(), 1, "{:?}", report.regressions);
+        assert!(report.regressions[0].contains("p50_ns"));
+
+        fs::write(
+            results.join("test.json"),
+            json!({"schema_version": 2, "cases": [{"name": "a", "p50_ns": 100.0}]}).to_string(),
+        )
+        .unwrap();
+        let error = compare(&manifest_path, &results).unwrap_err();
+        assert!(error.to_string().contains("schema"), "{error}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_null_exact_field_is_present_and_comparable() {
         let mut suite = suite();
         suite.exact = vec!["drawn".to_owned()];

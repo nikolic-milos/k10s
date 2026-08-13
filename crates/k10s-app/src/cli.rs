@@ -293,10 +293,10 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
             }
             "--machine" => args.machine = Some(value("--machine", inline, &mut rest)?),
             "--cluster" => args.cluster = true,
-            "--context" => args.context = Some(value("--context", inline, &mut rest)?),
+            "--context" => args.context = Some(named("--context", inline, &mut rest)?),
             "--namespace" => args
                 .namespaces
-                .push(value("--namespace", inline, &mut rest)?),
+                .push(named("--namespace", inline, &mut rest)?),
             "--sync-timeout" => {
                 args.sync_timeout_secs = bounded(
                     "--sync-timeout",
@@ -366,6 +366,26 @@ fn value(
         Some(inline) => Ok(inline.to_string()),
         None => rest.next().ok_or(ArgError::MissingValue { flag }),
     }
+}
+
+// A name of something in a cluster. An empty one is what an unset shell
+// variable expands to, and passing it on would probe a namespace that cannot
+// exist or ask for a context nobody named -- an answer that looks like a
+// cluster's rather than the command line's.
+fn named(
+    flag: &'static str,
+    inline: Option<&str>,
+    rest: &mut impl Iterator<Item = String>,
+) -> Result<String, ArgError> {
+    let got = value(flag, inline, rest)?;
+    if got.trim().is_empty() {
+        return Err(ArgError::BadValue {
+            flag,
+            expected: "a name".to_string(),
+            got: format!("{got:?}"),
+        });
+    }
+    Ok(got)
 }
 
 fn number<T: std::str::FromStr>(

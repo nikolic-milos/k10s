@@ -478,7 +478,7 @@ fn convert(schema: &serde_json::Value, depth: usize, nulls: Nulls) -> Arc<Schema
             nullable: nullable || merged.nullable,
         });
     }
-    let declared = schema.get("type").and_then(serde_json::Value::as_str);
+    let declared = declared_type(schema);
     let shape = match declared {
         Some("object") => object_shape(schema, depth, nulls),
         None if schema.get("properties").is_some() => object_shape(schema, depth, nulls),
@@ -498,6 +498,23 @@ fn convert(schema: &serde_json::Value, depth: usize, nulls: Nulls) -> Arc<Schema
         shape,
         nullable,
     })
+}
+
+// The type a schema declares, which JSON Schema also spells as a list. The
+// `null` member of such a list is nullability and `declares_null` has already
+// read it; what is left is the shape, and dropping it because it arrived in a
+// list left hand-written CRDs indexed but unchecked -- no scalar kind, no
+// enum, no completion -- while looking exactly like a schema that had been
+// read.
+fn declared_type(schema: &serde_json::Value) -> Option<&str> {
+    match schema.get("type") {
+        Some(serde_json::Value::String(name)) => Some(name.as_str()),
+        Some(serde_json::Value::Array(entries)) => entries
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .find(|name| *name != "null"),
+        _ => None,
+    }
 }
 
 // `nullable: true` is how OpenAPI 3.0 and CRD structural schemas spell it;
@@ -555,7 +572,13 @@ fn merge_all_of(members: &[serde_json::Value], depth: usize, nulls: Nulls) -> Ar
                         .entry(key.clone())
                         .or_insert_with(|| value.clone());
                 }
-                required.extend(member_required.iter().cloned());
+                // A name two members both require is one requirement, not two:
+                // the validator reports one diagnostic per entry here.
+                for name in member_required {
+                    if !required.iter().any(|kept| kept == name) {
+                        required.push(name.clone());
+                    }
+                }
                 // The most permissive member wins, whichever order the members
                 // arrive in: an `allOf` member that opens the map opens it for
                 // the merge too.

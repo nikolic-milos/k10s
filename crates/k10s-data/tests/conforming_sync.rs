@@ -286,11 +286,8 @@ fn an_assembled_sync_is_something_the_world_accepts() {
         .expect("staging");
 
     assert_eq!(prod.workloads.len(), 3);
-    assert!(
-        prod.workloads
-            .iter()
-            .all(|w| w.kind != replica_set(&mut Catalog::new()))
-    );
+    let rs = replica_set(&mut catalog);
+    assert!(prod.workloads.iter().all(|w| w.kind != rs));
     let api = prod
         .workloads
         .iter()

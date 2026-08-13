@@ -66,6 +66,22 @@ fn replace_matches_the_string_model_at_seams() {
     }
 }
 
+#[test]
+#[should_panic(expected = "rope edits must be a range inside the rope")]
+fn a_reversed_edit_range_is_refused_by_name() {
+    // Not only under `debug_assertions`, and not as the char-boundary assert
+    // a wrapped length reaches several frames deeper.
+    let mut rope = Rope::from("alpha\nbeta\n");
+    rope.replace(std::ops::Range { start: 6, end: 2 }, "x");
+}
+
+#[test]
+#[should_panic(expected = "rope edits must be a range inside the rope")]
+fn an_edit_range_past_the_end_is_refused_by_name() {
+    let mut rope = Rope::from("alpha\nbeta\n");
+    rope.replace(6..600, "x");
+}
+
 fn nearest_boundary(text: &str, mut offset: usize) -> usize {
     while offset < text.len() && !text.is_char_boundary(offset) {
         offset += 1;
@@ -209,21 +225,54 @@ fn grapheme_steps_move_over_clusters_not_scalars() {
 #[test]
 fn a_cluster_split_across_two_leaves_is_still_one_cluster() {
     // Chunks never split a char but happily split a cluster, so the
-    // boundary search has to cross leaves.
-    let mut text = "a".repeat(TARGET_CHUNK * 3 - 1);
+    // boundary search has to cross leaves. The letter has to be the last
+    // byte of a leaf for that to be what is tested: a cluster that happens
+    // to sit inside one leaf proves only that the easy path works.
+    let mut text = "a".repeat(TARGET_CHUNK - 1);
+    let seam = text.len();
     text.push('e');
     text.push('\u{301}');
     text.push('b');
+    text.push_str(&"a".repeat(TARGET_CHUNK * 2));
     let rope = Rope::from(text.as_str());
     assert!(rope.depth() > 0, "the fixture spans several leaves");
-    let seam = text.len() - 4;
+    assert_eq!(
+        rope.chunk_bytes_from(seam).len(),
+        1,
+        "the letter ends a leaf"
+    );
     assert_eq!(rope.char_at(seam), Some('e'));
     assert_eq!(
         rope.next_grapheme_offset(seam),
-        text.len() - 1,
+        seam + 3,
         "the accent rides with its letter across the leaf boundary"
     );
-    assert_eq!(rope.prev_grapheme_offset(text.len() - 1), seam);
+    assert_eq!(rope.prev_grapheme_offset(seam + 3), seam);
+    assert_eq!(rope.snap_to_grapheme_boundary(seam + 1), seam);
+}
+
+#[test]
+fn a_flag_split_across_two_leaves_still_needs_its_pre_context() {
+    // Regional indicators pair up, so the segmenter has to be told what
+    // precedes the chunk it is looking at -- and here what precedes it is a
+    // different leaf.
+    let mut text = "a".repeat(TARGET_CHUNK - 4);
+    let seam = text.len();
+    text.push('\u{1F1E9}');
+    text.push('\u{1F1EA}');
+    text.push_str(&"a".repeat(TARGET_CHUNK * 2));
+    let rope = Rope::from(text.as_str());
+    assert_eq!(
+        rope.chunk_bytes_from(seam).len(),
+        4,
+        "the first indicator ends a leaf"
+    );
+    assert_eq!(
+        rope.next_grapheme_offset(seam),
+        seam + 8,
+        "both halves of the flag move as one"
+    );
+    assert_eq!(rope.prev_grapheme_offset(seam + 8), seam);
 }
 
 #[test]

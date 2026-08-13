@@ -311,6 +311,58 @@ fn the_most_permissive_all_of_member_decides_in_either_order() {
 }
 
 #[test]
+fn a_type_written_as_a_list_still_states_a_shape() {
+    // Hand-written CRDs spell an optional scalar the JSON Schema way. Reading
+    // the list for nullability but not for the type left the field indexed
+    // and unchecked: every value passed, and nothing completed.
+    let spec = crd_spec(
+        r#"{"type":"object","properties":{
+            "mode":{"type":["string","null"],"enum":["tcp","udp"]},
+            "port":{"type":["integer"]}}}"#,
+    );
+    let Shape::Object { properties, .. } = &spec.shape else {
+        panic!("spec is an object, got {spec:?}");
+    };
+    let mode = properties.get("mode").expect("mode is declared");
+    assert!(mode.nullable, "the list's `null` member is the nullability");
+    let Shape::Scalar { kind, values } = &mode.shape else {
+        panic!("mode is a string, got {mode:?}");
+    };
+    assert_eq!(*kind, ScalarKind::Str);
+    assert_eq!(values, &["tcp".to_string(), "udp".to_string()]);
+    let port = properties.get("port").expect("port is declared");
+    assert!(!port.nullable, "a list without `null` is not nullable");
+    assert!(
+        matches!(
+            port.shape,
+            Shape::Scalar {
+                kind: ScalarKind::Integer,
+                ..
+            }
+        ),
+        "a single-member list is still a type, got {port:?}"
+    );
+}
+
+#[test]
+fn a_field_two_all_of_members_require_is_named_once() {
+    let spec = crd_spec(
+        r#"{"allOf":[
+            {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},
+            {"type":"object","properties":{"port":{"type":"integer"}},
+             "required":["name","port"]}]}"#,
+    );
+    let Shape::Object { required, .. } = &spec.shape else {
+        panic!("the merge is an object, got {spec:?}");
+    };
+    assert_eq!(
+        required,
+        &["name".to_string(), "port".to_string()],
+        "one requirement, not one diagnostic per member that states it"
+    );
+}
+
+#[test]
 fn nullable_survives_a_ref_hop_the_crd_root_and_array_items() {
     let mut index = SchemaIndex::new();
     for (name, nullable) in [("Plain", false), ("Nullable", true)] {

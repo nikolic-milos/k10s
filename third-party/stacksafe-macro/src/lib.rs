@@ -121,6 +121,65 @@ mod tests {
         .is_ok());
     }
 
+    fn flattened(tokens: proc_macro2::TokenStream) -> String {
+        tokens
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn the_expansion_keeps_the_shape_stacksafe_0_1_4_expects() {
+        let plain = flattened(
+            expand(
+                quote!(),
+                quote!(
+                    fn plain() -> u8 {
+                        1
+                    }
+                ),
+            )
+            .expect("a plain function expands"),
+        );
+        assert!(
+            plain.contains("::stacksafe::internal::stacker::maybe_grow(::stacksafe::get_minimum_stack_size(),::stacksafe::get_stack_allocation_size(),::stacksafe::internal::with_protected(move||->u8{{1}}))"),
+            "{plain}"
+        );
+
+        let overridden = flattened(
+            expand(
+                quote!(crate = my_crate),
+                quote!(
+                    fn plain() {}
+                ),
+            )
+            .expect("an overridden crate path expands"),
+        );
+        assert!(
+            overridden.contains("my_crate::internal::stacker::maybe_grow"),
+            "{overridden}"
+        );
+
+        let opaque = flattened(
+            expand(
+                quote!(),
+                quote!(
+                    fn opaque() -> impl Iterator<Item = u8> {
+                        [1].into_iter()
+                    }
+                ),
+            )
+            .expect("an opaque return expands"),
+        );
+        assert!(opaque.contains("with_protected(move||{{"), "{opaque}");
+        assert_eq!(
+            opaque.matches("implIterator").count(),
+            1,
+            "an opaque return type is written once, on the signature: {opaque}"
+        );
+    }
+
     #[test]
     fn rejects_invalid_targets_and_parameters() {
         let cases = [

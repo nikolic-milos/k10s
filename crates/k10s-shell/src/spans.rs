@@ -100,8 +100,12 @@ pub fn compose_line(len: usize, layers: &LineLayers) -> Vec<(Range<usize>, SpanF
             diagnostic: layers
                 .diagnostics
                 .iter()
-                .find(|(range, _)| covers(range))
-                .map(|(_, severity)| *severity),
+                .filter(|(range, _)| covers(range))
+                .map(|(_, severity)| *severity)
+                .reduce(|worst, severity| match worst {
+                    DiagnosticSeverity::Error => worst,
+                    DiagnosticSeverity::Warning => severity,
+                }),
         };
         if flags.any() {
             spans.push((segment, flags));
@@ -313,6 +317,28 @@ mod tests {
             .find(|(range, _)| range.start == 5)
             .expect("current match segment exists");
         assert!(current.1.current_match);
+    }
+
+    #[test]
+    fn the_worst_diagnostic_over_a_segment_is_the_one_that_paints() {
+        let mut line = layers();
+        line.diagnostics.push((0..10, DiagnosticSeverity::Warning));
+        line.diagnostics.push((2..6, DiagnosticSeverity::Error));
+        let spans = compose_line(10, &line);
+        let overlap = spans
+            .iter()
+            .find(|(range, _)| range.start == 2)
+            .expect("the covered segment exists");
+        assert_eq!(
+            overlap.1.diagnostic,
+            Some(DiagnosticSeverity::Error),
+            "an error under a warning must not paint as a warning: {spans:?}"
+        );
+        let warning_only = spans
+            .iter()
+            .find(|(range, _)| range.start == 6)
+            .expect("the segment past the error exists");
+        assert_eq!(warning_only.1.diagnostic, Some(DiagnosticSeverity::Warning));
     }
 
     #[test]

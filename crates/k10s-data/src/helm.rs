@@ -473,7 +473,7 @@ pub fn render(releases: &Releases) -> Vec<String> {
         let width = release
             .revisions
             .iter()
-            .map(|revision| revision.status.len())
+            .map(|revision| revision.status.chars().count())
             .max()
             .unwrap_or(0);
         for revision in &release.revisions {

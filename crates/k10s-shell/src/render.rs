@@ -346,19 +346,14 @@ impl Render for Workspace {
                 this.map.update(cx, |map, cx| map.zoom_out(window, cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
-                this.inspector_open = !this.inspector_open;
-                // A closed inspector must not keep a usage poll alive under it.
-                this.sync_usage_poll(cx);
-                cx.notify();
+                this.toggle_inspector(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleLeftDock, _, cx| {
                 this.left.toggle();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleRightDock, _, cx| {
-                this.inspector_open = !this.inspector_open;
-                this.sync_usage_poll(cx);
-                cx.notify();
+                this.toggle_inspector(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleBottomDock, _, cx| {
                 this.bottom.toggle();
@@ -486,5 +481,17 @@ impl Render for Workspace {
             .children(launch)
             .children(picker)
             .children(finder)
+    }
+}
+
+impl Workspace {
+    // The right dock *is* the inspector, and two actions open it: the `i`
+    // mnemonic and the dock chord. One place to flip it, so a rule added to one
+    // of them cannot go missing from the other -- a closed inspector must not
+    // keep a usage poll alive under it.
+    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        self.inspector_open = !self.inspector_open;
+        self.sync_usage_poll(cx);
+        cx.notify();
     }
 }

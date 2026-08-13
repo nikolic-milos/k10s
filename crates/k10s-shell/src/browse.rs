@@ -740,6 +740,7 @@ impl Render for BrowseView {
                                 hints.push_str(" · m more");
                             }
                             if let TableSource::Kind(kind) = source {
+                                hints.push_str(" · y edit");
                                 if kind.kind == "Pod" || selects_pods(&kind.kind) {
                                     hints.push_str(" · l logs");
                                 }

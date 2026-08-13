@@ -7,13 +7,15 @@
 //! comes from `alacritty_terminal`'s tty module (spawn, setsid, SIGHUP on
 //! drop are its battle-tested problems, not ours); only the transport lives
 //! here: a reader thread that forwards output until the shell exits, a dup'd
-//! writer for keystrokes, and a resize that reaches the kernel's window size.
-//! Dropping the session hangs up and reaps the child.
+//! writer whose first refusal is reported rather than swallowed, and a resize
+//! that reaches the kernel's window size. Dropping the session hangs up and
+//! reaps the child.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty::{self, Options, Pty, Shell};
@@ -53,22 +55,45 @@ struct LocalSession {
     // Resize needs `&mut Pty`; everything else works on dup'd fds.
     pty: Mutex<Pty>,
     writer: File,
+    on_event: Arc<dyn Fn(ExecEvent) + Send + Sync>,
+    write_failed: AtomicBool,
 }
 
 impl ExecSession for LocalSession {
     fn write(&self, bytes: &[u8]) {
-        let _ = (&self.writer).write_all(bytes);
+        write_or_report(
+            &self.writer,
+            bytes,
+            &self.write_failed,
+            self.on_event.as_ref(),
+        );
     }
 
     fn resize(&self, cols: u16, rows: u16) {
-        if let Ok(mut pty) = self.pty.lock() {
-            pty.on_resize(WindowSize {
-                num_lines: rows.max(2),
-                num_cols: cols.max(2),
-                cell_width: CELL_WIDTH,
-                cell_height: CELL_HEIGHT,
-            });
-        }
+        let mut pty = self.pty.lock().unwrap_or_else(PoisonError::into_inner);
+        pty.on_resize(WindowSize {
+            num_lines: rows.max(2),
+            num_cols: cols.max(2),
+            cell_width: CELL_WIDTH,
+            cell_height: CELL_HEIGHT,
+        });
+    }
+}
+
+// Keystrokes that the far side refuses must not vanish; the first refusal is
+// the one that says the shell is gone, and every later one says it again.
+fn write_or_report(
+    mut writer: impl Write,
+    bytes: &[u8],
+    reported: &AtomicBool,
+    on_event: &dyn Fn(ExecEvent),
+) {
+    if let Err(error) = writer.write_all(bytes)
+        && !reported.swap(true, Ordering::Relaxed)
+    {
+        on_event(ExecEvent::Failed(format!(
+            "the shell stopped taking input ({error})"
+        )));
     }
 }
 
@@ -113,6 +138,7 @@ fn start(
         .try_clone()
         .map_err(|error| label("cannot clone the PTY fd", &error))?;
 
+    let reader_events = on_event.clone();
     std::thread::Builder::new()
         .name("k10s-local-pty".to_string())
         .spawn(move || {
@@ -120,20 +146,22 @@ fn start(
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(read) => on_event(ExecEvent::Output(buffer[..read].to_vec())),
+                    Ok(read) => reader_events(ExecEvent::Output(buffer[..read].to_vec())),
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     // EIO is how a Linux PTY master says the shell is gone;
                     // every read error after SIGHUP means the same thing.
                     Err(_) => break,
                 }
             }
-            on_event(ExecEvent::Ended("the shell exited".to_string()));
+            reader_events(ExecEvent::Ended("the shell exited".to_string()));
         })
         .map_err(|error| label("cannot spawn the reader thread", &error))?;
 
     Ok(LocalSession {
         pty: Mutex::new(pty),
         writer,
+        on_event,
+        write_failed: AtomicBool::new(false),
     })
 }
 
@@ -197,6 +225,41 @@ mod tests {
                 Ok(_) => continue,
                 Err(_) => panic!("dropping the session must end it"),
             }
+        }
+    }
+
+    struct RefusingWriter;
+
+    impl Write for RefusingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_write_the_shell_cannot_take_is_labelled_once_rather_than_swallowed() {
+        let seen = Mutex::new(Vec::new());
+        let reported = AtomicBool::new(false);
+        let record = |event: ExecEvent| seen.lock().unwrap().push(event);
+
+        write_or_report(std::io::sink(), b"ping", &reported, &record);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a write the shell took says nothing"
+        );
+
+        write_or_report(RefusingWriter, b"ping", &reported, &record);
+        write_or_report(RefusingWriter, b"ping again", &reported, &record);
+        let seen = seen.into_inner().unwrap();
+        match &seen[..] {
+            [ExecEvent::Failed(why)] => assert!(why.contains("stopped taking input"), "{why}"),
+            other => panic!(
+                "one label, and exactly one, for a shell that stopped taking input: {other:?}"
+            ),
         }
     }
 

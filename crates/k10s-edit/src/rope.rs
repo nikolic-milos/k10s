@@ -11,6 +11,7 @@
 //! from a segmentation cursor fed the rope's chunks rather than from a
 //! materialized string.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
@@ -340,7 +341,14 @@ impl Rope {
     }
 
     pub fn replace(&mut self, range: Range<usize>, text: &str) {
-        debug_assert!(range.start <= range.end && range.end <= self.len());
+        // Stated here rather than only under `debug_assertions`, because the
+        // release failure for a reversed range is a wrapped length that lands
+        // as a char-boundary assert several frames deep in `split`, naming the
+        // wrong precondition.
+        assert!(
+            range.start <= range.end && range.end <= self.len(),
+            "rope edits must be a range inside the rope"
+        );
         let (left, rest) = split(&self.root, range.start);
         let (_, right) = split(&rest, range.end - range.start);
         let middle = level_of(chunk_leaves(text));
@@ -628,19 +636,29 @@ impl Rope {
         }
     }
 
+    // A run of one line's bytes, borrowed from the leaf that holds it whenever
+    // it fits in one -- which is every line the editor draws -- and copied only
+    // when it straddles leaves. Vertical motion asks twice per keypress.
+    fn line_text(&self, start: usize, len: usize) -> Cow<'_, str> {
+        let (chunk, chunk_start) = self.chunk_at(start);
+        let from = start - chunk_start;
+        match from.checked_add(len) {
+            Some(to) if to <= chunk.len() => Cow::Borrowed(&chunk[from..to]),
+            _ => Cow::Owned(self.slice_to_string(start..start + len)),
+        }
+    }
+
     // How far along its line an offset sits, counted in grapheme clusters:
     // the goal column vertical motion remembers.
     pub fn grapheme_column(&self, offset: usize) -> usize {
         let point = self.byte_to_point(offset);
         let start = self.line_start(point.row);
-        self.slice_to_string(start..start + point.column)
-            .graphemes(true)
-            .count()
+        self.line_text(start, point.column).graphemes(true).count()
     }
 
     pub fn offset_at_grapheme_column(&self, row: usize, column: usize) -> usize {
         let start = self.line_start(row);
-        let line = self.line(row);
+        let line = self.line_text(start, self.line_len(row));
         let byte_column = line
             .grapheme_indices(true)
             .nth(column)
@@ -698,13 +716,11 @@ impl<'a> Iterator for Chunks<'a> {
                     }
                 }
                 Node::Internal { children, .. } => {
-                    let mut child_start = start;
-                    let mut frames = Vec::with_capacity(children.len());
-                    for child in children {
-                        frames.push((child, child_start));
-                        child_start += child.summary().bytes;
+                    let mut child_start = start + bytes;
+                    for child in children.iter().rev() {
+                        child_start -= child.summary().bytes;
+                        self.stack.push((child, child_start));
                     }
-                    self.stack.extend(frames.into_iter().rev());
                 }
             }
         }

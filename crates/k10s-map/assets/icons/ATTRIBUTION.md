@@ -5,6 +5,10 @@ Kubernetes resource icons, <https://github.com/kubernetes/community>
 (`icons/svg/resources/unlabeled/`), © the Kubernetes Authors, licensed
 CC BY 4.0 <https://creativecommons.org/licenses/by/4.0/>.
 
+Two kinds share one file where the upstream set has no separate glyph:
+CronJob is drawn with `job.svg` and Ingress with `svc.svg` (see `KIND_GLYPHS`
+in `src/lib.rs`), so this notice covers both uses of each file.
+
 Modifications: Inkscape/RDF metadata removed, the opaque `#326ce5` background
 hexagon dropped, and remaining paths collapsed to a plain white fill; gpui
 rasterizes SVGs as monochrome alpha masks tinted at paint time, so only the

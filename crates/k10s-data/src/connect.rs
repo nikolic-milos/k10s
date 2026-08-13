@@ -268,18 +268,19 @@ pub fn resolve_context(cfg: &Kubeconfig, requested: Option<&str>) -> Result<Stri
 
 const CREDENTIAL_SKEW_SECS: i64 = 30;
 
-pub fn credential_is_fresh(expires_at: Option<i64>, now_secs: i64) -> bool {
-    match expires_at {
-        None => true,
-        Some(deadline) => now_secs + CREDENTIAL_SKEW_SECS < deadline,
+pub fn credential_is_fresh(expires_at: Option<i64>, now_secs: Option<i64>) -> bool {
+    match (expires_at, now_secs) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(deadline), Some(now)) => now + CREDENTIAL_SKEW_SECS < deadline,
     }
 }
 
-fn now_secs() -> i64 {
+fn now_secs() -> Option<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
+        .ok()
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[derive(Clone)]

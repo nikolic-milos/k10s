@@ -245,6 +245,23 @@ fn publish_under_a_lapped_reader_stays_correct() {
 }
 
 #[test]
+fn a_derived_count_that_still_holds_pods_gives_one_back() {
+    let mut count = 2;
+    crate::release_one(&mut count);
+    assert_eq!(count, 1);
+    crate::release_one(&mut count);
+    assert_eq!(count, 0);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a derived count lost a pod it never held")]
+fn a_derived_count_that_would_go_negative_fails_loudly_instead_of_wrapping() {
+    let mut count = 0;
+    crate::release_one(&mut count);
+}
+
+#[test]
 fn rollup_arithmetic_survives_adversarial_dirty_streams() {
     let spec = platform(13, 3_000);
     let scene = k10s_core::new_shared_scene();

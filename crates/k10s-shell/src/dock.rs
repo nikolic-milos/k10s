@@ -52,6 +52,13 @@ impl<T> Dock<T> {
         self.panels.iter()
     }
 
+    /// The panel an index names, or nothing when it names none. What a caller
+    /// that already has an index from [`Dock::find`] should ask, rather than
+    /// counting that far into [`Dock::panels`] again.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        self.panels.get(index)
+    }
+
     pub fn active_index(&self) -> usize {
         self.panels.active_index()
     }
@@ -126,6 +133,27 @@ mod tests {
         dock.remove(0);
         assert!(!dock.is_open());
         assert!(dock.is_empty());
+    }
+
+    #[test]
+    fn an_index_from_find_names_the_same_panel_get_answers_with() {
+        let mut dock: Dock<&str> = Dock::default();
+        dock.push("logs");
+        dock.push("forwards");
+        dock.push("terminal");
+
+        let index = dock.find(|panel| *panel == "forwards").expect("the panel");
+        assert_eq!(dock.get(index), Some(&"forwards"));
+        assert_eq!(
+            dock.get(index),
+            dock.panels().nth(index).map(|(_, panel)| panel),
+            "the two ways of resolving an index have to agree"
+        );
+        assert_eq!(
+            dock.get(3),
+            None,
+            "an index that names no panel answers none"
+        );
     }
 
     #[test]

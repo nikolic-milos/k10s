@@ -174,7 +174,7 @@ async fn owner_chain(
                     owner.kind,
                     owner.name,
                     match &error {
-                        kube::Error::Api(response) if response.code == 403 =>
+                        kube::Error::Api(response) if matches!(response.code, 401 | 403) =>
                             "access denied for this account".to_string(),
                         kube::Error::Api(response) if response.code == 404 =>
                             "no longer exists".to_string(),

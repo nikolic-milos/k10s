@@ -11,6 +11,9 @@ description = "Generic 2D semantic-zoom map engine: camera, LOD policy, hierarch
 workspace = true
 
 [features]
+# Gates `src/testing.rs` -- the synthetic scenes and the bench LOD policy -- and
+# with it both benches, which require it. Off by default so a shipping build
+# links neither the fixtures nor the strings they allocate.
 testing = []
 
 [dependencies]

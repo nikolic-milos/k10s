@@ -591,9 +591,8 @@ impl Workspace {
             if let Some(request) = start
                 && let Some(view) = self
                     .bottom
-                    .panels()
-                    .nth(index)
-                    .and_then(|(_, tab)| tab.view.to_any().downcast::<ForwardsView>().ok())
+                    .get(index)
+                    .and_then(|tab| tab.view.to_any().downcast::<ForwardsView>().ok())
             {
                 view.update(cx, |view, cx| view.start(request, cx));
             }

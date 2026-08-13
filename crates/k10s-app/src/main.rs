@@ -248,6 +248,7 @@ fn main() {
                 startup.configuration_ready();
             }
             let bounds = Bounds::centered(None, size(px(1600.0), px(1000.0)), cx);
+            let startup_deadline = startup_window.clone();
             let opened = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -346,6 +347,19 @@ fn main() {
                 cx.quit();
                 return;
             }
+            if let Some(startup) = startup_deadline {
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(startup::STARTUP_PRESENT_TIMEOUT)
+                        .await;
+                    cx.update(|cx| {
+                        if !startup.completed() {
+                            cx.quit();
+                        }
+                    });
+                })
+                .detach();
+            }
             cx.on_window_closed(|cx, _| cx.quit()).detach();
             cx.activate(true);
         });
@@ -359,30 +373,77 @@ fn main() {
     // the thread carrying its stream, which is the order that lets a watch parked
     // on a full sink see a disconnect instead of a deadlock.
     launch.retire();
-    if bench_failed.load(Ordering::Relaxed) {
-        // Its own status, because a recording that did not happen and a window
-        // that would not open are different answers to whatever ran this.
-        std::process::exit(3);
+    let ending = Ending {
+        bench_failed: bench_failed.load(Ordering::Relaxed),
+        startup: startup_status.as_ref().map(|startup| StartupEnding {
+            failed: startup.failed(),
+            completed: startup.completed(),
+        }),
+        world_ended_cleanly,
+        window_failed: window_failed.load(Ordering::Relaxed),
+        connection_failed: connection_failed.load(Ordering::Relaxed),
+    };
+    let code = ending.code();
+    if code == STARTUP_BENCH_EXIT && ending.startup_ended_before_a_useful_frame() {
+        eprintln!("k10s: the startup benchmark ended before a useful frame was presented");
     }
-    if startup_status
-        .as_ref()
-        .is_some_and(|startup| startup.failed() || !startup.completed())
-    {
-        if startup_status
-            .as_ref()
-            .is_some_and(|startup| !startup.failed())
-        {
-            eprintln!("k10s: the startup benchmark ended before a useful frame was presented");
-        }
-        std::process::exit(4);
-    }
-    if !world_ended_cleanly
-        || window_failed.load(Ordering::Relaxed)
-        || connection_failed.load(Ordering::Relaxed)
-    {
-        std::process::exit(1);
+    if code != 0 {
+        std::process::exit(code);
     }
 }
+
+const BENCH_EXIT: i32 = 3;
+const STARTUP_BENCH_EXIT: i32 = 4;
+
+// What each half of the shutdown observed. Held as one value because the exit
+// code is a policy over all of them, and a policy nobody can call is a policy
+// nobody can test.
+#[derive(Clone, Copy)]
+struct StartupEnding {
+    failed: bool,
+    completed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Ending {
+    bench_failed: bool,
+    startup: Option<StartupEnding>,
+    world_ended_cleanly: bool,
+    window_failed: bool,
+    connection_failed: bool,
+}
+
+impl Ending {
+    /// The one number whatever ran this reads. A recording that did not happen,
+    /// a startup measurement without a useful frame, and a window that would not
+    /// open are different answers, and each keeps its own code.
+    fn code(self) -> i32 {
+        if self.bench_failed {
+            return BENCH_EXIT;
+        }
+        if self
+            .startup
+            .is_some_and(|startup| startup.failed || !startup.completed)
+        {
+            return STARTUP_BENCH_EXIT;
+        }
+        if !self.world_ended_cleanly || self.window_failed || self.connection_failed {
+            return 1;
+        }
+        0
+    }
+
+    // The only ending that needs a sentence beside its code: the measurement
+    // itself never failed, it just never got the frame it was waiting for.
+    fn startup_ended_before_a_useful_frame(self) -> bool {
+        self.startup
+            .is_some_and(|startup| !startup.failed && !startup.completed)
+    }
+}
+
+#[cfg(test)]
+#[path = "main_test.rs"]
+mod tests;
 
 // A generated scene and the one line that describes it. The line used to go
 // straight to stderr, which was fine when the generator was the only way in;

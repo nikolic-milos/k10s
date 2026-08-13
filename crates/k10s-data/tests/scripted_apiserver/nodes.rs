@@ -1,7 +1,8 @@
 //! The node capacity table: allocatable against requests and usage, pods
-//! counted under an exhausted disruption budget, and the two degradations --
-//! unreadable budgets hide the column rather than undercounting it, and a
-//! cluster with no metrics server hides usage rather than breaking.
+//! counted under an exhausted disruption budget, and the three degradations --
+//! unreadable budgets hide the column rather than undercounting it, a
+//! cluster with no metrics server hides usage rather than breaking, and a
+//! node whose pods do not fit one page says `?` rather than summing a page.
 
 use crate::*;
 
@@ -208,6 +209,57 @@ fn unreadable_disruption_budgets_hide_the_column_rather_than_undercounting() {
         "a denied budget list makes the column invisible, never wrong: {:?}",
         page.columns
     );
+
+    drop(runtime);
+}
+#[test]
+fn a_node_whose_pods_do_not_fit_one_page_reports_unknown_rather_than_a_partial_sum() {
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route("GET", "/api/v1/nodes?", 200, NODE_LIST_JSON);
+    script.route(
+        "GET",
+        "/api/v1/pods?fieldSelector=spec.nodeName%3Dn1",
+        200,
+        r#"{"kind":"PodList","apiVersion":"v1","metadata":{"continue":"there-are-more"},"items":[
+            {"metadata":{"name":"api-1","uid":"uid-pod-1","namespace":"prod"},
+             "spec":{"nodeName":"n1","containers":[{"name":"app",
+                "resources":{"requests":{"cpu":"100m","memory":"64Mi"}}}]},
+             "status":{"phase":"Running"}}
+        ]}"#,
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_node_table(move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    let Fetched::Ok(page) = wait(&rx) else {
+        panic!("the node table must still resolve");
+    };
+    let cell = |name: &str| {
+        let at = page
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("the {name} column exists: {:?}", page.columns));
+        page.rows[0].cells[at].as_str()
+    };
+    for column in ["Pods", "CPU req", "Memory req"] {
+        assert_eq!(
+            cell(column),
+            "?",
+            "one page of a node's pods is not the node's load: {:?}",
+            page.rows[0].cells
+        );
+    }
 
     drop(runtime);
 }

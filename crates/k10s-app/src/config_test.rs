@@ -53,6 +53,40 @@ fn missing_files_read_as_empty_rather_than_failing() {
 }
 
 #[test]
+fn a_file_that_will_not_read_is_not_a_file_that_was_deleted() {
+    let root = scratch("unreadable");
+    // A directory where a file is expected is the portable way to make a read
+    // fail with something that is not "not found"; a mid-write settings file
+    // that a poll cannot open is the case it stands in for.
+    std::fs::create_dir_all(root.join("settings.json")).unwrap();
+    std::fs::write(root.join("themes"), "not a directory").unwrap();
+
+    let text = files_under(&root).read();
+    assert_eq!(text.settings, "");
+    assert_eq!(text.unreadable.len(), 2, "{:?}", text.unreadable);
+    assert!(
+        text.unreadable
+            .iter()
+            .any(|note| note.contains("settings.json")),
+        "{:?}",
+        text.unreadable
+    );
+    assert!(
+        text.unreadable.iter().any(|note| note.contains("themes")),
+        "{:?}",
+        text.unreadable
+    );
+
+    // The keymap of that same read is simply absent, and an absence is not a
+    // failure: only the files that refused are named.
+    let missing = scratch("unreadable-missing");
+    assert!(
+        files_under(&missing).read().unreadable.is_empty(),
+        "a config home with nothing in it reads cleanly"
+    );
+}
+
+#[test]
 fn a_read_carries_what_the_files_say() {
     let root = scratch("content");
     std::fs::write(root.join("settings.json"), "{\"theme\": \"k10s\"}").unwrap();

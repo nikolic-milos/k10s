@@ -1,3 +1,11 @@
+//! Where the first snapshot's time goes: fold, layout, assemble, publish.
+//!
+//! Deliberately a coarse phase splitter and not a latency gate. Each phase is
+//! milliseconds to seconds at these object counts, so a median of five samples
+//! assigns a regression to a phase without the budgeted sampling and rMAD the
+//! nanosecond benches (`publish`, `fanout_cull`) need to be believed. Read a
+//! number here to learn which phase moved, then measure that phase properly.
+
 use std::hint::black_box;
 use std::time::Duration;
 

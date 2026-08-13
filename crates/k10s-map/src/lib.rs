@@ -1032,9 +1032,15 @@ impl Render for MapView {
                             f32::from(bounds.size.width),
                             f32::from(bounds.size.height),
                         );
-                        if map_bounds.replace(next_bounds) != next_bounds {
-                            // The next render now has the element-relative
-                            // viewport for fit, reveal, picking and chrome.
+                        // Store the precise rect for picking and fit; ask for
+                        // another frame only when the device-pixel grid moved.
+                        // Hyprland fractional scale can rescale logical bounds
+                        // by a fraction every configure, and comparing f32s
+                        // would re-arm RAF forever while nothing visible
+                        // changed -- which is how the idle claim dies.
+                        let scale = window.scale_factor();
+                        let prev = map_bounds.replace(next_bounds);
+                        if device_px(prev, scale) != device_px(next_bounds, scale) {
                             window.request_animation_frame();
                         }
                         paint_map(
@@ -1071,6 +1077,57 @@ impl Render for MapView {
 fn skip_workloads() -> bool {
     static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SKIP.get_or_init(|| std::env::var_os("K10S_SKIP_WL").is_some_and(|v| v != "0"))
+}
+
+/// The device-pixel grid a logical rect occupies at `scale`.
+///
+/// Used to decide whether a bounds change is worth another frame: comparing
+/// the f32s themselves treats a 0.01 px Hyprland rescale as damage.
+fn device_px(rect: k10s_core::Rect, scale: f32) -> [i32; 4] {
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    [
+        (rect.x * s).round() as i32,
+        (rect.y * s).round() as i32,
+        (rect.w * s).round() as i32,
+        (rect.h * s).round() as i32,
+    ]
+}
+
+/// Round a paint rect onto the device pixel grid before `paint_svg`.
+///
+/// gpui keys its SVG atlas on the size of `snap_bounds`, which rounds each
+/// edge independently. Two icons of the same ladder size at different
+/// subpixel origins then become two tiles, and a fractional scale (1.25 /
+/// 1.5) makes that the common case. Rounding origin and size here keeps the
+/// atlas key equal to the ladder size the walk already chose. The walk is
+/// untouched: only the paint quad moves.
+fn snap_to_device(bounds: Bounds<Pixels>, scale: f32) -> Bounds<Pixels> {
+    if !(scale.is_finite() && scale > 0.0) {
+        return bounds;
+    }
+    let snap = |v: f32| px((v * scale).round() / scale);
+    Bounds {
+        origin: point(
+            snap(f32::from(bounds.origin.x)),
+            snap(f32::from(bounds.origin.y)),
+        ),
+        size: size(
+            snap(f32::from(bounds.size.width)),
+            snap(f32::from(bounds.size.height)),
+        ),
+    }
+}
+
+fn say_once(message: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        eprintln!("k10s: {message}");
+    }
 }
 
 fn letterbox_bounds(canvas: Bounds<Pixels>) -> Bounds<Pixels> {
@@ -1319,19 +1376,20 @@ fn paint_map(
     if !icons.is_empty() {
         let wl_icon_color: gpui::Hsla =
             scale_alpha(rgb(theme.map.wl_icon), 0.95 * block_alpha).into();
+        let scale = window.scale_factor();
         window.paint_layer(bounds, |window| {
             for job in icons.iter() {
                 let (key, data, icon_bounds, color) = match job {
                     IconJob::Wl(kind, b) => {
                         let (key, data) = kind_icon(*kind);
-                        (key, data, *b, wl_icon_color)
+                        (key, data, snap_to_device(*b, scale), wl_icon_color)
                     }
                     IconJob::ToolId(tool, b) => {
                         let (key, data) = tool_icon(*tool);
                         (
                             key,
                             data,
-                            *b,
+                            snap_to_device(*b, scale),
                             scale_alpha(theme.map.tool_color(*tool), 0.95 * block_alpha).into(),
                         )
                     }
@@ -1340,19 +1398,26 @@ fn paint_map(
                         (
                             key,
                             data,
-                            *b,
+                            snap_to_device(*b, scale),
                             scale_alpha(theme.map.kind_color(*kind), cell_alpha).into(),
                         )
                     }
                 };
-                let _ = window.paint_svg(
-                    icon_bounds,
-                    key,
-                    Some(data),
-                    TransformationMatrix::unit(),
-                    color,
-                    cx,
-                );
+                if window
+                    .paint_svg(
+                        icon_bounds,
+                        key,
+                        Some(data),
+                        TransformationMatrix::unit(),
+                        color,
+                        cx,
+                    )
+                    .is_err()
+                {
+                    say_once(
+                        "a map icon failed to paint; further failures this process are silent",
+                    );
+                }
             }
         });
     }

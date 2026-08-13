@@ -789,7 +789,7 @@ impl DiffView {
                 // for as long as it stands, rather than printing it once into a
                 // message the next action overwrites.
                 self.answered = uid;
-                let live = self.state.live.clone();
+                let live = std::mem::take(&mut self.state.live);
                 self.state.set(Mode::DryRun, live, None, yaml);
                 self.status = Some(match reviewed(self.state.diff().verdict()) {
                     Ok(note) => {
