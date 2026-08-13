@@ -96,6 +96,17 @@ impl SavedView {
             .as_deref()
             .and_then(k10s_map::OverlayKind::parse)
     }
+
+    /// The camera the map already flies to. Clamped so a saved zoom of 0
+    /// cannot be divided by on the way there.
+    pub fn camera_target(&self) -> k10s_atlas::Camera {
+        k10s_atlas::Camera {
+            cx: self.camera.x,
+            cy: self.camera.y,
+            zoom: self.camera.zoom,
+        }
+        .clamped()
+    }
 }
 
 fn read_filter(value: &Value) -> MapFilter {
@@ -183,6 +194,10 @@ mod tests {
         assert_eq!(view.filter.health, Some(HealthFilter::Unhealthy));
         assert_eq!(view.overlay.as_deref(), Some("policy"));
         assert_eq!(view.overlay_kind(), Some(k10s_map::OverlayKind::Policy));
+        let camera = view.camera_target();
+        assert_eq!(camera.cx, 10.0);
+        assert_eq!(camera.cy, 20.0);
+        assert_eq!(camera.zoom, 4.0);
     }
 
     #[test]
@@ -190,6 +205,16 @@ mod tests {
         let view = parse_view(r#"{"name":"x","overlay":"grafana"}"#).unwrap();
         assert_eq!(view.overlay.as_deref(), Some("grafana"));
         assert_eq!(view.overlay_kind(), None);
+    }
+
+    #[test]
+    fn a_zero_zoom_is_clamped_so_fly_to_can_divide() {
+        let view = parse_view(r#"{"name":"x","camera":{"zoom":0}}"#).unwrap();
+        let camera = view.camera_target();
+        assert!(
+            camera.zoom.is_finite() && camera.zoom > 0.0,
+            "fly-to divides by zoom: {camera:?}"
+        );
     }
 
     #[test]
