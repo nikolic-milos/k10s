@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Collects the nine headless suites. That is not the app measurement.
+# The flight/startup gate is benchmarks/check-flight-gate.sh, labelled-host
+# only, and must not be invoked from this script (it opens a real window).
 set -euo pipefail
 
 RESULT_DIR="${RESULT_DIR:-target/benchmark-results}"

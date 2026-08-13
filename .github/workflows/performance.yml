@@ -5,6 +5,13 @@ name: Performance
 # void or measure the person using the machine rather than the change. A
 # perf-sensitive merge asks for a run with workflow_dispatch and gives the
 # machine thirty quiet minutes.
+#
+# The nine cargo-bench steps below gate the headless suites. They are not the
+# one measurement that is the app. That measurement is the in-app flight
+# (`k10s --bench`) and `--startup-bench`, which open a real window. Do not add
+# those commands to this workflow: a dispatch would take over this desktop.
+# The labelled-host gate is benchmarks/check-flight-gate.sh. Do not refresh
+# baselines from a flight run to make a headless suite pass.
 on:
   workflow_dispatch:
 
