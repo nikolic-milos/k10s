@@ -49,6 +49,10 @@ fn main() {
         println!("{}", cli::USAGE);
         return;
     }
+    if args.attribution {
+        print!("{}", k10s_shell::attribution::DOCUMENT);
+        return;
+    }
     let arguments_parsed = std::time::Instant::now();
     for ignored in &args.ignored {
         eprintln!("k10s: ignoring unrecognized argument {ignored}");

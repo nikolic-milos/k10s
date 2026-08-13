@@ -52,6 +52,7 @@ fn every_flag_sets_its_field() {
         (&["--bench", "--json", "--machine", "m"], |a| a.json),
         (&["--help"], |a| a.help),
         (&["-h"], |a| a.help),
+        (&["--attribution"], |a| a.attribution),
         (&["--cluster"], |a| a.cluster),
         (&["--context", "prod"], |a| {
             a.context.as_deref() == Some("prod")
@@ -512,6 +513,12 @@ fn help_wins_over_validation() {
 }
 
 #[test]
+fn attribution_wins_over_validation() {
+    let args = ok(&["--attribution", "--json"]);
+    assert!(args.attribution);
+}
+
+#[test]
 fn a_name_that_is_not_a_name_is_refused_rather_than_probed() {
     // `--namespace "$NS"` with `NS` unset is the way this happens, and an empty
     // namespace would otherwise become a probe target and a line of warning
@@ -552,6 +559,7 @@ fn usage_lists_every_flag() {
         "--bench",
         "--startup-bench",
         "--json",
+        "--attribution",
         "--help",
         "--cluster",
         "--context",
