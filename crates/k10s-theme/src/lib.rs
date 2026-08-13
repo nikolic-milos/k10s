@@ -22,6 +22,7 @@
 //! active theme.
 
 mod builtin;
+mod charts;
 mod load;
 mod registry;
 
@@ -31,6 +32,7 @@ use gpui::{Rgba, SharedString};
 use k10s_core::{BUILTIN_KIND_COUNT, BUILTIN_TOOL_COUNT, KindId, Severity, ToolId};
 
 pub use builtin::{K10S_DARK, K10S_LIGHT, ONE_DARK, builtin_family};
+pub use charts::{Point, Sample, Series, downsample_samples, sparkline, sparkline_bounded};
 pub use load::{LoadedFamily, Overrides, parse_color, parse_family, parse_overrides, strip_jsonc};
 pub use registry::ThemeRegistry;
 
