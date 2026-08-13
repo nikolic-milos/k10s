@@ -51,6 +51,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("d", DescribeSelection, workspace),
         KeyBinding::new("l", LogsSelection, workspace),
         KeyBinding::new("s", ExecSelection, workspace),
+        KeyBinding::new("a", AttachSelection, workspace),
         KeyBinding::new("ctrl-b", ToggleLeftDock, workspace),
         KeyBinding::new("ctrl-alt-b", ToggleRightDock, workspace),
         KeyBinding::new("ctrl-j", ToggleBottomDock, workspace),
@@ -68,6 +69,8 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", OpenRow, browse),
         KeyBinding::new("l", LogsRow, browse),
         KeyBinding::new("s", ExecRow, browse),
+        KeyBinding::new("shift-d", TalosDmesg, browse),
+        KeyBinding::new("shift-s", TalosServices, browse),
         KeyBinding::new("r", Refresh, browse),
         KeyBinding::new("m", LoadMore, browse),
         KeyBinding::new("shift-f", StartForward, browse),
@@ -168,6 +171,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-o", OpenFolder, workspace),
         KeyBinding::new("ctrl-alt-n", NewFile, workspace),
         KeyBinding::new("ctrl-p", FindFile, workspace),
+        KeyBinding::new("/", FindCluster, workspace),
         KeyBinding::new("ctrl-,", OpenSettings, workspace),
         KeyBinding::new("ctrl-k ctrl-s", OpenKeymap, workspace),
         // Zed's ctrl-k prefix, whose only other tenant here is the keymap file.
@@ -339,7 +343,7 @@ mod tests {
                 .filter(|binding| types_text(binding))
                 .find(|binding| typed(binding) == key)
         };
-        for key in ["b", "n", "d", "l", "s", "i", "y", "shift-f"] {
+        for key in ["b", "n", "d", "l", "s", "a", "i", "y", "shift-f"] {
             let binding = editor_binding(key)
                 .unwrap_or_else(|| panic!("{key} needs a guard or typing it runs a command"));
             assert!(

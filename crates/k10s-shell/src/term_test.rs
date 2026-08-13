@@ -5,6 +5,7 @@
 //! loses screen content but never learns of the end too late.
 
 use super::*;
+use gpui::rgb;
 use std::sync::{Arc, Mutex};
 
 // The fake transport's session half: records what the terminal writes.
@@ -78,6 +79,19 @@ fn ansi_cells_keep_zeds_palette_backgrounds_and_attributes() {
         lines[0].runs.last().unwrap().style.foreground,
         0x87ff87,
         "the xterm 6×6×6 cube is resolved exactly"
+    );
+
+    let cube = lines[0].runs.last().unwrap().style.highlight(shell);
+    assert_eq!(
+        cube.color,
+        Some(rgb(0x87ff87).into()),
+        "cell fg reaches the HighlightStyle StyledText paints"
+    );
+    let painted = lines[0].runs[0].style.highlight(shell);
+    assert_eq!(
+        painted.background_color,
+        Some(rgb(shell.terminal_ansi[4]).into()),
+        "cell bg reaches the HighlightStyle StyledText paints"
     );
 
     assert_eq!(
@@ -229,5 +243,48 @@ fn a_flooded_view_drops_output_but_never_how_the_session_ended() {
         ended.as_deref(),
         Some("the shell exited"),
         "how the session ended is not screen content: a flood must never eat it"
+    );
+}
+
+#[test]
+fn scrollback_is_bounded_history_the_viewport_can_walk() {
+    let mut state = TerminalState::with_history(12, 4, 8);
+    for i in 0..12 {
+        state.advance(format!("line-{i:02}\r\n").as_bytes());
+    }
+    let live = state.lines();
+    assert!(
+        live.iter().any(|line| line.contains("line-11")),
+        "the live screen holds the newest rows: {live:?}"
+    );
+    assert!(
+        live.iter().all(|line| !line.contains("line-00")),
+        "the first rows have left the screen for history: {live:?}"
+    );
+    assert!(state.history_size() > 0);
+    assert!(
+        state.history_size() <= 8,
+        "history is capped at the config the Term was built with: {}",
+        state.history_size()
+    );
+
+    assert!(state.scroll_delta(state.history_size() as i32));
+    let top = state.lines();
+    assert_ne!(top, live, "the viewport actually moved into history");
+    assert!(
+        top.iter().any(|line| line.contains("line-01")),
+        "scrolling into history shows the lines that left the screen: {top:?}"
+    );
+    assert!(state.scroll_to_bottom());
+    assert_eq!(state.display_offset(), 0, "the live screen is offset zero");
+
+    let mut capped = TerminalState::with_history(8, 3, 5);
+    for i in 0..40 {
+        capped.advance(format!("{i}\r\n").as_bytes());
+    }
+    assert!(
+        capped.history_size() <= 5,
+        "a flood cannot grow past the cap: {}",
+        capped.history_size()
     );
 }

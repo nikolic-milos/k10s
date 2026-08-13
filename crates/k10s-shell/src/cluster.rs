@@ -302,6 +302,7 @@ impl Workspace {
         self.chose_scene(cx);
         self.status_note = Some(note);
         self.refresh_detail(cx);
+        self.refresh_overlay(cx);
         cx.notify();
     }
 

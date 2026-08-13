@@ -25,7 +25,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use k10s_core::KindId;
+use k10s_core::{KindId, Severity};
+use k10s_map::OverlayKind;
 
 pub type Reply<T> = Box<dyn FnOnce(T) + Send>;
 
@@ -42,6 +43,49 @@ pub struct EventRow {
 pub enum Detail {
     Events(Vec<EventRow>),
     Log(Vec<String>),
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayStamp {
+    pub uid: String,
+    pub namespace: String,
+    pub name: String,
+    pub tint: Option<Severity>,
+    pub samples: Vec<(i64, f64)>,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverlayOutcome {
+    Ready {
+        stamps: Vec<OverlayStamp>,
+        truncated: bool,
+        note: Option<String>,
+    },
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodPostureView {
+    pub ingress_isolated: bool,
+    pub ingress_policies: usize,
+    pub ingress_names: Vec<String>,
+    pub ingress_truncated: bool,
+    pub egress_isolated: bool,
+    pub egress_policies: usize,
+    pub egress_names: Vec<String>,
+    pub egress_truncated: bool,
+    pub ports: Vec<String>,
+    pub completeness: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostureOutcome {
+    Ready(PodPostureView),
+    Missing,
     Denied(&'static str),
     Failed(String),
 }
@@ -393,6 +437,10 @@ pub struct ExecRequest {
     pub pod: String,
     pub container: Option<String>,
     pub command: Vec<String>,
+    /// Attach to the running process (stdin, no TTY command) rather than
+    /// exec a shell. The transport still takes this request; a backend that
+    /// does not yet distinguish the two ignores the flag and execs.
+    pub attach: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,6 +580,12 @@ read_provider! {
         request: &ExecRequest,
         on_event: Box<dyn Fn(ExecEvent) + Send + Sync>,
     ) -> Box<dyn ExecSession>;
+    /// Overlay stamps assembled off the paint path. Empty Ready is a missing
+    /// adapter, not a hole in the cluster.
+    fn fetch_overlay(&self, kind: OverlayKind, reply: Reply<OverlayOutcome>);
+    /// Isolation and named ports. Not an allow or deny: that needs a source,
+    /// protocol, and destination port.
+    fn fetch_pod_posture(&self, namespace: &str, name: &str, reply: Reply<PostureOutcome>);
 }
 
 pub struct NullProvider;
@@ -633,6 +687,14 @@ impl ReadProvider for NullProvider {
     ) -> Box<dyn ExecSession> {
         on_event(ExecEvent::Failed(NO_CLUSTER.to_string()));
         Box::new(NullExecSession)
+    }
+
+    fn fetch_overlay(&self, _: OverlayKind, reply: Reply<OverlayOutcome>) {
+        reply(OverlayOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_pod_posture(&self, _: &str, _: &str, reply: Reply<PostureOutcome>) {
+        reply(PostureOutcome::Failed(NO_CLUSTER.to_string()));
     }
 }
 

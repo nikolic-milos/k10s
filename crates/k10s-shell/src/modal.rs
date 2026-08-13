@@ -110,3 +110,9 @@ impl Overlay for crate::finder::FileFinderView {
         crate::finder::FileFinderView::focus_handle(self)
     }
 }
+
+impl Overlay for crate::finder::ClusterFinderView {
+    fn focus_handle(&self) -> FocusHandle {
+        crate::finder::ClusterFinderView::focus_handle(self)
+    }
+}

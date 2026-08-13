@@ -18,13 +18,14 @@ use crate::finder::PickerMode;
 use crate::hosting::ConfigFile;
 use crate::selection::{LogTarget, Selection};
 use crate::tag::ItemTag;
-use crate::ui::{DockSizes, MODAL_TOP, STATUS_BAR_HEIGHT, key_hint};
+use crate::ui::{ACTIVITY_BAR_WIDTH, DockSizes, MODAL_TOP, STATUS_BAR_HEIGHT, key_hint};
 use crate::workspace::{PickerPurpose, Workspace};
 use crate::{
-    ChooseCluster, ClearSelection, CloseItem, DescribeSelection, EditSelection, ExecSelection,
-    FindFile, LogsSelection, NewFile, NextItem, OpenBrowser, OpenFile, OpenFolder, OpenForwards,
-    OpenKeymap, OpenNodes, OpenPalette, OpenReleases, OpenSettings, PrevItem, Quit,
-    ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    AttachSelection, ChooseCluster, ClearSelection, CloseItem, DescribeSelection, EditSelection,
+    ExecSelection, FindCluster, FindFile, LogsSelection, NewFile, NextItem, OpenBrowser, OpenFile,
+    OpenFolder, OpenForwards, OpenKeymap, OpenNodes, OpenPalette, OpenReleases, OpenSettings,
+    PrevItem, Quit, ShowStarmap, ToggleBottomDock, ToggleInspector, ToggleLeftDock,
+    ToggleRightDock, ToggleTerminal,
 };
 
 impl Render for Workspace {
@@ -33,8 +34,12 @@ impl Render for Workspace {
         let fonts = k10s_theme::typography(cx).clone();
         let requested = self.requested_dock_sizes(cx);
         let workspace = cx.entity();
+        let mut layout_viewport = self.viewport;
+        if !self.bench {
+            layout_viewport.width = (layout_viewport.width - ACTIVITY_BAR_WIDTH).max(0.0);
+        }
         let sizes = DockSizes::resolve(
-            self.viewport,
+            layout_viewport,
             requested,
             self.left.is_open(),
             self.inspector_open,
@@ -122,19 +127,12 @@ impl Render for Workspace {
         let right = (!self.bench && self.inspector_open)
             .then(|| self.inspector(&theme, &fonts, sizes.right, self.selection.clone()));
         let status = (!self.bench).then(|| {
-            // Lit exactly when the dock is showing that panel, Zed's
-            // is_active_button rule.
-            let terminal_active = self.bottom.is_open()
-                && self
-                    .bottom
-                    .active()
-                    .is_some_and(|tab| tab.tag == ItemTag::LocalTerm);
             div()
                 .id("status-bar")
                 .h(px(STATUS_BAR_HEIGHT))
                 .w_full()
                 .flex_none()
-                .px(px(6.0))
+                .px(px(8.0))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -149,58 +147,13 @@ impl Render for Workspace {
                 .aria_label("Status bar")
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
+                        .flex_1()
                         .min_w(px(0.0))
+                        .whitespace_nowrap()
                         .overflow_hidden()
-                        .child(Self::panel_button(
-                            "toggle-left-dock",
-                            "icons/file_tree.svg",
-                            "Toggle Left Dock",
-                            self.left.is_open(),
-                            ToggleLeftDock,
-                            &theme,
-                        ))
-                        .child(Self::panel_button(
-                            "toggle-terminal",
-                            "icons/terminal_alt.svg",
-                            "Toggle Terminal",
-                            terminal_active,
-                            ToggleTerminal,
-                            &theme,
-                        ))
-                        .child(
-                            div()
-                                .w(px(1.0))
-                                .h(px(14.0))
-                                .mx(px(4.0))
-                                .flex_none()
-                                .bg(rgb(theme.shell.border)),
-                        )
-                        .child(
-                            div()
-                                .whitespace_nowrap()
-                                .overflow_hidden()
-                                .child(SharedString::from(self.status_line())),
-                        ),
+                        .child(SharedString::from(self.status_line())),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .flex_none()
-                        .child(key_hint(&theme, &fonts, "Ctrl Shift P", "Commands"))
-                        .child(Self::panel_button(
-                            "toggle-inspector",
-                            "icons/info.svg",
-                            "Toggle Inspector",
-                            self.inspector_open,
-                            ToggleRightDock,
-                            &theme,
-                        )),
-                )
+                .child(key_hint(&theme, &fonts, "Ctrl Shift P", "Commands"))
         });
         let viewport_observer = (!self.bench).then(|| {
             canvas(
@@ -240,8 +193,8 @@ impl Render for Workspace {
             )
             .children(bottom);
         let title_bar = (!self.bench).then(|| self.title_bar(&theme, &fonts, window, cx));
-        let app_menu =
-            (self.app_menu_open && !self.bench).then(|| self.app_menu(&theme, &fonts, window, cx));
+        let app_menu = (self.app_menu_open && !self.bench)
+            .then(|| self.app_menu(&theme, &fonts, window, cx).into_any_element());
         let palette = self.palette.view().map(|view| {
             div()
                 .absolute()
@@ -283,6 +236,14 @@ impl Render for Workspace {
                 view.clone().into_any_element(),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                     this.close_finder(window, cx);
+                }),
+            )
+        });
+        let cluster_finder = self.cluster_finder.view().map(|view| {
+            Self::modal_scrim(
+                view.clone().into_any_element(),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.close_cluster_finder(window, cx);
                 }),
             )
         });
@@ -336,6 +297,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &k10s_map::ToggleLegend, _, cx| {
                 this.map.update(cx, |map, cx| map.toggle_legend(cx));
             }))
+            .on_action(cx.listener(|this, _: &k10s_map::CycleOverlay, _, cx| {
+                this.cycle_overlay(cx);
+            }))
             .on_action(cx.listener(|this, _: &k10s_map::FitView, window, cx| {
                 this.map.update(cx, |map, cx| map.fit(window, cx));
             }))
@@ -376,17 +340,20 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
+            .on_action(cx.listener(|this, _: &ShowStarmap, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Starmap, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenBrowser, window, cx| {
-                this.open_browse(window, cx);
+                this.activate_activity(crate::activity::ActivityId::Resources, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenNodes, window, cx| {
-                this.open_nodes(window, cx);
+                this.activate_activity(crate::activity::ActivityId::Nodes, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenForwards, window, cx| {
-                this.open_forwards(None, window, cx);
+                this.activate_activity(crate::activity::ActivityId::Forwards, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenReleases, window, cx| {
-                this.open_releases(window, cx);
+                this.activate_activity(crate::activity::ActivityId::Releases, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 this.toggle_terminal(window, cx);
@@ -420,6 +387,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &FindFile, window, cx| {
                 this.open_finder(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &FindCluster, window, cx| {
+                this.open_cluster_finder(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.status_note = None;
                 this.new_file(window, cx);
@@ -449,6 +419,11 @@ impl Render for Workspace {
                     this.open_terminal(namespace, name, window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &AttachSelection, window, cx| {
+                if let Some((namespace, name)) = this.selection.as_ref().and_then(Selection::pod) {
+                    this.open_attach(namespace, name, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &NextItem, window, cx| {
                 if let Some(next) = this.center.next_index() {
                     this.activate_center(next, window, cx);
@@ -464,23 +439,26 @@ impl Render for Workspace {
             }))
             .children(viewport_observer)
             .children(title_bar)
-            .child(
+            .child({
+                let rail = (!self.bench).then(|| self.activity_rail(&theme).into_any_element());
                 div()
                     .flex_1()
                     .min_h(px(0.0))
                     .flex()
                     .flex_row()
                     .overflow_hidden()
+                    .children(rail)
                     .children(left)
                     .child(center)
-                    .children(right),
-            )
+                    .children(right)
+            })
             .children(status)
             .children(app_menu)
             .children(palette)
             .children(launch)
             .children(picker)
             .children(finder)
+            .children(cluster_finder)
     }
 }
 
@@ -489,7 +467,7 @@ impl Workspace {
     // mnemonic and the dock chord. One place to flip it, so a rule added to one
     // of them cannot go missing from the other -- a closed inspector must not
     // keep a usage poll alive under it.
-    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
         self.inspector_open = !self.inspector_open;
         self.sync_usage_poll(cx);
         cx.notify();
