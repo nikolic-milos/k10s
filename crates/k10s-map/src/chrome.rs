@@ -8,11 +8,14 @@
 use gpui::{Context, SharedString, rgb};
 use k10s_atlas::{Camera, LodPolicy};
 use k10s_core::{BUILTIN_KINDS, SceneSnapshot, Severity, Totals};
-use k10s_theme::Theme;
+use k10s_theme::{Theme, sparkline};
 
+use crate::overlay::{OverlayFrame, OverlayKind, uid_at};
 use crate::{Grouped, PickPath, path_rect};
 const HOVER_WIDTH: f32 = 252.0;
 const HOVER_HEIGHT: f32 = 74.0;
+const HOVER_OVERLAY_LINE: f32 = 16.0;
+const HOVER_SPARK: f32 = 22.0;
 const EDGE_MARGIN: f32 = 12.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +113,10 @@ struct HoverInfo {
     status: &'static str,
     mark: &'static str,
     severity: Option<Severity>,
+    overlay_kind: Option<OverlayKind>,
+    overlay_label: Option<SharedString>,
+    overlay_spark: Vec<k10s_theme::Point>,
+    overlay_tint: Option<Severity>,
 }
 
 impl HoverInfo {
@@ -160,6 +167,10 @@ impl HoverInfo {
                     status: "Attached",
                     mark: "◇",
                     severity: None,
+                    overlay_kind: None,
+                    overlay_label: None,
+                    overlay_spark: Vec::new(),
+                    overlay_tint: None,
                 })
             }
         }
@@ -186,6 +197,10 @@ impl HoverInfo {
             status,
             mark,
             severity,
+            overlay_kind: None,
+            overlay_label: None,
+            overlay_spark: Vec::new(),
+            overlay_tint: None,
         }
     }
 
@@ -209,14 +224,26 @@ struct HoverAnchor {
     top: f32,
 }
 
+fn hover_card_height(info: &HoverInfo) -> f32 {
+    let mut height = HOVER_HEIGHT;
+    if info.overlay_kind.is_some() || info.overlay_label.is_some() {
+        height += HOVER_OVERLAY_LINE;
+    }
+    if info.overlay_spark.len() >= 2 {
+        height += HOVER_SPARK + 6.0;
+    }
+    height
+}
+
 fn hover_anchor(
     scene: &SceneSnapshot,
     path: PickPath,
     camera: Camera,
     width: f32,
     height: f32,
+    card_h: f32,
 ) -> Option<HoverAnchor> {
-    if width < HOVER_WIDTH + EDGE_MARGIN * 2.0 || height < HOVER_HEIGHT + EDGE_MARGIN * 2.0 {
+    if width < HOVER_WIDTH + EDGE_MARGIN * 2.0 || height < card_h + EDGE_MARGIN * 2.0 {
         return None;
     }
     let rect = path_rect(scene, &path)?;
@@ -224,10 +251,10 @@ fn hover_anchor(
     let (right, bottom) = camera.w2s(rect.max_x(), rect.max_y(), width, height);
     let wanted_left = (left + right) * 0.5 - HOVER_WIDTH * 0.5;
     let below = bottom + 10.0;
-    let wanted_top = if below + HOVER_HEIGHT <= height - EDGE_MARGIN {
+    let wanted_top = if below + card_h <= height - EDGE_MARGIN {
         below
     } else {
-        top - HOVER_HEIGHT - 10.0
+        top - card_h - 10.0
     };
     Some(HoverAnchor {
         left: wanted_left.clamp(
@@ -236,7 +263,7 @@ fn hover_anchor(
         ),
         top: wanted_top.clamp(
             EDGE_MARGIN,
-            (height - HOVER_HEIGHT - EDGE_MARGIN).max(EDGE_MARGIN),
+            (height - card_h - EDGE_MARGIN).max(EDGE_MARGIN),
         ),
     })
 }
@@ -250,6 +277,7 @@ pub(crate) struct Overlay<'a> {
     pub(crate) edges_on: bool,
     pub(crate) legend_on: bool,
     pub(crate) viewport: (f32, f32),
+    pub(crate) map_overlay: &'a OverlayFrame,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,18 +289,33 @@ pub(crate) struct State {
     edges_on: bool,
     legend_on: bool,
     empty: bool,
+    overlay_kind: Option<OverlayKind>,
 }
 
 impl State {
     pub(crate) fn resolve(overlay: Overlay<'_>) -> State {
         let hover = overlay.hovered.and_then(|path| {
-            let info = HoverInfo::resolve(overlay.scene, path)?;
+            let mut info = HoverInfo::resolve(overlay.scene, path)?;
+            if let Some(uid) = uid_at(overlay.scene, path)
+                && let Some(mark) = overlay.map_overlay.get(uid)
+            {
+                info.overlay_kind = overlay.map_overlay.kind;
+                info.overlay_label = mark.label.clone().map(SharedString::from);
+                info.overlay_spark = mark
+                    .sparkline
+                    .as_ref()
+                    .map(|series| sparkline(&series.samples))
+                    .unwrap_or_default();
+                info.overlay_tint = mark.tint;
+            }
+            let card_h = hover_card_height(&info);
             let anchor = hover_anchor(
                 overlay.scene,
                 path,
                 overlay.camera,
                 overlay.viewport.0,
                 overlay.viewport.1,
+                card_h,
             )?;
             Some((info, anchor))
         });
@@ -284,6 +327,7 @@ impl State {
             edges_on: overlay.edges_on,
             legend_on: overlay.legend_on,
             empty: overlay.scene.rev > 0 && overlay.scene.totals.regions == 0,
+            overlay_kind: overlay.map_overlay.kind,
         }
     }
 }
@@ -298,6 +342,7 @@ impl Default for State {
             edges_on: false,
             legend_on: true,
             empty: false,
+            overlay_kind: None,
         }
     }
 }

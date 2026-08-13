@@ -3,13 +3,16 @@ use gpui::{
     linear_color_stop, linear_gradient, point, px, quad, rgb, size,
 };
 use k10s_atlas::curves::{bow_jitter, curve_ctrl, dash_quadratic};
-use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
+use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend, WorkloadPresentation};
 use k10s_core::layout::{NS_HEADER, NS_PAD};
 use k10s_core::{
     KindId, NsNode, PodNode, ReasonId, Rect, SatNode, SceneSnapshot, Severity, ToolId, WorkloadNode,
 };
 
 use crate::hex;
+use crate::primitive::{ISLAND_DETAIL_MIN_PX, Projection, card, pod, region as region_primitive};
+#[cfg(test)]
+use crate::primitive::{SAT_ICON_MAX_PX, WL_ICON_MAX_PX, WL_MEDALLION_MIN_PX, island_radii};
 use k10s_theme::{HeatRamp, MapTheme, MapType, mix, quantize, scale_alpha};
 
 const CURVE_DASH_ON: f32 = 6.0;
@@ -17,61 +20,6 @@ const CURVE_DASH_OFF: f32 = 5.0;
 const CURVE_TOL: f32 = 0.35;
 const CURVE_CORE_W: f32 = 1.5;
 const CURVE_GLOW_W: f32 = 5.0;
-
-// A namespace is drawn as an island rather than a rectangle, and the whole of
-// that is corner radii: one quad, four radii, each a fraction of the island's
-// short side scaled by a hash of where the island sits. The alternative -- a
-// tessellated spline outline -- costs a fifth `PathBuilder`, a new `CullStats`
-// counter mirrored across five cull functions, and a per-region path build on
-// the one walk SS6.1 budgets at O(regions). This costs nothing and reads as a
-// coastline at every zoom, because a rounded rect with unequal corners is one.
-//
-// The hash is over the island's ORIGIN, which is its identity: both layout
-// engines grow a region right and down from a fixed corner and `refit_after_batch`
-// keeps it, so a namespace that gains or loses a workload keeps its silhouette
-// instead of popping to a different one.
-const ISLAND_RADIUS: f32 = 0.34;
-// One threshold decides both details an island gets: unequal corners, and a
-// shaded fill instead of a flat one. Below it the corners collapse to a single
-// radius and the fill is solid.
-//
-// Both are measured rather than chosen. A gradient stop is `Rgba -> Hsla` and an
-// island's fill is the heat colour, so it cannot be hoisted out of the region
-// loop the way the card's four can; and the corner hash is another handful of
-// operations. On a forty-pixel island at the fit camera the asymmetry is two
-// pixels and the gradient is invisible, and paying for them cost 2x on the one
-// walk SS6.1 budgets at O(regions). Above the threshold the number of islands
-// that large is bounded by the viewport rather than by the cluster, which is
-// that doctrine applied to a detail instead of to a node.
-const ISLAND_DETAIL_MIN_PX: f32 = 96.0;
-// Sixteen jitter steps, read rather than computed: an `as f32` per corner is a
-// pipeline stall this loop can measure and a table lookup in L1 is not.
-const ISLAND_JITTER: [f32; 16] = [
-    0.30, 0.38, 0.47, 0.55, 0.64, 0.72, 0.81, 0.89, 0.34, 0.43, 0.51, 0.60, 0.68, 0.77, 0.85, 1.00,
-];
-const CARD_RADIUS: f32 = 0.14;
-const CARD_RADIUS_MAX_PX: f32 = 14.0;
-const POD_RADIUS: f32 = 0.22;
-
-// The workload glyph, as a fraction of what it is allowed to fill. A card wide
-// enough for chrome puts the glyph in the header beside the name; below that
-// threshold there is no header and no pod grid to sit under it, so the glyph
-// becomes the card -- which is the whole point of shipping an icon set and then
-// drawing it at twelve pixels in a corner.
-const WL_ICON_OF_HEADER: f32 = 0.84;
-// A medallion is legible or it is not there. Below this it would be a smudge of
-// the wrong shape, and a coloured dot says more; above it, the glyph carries the
-// workload's identity on its own. It is a floor rather than a target, so a card
-// smaller than the floor still gets a readable mark.
-const WL_MEDALLION_MIN_PX: f32 = 16.0;
-// ...and it may not eat the orbit. Satellites sit on a ring whose radius is the
-// card's half-diagonal plus a fixed gap, so the halo is a little over twice that
-// ring; a glyph spanning this much of the halo's short side reaches about half
-// way to the ring and stays clear of it at every zoom where both are drawn.
-const WL_MEDALLION_OF_HALO: f32 = 0.55;
-const WL_ICON_MAX_PX: f32 = 96.0;
-const SAT_ICON_OF_CELL: f32 = 1.05;
-const SAT_ICON_MAX_PX: f32 = 48.0;
 
 // The label's box, as a multiple of the satellite it belongs to: a satellite is
 // eighteen world units and its name is not, so the name is centred in a box wide
@@ -142,9 +90,9 @@ pub struct LabelJob {
 }
 
 pub enum IconJob {
-    Wl(KindId, Bounds<Pixels>),
-    ToolId(ToolId, Bounds<Pixels>),
-    Sat(KindId, Bounds<Pixels>),
+    Wl(KindId, crate::MarkPrimitive),
+    ToolId(ToolId, crate::MarkPrimitive),
+    Sat(KindId, crate::MarkPrimitive),
 }
 
 pub trait FrameSink {
@@ -212,11 +160,8 @@ struct FrameWalk<'a, S> {
     // card's geometry reveals which. Guessing it from the card's height drew the
     // header over the first row of pods in whichever mode was not guessed for.
     card_header: f32,
-    // The island's two size thresholds and its radius, pre-divided into world
-    // units at this frame's zoom. The region loop then answers both questions
-    // with a comparison against a number it already has, instead of converting
-    // its rect to screen pixels to ask them.
-    island_scale: f32,
+    // The shading threshold stays pre-divided because the region loop already
+    // has the world-space short side and should not do another conversion.
     island_detail_min: f32,
     header_fill: gpui::Background,
     // Pod fills paired with the border a terminating pod is drawn with instead.
@@ -252,9 +197,13 @@ impl<S: FrameSink> FrameWalk<'_, S> {
     }
 
     #[inline]
+    fn projection(&self) -> Projection {
+        Projection::new(self.camera, self.viewport, self.origin)
+    }
+
+    #[inline]
     fn paint_region(&mut self, region: &NsNode) {
         self.stats.drawn_regions += 1;
-        let bounds = self.screen_bounds(&region.rect);
         // The island's short side, in WORLD units, compared against thresholds
         // already divided into world units at walk setup. This loop runs once
         // per namespace in the cluster at the fit camera, so it asks both of its
@@ -264,6 +213,14 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         } else {
             region.rect.h
         };
+        let detailed = short >= self.island_detail_min;
+        let primitive = region_primitive(
+            region.rect,
+            self.screen_bounds(&region.rect),
+            short * self.zoom,
+            detailed,
+        );
+        let bounds = primitive.bounds;
 
         // One quad, whatever the stage. The stage decides its colours, the LOD
         // cross-fade interpolates between them, and the silhouette is the same
@@ -277,15 +234,10 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         // That conversion is branchy and this loop runs once per namespace in
         // the cluster; it cost more than everything else in the redesign put
         // together.
-        let detailed = short >= self.island_detail_min;
         // A hairline around an island that fills a third of the screen does not
         // read as a coastline; around forty pixels of island it is all there is.
         let edge = px(if detailed { 1.6 } else { 1.0 });
-        let radii = if detailed {
-            island_radii(&region.rect, short * self.zoom)
-        } else {
-            Corners::all(px(short * self.island_scale))
-        };
+        let radii = primitive.corners;
         if self.z01_t <= 0.0 {
             let heat = self.heat.color(region.ext.unhealthy_frac);
             self.sink.bg_quad(quad(
@@ -415,18 +367,26 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         if !(region_inside || block.rect.intersects(&self.visible)) {
             return;
         }
-        let painted = self.policy.block_painted(block.inner.w, self.zoom) && !self.skip_blocks;
-        if painted {
+        let presentation = if self.skip_blocks {
+            WorkloadPresentation::Hidden
+        } else {
+            self.policy
+                .workload_presentation(block.inner.w, self.zoom, self.stage)
+        };
+        let header_height = self.card_header.min(block.inner.h * 0.5);
+        let chrome = presentation == WorkloadPresentation::Detailed
+            && self.policy.block_chrome_shown(block.inner.w, self.zoom);
+        if presentation != WorkloadPresentation::Hidden {
             self.stats.drawn_blocks += 1;
+        }
+        if presentation.card_shown() {
             let severity = severity_index(block.ext.rollup);
             let (fill_color, border) = self.workload_paint[severity];
-            let card = self.screen_bounds(&block.inner);
-            let card_w = block.inner.w * self.zoom;
-            let card_h = block.inner.h * self.zoom;
-            let radius = px((card_w.min(card_h) * CARD_RADIUS).min(CARD_RADIUS_MAX_PX));
+            let primitive = card(self.screen_bounds(&block.inner));
+            let radius = primitive.corners.top_left;
             self.sink.fg_quad(quad(
-                card,
-                Corners::all(radius),
+                primitive.bounds,
+                primitive.corners,
                 fill_color,
                 px(1.0),
                 border,
@@ -434,8 +394,6 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             ));
             self.stats.quads += 1;
 
-            let chrome = self.policy.block_chrome_shown(block.inner.w, self.zoom);
-            let header_height = self.card_header.min(block.inner.h * 0.5);
             if chrome {
                 // The header keeps the card's top corners and squares off where
                 // the pod grid begins, so it reads as part of the card rather
@@ -480,97 +438,62 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 ));
                 self.stats.quads += 2;
             }
+        }
 
-            let header_px = header_height * self.zoom;
-            if self.policy.block_icon_shown(block.inner.w, self.zoom) {
-                let bounds = if chrome {
-                    // Beside the name, filling the header band.
-                    let side = icon_side(header_px * WL_ICON_OF_HEADER, WL_ICON_MAX_PX);
-                    let (x, y) = self.camera.w2s(
-                        block.inner.x,
-                        block.inner.y,
-                        self.viewport.0,
-                        self.viewport.1,
-                    );
-                    let inset = (header_px - side) * 0.5;
-                    Bounds {
-                        origin: point(px(self.origin.0 + x + inset), px(self.origin.1 + y + inset)),
-                        size: size(px(side), px(side)),
-                    }
-                } else {
-                    // No header and no pod grid at this size: the glyph is the
-                    // workload, which is what shipping an icon set is for. It is
-                    // allowed to be bigger than the card -- a card holding two
-                    // replicas is a few pixels across and says nothing -- and is
-                    // held clear of the orbit by the halo bound.
-                    // Sized from the HALO, not the card. Without chrome the
-                    // card is by definition under the chrome threshold, so any
-                    // fraction of it lands within a pixel or two of the
-                    // legibility floor and the card term would never decide
-                    // anything -- a mutation test found it dead and it is gone.
-                    // Three live terms remain: the orbit bound, the floor, and
-                    // the halo itself, which is what makes the glyph provably
-                    // unable to leave the space its workload owns.
-                    let halo_short = block.rect.w.min(block.rect.h) * self.zoom;
-                    let side = icon_side(
-                        (halo_short * WL_MEDALLION_OF_HALO)
-                            .max(WL_MEDALLION_MIN_PX)
-                            .min(halo_short),
-                        WL_ICON_MAX_PX,
-                    );
-                    let (center_x, center_y) = block.inner.center();
-                    let (x, y) =
-                        self.camera
-                            .w2s(center_x, center_y, self.viewport.0, self.viewport.1);
-                    Bounds {
-                        origin: point(
-                            px(self.origin.0 + x - side * 0.5),
-                            px(self.origin.1 + y - side * 0.5),
-                        ),
-                        size: size(px(side), px(side)),
-                    }
-                };
+        if self.policy.block_icon_shown(block.inner.w, self.zoom) {
+            let primitive = match presentation {
+                WorkloadPresentation::Medallion => {
+                    Some(self.projection().medallion(block.rect, block.inner))
+                }
+                WorkloadPresentation::Detailed => {
+                    Some(self.projection().header_icon(block.inner, header_height))
+                }
+                WorkloadPresentation::Hidden | WorkloadPresentation::Card => None,
+            };
+            if let Some(primitive) = primitive {
                 push_icon(&mut self.stats, self.policy, self.sink, || {
                     if block.ext.tool != ToolId::NONE {
-                        IconJob::ToolId(block.ext.tool, bounds)
+                        IconJob::ToolId(block.ext.tool, primitive)
                     } else {
-                        IconJob::Wl(block.ext.kind, bounds)
+                        IconJob::Wl(block.ext.kind, primitive)
                     }
                 });
             }
+        }
 
-            if self.policy.block_label_shown(block.inner.w, self.zoom) {
-                let (x, y) = self.camera.w2s(
-                    block.inner.x,
-                    block.inner.y,
-                    self.viewport.0,
-                    self.viewport.1,
-                );
-                // The name takes the header minus the square the glyph occupies
-                // on its left, and is centred and clipped inside what is left,
-                // so a forty-character name stops at its own card.
-                let inset = if chrome { header_px } else { 0.0 };
-                let width = (card_w - inset - header_px * 0.25).max(1.0);
-                let size_px = self.type_.workload;
-                push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
-                    text: SharedString::from(&block.label),
-                    x: self.origin.0 + x + inset,
-                    y: self.origin.1
-                        + y
-                        + (header_px - size_px * self.type_.line_height).max(0.0) * 0.5,
-                    size_px,
-                    color: self.workload_label,
-                    face: LabelFace::Ui,
-                    width,
-                });
-            }
+        if presentation.card_shown() && self.policy.block_label_shown(block.inner.w, self.zoom) {
+            let card_w = block.inner.w * self.zoom;
+            let header_px = header_height * self.zoom;
+            let (x, y) = self.camera.w2s(
+                block.inner.x,
+                block.inner.y,
+                self.viewport.0,
+                self.viewport.1,
+            );
+            // The name takes the header minus the square the glyph occupies
+            // on its left, and is centred and clipped inside what is left,
+            // so a forty-character name stops at its own card.
+            let inset = if chrome { header_px } else { 0.0 };
+            let width = (card_w - inset - header_px * 0.25).max(1.0);
+            let size_px = self.type_.workload;
+            push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
+                text: SharedString::from(&block.label),
+                x: self.origin.0 + x + inset,
+                y: self.origin.1
+                    + y
+                    + (header_px - size_px * self.type_.line_height).max(0.0) * 0.5,
+                size_px,
+                color: self.workload_label,
+                face: LabelFace::Ui,
+                width,
+            });
         }
 
         if self.stage < 2 {
             return;
         }
         let block_inside = region_inside || self.visible.contains(&block.rect);
-        if painted || self.policy.stress_curves {
+        if presentation != WorkloadPresentation::Hidden || self.policy.stress_curves {
             let (hub_x, hub_y) = block.inner.center();
             let (x, y) = self
                 .camera
@@ -591,7 +514,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             }
         }
 
-        if !painted {
+        if !presentation.cells_shown() {
             return;
         }
         let cells = block.children.len();
@@ -663,15 +586,9 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             // is no quad behind a satellite -- the glyph IS the satellite -- so
             // a constant size meant it was the same size whether it was the
             // thing you were looking at or one of ninety in the background.
-            let side = icon_side(cell_px * SAT_ICON_OF_CELL, SAT_ICON_MAX_PX);
+            let primitive = self.projection().satellite(satellite.rect);
             push_icon(&mut self.stats, self.policy, self.sink, || {
-                IconJob::Sat(
-                    satellite.ext.kind,
-                    Bounds {
-                        origin: gpui::point(px(point.0 - side * 0.5), px(point.1 - side * 0.5)),
-                        size: size(px(side), px(side)),
-                    },
-                )
+                IconJob::Sat(satellite.ext.kind, primitive)
             });
         }
 
@@ -732,8 +649,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         }
         self.stats.drawn_cells += 1;
         let severity = severity_index(cell.ext.state.severity);
-        let bounds = self.screen_bounds(&cell.rect);
-        let radius = px(cell.rect.w.min(cell.rect.h) * self.zoom * POD_RADIUS);
+        let primitive = pod(self.screen_bounds(&cell.rect));
         if cell.ext.state.reason == ReasonId::TERMINATING {
             // A pod inside its termination grace period is still there and still
             // counted, and it is on its way out. Drawn hollow it says both, in
@@ -741,8 +657,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             // where the grace window is the whole of the delay between asking
             // for eight replicas and the card coming down to eight.
             self.sink.fg_quad(quad(
-                bounds,
-                Corners::all(radius),
+                primitive.bounds,
+                primitive.corners,
                 gpui::transparent_black(),
                 px(1.0),
                 self.pod_hollow[severity],
@@ -750,8 +666,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             ));
         } else {
             self.sink.fg_quad(quad(
-                bounds,
-                Corners::all(radius),
+                primitive.bounds,
+                primitive.corners,
                 self.pod_paint[severity],
                 px(0.0),
                 gpui::transparent_black(),
@@ -843,16 +759,6 @@ impl<S: FrameSink> FrameWalk<'_, S> {
     }
 }
 
-/// A screen size snapped to the shared ladder and floored so a glyph is never
-/// drawn larger than the space that earned it. Everything the map rasterizes at
-/// a size derived from the camera goes through here: gpui keys its sprite atlas
-/// on the rasterized pixel size, so a size that varies smoothly with zoom mints
-/// a fresh tile and a fresh GPU upload on every frame of a zoom.
-#[inline]
-fn icon_side(want: f32, max_px: f32) -> f32 {
-    quantize(want.min(max_px))
-}
-
 /// A fill mixed toward the canvas along the map's light direction.
 ///
 /// One call, no second theme token: every surface shades from its own colour
@@ -865,35 +771,6 @@ fn shade(fill: gpui::Rgba, bg: gpui::Rgba, amount: f32) -> Background {
         linear_color_stop(fill, 0.0),
         linear_color_stop(mix(fill, bg, amount), 1.0),
     )
-}
-
-/// The four corner radii that turn one quad into an island.
-///
-/// Keyed on the region's world origin, which both layout engines hold fixed
-/// while a namespace grows and shrinks, so a namespace keeps its silhouette for
-/// as long as it exists. `splitmix64` is the same mixer `k10s-world`'s batch
-/// layout jitters with; the point is only that four bytes of it are independent.
-/// The four unequal radii of an island big enough to show a coastline. The
-/// caller decides whether it is big enough -- it holds the threshold in world
-/// units and this takes screen pixels -- so that the common case at the fit
-/// camera is one comparison and one multiply, not a call.
-#[inline]
-fn island_radii(rect: &Rect, short_px: f32) -> Corners<Pixels> {
-    let base = short_px * ISLAND_RADIUS;
-    // The odd constant is not decoration. Both layout engines shift the world so
-    // its minimum corner is exactly (0, 0), so the first island's origin hashes
-    // from all-zero bits -- and a bare multiply maps zero to zero, which cut
-    // that one island perfectly square. A test at the origin pins it.
-    let bits = ((rect.x.to_bits() as u64) ^ ((rect.y.to_bits() as u64) << 32))
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let hash = (bits ^ (bits >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    let corner = |shift: u32| px(base * ISLAND_JITTER[((hash >> shift) & 15) as usize]);
-    Corners {
-        top_left: corner(4),
-        top_right: corner(20),
-        bottom_right: corner(36),
-        bottom_left: corner(52),
-    }
 }
 
 #[inline(always)]
@@ -965,7 +842,6 @@ pub fn walk<S: FrameSink>(
         ns_border_rgba: rgb(opts.theme.ns_border),
         bg_rgba,
         card_header: scene.card_header,
-        island_scale: ISLAND_RADIUS * camera.zoom,
         island_detail_min: ISLAND_DETAIL_MIN_PX / camera.zoom,
         header_fill: shade(
             scale_alpha(rgb(opts.theme.card_header_fill), block_alpha),
