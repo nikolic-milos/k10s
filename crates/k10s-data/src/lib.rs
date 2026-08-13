@@ -12,26 +12,44 @@
 //! `tests/scripted_apiserver.rs` be the API server.
 
 pub mod apply;
+pub mod argo;
 pub mod assemble;
 pub mod browse;
 pub mod connect;
+pub mod day2;
 pub mod describe;
 pub mod discover;
 pub mod exec;
+pub mod flux;
 pub mod forward;
+pub mod grafana;
+pub mod harbor;
 pub mod helm;
+pub mod helm_reveal;
 pub mod inspect;
 pub mod logs;
+pub mod loki;
 pub mod manifest;
 #[cfg(test)]
 mod manifest_test;
 pub mod mapping;
+pub mod mesh;
 pub mod metrics;
+pub mod netpol;
 pub mod nodes;
+pub mod oci;
 pub mod openapi;
+pub mod overlay;
+pub mod policy;
 mod projection;
+pub mod prom;
+pub mod pss;
 pub mod rbac;
+pub mod rbac_index;
+pub mod reach;
 pub mod read;
+pub mod talos;
+pub mod traces;
 pub mod watch;
 
 use std::collections::HashMap;

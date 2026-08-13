@@ -139,6 +139,35 @@ fn roles_come_from_the_role_labels_sorted_or_are_absent() {
 }
 
 #[test]
+fn node_addresses_prefer_internal_over_external_and_refuse_empty_values() {
+    use k8s_openapi::api::core::v1::{NodeAddress, NodeStatus};
+
+    let mut node = Node {
+        status: Some(NodeStatus {
+            addresses: Some(vec![
+                NodeAddress {
+                    type_: "ExternalIP".to_string(),
+                    address: "203.0.113.8".to_string(),
+                },
+                NodeAddress {
+                    type_: "InternalIP".to_string(),
+                    address: "10.0.0.8".to_string(),
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(node_address(&node).as_deref(), Some("10.0.0.8"));
+
+    node.status.as_mut().unwrap().addresses = Some(vec![NodeAddress {
+        type_: "InternalIP".to_string(),
+        address: String::new(),
+    }]);
+    assert_eq!(node_address(&node), None);
+}
+
+#[test]
 fn pdb_selectors_follow_policy_v1_semantics_including_the_nil_empty_split() {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement;
 

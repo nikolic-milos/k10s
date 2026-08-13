@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::read::{Fetched, classify};
+use crate::talos;
 
 const NODE_LIMIT: u32 = 500;
 const PODS_PER_NODE_LIMIT: u32 = 1_500;
@@ -64,6 +65,8 @@ pub(crate) async fn fetch_node_table(client: &Client) -> Fetched<TablePage> {
         column("Status"),
         column("Roles"),
         column("Version"),
+        column("OS"),
+        column("Address"),
         column("Pods"),
         column("CPU req"),
         column("Memory req"),
@@ -244,6 +247,14 @@ fn row(node: Node, load: Option<Load>, usage: Option<&Usage>, show_pdb: bool) ->
             .and_then(|s| s.node_info.as_ref())
             .map(|info| info.kubelet_version.clone())
             .unwrap_or_default(),
+        status
+            .and_then(|status| status.node_info.as_ref())
+            .map(|info| info.os_image.clone())
+            .unwrap_or_default(),
+        talos::detect(&node)
+            .and_then(|talos| talos.address)
+            .or_else(|| node_address(&node))
+            .unwrap_or_default(),
     ];
     match &load {
         Some(load) => {
@@ -290,6 +301,20 @@ fn row(node: Node, load: Option<Load>, usage: Option<&Usage>, show_pdb: bool) ->
         namespace: None,
         uid,
     }
+}
+
+fn node_address(node: &Node) -> Option<String> {
+    let addresses = node.status.as_ref()?.addresses.as_deref()?;
+    addresses
+        .iter()
+        .find(|address| address.type_ == "InternalIP")
+        .or_else(|| {
+            addresses
+                .iter()
+                .find(|address| address.type_ == "ExternalIP")
+        })
+        .map(|address| address.address.clone())
+        .filter(|address| !address.is_empty())
 }
 
 fn counted(value: i64, allocatable: Option<i64>, fmt: impl Fn(i64) -> String) -> String {

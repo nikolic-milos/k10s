@@ -64,12 +64,12 @@
 //! whose account can read and cannot patch. `K10S_LIVE_NOMETRICS_CONTEXT`
 //! (default `nometrics@k10s-lab`) must name one wired to that ServiceAccount.
 //!
-//! Two of these tests need a cluster with a *kubelet*, and are skipped rather
+//! Three of these tests need a cluster with a *kubelet*, and are skipped rather
 //! than failed where there is none: a standalone API server can serve every
-//! other row here, but port-forward and exec are HTTP upgrades that terminate at
-//! a node. Set `K10S_LIVE_KUBELET=1` when the cluster has one, and make sure the
+//! other row here, but port-forward, exec, and log follow terminate at a node.
+//! Set `K10S_LIVE_KUBELET=1` when the cluster has one, and make sure the
 //! `web` Deployment's pod is actually Running -- a Deployment that no kubelet
-//! ever scheduled satisfies the other tests and neither of those.
+//! ever scheduled satisfies the other tests and none of those.
 //!
 //! The usage tests also need a kubelet, and split on one more axis:
 //! `K10S_LIVE_METRICS_SERVER=1` runs the metrics-server row, `=0` runs the
@@ -892,6 +892,65 @@ fn exec_reaches_a_container_and_brings_its_output_back() {
         "the container never answered through the upgrade; saw {seen:?}"
     );
     drop(session);
+}
+
+// Log follow, against a kubelet, for the first time.
+//
+// The stream is an HTTP body the API server proxies from the node, not an
+// upgrade, but a standalone API server still cannot stand in for it: there is
+// no container and nothing writing. The scripted suite proves the client
+// labels an end, a denial, and a cancel; this is the first time the bytes
+// themselves came from a process a kubelet is running.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_log_follow_carries_lines_the_kubelet_already_has() {
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "web-");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = sync.reader.follow_log(
+        k10s_data::logs::LogRequest {
+            namespace: namespace(),
+            pod,
+            container: None,
+            previous: false,
+        },
+        Box::new(move |chunk| {
+            let _ = tx.send(chunk);
+        }),
+    );
+
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(k10s_data::logs::LogChunk::Lines(batch)) => {
+                for line in &batch {
+                    seen.push_str(line);
+                    seen.push('\n');
+                }
+                if seen.contains("start worker") {
+                    break;
+                }
+            }
+            Ok(k10s_data::logs::LogChunk::Denied { what }) => {
+                panic!("the follow was denied: {what}")
+            }
+            Ok(k10s_data::logs::LogChunk::Failed { why, .. }) => {
+                panic!("the follow failed: {why}")
+            }
+            Ok(k10s_data::logs::LogChunk::Ended { .. }) => break,
+            Err(_) => continue,
+        }
+    }
+    drop(stop);
+    assert!(
+        seen.contains("start worker"),
+        "the kubelet never handed the container's log stream; saw {seen:?}"
+    );
 }
 
 // Port-forward, against a kubelet, for the first time.

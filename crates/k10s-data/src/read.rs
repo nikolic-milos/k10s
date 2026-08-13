@@ -11,24 +11,33 @@
 //! this crate.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kube::Client;
 
 use k10s_core::{Capability, KindId};
 
 use crate::apply::{self, ApplyOutcome, ApplyRequest};
+use crate::argo;
 use crate::browse::{self, TablePage};
 use crate::describe::{self, DescribeRequest, Described};
 use crate::discover::KindTarget;
 use crate::exec::{ExecEvent, ExecRequest, ExecSession, ExecTransport, KubeExecTransport};
+use crate::flux;
 use crate::forward::{self, ForwardRegistry, ForwardRequest, ForwardRow, KubeForwarder};
 use crate::helm;
 use crate::logs::{self, LogChunk, LogRequest, LogStop};
 use crate::manifest;
+use crate::mesh;
 use crate::metrics::{self, UsageOutcome, UsageRequest, UsageStop};
+use crate::netpol;
 use crate::nodes;
 use crate::openapi;
+use crate::overlay;
+use crate::policy;
+use crate::prom;
+use crate::reach::{self, Bound, ReachSettings, ToolKind, ToolReach};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fetched<T> {
@@ -98,6 +107,7 @@ pub struct Reader {
     targets: Arc<[KindTarget]>,
     verdicts: Arc<HashMap<KindId, Capability>>,
     forwards: ForwardRegistry,
+    netpol: Arc<Mutex<Option<(Instant, netpol::Inventory)>>>,
 }
 
 impl Reader {
@@ -120,6 +130,7 @@ impl Reader {
             handle,
             targets: targets.into(),
             verdicts: Arc::new(verdicts.iter().copied().collect()),
+            netpol: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -267,6 +278,17 @@ impl Reader {
         });
     }
 
+    /// Fetch one bounded cluster-wide input for repeated policy inspection.
+    pub fn fetch_network_policy_inventory(
+        &self,
+        reply: impl FnOnce(Fetched<netpol::Inventory>) + Send + 'static,
+    ) {
+        let client = self.client.clone();
+        self.handle.spawn(async move {
+            reply(netpol::fetch(&client).await);
+        });
+    }
+
     pub fn follow_log(
         &self,
         request: LogRequest,
@@ -363,6 +385,235 @@ impl Reader {
         };
         logs::follow_workload(&self.handle, self.client.clone(), target, request, on_chunk)
     }
+
+    /// Find and bind an in-cluster tool. First paint must not wait on this.
+    pub fn bind_tool(
+        &self,
+        kind: ToolKind,
+        settings: ReachSettings,
+        reply: impl FnOnce(ToolReach) + Send + 'static,
+    ) {
+        let client = self.client.clone();
+        self.handle.spawn(async move {
+            reply(reach::bind(&client, kind, &settings).await);
+        });
+    }
+
+    pub fn tool_get(
+        &self,
+        bound: Bound,
+        rest: String,
+        reply: impl FnOnce(Fetched<Vec<u8>>) + Send + 'static,
+    ) {
+        let client = self.client.clone();
+        self.handle.spawn(async move {
+            reply(reach::tool_get(&client, &bound, &rest).await);
+        });
+    }
+
+    /// Run one already-named PromQL range query through a previously bound
+    /// endpoint. Binding and querying remain separate so tool discovery never
+    /// delays the scene's first publish or first paint.
+    pub fn query_prometheus_range(
+        &self,
+        bound: Bound,
+        expr: String,
+        start: f64,
+        end: f64,
+        step: String,
+        reply: impl FnOnce(Fetched<prom::QueryResult>) + Send + 'static,
+    ) {
+        let client = self.client.clone();
+        self.handle.spawn(async move {
+            reply(prom::query_range(&client, &bound, &expr, start, end, &step).await);
+        });
+    }
+
+    /// Overlay inventories, assembled off the paint path. Binding a tool never
+    /// delays the scene's first publish.
+    pub fn fetch_overlay(
+        &self,
+        kind: overlay::Kind,
+        settings: ReachSettings,
+        reply: impl FnOnce(Fetched<overlay::Frame>) + Send + 'static,
+    ) {
+        let client = self.client.clone();
+        let netpol = self.netpol.clone();
+        let targets = self.targets.clone();
+        self.handle.spawn(async move {
+            reply(load_overlay(&client, &targets, &netpol, kind, settings).await);
+        });
+    }
+
+    /// Isolation and named ports for one pod. Not a traffic verdict.
+    pub fn fetch_pod_posture(
+        &self,
+        namespace: String,
+        name: String,
+        reply: impl FnOnce(Fetched<netpol::PodInspection>) + Send + 'static,
+    ) {
+        let client = self.client.clone();
+        let netpol = self.netpol.clone();
+        self.handle.spawn(async move {
+            reply(load_pod_inspection(&client, &netpol, &namespace, &name).await);
+        });
+    }
+}
+
+const NETPOL_TTL: Duration = Duration::from_secs(30);
+
+async fn load_overlay(
+    client: &Client,
+    targets: &[KindTarget],
+    cache: &Mutex<Option<(Instant, netpol::Inventory)>>,
+    kind: overlay::Kind,
+    settings: ReachSettings,
+) -> Fetched<overlay::Frame> {
+    match kind {
+        overlay::Kind::Sync => load_sync(client, targets).await,
+        overlay::Kind::Metrics => load_metrics(client, settings).await,
+        overlay::Kind::Policy => load_policy(client, cache).await,
+        overlay::Kind::MeshDeclared => {
+            Fetched::Ok(overlay::from_mesh_declared(&mesh::inventory(client).await))
+        }
+        overlay::Kind::MeshObserved => load_mesh_observed(client, settings).await,
+    }
+}
+
+async fn load_sync(client: &Client, targets: &[KindTarget]) -> Fetched<overlay::Frame> {
+    match argo::fetch_inventory(client, targets, None).await {
+        Fetched::Ok(inventory) if inventory.served => Fetched::Ok(overlay::from_argo(&inventory)),
+        Fetched::Denied { what } => Fetched::Denied { what },
+        Fetched::Failed { what, why } => Fetched::Failed { what, why },
+        Fetched::Ok(_) => match flux::fetch(client, None).await {
+            Fetched::Ok(inventory) => Fetched::Ok(overlay::from_flux(&inventory)),
+            Fetched::Denied { what } => Fetched::Denied { what },
+            Fetched::Failed { what, why } => Fetched::Failed { what, why },
+        },
+    }
+}
+
+async fn load_policy(
+    client: &Client,
+    cache: &Mutex<Option<(Instant, netpol::Inventory)>>,
+) -> Fetched<overlay::Frame> {
+    match policy::fetch_reports(client).await {
+        Fetched::Ok(inventory) if inventory.served && !inventory.tints().is_empty() => {
+            Fetched::Ok(overlay::from_policy_reports(&inventory))
+        }
+        Fetched::Denied { what } => Fetched::Denied { what },
+        Fetched::Failed { what, why } => Fetched::Failed { what, why },
+        Fetched::Ok(_) => match cached_netpol(client, cache).await {
+            Fetched::Ok(inventory) => Fetched::Ok(overlay::from_netpol(&inventory)),
+            Fetched::Denied { what } => Fetched::Denied { what },
+            Fetched::Failed { what, why } => Fetched::Failed { what, why },
+        },
+    }
+}
+
+async fn load_metrics(client: &Client, settings: ReachSettings) -> Fetched<overlay::Frame> {
+    match query_prometheus(client, settings, overlay::CPU_EXPR).await {
+        Fetched::Ok(result) => Fetched::Ok(overlay::from_prometheus(&result)),
+        Fetched::Denied { what } => Fetched::Denied { what },
+        Fetched::Failed { why, .. } => Fetched::Ok(overlay::Frame {
+            stamps: Vec::new(),
+            truncated: false,
+            note: Some(why),
+        }),
+    }
+}
+
+async fn load_mesh_observed(client: &Client, settings: ReachSettings) -> Fetched<overlay::Frame> {
+    match query_prometheus(client, settings, overlay::MESH_EXPR).await {
+        Fetched::Ok(result) => {
+            let labels: Vec<mesh::SeriesLabels> = result
+                .series
+                .iter()
+                .map(|series| mesh::SeriesLabels {
+                    name: series
+                        .labels
+                        .iter()
+                        .find(|(key, _)| key == "__name__")
+                        .map(|(_, value)| value.clone())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "istio_requests_total".to_string()),
+                    labels: series.labels.clone(),
+                })
+                .collect();
+            Fetched::Ok(overlay::from_mesh_observed(&mesh::observed_from_series(
+                &labels,
+            )))
+        }
+        Fetched::Denied { what } => Fetched::Denied { what },
+        Fetched::Failed { why, .. } => Fetched::Ok(overlay::Frame {
+            stamps: Vec::new(),
+            truncated: false,
+            note: Some(why),
+        }),
+    }
+}
+
+async fn query_prometheus(
+    client: &Client,
+    settings: ReachSettings,
+    expr: &str,
+) -> Fetched<prom::QueryResult> {
+    match reach::bind(client, ToolKind::Prometheus, &settings).await {
+        ToolReach::Absent { .. } => Fetched::Failed {
+            what: "prometheus",
+            why: "Prometheus is not in this cluster".to_string(),
+        },
+        ToolReach::Unbound(unbound) => Fetched::Failed {
+            what: "prometheus",
+            why: unbound.why,
+        },
+        ToolReach::Bound(bound) => {
+            let end = unix_secs();
+            let start = end - overlay::RANGE_SECS;
+            prom::query_range(client, &bound, expr, start, end, overlay::STEP).await
+        }
+    }
+}
+
+async fn load_pod_inspection(
+    client: &Client,
+    cache: &Mutex<Option<(Instant, netpol::Inventory)>>,
+    namespace: &str,
+    name: &str,
+) -> Fetched<netpol::PodInspection> {
+    match cached_netpol(client, cache).await {
+        Fetched::Ok(inventory) => Fetched::Ok(netpol::PodInspection::from_inventory(
+            &inventory, namespace, name,
+        )),
+        Fetched::Denied { what } => Fetched::Denied { what },
+        Fetched::Failed { what, why } => Fetched::Failed { what, why },
+    }
+}
+
+async fn cached_netpol(
+    client: &Client,
+    cache: &Mutex<Option<(Instant, netpol::Inventory)>>,
+) -> Fetched<netpol::Inventory> {
+    if let Ok(guard) = cache.lock()
+        && let Some((at, inventory)) = guard.as_ref()
+        && at.elapsed() < NETPOL_TTL
+    {
+        return Fetched::Ok(inventory.clone());
+    }
+    let fetched = netpol::fetch(client).await;
+    if let Fetched::Ok(inventory) = &fetched
+        && let Ok(mut guard) = cache.lock()
+    {
+        *guard = Some((Instant::now(), inventory.clone()));
+    }
+    fetched
+}
+
+fn unix_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]

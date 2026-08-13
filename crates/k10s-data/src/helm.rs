@@ -239,6 +239,13 @@ pub(crate) fn decode(encoded: &str) -> Result<Stored, &'static str> {
     })
 }
 
+/// The same gzip/base64 layers [`decode`] reads, returned as a scratch buffer
+/// rather than reduced to an inventory. [`Revision`] still has nowhere to put
+/// the values; this is the reveal path's entrance, and the only other one.
+pub(crate) fn decode_scratch(encoded: &str) -> Result<crate::reach::Scratch, &'static str> {
+    Ok(crate::reach::Scratch::from_bytes(payload(encoded)?))
+}
+
 // One field, at a length a line can hold. Truncated with the ellipsis
 // `describe` uses, so a clipped value looks clipped rather than merely short.
 fn clipped(text: String) -> String {

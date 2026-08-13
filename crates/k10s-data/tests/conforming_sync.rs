@@ -355,7 +355,25 @@ fn an_assembled_sync_builds_a_world_without_tripping_its_assertions() {
             if mode.emits_attachments() { 4 } else { 0 },
             "{mode:?}: dense layout places no attachments"
         );
-        assert_eq!(snapshot.edges.len(), 1, "{mode:?}: the Job to CronJob edge");
+        let owner_edges = snapshot
+            .edges
+            .iter()
+            .filter(|edge| edge.is_block_pair())
+            .count();
+        assert_eq!(owner_edges, 1, "{mode:?}: the Job to CronJob edge");
+        if mode.emits_attachments() {
+            assert_eq!(
+                snapshot.edges.len(),
+                7,
+                "{mode:?}: Job→CronJob plus Service and PVC to the three api pods"
+            );
+        } else {
+            assert_eq!(
+                snapshot.edges.len(),
+                1,
+                "{mode:?}: dense layout places no attachment edges"
+            );
+        }
     }
 }
 
