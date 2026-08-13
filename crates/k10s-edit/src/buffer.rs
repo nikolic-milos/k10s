@@ -14,6 +14,7 @@
 //! cluster, so an accented letter or a family emoji moves and deletes once.
 
 use crate::rope::{Point, Rope};
+use std::collections::VecDeque;
 use std::ops::Range;
 
 const MAX_UNDO_DEPTH: usize = 512;
@@ -98,8 +99,8 @@ pub struct Buffer {
     rope: Rope,
     selections: Vec<Selection>,
     primary: usize,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
+    undo: VecDeque<Snapshot>,
+    redo: VecDeque<Snapshot>,
     last_group: Option<EditGroup>,
     version: u64,
 }
@@ -110,8 +111,8 @@ impl Buffer {
             rope: Rope::from(text),
             selections: vec![Selection::caret(0)],
             primary: 0,
-            undo: Vec::new(),
-            redo: Vec::new(),
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
             last_group: None,
             version: 0,
         }
@@ -186,13 +187,13 @@ impl Buffer {
     fn push_undo(&mut self, group: EditGroup) {
         let coalesce = group != EditGroup::Other && self.last_group == Some(group);
         if !coalesce {
-            self.undo.push(Snapshot {
+            self.undo.push_back(Snapshot {
                 rope: self.rope.clone(),
                 selections: self.selections.clone(),
                 primary: self.primary,
             });
             if self.undo.len() > MAX_UNDO_DEPTH {
-                self.undo.remove(0);
+                self.undo.pop_front();
             }
         }
         self.redo.clear();
@@ -230,7 +231,7 @@ impl Buffer {
                 new_end_point: extend_point(start_point, text),
             });
         }
-        let carets: Vec<usize> = {
+        let mut carets: Vec<usize> = {
             let mut delta = 0usize;
             let mut shrink = 0usize;
             edits
@@ -247,9 +248,15 @@ impl Buffer {
         // cursor; a cursor whose edit was filtered out as empty (backspace at
         // column zero) has nothing to pair with and maps instead.
         if intent == SelectionIntent::Collapse && carets.len() == self.selections.len() {
-            let primary = self.primary;
+            // Disjoint edits applied left to right leave their carets in
+            // ascending order, and two cursors that met -- backspacing over the
+            // one character between them -- leave two carets at one offset. A
+            // second cursor at an offset that already has one is not a cursor,
+            // it is the same edit applied twice by the next keystroke.
+            let primary = carets[self.primary.min(carets.len() - 1)];
+            carets.dedup();
+            self.primary = carets.partition_point(|caret| *caret < primary);
             self.selections = carets.into_iter().map(Selection::caret).collect();
-            self.primary = primary.min(self.selections.len() - 1);
         } else {
             let map = |offset: usize| map_offset(offset, &edits);
             for selection in &mut self.selections {
@@ -451,10 +458,10 @@ impl Buffer {
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(snapshot) = self.undo.pop() else {
+        let Some(snapshot) = self.undo.pop_back() else {
             return false;
         };
-        self.redo.push(Snapshot {
+        self.redo.push_back(Snapshot {
             rope: self.rope.clone(),
             selections: self.selections.clone(),
             primary: self.primary,
@@ -464,10 +471,10 @@ impl Buffer {
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(snapshot) = self.redo.pop() else {
+        let Some(snapshot) = self.redo.pop_back() else {
             return false;
         };
-        self.undo.push(Snapshot {
+        self.undo.push_back(Snapshot {
             rope: self.rope.clone(),
             selections: self.selections.clone(),
             primary: self.primary,

@@ -312,11 +312,12 @@ impl fmt::Debug for SlotIds {
     }
 }
 
-// Opaque per-slot identities, parallel to the scene's node vectors. The
-// engine below never reads them: they exist so a consumer holding a snapshot
-// can say what a slot *is* -- selection, data requests -- across publishes,
-// where slot reuse would otherwise let a bare index silently change meaning.
-// Tombstoned slots hold the empty string.
+/// Opaque per-slot identities, parallel to the scene's node vectors.
+///
+/// The engine below never reads them: they exist so a consumer holding a
+/// snapshot can say what a slot *is* -- selection, data requests -- across
+/// publishes, where slot reuse would otherwise let a bare index silently change
+/// meaning. Tombstoned slots hold the empty string.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SceneIds {
     pub regions: SlotIds,
@@ -325,17 +326,18 @@ pub struct SceneIds {
     pub sats: SlotIds,
 }
 
-// The scene the engine draws plus the identity the model layer needs, one
-// value so both swap atomically under the same Arc. Identity lives here and
-// not on `Scene` deliberately: the engine's hot type stays engine-only, and
-// the ids cost one reference bump per snapshot clone.
+/// The scene the engine draws plus the identity the model layer needs, one
+/// value so both swap atomically under the same Arc.
+///
+/// Identity lives here and not on `Scene` deliberately: the engine's hot type
+/// stays engine-only, and the ids cost one reference bump per snapshot clone.
 #[derive(Debug, Clone, Default)]
 pub struct SceneSnapshot {
     pub scene: SceneData,
     pub ids: Arc<SceneIds>,
 }
 
-// Where an object is, for anything that has a uid and wants a place.
+/// Where an object is, for anything that has a uid and wants a place.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Located {
     pub level: Level,
@@ -506,6 +508,44 @@ mod tests {
         ids.push(Arc::from("after-truncate"));
         assert_eq!(ids.len(), SLOT_ID_PAGE_LEN - 2);
         assert_eq!(ids[ids.len() - 1].as_ref(), "after-truncate");
+    }
+
+    #[test]
+    fn slot_ids_regrow_past_a_page_the_clone_had_overlaid_and_then_truncated_away() {
+        let original: SlotIds = (0..SLOT_ID_PAGE_LEN * 2 + 7).map(uid).collect();
+        let mut changed = original.clone();
+        changed[SLOT_ID_PAGE_LEN + 3] = Arc::from("second-page-change");
+
+        changed.truncate(SLOT_ID_PAGE_LEN - 5);
+        changed.push(Arc::from("regrown"));
+        changed[0] = Arc::from("first-page-change");
+        while changed.len() <= SLOT_ID_PAGE_LEN {
+            let next = uid(changed.len() + 100_000);
+            changed.push(next);
+        }
+        let across = uid(SLOT_ID_PAGE_LEN + 100_000);
+        assert_eq!(
+            changed[SLOT_ID_PAGE_LEN], across,
+            "the page the clone had overlaid was truncated away, so regrowing \
+             must not resurrect what that overlay held"
+        );
+        changed[SLOT_ID_PAGE_LEN] = Arc::from("across-the-boundary");
+
+        assert_eq!(changed[0].as_ref(), "first-page-change");
+        assert_eq!(
+            changed[SLOT_ID_PAGE_LEN - 6].as_ref(),
+            format!("uid-{}", SLOT_ID_PAGE_LEN - 6)
+        );
+        assert_eq!(changed[SLOT_ID_PAGE_LEN - 5].as_ref(), "regrown");
+        assert_eq!(changed[SLOT_ID_PAGE_LEN].as_ref(), "across-the-boundary");
+        assert_eq!(changed.len(), SLOT_ID_PAGE_LEN + 1);
+
+        assert_eq!(original.len(), SLOT_ID_PAGE_LEN * 2 + 7);
+        assert_eq!(original[0].as_ref(), "uid-0");
+        assert_eq!(
+            original[SLOT_ID_PAGE_LEN + 3].as_ref(),
+            format!("uid-{}", SLOT_ID_PAGE_LEN + 3)
+        );
     }
 
     #[test]

@@ -47,6 +47,24 @@ fn a_replacement_selection_types_over_its_range() {
 }
 
 #[test]
+fn cursors_that_meet_over_a_deletion_become_one_cursor() {
+    // Two carets with one character between them both delete it away and land
+    // on the same offset. Left as two, the next keystroke is applied twice.
+    let mut buffer = buffer("abcd");
+    buffer.set_selections(vec![Selection::caret(2), Selection::caret(3)], 1);
+    buffer.backspace();
+    assert_eq!(buffer.text(), "ad");
+    assert_eq!(
+        buffer.selections(),
+        &[Selection::caret(1)],
+        "two carets at one offset are one cursor"
+    );
+    assert_eq!(buffer.primary_selection(), Selection::caret(1));
+    buffer.insert("x");
+    assert_eq!(buffer.text(), "axd", "and type once");
+}
+
+#[test]
 fn splices_report_tree_sitter_coordinates_in_application_order() {
     let mut buffer = buffer("aa\nbb\n");
     buffer.set_selections(vec![Selection::caret(0), Selection::caret(3)], 0);

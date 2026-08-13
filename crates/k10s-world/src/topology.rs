@@ -14,11 +14,11 @@ use k10s_core::{
     EdgeInst, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent, Severity, SlotIds, State,
     ToolId,
 };
-use rustc_hash::{FxHashMap as HashMap, FxHasher};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 
 use crate::{
     Aggregates, Dirty, DirtyPods, Pending, PodDelta, SnapshotPool, Topology, layout::LayoutMode,
-    rollup_of,
+    release_one, rollup_of,
 };
 
 const NO_SLOT: u32 = u32::MAX;
@@ -605,10 +605,10 @@ fn shift_pod_severity(
     if let Some((workload, state)) = from {
         let namespace = topology.wl_ns[workload as usize] as usize;
         let rank = state.severity.rank() as usize;
-        aggregates.wl_sev_counts[workload as usize][rank] -= 1;
-        aggregates.ns_sev_counts[namespace][rank] -= 1;
+        release_one(&mut aggregates.wl_sev_counts[workload as usize][rank]);
+        release_one(&mut aggregates.ns_sev_counts[namespace][rank]);
         if state.severity.is_unhealthy() {
-            aggregates.ns_unhealthy_count[namespace] -= 1;
+            release_one(&mut aggregates.ns_unhealthy_count[namespace]);
         }
         touched[0] = Some(workload);
     }
@@ -783,7 +783,7 @@ fn upsert_pod(
         Some((old_workload, old_state)) => {
             if moved {
                 let old_ns = topology.wl_ns[old_workload as usize] as usize;
-                topology.ns_pod_count[old_ns] -= 1;
+                release_one(&mut topology.ns_pod_count[old_ns]);
                 topology.ns_pod_count[topology.wl_ns[workload as usize] as usize] += 1;
             }
             if moved || old_state != state {
@@ -935,7 +935,7 @@ fn remove_pod(
         let state = aggregates.pod_state[index];
         if topology.wl_slots.is_active(workload as usize) {
             let namespace = topology.wl_ns[workload as usize] as usize;
-            topology.ns_pod_count[namespace] -= 1;
+            release_one(&mut topology.ns_pod_count[namespace]);
             shift_pod_severity(topology, aggregates, Some((workload, state)), None);
             dirt.wls.push(workload);
             dirt.nss.push(namespace as u32);
@@ -1151,7 +1151,7 @@ fn place_pod(topology: &mut Topology, slot: u32, workload: u32, mode: LayoutMode
     // probing then costs the candidate count, not candidates x every pod in
     // the world. Positions compare exactly because every pod rect comes from
     // the same formula below.
-    let occupied: std::collections::HashSet<(u32, u32)> = (0..topology.pod_slots.slots())
+    let occupied: HashSet<(u32, u32)> = (0..topology.pod_slots.slots())
         .filter(|&index| {
             topology.pod_slots.is_active(index)
                 && index != slot as usize

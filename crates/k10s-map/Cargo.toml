@@ -10,6 +10,10 @@ license.workspace = true
 workspace = true
 
 [features]
+# `testing` compiles the headless walk harness the bench and the app's flight
+# recorder drive: cargo bench -p k10s-map --bench walk --features testing.
+# `bench-alloc` adds the counting allocator that ratchets label allocations to
+# zero: ... --features testing,bench-alloc. Neither is on for a shipping build.
 testing = []
 bench-alloc = []
 

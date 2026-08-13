@@ -116,15 +116,16 @@ impl HoverInfo {
     fn resolve(scene: &SceneSnapshot, path: PickPath) -> Option<Self> {
         let region = scene.regions.get(path.region as usize)?;
         let namespace = SharedString::from(&region.label);
-        let owner = path
-            .block
-            .and_then(|slot| scene.blocks.get(slot as usize))
-            .map(|node| SharedString::from(&node.label));
+        let owner = || {
+            path.block
+                .and_then(|slot| scene.blocks.get(slot as usize))
+                .map(|node| SharedString::from(&node.label))
+        };
 
         match path.level() {
             k10s_core::Level::Region => Some(HoverInfo::new(
                 "Namespace",
-                SharedString::from(&region.label),
+                namespace,
                 None,
                 None,
                 Some(region.ext.rollup),
@@ -145,7 +146,7 @@ impl HoverInfo {
                     "Pod",
                     SharedString::from(&node.label),
                     Some(namespace),
-                    owner,
+                    owner(),
                     Some(node.ext.state.severity),
                 ))
             }
@@ -155,7 +156,7 @@ impl HoverInfo {
                     kind: kind_name(node.ext.kind),
                     name: SharedString::from(&node.label),
                     namespace: Some(namespace),
-                    owner,
+                    owner: owner(),
                     status: "Attached",
                     mark: "◇",
                     severity: None,

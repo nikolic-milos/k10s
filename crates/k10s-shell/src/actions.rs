@@ -135,6 +135,7 @@ actions!(
 pub const KEY_CONTEXTS: &[&str] = &[
     "Workspace",
     "Browse",
+    "Forwards",
     "Doc",
     "Diff",
     "Editor",

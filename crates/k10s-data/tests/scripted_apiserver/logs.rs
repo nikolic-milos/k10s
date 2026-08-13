@@ -250,7 +250,7 @@ fn a_denied_pod_list_makes_the_merged_follow_a_labelled_denial() {
     drop(runtime);
 }
 #[test]
-fn containers_come_from_the_pod_spec_in_run_order() {
+fn containers_come_from_the_pod_spec_in_field_order() {
     use k10s_data::read::Fetched;
 
     let script = Script::default();
@@ -284,7 +284,9 @@ fn containers_come_from_the_pod_spec_in_run_order() {
             "proxy".to_string(),
             "init-db".to_string(),
             "debug".to_string(),
-        ])
+        ]),
+        "the picker offers spec-field order -- containers, then init, then ephemeral -- \
+         and not kubectl's run order, which starts with the init containers"
     );
 
     drop(runtime);

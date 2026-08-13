@@ -9,13 +9,25 @@
 //! swap and a notify, because every view reads through the one slot rather than
 //! through a clone it was built with; what that cannot fix is a tab whose
 //! *content* came out of the cluster that just left, which is what
-//! [`Workspace::retire_cluster_views`] is for.
+//! [`Workspace::retire_cluster_views`] is for -- and what the schemas an editor
+//! completes and validates against came out of, which is what
+//! [`swap_connection`] is for. A generated starmap arrives through the same door
+//! and gives a cluster up the same way: attaching it retires the data plane
+//! behind whatever was attached before, so the window has to stop claiming a
+//! context it no longer reads anything from.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use gpui::{AppContext as _, Context, Entity, Window};
 
+use crate::editor::SchemaStore;
 use crate::finder::PickerMode;
 use crate::launch::{self, LaunchEvent, LaunchView};
-use crate::provider::{ConnectOutcome, ConnectRequest, Connection, DemoOutcome, ScanRequest};
+use crate::provider::{
+    ConnectOutcome, ConnectRequest, Connection, DemoOutcome, NullProvider, ProviderSlot,
+    ReadProvider, ScanRequest,
+};
 use crate::workspace::{PickerPurpose, Workspace};
 
 impl Workspace {
@@ -74,11 +86,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let outcome = reply.await;
             let _ = this.update(cx, |this, cx| match outcome {
-                Ok(DemoOutcome::Started(summary)) => {
-                    this.chose_scene(cx);
-                    this.status_note = Some(summary);
-                    cx.notify();
-                }
+                Ok(DemoOutcome::Started(summary)) => this.land_generated(summary, cx),
                 Ok(DemoOutcome::Failed(why)) => {
                     this.scene_chosen = false;
                     this.status_note = Some(why);
@@ -258,19 +266,41 @@ impl Workspace {
     // Adopting is a provider swap and a notify, because every view reads through
     // the one slot rather than through a clone it was built with.
     pub(crate) fn adopt(&mut self, connection: Connection, cx: &mut Context<Self>) {
+        let Connection {
+            context,
+            summary,
+            notes,
+            provider,
+        } = connection;
         // Every cluster-shaped view open right now belongs to the connection this
         // one replaces, and a table that keeps painting a cluster the window has
         // left is the one failure nothing on screen would admit to.
         let retired = self.retire_cluster_views(cx);
-        self.slot.set((connection.provider)());
+        swap_connection(&self.slot, &self.schema, provider());
         self.connected = true;
+        self.context = context;
+        self.land_scene(adopt_note(summary, notes.len(), retired), cx);
+    }
+
+    /// Land the generated starmap, which is not a cluster.
+    ///
+    /// The seam attaches it by retiring whatever was attached before, so by the
+    /// time this runs the previous cluster's data plane has already stopped.
+    /// Everything the window says about that cluster has to go with it: the
+    /// context beside the state dot, the tabs holding its objects, and the
+    /// provider every view still reads through.
+    pub(crate) fn land_generated(&mut self, summary: String, cx: &mut Context<Self>) {
+        let retired = self.retire_cluster_views(cx);
+        swap_connection(&self.slot, &self.schema, Rc::new(NullProvider));
+        self.connected = false;
+        self.context = None;
+        self.land_scene(adopt_note(summary, 0, retired), cx);
+    }
+
+    /// What both doors do once the connection state behind them is settled.
+    fn land_scene(&mut self, note: String, cx: &mut Context<Self>) {
         self.chose_scene(cx);
-        self.context = connection.context;
-        self.status_note = Some(adopt_note(
-            connection.summary,
-            connection.notes.len(),
-            retired,
-        ));
+        self.status_note = Some(note);
         self.refresh_detail(cx);
         cx.notify();
     }
@@ -306,8 +336,7 @@ impl Workspace {
                 match outcome {
                     DemoOutcome::Started(summary) => {
                         let _ = this.update_in(cx, |this, window, cx| {
-                            this.chose_scene(cx);
-                            this.status_note = Some(summary);
+                            this.land_generated(summary, cx);
                             this.close_launch(window, cx);
                         });
                     }
@@ -348,13 +377,48 @@ impl Workspace {
     }
 }
 
+/// Everything one connection owns, replaced in one place.
+///
+/// The slot is what every view reads through, and the schema store is what every
+/// editor completes and validates against; both describe one API server. Leaving
+/// the store behind was invisible in a way the tabs are not: a completion offered
+/// from the cluster the window has left looks exactly like a right one, and a
+/// diagnostic from its CRDs contradicts a manifest that is perfectly valid here.
+/// Pure, so the pair moving together is checked without a window.
+pub(crate) fn swap_connection(
+    slot: &ProviderSlot,
+    schema: &RefCell<SchemaStore>,
+    provider: Rc<dyn ReadProvider>,
+) {
+    slot.set(provider);
+    schema.borrow_mut().retire();
+}
+
 // Where a kubeconfig usually is, which is the only useful guess: the picker
 // lists whatever is there and a typed path overrides it.
 pub(crate) fn kubeconfig_seed() -> std::path::PathBuf {
-    let kube = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| std::path::PathBuf::from(home).join(".kube"));
-    crate::workspace::seed_dir(kube.as_deref())
+    let listed = std::env::var_os("KUBECONFIG");
+    let home = std::env::var_os("HOME");
+    crate::workspace::seed_dir(kubeconfig_dir(listed.as_deref(), home.as_deref()).as_deref())
+}
+
+/// Which directory the kubeconfig picker opens in. `KUBECONFIG` wins when it is
+/// set, because somebody who points the variable at a merged list is not keeping
+/// their config in the default place; its first entry is the one kubectl calls
+/// primary. Otherwise the usual `~/.kube`.
+pub(crate) fn kubeconfig_dir(
+    listed: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    let from_variable = listed
+        .filter(|listed| !listed.is_empty())
+        .and_then(|listed| std::env::split_paths(listed).next())
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .filter(|parent| !parent.as_os_str().is_empty());
+    from_variable.or_else(|| {
+        home.filter(|home| !home.is_empty())
+            .map(|home| std::path::PathBuf::from(home).join(".kube"))
+    })
 }
 
 // The one sentence an adopted connection shows. The notes themselves go to
@@ -380,7 +444,89 @@ pub(crate) fn adopt_note(summary: String, notes: usize, retired: usize) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::adopt_note;
+    use std::cell::RefCell;
+    use std::ffi::OsStr;
+    use std::rc::Rc;
+
+    use super::{adopt_note, kubeconfig_dir, swap_connection};
+    use crate::editor::SchemaStore;
+    use crate::provider::{NullProvider, ProviderSlot};
+
+    #[test]
+    fn a_connection_swap_retires_the_schemas_of_the_cluster_that_left() {
+        let slot = ProviderSlot::empty();
+        let schema = RefCell::new(SchemaStore::new());
+        {
+            let mut store = schema.borrow_mut();
+            store.index.add_api_version("apps/v1");
+            store.requested_catalog = true;
+            store.requested_crds = true;
+            store.note("the previous cluster denied its CRD schemas".to_string());
+        }
+
+        swap_connection(&slot, &schema, Rc::new(NullProvider));
+
+        let store = schema.borrow();
+        assert_eq!(
+            store.index.api_versions().count(),
+            0,
+            "an editor opened after the switch would complete against the cluster that left"
+        );
+        assert!(
+            !store.requested_catalog && !store.requested_crds,
+            "the flags say the fetches were made, and they were made of another server"
+        );
+        assert!(
+            store.first_note().is_none(),
+            "a note about the previous cluster is not about this one"
+        );
+    }
+
+    #[test]
+    fn an_answer_asked_of_the_previous_connection_cannot_fill_the_next_one() {
+        let slot = ProviderSlot::empty();
+        let schema = RefCell::new(SchemaStore::new());
+        let asked_at = schema.borrow().epoch();
+
+        swap_connection(&slot, &schema, Rc::new(NullProvider));
+
+        assert_ne!(
+            schema.borrow().epoch(),
+            asked_at,
+            "a fetch still in flight is checked against this, and nothing else can tell it apart"
+        );
+    }
+
+    #[test]
+    fn the_kubeconfig_picker_opens_where_the_kubeconfig_is() {
+        assert_eq!(
+            kubeconfig_dir(
+                Some(OsStr::new("/etc/k8s/admin.conf")),
+                Some(OsStr::new("/home/ana"))
+            ),
+            Some(std::path::PathBuf::from("/etc/k8s")),
+            "a variable pointing somewhere else is the whole reason it is set"
+        );
+        assert_eq!(
+            kubeconfig_dir(
+                Some(OsStr::new("/etc/k8s/admin.conf:/home/ana/.kube/config")),
+                None
+            ),
+            Some(std::path::PathBuf::from("/etc/k8s")),
+            "a merged list is led by the file kubectl calls primary"
+        );
+        assert_eq!(
+            kubeconfig_dir(Some(OsStr::new("")), Some(OsStr::new("/home/ana"))),
+            Some(std::path::PathBuf::from("/home/ana/.kube")),
+            "an empty variable is not a path"
+        );
+        assert_eq!(
+            kubeconfig_dir(None, Some(OsStr::new("/home/ana"))),
+            Some(std::path::PathBuf::from("/home/ana/.kube"))
+        );
+        assert_eq!(kubeconfig_dir(None, Some(OsStr::new(""))), None);
+        assert_eq!(kubeconfig_dir(None, None), None);
+    }
 
     #[test]
     fn the_adopt_note_counts_what_stderr_holds_and_what_the_switch_closed() {

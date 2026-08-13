@@ -165,7 +165,7 @@ pub fn build(parsed: &[ParsedBinding], cx: &App) -> (Vec<KeyBinding>, Vec<String
         ) {
             Ok(binding) => bindings.push(binding),
             Err(error) => notes.push(format!(
-                "keymap binding {:?} ignored: {error:?}",
+                "keymap binding {:?} ignored: {error}",
                 binding.keystrokes
             )),
         }

@@ -5,7 +5,9 @@
 //! live in the editor engine, which the scripted API server cannot reach.
 //! The `/openapi/v3` index maps group-versions to hash-stamped document
 //! URLs; those URLs are server data, so a document fetch refuses any path
-//! that escapes `/openapi/v3`. A server that predates the endpoint is a
+//! that escapes `/openapi/v3` -- the prefix has to end on a segment boundary
+//! and no segment may walk back out of it, which a bare `starts_with` would
+//! let through twice over. A server that predates the endpoint is a
 //! labelled failure, a 403 is a denial, and an absent CRD API degrades to
 //! an empty list, because a cluster without CRDs is normal and a cluster
 //! that hides them should still complete built-in kinds. Documents are
@@ -78,7 +80,7 @@ fn sources_from(index: WireIndex) -> Vec<SchemaSource> {
             let group_version = path
                 .strip_prefix("apis/")
                 .or_else(|| path.strip_prefix("api/"))?;
-            if group_version.is_empty() || !wire.server_relative_url.starts_with(OPENAPI_ROOT) {
+            if group_version.is_empty() || !under_openapi_root(&wire.server_relative_url) {
                 return None;
             }
             Some(SchemaSource {
@@ -92,8 +94,22 @@ fn sources_from(index: WireIndex) -> Vec<SchemaSource> {
     sources
 }
 
+fn under_openapi_root(url: &str) -> bool {
+    const UPWARDS: [&str; 4] = ["..", "%2e%2e", "%2e.", ".%2e"];
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let Some(rest) = path.strip_prefix(OPENAPI_ROOT) else {
+        return false;
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return false;
+    }
+    !rest
+        .split('/')
+        .any(|segment| UPWARDS.iter().any(|up| segment.eq_ignore_ascii_case(up)))
+}
+
 pub(crate) async fn fetch_document(client: &Client, url: &str) -> Fetched<String> {
-    if !url.starts_with(OPENAPI_ROOT) {
+    if !under_openapi_root(url) {
         return Fetched::Failed {
             what: "schema document",
             why: "refused a schema URL outside /openapi/v3".to_string(),
@@ -153,7 +169,9 @@ mod tests {
                 "apis/apps/v1":{"serverRelativeURL":"/openapi/v3/apis/apps/v1?hash=bbb"},
                 "apis/example.com/v1":{"serverRelativeURL":"/openapi/v3/apis/example.com/v1?hash=ccc"},
                 "logs":{"serverRelativeURL":"/logs"},
-                "apis/evil":{"serverRelativeURL":"/etc/passwd"}
+                "apis/evil":{"serverRelativeURL":"/etc/passwd"},
+                "apis/evil/v2":{"serverRelativeURL":"/openapi/v3/../../../etc/passwd"},
+                "apis/evil/v3":{"serverRelativeURL":"/openapi/v3suffix/apis/apps/v1"}
             }}"#,
         )
         .expect("the fixture parses");
@@ -169,5 +187,31 @@ mod tests {
                 .all(|source| source.url.starts_with("/openapi/v3")),
             "a URL escaping /openapi/v3 is dropped: {sources:?}"
         );
+    }
+
+    #[test]
+    fn a_schema_url_may_not_walk_out_of_the_openapi_root() {
+        for url in [
+            "/openapi/v3",
+            "/openapi/v3/api/v1?hash=aaa",
+            "/openapi/v3/apis/example.com/v1?hash=bbb",
+        ] {
+            assert!(under_openapi_root(url), "{url}");
+        }
+        for url in [
+            "/etc/passwd",
+            "openapi/v3/api/v1",
+            "/openapi/v3suffix/api/v1",
+            "/openapi/v3/../../../etc/passwd",
+            "/openapi/v3/apis/../../../etc/passwd",
+            "/openapi/v3/%2e%2e/%2e%2e/etc/passwd",
+            "/openapi/v3/%2E./etc/passwd",
+            "/openapi/v3/../secrets?hash=aaa",
+        ] {
+            assert!(
+                !under_openapi_root(url),
+                "a prefix test alone would fetch this: {url}"
+            );
+        }
     }
 }

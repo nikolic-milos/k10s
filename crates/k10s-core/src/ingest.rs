@@ -101,6 +101,7 @@ pub struct Intake {
     by_uid: HashMap<Arc<str>, usize>,
     control: Vec<IngestEvent>,
     overflowed: HashSet<KindId>,
+    unrecoverable: HashMap<KindId, DesyncReason>,
     capacity: usize,
     stats: IntakeStats,
 }
@@ -123,6 +124,7 @@ impl Intake {
             by_uid: HashMap::new(),
             control: Vec::new(),
             overflowed: HashSet::new(),
+            unrecoverable: HashMap::new(),
             capacity,
             stats: IntakeStats::default(),
         }
@@ -133,7 +135,10 @@ impl Intake {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_uid.is_empty() && self.control.is_empty() && self.overflowed.is_empty()
+        self.by_uid.is_empty()
+            && self.control.is_empty()
+            && self.overflowed.is_empty()
+            && self.unrecoverable.is_empty()
     }
 
     pub fn push(&mut self, event: IngestEvent) {
@@ -148,6 +153,11 @@ impl Intake {
     fn push_control(&mut self, kind: KindId, event: IngestEvent) {
         if self.control.len() >= CONTROL_CAPACITY {
             self.stats.dropped += 1;
+            if let IngestEvent::Desync { reason, .. } = event
+                && !reason.is_recoverable()
+            {
+                self.retain_unrecoverable(kind, reason);
+            }
             self.signal_overflow(kind);
             return;
         }
@@ -155,6 +165,21 @@ impl Intake {
             self.stats.desyncs += 1;
         }
         self.control.push(event);
+    }
+
+    /// Keep a desync retrying cannot fix even when the control buffer is full.
+    ///
+    /// Overflow replaces dropped control events with one recoverable `Overflow`
+    /// desync per kind. A `Forbidden` verdict answered that way would tell the
+    /// world to retry a permission it will never be granted, so the verdict is
+    /// held aside -- bounded and deduplicated like the overflow set -- and
+    /// drained after it.
+    fn retain_unrecoverable(&mut self, kind: KindId, reason: DesyncReason) {
+        if self.unrecoverable.len() < CONTROL_CAPACITY
+            && self.unrecoverable.insert(kind, reason).is_none()
+        {
+            self.stats.desyncs += 1;
+        }
     }
 
     fn signal_overflow(&mut self, kind: KindId) {
@@ -168,7 +193,7 @@ impl Intake {
             let prev = self.pending[slot]
                 .as_ref()
                 .expect("an indexed slot always holds an event");
-            if prev.op == Op::Added && ev.op == Op::Deleted && self.first_added[slot] {
+            if ev.op == Op::Deleted && self.first_added[slot] {
                 self.by_uid.remove(&ev.uid);
                 if slot + 1 == self.pending.len() {
                     self.pending.pop();
@@ -227,7 +252,12 @@ impl Intake {
     }
 
     pub fn drain_into(&mut self, out: &mut Vec<IngestEvent>) {
-        out.reserve(self.pending.len() + self.control.len() + self.overflowed.len());
+        out.reserve(
+            self.pending.len()
+                + self.control.len()
+                + self.overflowed.len()
+                + self.unrecoverable.len(),
+        );
         for ev in self.pending.drain(..).flatten() {
             out.push(IngestEvent::Resource(ev));
         }
@@ -238,6 +268,13 @@ impl Intake {
             kind,
             reason: DesyncReason::Overflow,
         }));
+        let mut unrecoverable: Vec<(KindId, DesyncReason)> = self.unrecoverable.drain().collect();
+        unrecoverable.sort_unstable_by_key(|(kind, _)| kind.0);
+        out.extend(
+            unrecoverable
+                .into_iter()
+                .map(|(kind, reason)| IngestEvent::Desync { kind, reason }),
+        );
         self.first_added.clear();
         self.by_uid.clear();
     }

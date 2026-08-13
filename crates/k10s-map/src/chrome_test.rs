@@ -64,6 +64,88 @@ fn identical_chrome_state_does_not_dirty_its_reactive_boundary() {
     assert!(!chrome.replace(state));
 }
 
+fn hover_scene() -> SceneSnapshot {
+    let mut scene = SceneSnapshot::default();
+    scene.regions.push(k10s_core::NsNode {
+        rect: k10s_core::Rect::new(0.0, 0.0, 200.0, 120.0),
+        label: "payments".into(),
+        weight: 1,
+        children: 0..1,
+        ext: k10s_core::NsExt {
+            unhealthy_frac: 0.5,
+            rollup: Severity::Warn,
+        },
+    });
+    scene.blocks.push(k10s_core::WorkloadNode {
+        rect: k10s_core::Rect::new(10.0, 10.0, 80.0, 80.0),
+        inner: k10s_core::Rect::new(10.0, 10.0, 80.0, 80.0),
+        label: "checkout-api".into(),
+        children: 0..1,
+        sats: 0..1,
+        ext: k10s_core::WlExt {
+            kind: k10s_core::KindId::DEPLOYMENT,
+            tool: k10s_core::ToolId::NONE,
+            rollup: Severity::Err,
+            ns: 0,
+        },
+    });
+    scene.cells.push(k10s_core::PodNode {
+        rect: k10s_core::Rect::new(12.0, 12.0, 20.0, 20.0),
+        label: "checkout-api-7f9c8".into(),
+        ext: k10s_core::PodExt {
+            state: k10s_core::State::of(k10s_core::ReasonId::CRASH_LOOP_BACK_OFF),
+        },
+    });
+    scene.sats.push(k10s_core::SatNode {
+        rect: k10s_core::Rect::new(120.0, 20.0, 10.0, 10.0),
+        label: "checkout-api-svc".into(),
+        ext: k10s_core::SatExt {
+            kind: k10s_core::KindId::SERVICE,
+            detail: "ClusterIP".into(),
+        },
+    });
+    scene
+}
+
+#[test]
+fn every_hover_level_names_its_object_and_carries_its_ancestry() {
+    let scene = hover_scene();
+    let path = |block, cell, sat| PickPath {
+        region: 0,
+        block,
+        cell,
+        sat,
+    };
+
+    let region = HoverInfo::resolve(&scene, path(None, None, None)).expect("region hover");
+    assert_eq!(region.kind, "Namespace");
+    assert_eq!(region.name.as_ref(), "payments");
+    assert_eq!(region.namespace, None);
+    assert_eq!(region.owner, None);
+    assert_eq!(region.status, "Warning");
+
+    let block = HoverInfo::resolve(&scene, path(Some(0), None, None)).expect("block hover");
+    assert_eq!(block.kind, "Deployment");
+    assert_eq!(block.name.as_ref(), "checkout-api");
+    assert_eq!(block.namespace.as_deref(), Some("payments"));
+    assert_eq!(block.owner, None);
+    assert_eq!(block.status, "Critical");
+
+    let cell = HoverInfo::resolve(&scene, path(Some(0), Some(0), None)).expect("cell hover");
+    assert_eq!(cell.kind, "Pod");
+    assert_eq!(cell.name.as_ref(), "checkout-api-7f9c8");
+    assert_eq!(cell.namespace.as_deref(), Some("payments"));
+    assert_eq!(cell.owner.as_deref(), Some("checkout-api"));
+    assert_eq!(cell.status, "Critical");
+
+    let sat = HoverInfo::resolve(&scene, path(Some(0), None, Some(0))).expect("sat hover");
+    assert_eq!(sat.kind, "Service");
+    assert_eq!(sat.name.as_ref(), "checkout-api-svc");
+    assert_eq!(sat.namespace.as_deref(), Some("payments"));
+    assert_eq!(sat.owner.as_deref(), Some("checkout-api"));
+    assert_eq!(sat.status, "Attached");
+}
+
 #[test]
 fn hover_cards_stay_inside_the_viewport() {
     let mut scene = SceneSnapshot::default();

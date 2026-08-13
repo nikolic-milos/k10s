@@ -148,6 +148,20 @@ struct Aggregates {
     ns_unhealthy_count: Vec<u32>,
 }
 
+/// Take one pod out of a derived count.
+///
+/// Every decrement of a severity bucket or an unhealthy tally is paired with an
+/// increment that already happened, so reaching zero here means a structural
+/// path and a state path disagreed about which bucket a pod was in. A bare
+/// `-= 1` wraps to `u32::MAX` in release and poisons every rollup that reads
+/// the bucket afterwards; this fails the suites loudly and keeps a shipped
+/// world merely wrong by one pod instead of by four billion.
+#[inline(always)]
+fn release_one(count: &mut u32) {
+    debug_assert!(*count > 0, "a derived count lost a pod it never held");
+    *count = count.saturating_sub(1);
+}
+
 fn rollup_of(counts: &[u32; 4]) -> Severity {
     if counts[3] > 0 {
         Severity::Err
@@ -297,16 +311,16 @@ fn rollup(
         let wl = topo.pod_wl[i];
         let ns = topo.wl_ns[wl as usize] as usize;
         let sev = &mut agg.wl_sev_counts[wl as usize];
-        sev[old.severity.rank() as usize] -= 1;
+        release_one(&mut sev[old.severity.rank() as usize]);
         sev[new.severity.rank() as usize] += 1;
         let nsev = &mut agg.ns_sev_counts[ns];
-        nsev[old.severity.rank() as usize] -= 1;
+        release_one(&mut nsev[old.severity.rank() as usize]);
         nsev[new.severity.rank() as usize] += 1;
         if old.severity.is_unhealthy() != new.severity.is_unhealthy() {
             if new.severity.is_unhealthy() {
                 agg.ns_unhealthy_count[ns] += 1;
             } else {
-                agg.ns_unhealthy_count[ns] -= 1;
+                release_one(&mut agg.ns_unhealthy_count[ns]);
             }
         }
         if !std::mem::replace(&mut scratch.wl_stamp[wl as usize], true) {

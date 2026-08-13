@@ -10,7 +10,8 @@ use crate::connect::describe;
 // bounded log tail. Fire-and-forget onto the data plane's runtime, the reply
 // handed to a caller-supplied callback -- the render thread never blocks on
 // the cluster, and a denial arrives as a labelled variant, never an empty
-// panel.
+// panel. Both answers are bounded where they enter: an event's fields are
+// clipped in characters and a tail line is capped like a followed one.
 #[derive(Clone)]
 pub struct Inspector {
     client: Client,
@@ -44,6 +45,7 @@ pub enum InspectDetail {
 const MAX_EVENTS: usize = 20;
 const LOG_TAIL_LINES: i64 = 200;
 const LOG_LIMIT_BYTES: i64 = 64 * 1024;
+const MAX_EVENT_CHARS: usize = 2_000;
 
 impl Inspector {
     pub(crate) fn new(client: Client) -> Inspector {
@@ -66,21 +68,8 @@ impl Inspector {
         self.handle.spawn(async move {
             let outcome = match api.list(&params).await {
                 Ok(list) => {
-                    let mut lines: Vec<EventLine> = list
-                        .items
-                        .into_iter()
-                        .map(|event| EventLine {
-                            last_seen: event
-                                .last_timestamp
-                                .map(|t| t.0.to_string())
-                                .or_else(|| event.event_time.map(|t| t.0.to_string()))
-                                .unwrap_or_default(),
-                            kind: event.type_.unwrap_or_default(),
-                            reason: event.reason.unwrap_or_default(),
-                            message: event.message.unwrap_or_default(),
-                            count: event.count.unwrap_or(1),
-                        })
-                        .collect();
+                    let mut lines: Vec<EventLine> =
+                        list.items.into_iter().map(event_line).collect();
                     lines.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
                     lines.truncate(MAX_EVENTS);
                     InspectDetail::Events(lines)
@@ -108,7 +97,7 @@ impl Inspector {
         self.handle.spawn(async move {
             let outcome = match api.logs(&pod, &params).await {
                 Ok(text) => InspectDetail::Log(LogTail {
-                    lines: text.lines().map(str::to_owned).collect(),
+                    lines: tail_lines(&text),
                 }),
                 Err(error) => classify("logs", &error),
             };
@@ -117,14 +106,118 @@ impl Inspector {
     }
 }
 
+fn event_line(event: Event) -> EventLine {
+    EventLine {
+        last_seen: clipped(
+            event
+                .last_timestamp
+                .map(|t| t.0.to_string())
+                .or_else(|| event.event_time.map(|t| t.0.to_string()))
+                .unwrap_or_default(),
+        ),
+        kind: clipped(event.type_.unwrap_or_default()),
+        reason: clipped(event.reason.unwrap_or_default()),
+        message: clipped(event.message.unwrap_or_default()),
+        count: event.count.unwrap_or(1),
+    }
+}
+
+fn clipped(text: String) -> String {
+    if text.chars().count() <= MAX_EVENT_CHARS {
+        return text;
+    }
+    let mut cut: String = text.chars().take(MAX_EVENT_CHARS).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
+fn tail_lines(text: &str) -> Vec<String> {
+    text.lines().map(crate::logs::capped).collect()
+}
+
 fn classify(what: &'static str, error: &kube::Error) -> InspectDetail {
     if let kube::Error::Api(response) = error
-        && response.code == 403
+        && matches!(response.code, 401 | 403)
     {
         return InspectDetail::Denied { what };
     }
     InspectDetail::Failed {
         what,
         why: describe(error as &(dyn std::error::Error + 'static)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_event_is_bounded_where_it_enters_rather_than_by_the_panel() {
+        let line = event_line(Event {
+            message: Some("m".repeat(MAX_EVENT_CHARS * 4)),
+            reason: Some("é".repeat(MAX_EVENT_CHARS + 10)),
+            type_: Some("Warning".to_string()),
+            count: Some(7),
+            ..Event::default()
+        });
+        assert_eq!(
+            line.message.chars().count(),
+            MAX_EVENT_CHARS + 1,
+            "the cut is a character and the ellipsis says it happened"
+        );
+        assert!(line.message.ends_with('\u{2026}'));
+        assert_eq!(
+            line.reason.chars().count(),
+            MAX_EVENT_CHARS + 1,
+            "a multibyte field is cut in characters, not bytes"
+        );
+        assert!(line.reason.ends_with('\u{2026}'));
+        assert_eq!(
+            line.kind, "Warning",
+            "a field inside the budget is untouched"
+        );
+        assert_eq!(line.count, 7);
+        assert_eq!(
+            event_line(Event::default()).count,
+            1,
+            "an event that counted nothing happened once"
+        );
+    }
+
+    #[test]
+    fn an_account_the_cluster_refuses_is_denied_whichever_way_it_says_so() {
+        let refused = |code: u16| {
+            kube::Error::Api(
+                kube::core::Status::failure("no", "Forbidden")
+                    .with_code(code)
+                    .boxed(),
+            )
+        };
+        assert_eq!(
+            classify("events", &refused(403)),
+            InspectDetail::Denied { what: "events" }
+        );
+        assert_eq!(
+            classify("events", &refused(401)),
+            InspectDetail::Denied { what: "events" },
+            "the panel reads 401 the way the watch and the reader do"
+        );
+        assert!(matches!(
+            classify("logs", &refused(500)),
+            InspectDetail::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_log_tail_line_is_capped_the_way_a_followed_line_is() {
+        let text = format!("{}\nshort\n", "x".repeat(64 * 1024));
+        let lines = tail_lines(&text);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].len() < 64 * 1024,
+            "one mega-line does not reach the panel whole"
+        );
+        assert!(lines[0].ends_with('\u{2026}'));
+        assert_eq!(lines[1], "short");
     }
 }

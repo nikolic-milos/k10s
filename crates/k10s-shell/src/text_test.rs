@@ -176,3 +176,19 @@ fn the_kubelet_timestamp_is_stripped_only_when_it_is_one() {
     );
     assert_eq!(strip_timestamp(""), "");
 }
+
+#[test]
+fn a_line_that_only_starts_like_a_date_keeps_its_head() {
+    assert_eq!(
+        strip_timestamp("2026-08-02Tnope here is the rest"),
+        "2026-08-02Tnope here is the rest"
+    );
+    assert_eq!(
+        strip_timestamp("1234-56-78T90 pod started"),
+        "1234-56-78T90 pod started"
+    );
+    assert_eq!(
+        strip_timestamp("2026-8-02T05:00:01Z ready"),
+        "2026-8-02T05:00:01Z ready"
+    );
+}

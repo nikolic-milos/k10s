@@ -437,7 +437,9 @@ impl Workspace {
                     match cx.build_action(name, None) {
                         Ok(action) => window.dispatch_action(action, cx),
                         Err(error) => {
-                            eprintln!("k10s: the palette cannot build {name:?}: {error}")
+                            eprintln!("k10s: the palette cannot build {name:?}: {error}");
+                            this.status_note = Some(palette_note(name));
+                            cx.notify();
                         }
                     }
                 }
@@ -456,4 +458,26 @@ pub(crate) fn seed_dir(root: Option<&std::path::Path>) -> PathBuf {
     root.map(std::path::Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// What the window says when a command the palette listed cannot be built. The
+/// reason itself goes to stderr, where the rest of them go, but somebody who
+/// pressed enter on a command watched nothing happen and is owed a sentence
+/// about it. A value rather than a method so the sentence can be checked
+/// without a window.
+pub(crate) fn palette_note(name: &str) -> String {
+    format!("{name} did not run; the reason is on stderr")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::palette_note;
+
+    #[test]
+    fn a_command_that_cannot_be_built_says_so_on_screen() {
+        assert_eq!(
+            palette_note("k10s::OpenSettings"),
+            "k10s::OpenSettings did not run; the reason is on stderr"
+        );
+    }
 }

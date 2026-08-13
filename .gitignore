@@ -5,3 +5,14 @@
 # licence-carrying under crates/k10s-assets/assets/, so nothing here is needed to
 # build -- and none of it belongs in a clone.
 /ui
+# Local cluster credentials and the lab scratch beside them. k10s never writes
+# these -- it reads the kubeconfig the environment already names -- but a lab
+# that stands a cluster up next to the checkout does, and a leaked kubeconfig is
+# a cluster, not a file.
+kubeconfig
+kubeconfig-*
+*.kubeconfig
+.env
+.env.*
+*.pem
+*.key

@@ -433,12 +433,19 @@ pub fn attachment_refs(spec: &PodSpec, kinds: &AttachKinds) -> Vec<AttachRef> {
         }
     }
 
-    for container in spec
+    let env_sources = spec
         .containers
         .iter()
         .chain(spec.init_containers.iter().flatten())
-    {
-        for from in container.env_from.iter().flatten() {
+        .map(|container| (&container.env_from, &container.env))
+        .chain(
+            spec.ephemeral_containers
+                .iter()
+                .flatten()
+                .map(|container| (&container.env_from, &container.env)),
+        );
+    for (env_from, env) in env_sources {
+        for from in env_from.iter().flatten() {
             if let Some(cm) = &from.config_map_ref {
                 push(kinds.config_map, &cm.name);
             }
@@ -446,7 +453,7 @@ pub fn attachment_refs(spec: &PodSpec, kinds: &AttachKinds) -> Vec<AttachRef> {
                 push(kinds.secret, &secret.name);
             }
         }
-        for env in container.env.iter().flatten() {
+        for env in env.iter().flatten() {
             let Some(from) = &env.value_from else {
                 continue;
             };

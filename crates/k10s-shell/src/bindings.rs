@@ -24,6 +24,11 @@ use crate::actions::*;
 pub fn keybindings() -> Vec<KeyBinding> {
     let workspace = Some("Workspace");
     let browse = Some("Browse");
+    // The forwards panel is a Browse list plus one command of its own. `x`
+    // lives here rather than in Browse because the resource browser and the
+    // project tree are Browse too, and nothing there listens for it: a default
+    // that does nothing where it is offered teaches the wrong keystroke.
+    let forwards = Some("Forwards");
     let doc = Some("Doc");
     let typing = Some("Typing");
     let editor = Some("Editor");
@@ -66,7 +71,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("r", Refresh, browse),
         KeyBinding::new("m", LoadMore, browse),
         KeyBinding::new("shift-f", StartForward, browse),
-        KeyBinding::new("x", StopForward, browse),
+        KeyBinding::new("x", StopForward, forwards),
         KeyBinding::new("/", EnterFilter, browse),
         KeyBinding::new("escape", Back, browse),
         KeyBinding::new("up", DocScrollUp, doc),
@@ -353,6 +358,25 @@ mod tests {
                 "{chord} is the way out of the editor and must stay live"
             );
         }
+    }
+
+    #[test]
+    fn stopping_a_forward_is_offered_only_where_something_listens_for_it() {
+        let bindings = keybindings();
+        let named = |context: &str| -> BTreeSet<String> {
+            scoped_to(&bindings, context)
+                .map(|binding| binding.action().name().to_string())
+                .collect()
+        };
+        assert!(
+            named("Forwards").contains("k10s_shell::StopForward"),
+            "the forwards panel is the only view that listens for it"
+        );
+        assert!(
+            !named("Browse").contains("k10s_shell::StopForward"),
+            "the resource browser and the project tree are Browse too, and a default \
+             that does nothing there teaches the wrong keystroke"
+        );
     }
 
     #[test]

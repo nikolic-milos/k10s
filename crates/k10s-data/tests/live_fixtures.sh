@@ -236,6 +236,15 @@ metadata: { name: sprocket, namespace: $NS }
 spec: { size: 7, flavour: vanilla }
 YAML
 
+# Accepted is not running. Exec, port-forward and the usage poll all need a
+# started container, and without this wait the first run after a fixture
+# refresh races the image pull -- which fails as a timeout in a test that
+# names something else entirely.
+echo "waiting for the pods those tests exec into, forward to, and measure"
+for deployment in web forward-probe usage-probe; do
+  "${KUBECTL[@]}" -n "$NS" rollout status "deployment/$deployment" --timeout=180s >/dev/null
+done
+
 echo
 echo "ready. One caveat that is not cosmetic:"
 echo "  run the suite with --test-threads=1. The field-manager conflict test"

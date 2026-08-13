@@ -5,7 +5,11 @@
 //! every keystroke -- re-reading the folder per character is how a picker
 //! freezes on a network mount -- and the file finder scans once when it opens.
 //! Names are joined from the entries themselves, so a file whose name is not
-//! valid UTF-8 still opens; only what the row displays is lossy.
+//! valid UTF-8 still opens; only what the row displays is lossy. A folder whose
+//! name is not valid UTF-8 is the one thing that cannot be typed: stepping into
+//! it makes its name the next directory to list, and a path spelled with
+//! replacement characters names nothing, so tab and enter say so on that row
+//! rather than walking into a folder that is not there.
 //!
 //! A keystroke costs no syscall, but `enter` may: [`PickerState::confirm`]
 //! answers from the rows only while they are authoritative -- the listing for
@@ -67,6 +71,14 @@ pub enum PickerMode {
 // The row that means "the folder I am looking at", so confirming a folder is
 // a highlighted row like everything else rather than a special keystroke.
 pub(crate) const HERE: &str = ".";
+
+// What a folder whose name is not text is told on its row. Opening one still
+// works -- the path is joined from the name -- but typing it into the input
+// does not, and listing a path spelled with replacement characters answers
+// "no such file or directory" about a folder that is sitting there.
+fn untypable(label: &str) -> String {
+    format!("{label} cannot be typed: its name is not text")
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PickerAction {
@@ -243,12 +255,17 @@ impl PickerState {
         if entry.name == std::ffi::OsStr::new(HERE) {
             return;
         }
+        let tail = if entry.is_dir {
+            entry.name.to_str().map(|name| format!("{name}/"))
+        } else {
+            Some(entry.label())
+        };
+        let lossy = entry.label();
         let (dir, _) = self.split();
-        self.input = format!(
-            "{dir}{}{}",
-            entry.label(),
-            if entry.is_dir { "/" } else { "" }
-        );
+        match tail {
+            Some(tail) => self.input = format!("{dir}{tail}"),
+            None => self.note = Some(untypable(&lossy)),
+        }
     }
 
     pub fn confirm(&self, fs: &dyn Fs) -> PickerAction {
@@ -279,7 +296,10 @@ impl PickerState {
             let path = Path::new(&dir).join(&entry.name);
             return match (entry.is_dir, self.mode) {
                 (true, PickerMode::OpenFolder) => PickerAction::Open(path),
-                (true, _) => PickerAction::Descend(format!("{dir}{}/", entry.label())),
+                (true, _) => match entry.name.to_str() {
+                    Some(name) => PickerAction::Descend(format!("{dir}{name}/")),
+                    None => PickerAction::Reject(untypable(&entry.label())),
+                },
                 (false, PickerMode::OpenFolder) => {
                     PickerAction::Reject(format!("{} is a file; pick a folder", entry.label()))
                 }

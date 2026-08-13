@@ -279,41 +279,41 @@ fn indexed_color(index: u8, shell: &ShellTheme) -> u32 {
 }
 
 // One keystroke as the bytes a terminal expects, or None for keys that have
-// no encoding (bare modifiers, function rows we do not map).
+// no encoding (bare modifiers, chords we do not map).
 pub fn key_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
     let modifiers = &keystroke.modifiers;
-    if modifiers.control {
-        let key = keystroke.key.as_str();
-        if key.len() == 1 {
-            let c = key.as_bytes()[0].to_ascii_lowercase();
-            if c.is_ascii_lowercase() {
-                return Some(vec![c - b'a' + 1]);
-            }
+    let bytes: Vec<u8> = if modifiers.control {
+        control_bytes(keystroke.key.as_str())?
+    } else {
+        match keystroke.key.as_str() {
+            "enter" => b"\r".to_vec(),
+            "tab" => b"\t".to_vec(),
+            "backspace" => b"\x7f".to_vec(),
+            "escape" => b"\x1b".to_vec(),
+            "up" => b"\x1b[A".to_vec(),
+            "down" => b"\x1b[B".to_vec(),
+            "right" => b"\x1b[C".to_vec(),
+            "left" => b"\x1b[D".to_vec(),
+            "home" => b"\x1b[H".to_vec(),
+            "end" => b"\x1b[F".to_vec(),
+            "pageup" => b"\x1b[5~".to_vec(),
+            "pagedown" => b"\x1b[6~".to_vec(),
+            "delete" => b"\x1b[3~".to_vec(),
+            "insert" => b"\x1b[2~".to_vec(),
+            "f1" => b"\x1bOP".to_vec(),
+            "f2" => b"\x1bOQ".to_vec(),
+            "f3" => b"\x1bOR".to_vec(),
+            "f4" => b"\x1bOS".to_vec(),
+            "f5" => b"\x1b[15~".to_vec(),
+            "f6" => b"\x1b[17~".to_vec(),
+            "f7" => b"\x1b[18~".to_vec(),
+            "f8" => b"\x1b[19~".to_vec(),
+            "f9" => b"\x1b[20~".to_vec(),
+            "f10" => b"\x1b[21~".to_vec(),
+            "f11" => b"\x1b[23~".to_vec(),
+            "f12" => b"\x1b[24~".to_vec(),
+            _ => keystroke.key_char.as_deref()?.as_bytes().to_vec(),
         }
-        return match key {
-            "space" | "@" => Some(vec![0x00]),
-            "[" => Some(vec![0x1b]),
-            "\\" => Some(vec![0x1c]),
-            "]" => Some(vec![0x1d]),
-            _ => None,
-        };
-    }
-    let bytes: Vec<u8> = match keystroke.key.as_str() {
-        "enter" => b"\r".to_vec(),
-        "tab" => b"\t".to_vec(),
-        "backspace" => b"\x7f".to_vec(),
-        "escape" => b"\x1b".to_vec(),
-        "up" => b"\x1b[A".to_vec(),
-        "down" => b"\x1b[B".to_vec(),
-        "right" => b"\x1b[C".to_vec(),
-        "left" => b"\x1b[D".to_vec(),
-        "home" => b"\x1b[H".to_vec(),
-        "end" => b"\x1b[F".to_vec(),
-        "pageup" => b"\x1b[5~".to_vec(),
-        "pagedown" => b"\x1b[6~".to_vec(),
-        "delete" => b"\x1b[3~".to_vec(),
-        "insert" => b"\x1b[2~".to_vec(),
-        _ => keystroke.key_char.as_deref()?.as_bytes().to_vec(),
     };
     if modifiers.alt {
         // Meta sends ESC first, the way xterm does.
@@ -323,6 +323,40 @@ pub fn key_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
         return Some(out);
     }
     Some(bytes)
+}
+
+fn control_bytes(key: &str) -> Option<Vec<u8>> {
+    if key.len() == 1 {
+        let c = key.as_bytes()[0].to_ascii_lowercase();
+        if c.is_ascii_lowercase() {
+            return Some(vec![c - b'a' + 1]);
+        }
+    }
+    match key {
+        "space" | "@" => Some(vec![0x00]),
+        "[" => Some(vec![0x1b]),
+        "\\" => Some(vec![0x1c]),
+        "]" => Some(vec![0x1d]),
+        _ => None,
+    }
+}
+
+// A stalled UI drops output on the floor rather than buffering the far side
+// without bound; the terminal is a screen, not a log. How a session ended is
+// not screen content, so those events go through a fresh sender, whose
+// guaranteed slot no flood of output can take: a view that misses one shows a
+// live cursor over a shell that is already gone.
+fn exec_events(
+    tx: futures::channel::mpsc::Sender<ExecEvent>,
+) -> Box<dyn Fn(ExecEvent) + Send + Sync> {
+    let tx = std::sync::Mutex::new(tx);
+    Box::new(move |event| {
+        let mut tx = tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = match event {
+            ExecEvent::Output(_) => tx.try_send(event),
+            ended => tx.clone().try_send(ended),
+        };
+    })
 }
 
 pub struct TerminalView {
@@ -388,12 +422,7 @@ impl TerminalView {
             viewport: Viewport::default(),
         };
         let (tx, mut rx) = futures::channel::mpsc::channel::<ExecEvent>(256);
-        // A stalled UI drops output on the floor rather than buffering the
-        // far side without bound; the terminal is a screen, not a log.
-        view.session = Some(start(Box::new(move |event| {
-            let mut tx = tx.clone();
-            let _ = tx.try_send(event);
-        })));
+        view.session = Some(start(exec_events(tx)));
         cx.spawn(async move |this, cx| {
             use futures::StreamExt as _;
             while let Some(event) = rx.next().await {

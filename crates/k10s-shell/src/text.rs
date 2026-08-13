@@ -307,16 +307,30 @@ impl TextState {
 // "2026-08-02T05:00:01Z ready" -> "ready", but only when the head actually
 // looks like the timestamp the kubelet prepends.
 pub fn strip_timestamp(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    if bytes.len() > 11
-        && bytes[..4].iter().all(u8::is_ascii_digit)
-        && bytes[4] == b'-'
-        && bytes[10] == b'T'
+    if kubelet_stamped(line.as_bytes())
         && let Some(space) = line.find(' ')
     {
         return &line[space + 1..];
     }
     line
+}
+
+/// The whole `YYYY-MM-DDThh:mm:ss` head, not its first three characters: what
+/// gets thrown away here is the start of a log line, and a line that merely
+/// begins with four digits and a dash is not a stamped one.
+fn kubelet_stamped(bytes: &[u8]) -> bool {
+    bytes.len() > 19
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[10] == b'T'
+        && bytes[11..13].iter().all(u8::is_ascii_digit)
+        && bytes[13] == b':'
+        && bytes[14..16].iter().all(u8::is_ascii_digit)
+        && bytes[16] == b':'
+        && bytes[17..19].iter().all(u8::is_ascii_digit)
 }
 
 enum Source {

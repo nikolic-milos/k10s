@@ -393,12 +393,7 @@ pub async fn sync_from(
         });
     }
     for (kind, n) in &expected {
-        let all_settled = streams_settled(&settled, *kind) >= *n;
-        let listed = settled
-            .get(kind)
-            .map(|(_, listed)| *listed)
-            .unwrap_or(false);
-        if all_settled && listed && !report.unsettled.contains(kind) {
+        if kind_synced(&settled, *kind, *n) {
             events.push(IngestEvent::Synced { kind: *kind });
         }
     }
@@ -438,6 +433,12 @@ fn streams_settled(settled: &Settled, kind: KindId) -> usize {
     settled.get(&kind).map(|(n, _)| *n).unwrap_or(0)
 }
 
+fn kind_synced(settled: &Settled, kind: KindId, streams: usize) -> bool {
+    settled
+        .get(&kind)
+        .is_some_and(|(count, listed)| *count >= streams && *listed)
+}
+
 fn apply(
     message: Message,
     store: &mut Store,
@@ -459,17 +460,17 @@ fn apply(
         }
         Message::Delete { uid, .. } => {
             metrics.deletes.fetch_add(1, Ordering::Relaxed);
-            let before = store.remove(&uid).map(Box::new);
+            let before = Box::new(store.remove(&uid)?);
             Some(Change {
                 op: Op::Deleted,
                 uid,
-                before,
+                before: Some(before),
             })
         }
         Message::Settled { kind, listed } => {
-            let entry = settled.entry(kind).or_insert((0, false));
+            let entry = settled.entry(kind).or_insert((0, true));
             entry.0 += 1;
-            entry.1 |= listed;
+            entry.1 &= listed;
             None
         }
         Message::Desync { kind, reason } => {

@@ -98,6 +98,14 @@ pub struct DockSizes {
 }
 
 impl DockSizes {
+    /// What the open docks actually get, given what they asked for. This
+    /// budgets the centre and nothing else: the sides are scaled together when
+    /// they would leave less than [`MIN_CENTER_WIDTH`] between them, and the
+    /// bottom is capped at what the vertical chrome leaves. [`MIN_DOCK_SIZE`]
+    /// and [`MAX_DOCK_SIZE`] are deliberately not applied here -- they bound
+    /// what a person can *ask* for, so the drag path and the settings loader
+    /// own them, and a window too small to honour a legal request is still the
+    /// centre's to win.
     pub fn resolve(
         viewport: Viewport,
         requested: DockSizes,

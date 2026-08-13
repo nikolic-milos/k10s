@@ -120,11 +120,7 @@ impl TableState {
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                needle.is_empty()
-                    || row
-                        .cells
-                        .iter()
-                        .any(|cell| cell.to_lowercase().contains(&needle))
+                needle.is_empty() || row.cells.iter().any(|cell| contains_folded(cell, &needle))
             })
             .map(|(index, _)| index)
             .collect();
@@ -231,6 +227,25 @@ impl TableState {
             })
             .collect()
     }
+}
+
+// Whether a cell holds an already-lowercased needle, ignoring case. A filter
+// keystroke asks this of every cell of every row -- five thousand of them at
+// the cap -- so the ASCII answer, which is nearly every cell a cluster has,
+// is given without lowercasing a copy of the cell to throw away. A needle that
+// is not ASCII cannot be inside a cell that is.
+fn contains_folded(cell: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if cell.is_ascii() {
+        return needle.is_ascii()
+            && cell
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()));
+    }
+    cell.to_lowercase().contains(needle)
 }
 
 fn format_cells(cells: &[String], widths: &[usize]) -> String {
@@ -347,6 +362,39 @@ mod tests {
             "u2",
             "clearing the filter keeps the row"
         );
+    }
+
+    #[test]
+    fn the_filter_folds_case_on_both_sides_of_the_ascii_split() {
+        let mut table = TableState::new();
+        table.set_viewport(10);
+        table.set_page(page(&[
+            ("u1", &["BackOff", "0/1"]),
+            ("u2", &["Ärger-api", "1/1"]),
+            ("u3", &["quiet", "1/1"]),
+        ]));
+
+        table.push_filter("backoff");
+        assert_eq!(table.visible_rows(), 1, "an ASCII cell folds its own case");
+        assert_eq!(table.selected_row().unwrap().uid, "u1");
+
+        table.clear_filter();
+        table.push_filter("ärger");
+        assert_eq!(
+            table.visible_rows(),
+            1,
+            "and a cell that is not ASCII still folds"
+        );
+        assert_eq!(table.selected_row().unwrap().uid, "u2");
+
+        table.clear_filter();
+        table.push_filter("ä");
+        assert_eq!(
+            table.visible_rows(),
+            1,
+            "a needle that is not ASCII matches only the row that has it"
+        );
+        assert_eq!(table.selected_row().unwrap().uid, "u2");
     }
 
     #[test]

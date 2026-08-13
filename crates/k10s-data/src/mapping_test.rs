@@ -123,7 +123,7 @@ fn an_init_container_failure_beats_the_pod_phase() {
     assert_eq!(
         r.severity,
         Severity::Err,
-        "a reason with no compiled-in id must still rate as an error"
+        "a compiled-in Err reason on an init container outranks a Pending phase"
     );
 }
 
@@ -362,6 +362,32 @@ fn a_pod_spec_yields_every_attachment_it_names_once() {
         1
     );
     assert_eq!(names.len(), 8, "no phantom references: {names:?}");
+}
+
+#[test]
+fn a_debug_container_names_the_secrets_it_reads_like_any_other() {
+    let spec: PodSpec = serde_json::from_value(serde_json::json!({
+        "containers": [{"name": "app"}],
+        "ephemeralContainers": [{
+            "name": "debugger",
+            "envFrom": [{"secretRef": {"name": "debug-secret"}}],
+            "env": [
+                {"name": "CFG", "valueFrom": {"configMapKeyRef": {"name": "debug-config", "key": "k"}}}
+            ]
+        }]
+    }))
+    .expect("a pod spec with an ephemeral container");
+
+    let refs = attachment_refs(&spec, &AttachKinds::default());
+    let names: Vec<(KindId, &str)> = refs.iter().map(|r| (r.kind, &*r.name)).collect();
+    assert_eq!(
+        names,
+        [
+            (KindId::SECRET, "debug-secret"),
+            (KindId::CONFIG_MAP, "debug-config")
+        ],
+        "an ephemeral container reaches the same objects the graph must draw"
+    );
 }
 
 #[test]

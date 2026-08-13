@@ -381,6 +381,39 @@ fn held_writes_land_in_whatever_order_the_test_chooses() {
     );
 }
 
+// The mask a new file is created under is read from the kernel rather than
+// sampled by setting it to zero and back, because that window is process-wide.
+#[cfg(unix)]
+#[test]
+fn the_umask_is_read_out_of_the_process_status() {
+    assert_eq!(
+        umask_in_status("Name:\tk10s\nUmask:\t0022\nState:\tR (running)\n"),
+        Some(0o022)
+    );
+    assert_eq!(umask_in_status("Umask:\t0077\n"), Some(0o077));
+    assert_eq!(
+        umask_in_status("Name:\tk10s\nState:\tR (running)\n"),
+        None,
+        "a kernel that does not publish it answers nothing"
+    );
+    assert_eq!(
+        umask_in_status("Umask:\t0o22\n"),
+        None,
+        "and so does a line that is not an octal mask"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_umask_matches_what_this_kernel_reports() {
+    let status = std::fs::read_to_string("/proc/self/status").expect("a process status");
+    assert_eq!(
+        umask_in_status(&status),
+        Some(current_umask()),
+        "the sampled mask has to be the one the kernel published"
+    );
+}
+
 #[test]
 fn a_missing_file_is_an_error_not_a_panic() {
     let fs = FakeFs::default();

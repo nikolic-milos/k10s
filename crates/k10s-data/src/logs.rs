@@ -3,9 +3,11 @@
 //! A follow is a task on the data plane's runtime reading the pod's log
 //! stream line by line and handing each line to a callback the caller
 //! supplied; the render thread never blocks on the cluster. The feed is
-//! bounded by construction -- a line is capped in bytes here and retention is
-//! the consumer's ring -- and every terminal state arrives as a labelled
-//! chunk (`Ended`, `Denied`, `Failed`), never as silence. Dropping the
+//! bounded by construction -- a line is capped in bytes while it is read, so
+//! a stream that never sends a newline cannot grow a buffer here, and
+//! retention is the consumer's ring -- and every terminal state arrives as a
+//! labelled chunk (`Ended`, `Denied`, `Failed`), never as silence. Bytes that
+//! are not UTF-8 are replaced rather than ending the feed. Dropping the
 //! returned [`LogStop`] cancels the task at the next await point, including
 //! while the connection is still being opened.
 //!
@@ -102,7 +104,7 @@ pub(crate) fn follow(
                 return;
             }
         };
-        let mut line = String::new();
+        let mut line: Vec<u8> = Vec::new();
         loop {
             line.clear();
             let read = tokio::select! {
@@ -110,7 +112,7 @@ pub(crate) fn follow(
                     on_chunk(LogChunk::Ended { why: "stopped" });
                     return;
                 }
-                read = reader.read_line(&mut line) => read,
+                read = read_capped_line(&mut reader, &mut line) => read,
             };
             match read {
                 Ok(0) => {
@@ -120,15 +122,20 @@ pub(crate) fn follow(
                     return;
                 }
                 Ok(_) => {
-                    while line.ends_with('\n') || line.ends_with('\r') {
+                    while line
+                        .last()
+                        .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+                    {
                         line.pop();
                     }
-                    on_chunk(LogChunk::Lines(vec![capped(&line)]));
+                    on_chunk(LogChunk::Lines(vec![capped(&String::from_utf8_lossy(
+                        &line,
+                    ))]));
                 }
                 Err(error) => {
                     on_chunk(LogChunk::Failed {
                         what: "logs",
-                        why: error.to_string(),
+                        why: crate::connect::describe(&error as &dyn std::error::Error),
                     });
                     return;
                 }
@@ -140,7 +147,34 @@ pub(crate) fn follow(
     }
 }
 
-fn capped(line: &str) -> String {
+/// Reads to the next newline, keeping at most one byte more than the display
+/// cap and discarding the rest of an over-long line as it arrives: the buffer
+/// is bounded here, not by whatever the pod chose to send.
+async fn read_capped_line<R>(reader: &mut R, line: &mut Vec<u8>) -> std::io::Result<usize>
+where
+    R: futures::AsyncBufRead + Unpin,
+{
+    let mut read = 0usize;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read);
+        }
+        let (used, ended) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(at) => (at + 1, true),
+            None => (available.len(), false),
+        };
+        let room = (MAX_LINE_BYTES + 1).saturating_sub(line.len());
+        line.extend_from_slice(&available[..used.min(room)]);
+        reader.consume_unpin(used);
+        read += used;
+        if ended {
+            return Ok(read);
+        }
+    }
+}
+
+pub(crate) fn capped(line: &str) -> String {
     if line.len() <= MAX_LINE_BYTES {
         return line.to_string();
     }
@@ -323,7 +357,12 @@ pub(crate) fn selector_string(workload: &serde_json::Value) -> Result<String, &'
         let mut keys: Vec<&String> = labels.keys().collect();
         keys.sort();
         for key in keys {
-            let value = labels[key].as_str().unwrap_or_default();
+            let Some(value) = labels[key].as_str() else {
+                return Err(
+                    "this workload's selector holds a label value that is not text, so \
+                            the pods it means cannot be named",
+                );
+            };
             parts.push(format!("{key}={value}"));
         }
     }
@@ -411,6 +450,113 @@ pub(crate) async fn fetch_containers(
 mod tests {
     use super::*;
 
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A stream that hands out at most `chunk` bytes per fill, the way a
+    /// kubelet hands out whatever arrived: a line spans several fills, and a
+    /// line without a newline never finishes one.
+    struct Chunks {
+        data: Vec<u8>,
+        at: usize,
+        chunk: usize,
+    }
+
+    impl futures::AsyncRead for Chunks {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let end = (this.at + this.chunk.min(buf.len())).min(this.data.len());
+            let taken = end - this.at;
+            buf[..taken].copy_from_slice(&this.data[this.at..end]);
+            this.at = end;
+            Poll::Ready(Ok(taken))
+        }
+    }
+
+    impl futures::AsyncBufRead for Chunks {
+        fn poll_fill_buf(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::io::Result<&[u8]>> {
+            let this = self.get_mut();
+            let end = (this.at + this.chunk).min(this.data.len());
+            Poll::Ready(Ok(&this.data[this.at..end]))
+        }
+
+        fn consume(self: Pin<&mut Self>, amount: usize) {
+            self.get_mut().at += amount;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_is_bounded_while_it_is_read_not_after_it_arrives() {
+        let mut source = Chunks {
+            data: {
+                let mut data = "x".repeat(MAX_LINE_BYTES * 64).into_bytes();
+                data.push(b'\n');
+                data.extend_from_slice(b"after\n");
+                data
+            },
+            at: 0,
+            chunk: 997,
+        };
+        let mut line = Vec::new();
+        let read = read_capped_line(&mut source, &mut line)
+            .await
+            .expect("the fixture reads");
+        assert_eq!(
+            read,
+            MAX_LINE_BYTES * 64 + 1,
+            "the whole over-long line is consumed from the stream"
+        );
+        assert_eq!(
+            line.len(),
+            MAX_LINE_BYTES + 1,
+            "but only the cap plus the byte that proves it overflowed is buffered"
+        );
+
+        line.clear();
+        let read = read_capped_line(&mut source, &mut line)
+            .await
+            .expect("the fixture reads");
+        assert_eq!(read, 6, "the reader resumes at the line after the huge one");
+        assert_eq!(
+            line, b"after\n",
+            "a short line arrives whole, newline and all"
+        );
+
+        line.clear();
+        assert_eq!(
+            read_capped_line(&mut source, &mut line)
+                .await
+                .expect("the fixture reads"),
+            0,
+            "the end of the stream reads zero bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_never_sends_a_newline_still_stops_at_the_cap() {
+        let mut source = Chunks {
+            data: "y".repeat(MAX_LINE_BYTES * 16).into_bytes(),
+            at: 0,
+            chunk: 4096,
+        };
+        let mut line = Vec::new();
+        read_capped_line(&mut source, &mut line)
+            .await
+            .expect("the fixture reads");
+        assert_eq!(line.len(), MAX_LINE_BYTES + 1);
+        assert!(
+            capped(&String::from_utf8_lossy(&line)).ends_with('\u{2026}'),
+            "the line the feed shows says it was cut"
+        );
+    }
+
     #[test]
     fn a_line_is_capped_at_a_char_boundary_not_mid_codepoint() {
         assert_eq!(capped("short"), "short");
@@ -449,6 +595,11 @@ mod tests {
             }))
             .is_err(),
             "an untranslatable operator refuses rather than guesses"
+        );
+        assert!(
+            selector(serde_json::json!({"matchLabels": {"replicas": 3}})).is_err(),
+            "and so does a label value that is not text, rather than following a \
+             `replicas=` selector to whatever it matches"
         );
         assert!(
             selector(serde_json::json!({})).is_err(),

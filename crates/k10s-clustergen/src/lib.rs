@@ -55,24 +55,27 @@ impl Scenario {
 #[derive(Debug, Clone, Copy)]
 pub struct GenConfig {
     pub seed: u64,
+    /// The object budget, a band rather than an equality: generation stops on
+    /// the first workload that crosses it, so a cluster overshoots by at most
+    /// one workload and its children.
     pub target_objects: u32,
     pub scenario: Scenario,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PodSpec {
     pub name: String,
     pub state: State,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SatSpec {
     pub name: String,
     pub kind: KindId,
     pub detail: Arc<str>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkloadSpec {
     pub name: String,
     pub kind: KindId,
@@ -82,13 +85,13 @@ pub struct WorkloadSpec {
     pub deps: Vec<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NsSpec {
     pub name: String,
     pub workloads: Vec<WorkloadSpec>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ClusterSpec {
     pub namespaces: Vec<NsSpec>,
     pub cross_deps: Vec<(u32, u32)>,
