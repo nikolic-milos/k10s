@@ -30,9 +30,9 @@ use crate::ui::{
 };
 use crate::workspace::Workspace;
 use crate::{
-    ChooseCluster, FindCluster, OpenBrowser, OpenForwards, OpenNodes, OpenPalette, OpenReleases,
-    OpenSettings, Quit, ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock,
-    ToggleTerminal,
+    ChooseCluster, FindCluster, LoadSavedView, OpenBrowser, OpenForwards, OpenNodes, OpenPalette,
+    OpenReleases, OpenSettings, Quit, ToggleBottomDock, ToggleInspector, ToggleLeftDock,
+    ToggleRightDock, ToggleTerminal,
 };
 
 pub(crate) use crate::dock::DockEdge;
@@ -862,18 +862,19 @@ impl Workspace {
                     .aria_label("Application menu")
                     .child(entry(0, "Command Palette…", Box::new(OpenPalette)))
                     .child(entry(1, "Choose Cluster…", Box::new(ChooseCluster)))
+                    .child(entry(2, "Load Saved View…", Box::new(LoadSavedView)))
                     .child(separator())
-                    .child(entry(2, "Browse Resources", Box::new(OpenBrowser)))
-                    .child(entry(3, "Node Capacity", Box::new(OpenNodes)))
-                    .child(entry(4, "Port Forwards", Box::new(OpenForwards)))
-                    .child(entry(5, "Helm Releases", Box::new(OpenReleases)))
-                    .child(entry(6, "Terminal", Box::new(ToggleTerminal)))
+                    .child(entry(3, "Browse Resources", Box::new(OpenBrowser)))
+                    .child(entry(4, "Node Capacity", Box::new(OpenNodes)))
+                    .child(entry(5, "Port Forwards", Box::new(OpenForwards)))
+                    .child(entry(6, "Helm Releases", Box::new(OpenReleases)))
+                    .child(entry(7, "Terminal", Box::new(ToggleTerminal)))
                     .child(separator())
-                    .child(entry(7, "Toggle Left Dock", Box::new(ToggleLeftDock)))
-                    .child(entry(8, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
-                    .child(entry(9, "Toggle Inspector", Box::new(ToggleRightDock)))
+                    .child(entry(8, "Toggle Left Dock", Box::new(ToggleLeftDock)))
+                    .child(entry(9, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
+                    .child(entry(10, "Toggle Inspector", Box::new(ToggleRightDock)))
                     .child(separator())
-                    .child(entry(10, "Quit", Box::new(Quit))),
+                    .child(entry(11, "Quit", Box::new(Quit))),
             )
     }
 

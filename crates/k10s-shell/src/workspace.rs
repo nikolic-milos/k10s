@@ -58,6 +58,7 @@ pub(crate) enum PickerPurpose {
     Open,
     Save(gpui::WeakEntity<EditorView>),
     Kubeconfig,
+    SavedView,
 }
 
 pub struct Workspace {
@@ -343,6 +344,56 @@ impl Workspace {
         self.refresh_overlay(cx);
     }
 
+    /// Overlay through [`SavedView::overlay_kind`], camera through the same
+    /// fly-to a click uses. Parse already refused secrets; this is the apply
+    /// half, and it must not teleport.
+    pub(crate) fn apply_saved_view(
+        &mut self,
+        view: crate::saved_views::SavedView,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_overlay_kind(view.overlay_kind(), cx);
+        let target = view.camera_target();
+        self.map.update(cx, |map, cx| {
+            map.fly_to(target, k10s_atlas::Motion::reduced_when(cx.reduce_motion()));
+            cx.notify();
+        });
+        self.status_note = Some(format!("loaded view {}", view.name));
+        cx.notify();
+    }
+
+    pub(crate) fn load_saved_view(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match self.fs.read_to_string(&path) {
+            Ok(text) => match crate::saved_views::parse_view(&text) {
+                Ok(view) => self.apply_saved_view(view, cx),
+                Err(error) => {
+                    self.status_note = Some(error.to_string());
+                    cx.notify();
+                }
+            },
+            Err(error) => {
+                self.status_note = Some(format!("saved view could not be read: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn open_saved_view_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.status_note = None;
+        let seed = self
+            .config
+            .as_ref()
+            .and_then(|paths| paths.settings.parent().map(PathBuf::from))
+            .unwrap_or_else(|| seed_dir(self.files_root.as_deref()));
+        self.open_picker(
+            seed,
+            PickerMode::OpenFile,
+            PickerPurpose::SavedView,
+            window,
+            cx,
+        );
+    }
+
     pub(crate) fn refresh_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay_generation += 1;
         let Some(kind) = self.overlay_kind else {
@@ -496,6 +547,7 @@ impl Workspace {
                             }
                         },
                         PickerPurpose::Kubeconfig => this.scan_kubeconfig(path, cx),
+                        PickerPurpose::SavedView => this.load_saved_view(path, cx),
                         PickerPurpose::Open => this.open_path(path, window, cx),
                     }
                 }

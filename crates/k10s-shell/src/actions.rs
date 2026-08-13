@@ -118,6 +118,7 @@ actions!(
         NewFile,
         FindFile,
         FindCluster,
+        LoadSavedView,
         OpenSettings,
         OpenKeymap,
         PickParent,

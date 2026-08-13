@@ -22,10 +22,10 @@ use crate::ui::{ACTIVITY_BAR_WIDTH, DockSizes, MODAL_TOP, STATUS_BAR_HEIGHT, key
 use crate::workspace::{PickerPurpose, Workspace};
 use crate::{
     AttachSelection, ChooseCluster, ClearSelection, CloseItem, DescribeSelection, EditSelection,
-    ExecSelection, FindCluster, FindFile, LogsSelection, NewFile, NextItem, OpenBrowser, OpenFile,
-    OpenFolder, OpenForwards, OpenKeymap, OpenNodes, OpenPalette, OpenReleases, OpenSettings,
-    PrevItem, Quit, ShowStarmap, ToggleBottomDock, ToggleInspector, ToggleLeftDock,
-    ToggleRightDock, ToggleTerminal,
+    ExecSelection, FindCluster, FindFile, LoadSavedView, LogsSelection, NewFile, NextItem,
+    OpenBrowser, OpenFile, OpenFolder, OpenForwards, OpenKeymap, OpenNodes, OpenPalette,
+    OpenReleases, OpenSettings, PrevItem, Quit, ShowStarmap, ToggleBottomDock, ToggleInspector,
+    ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
 
 impl Render for Workspace {
@@ -393,6 +393,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.status_note = None;
                 this.new_file(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &LoadSavedView, window, cx| {
+                this.open_saved_view_picker(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_config(ConfigFile::Settings, window, cx);
