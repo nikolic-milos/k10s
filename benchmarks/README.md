@@ -44,6 +44,13 @@ Run the nine commands in [the performance workflow](../.github/workflows/perform
 produce that directory. The full-paint benchmark is an isolated workspace because GPUI's
 `test-support` feature substantially expands the dependency graph.
 
+Those nine suites are not the running application. The one measurement that is the app is
+the scripted flight (`k10s --bench`) and process start to first useful photon
+(`k10s --startup-bench`). Neither has a committed baseline or a comparator suite entry.
+`benchmarks/check-flight-gate.sh` is the labelled-host check for that gate. It does not
+record a baseline. Do not refresh the headless numbers to stand in for it. Do not run
+`--run` on a desktop session you care about; the flight opens a real window.
+
 Do not refresh a baseline to make a regression pass. Update one only after explaining the expected
 structural or performance change, recording every suite on the labelled host under the manifest's
 frequency policy, and reviewing the old/new case-level deltas. Keep the old profile directory when
