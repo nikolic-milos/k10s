@@ -723,7 +723,7 @@ impl MapView {
 
     #[cfg(feature = "testing")]
     pub fn testing_set_camera(&mut self, camera: Camera) {
-        self.camera = camera;
+        self.camera = camera.clamped();
         self.fitted = true;
         self.interacted = true;
         self.stage = StageMachine::new(0.0);
@@ -885,6 +885,11 @@ impl Render for MapView {
         if advance_flight(&mut self.fly, &mut self.camera, dt) {
             self.pacer.request_frame();
         }
+        // Once per frame, not inside `w2s`: that call is per entity on the
+        // walk the budgets measure, and a public zoom of zero or NaN has to
+        // be repaired before LOD and paint divide by it, not a million times
+        // during them.
+        self.camera = self.camera.clamped();
         let blend = self.stage.update(lod(), self.camera.zoom, dt);
         if self.stage.animating() {
             self.pacer.request_frame();
