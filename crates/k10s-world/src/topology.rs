@@ -11,8 +11,8 @@ use k10s_core::layout::{
     SAT_RING0_GAP, SAT_SIZE, WL_GAP, WL_HEADER, WL_PAD,
 };
 use k10s_core::{
-    EdgeInst, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent, Severity, SlotIds, State,
-    ToolId,
+    EdgeInst, Endpoint, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent, Severity, SlotIds,
+    State, ToolId,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 
@@ -22,6 +22,11 @@ use crate::{
 };
 
 const NO_SLOT: u32 = u32::MAX;
+/// Extra sat→cell (and Ingress→Service) edges per namespace. Without a cap a
+/// Service selecting every pod in a 50k scene would grow `edges` with the
+/// scene; the depends_on block-block set stays unbounded because it is already
+/// sparse.
+pub(super) const EXTRA_EDGES_PER_NS: usize = 64;
 const DEAD_RECT: Rect = Rect {
     x: f32::MAX,
     y: f32::MAX,
@@ -771,6 +776,9 @@ fn upsert_pod(
     if inserted || moved {
         dirt.wl_pod = true;
         topology.pod_rects[index] = place_pod(topology, slot, workload, mode);
+        if parent_has_link_sats(topology, workload) {
+            dirt.edges = true;
+        }
     }
     if inserted {
         dirt.identity = true;
@@ -830,6 +838,9 @@ fn upsert_satellite(
         dirt.wls.push(workload);
         dirt.nss.push(topology.wl_ns[workload as usize]);
         topology.sat_rects[index] = place_satellite(topology, slot, workload);
+        if extra_edge_kind(kind) {
+            dirt.edges = true;
+        }
     }
 }
 
@@ -940,6 +951,9 @@ fn remove_pod(
             dirt.wls.push(workload);
             dirt.nss.push(namespace as u32);
             dirt.grids.push(workload);
+            if parent_has_link_sats(topology, workload) {
+                dirt.edges = true;
+            }
         }
         aggregates.pod_state[index] = State::OK;
         topology.pod_labels[index] = Arc::from("");
@@ -961,6 +975,9 @@ fn remove_satellite(topology: &mut Topology, dirt: &mut BatchDirt, uid: &str) {
         // fitted nothing, and the halo kept the departed satellite's extent
         // forever, which kept the region at its old size too.
         let workload = topology.sat_wl[index];
+        if extra_edge_kind(topology.sat_kinds[index]) {
+            dirt.edges = true;
+        }
         if topology.wl_slots.is_active(workload as usize) {
             dirt.wls.push(workload);
             dirt.nss.push(topology.wl_ns[workload as usize]);
@@ -994,7 +1011,7 @@ fn ensure_pod_aggregates(aggregates: &mut Aggregates, len: usize) {
     }
 }
 
-fn rebuild_edges(topology: &mut Topology) {
+pub(super) fn rebuild_edges(topology: &mut Topology) {
     let mut local = vec![Vec::new(); topology.ns_slots.slots()];
     let mut cross = Vec::new();
     for source in 0..topology.wl_slots.slots() {
@@ -1014,6 +1031,7 @@ fn rebuild_edges(topology: &mut Topology) {
             }
         }
     }
+    push_extra_edges(topology, &mut local);
 
     topology.edges.clear();
     topology.ns_edge_range.clear();
@@ -1027,6 +1045,75 @@ fn rebuild_edges(topology: &mut Topology) {
     let start = topology.edges.len() as u32;
     topology.edges.extend(cross);
     topology.cross_edge_range = start..topology.edges.len() as u32;
+}
+
+fn extra_edge_kind(kind: KindId) -> bool {
+    kind == KindId::SERVICE || kind == KindId::VOLUME || kind == KindId::INGRESS
+}
+
+fn parent_has_link_sats(topology: &Topology, workload: u32) -> bool {
+    children(
+        &topology.wl_sat_range,
+        &topology.block_sats,
+        workload as usize,
+    )
+    .into_iter()
+    .any(|sat| extra_edge_kind(topology.sat_kinds[sat]))
+}
+
+/// Service/PVC satellites already sit on the workload assemble chose via
+/// selector or volume refs. Payload dropped those maps, so extra edges follow
+/// that parent: Service/PVC → its workload's pods, Ingress → sibling Services.
+/// Counted against `EXTRA_EDGES_PER_NS` so a 50k scene stays bounded.
+fn push_extra_edges(topology: &Topology, local: &mut [Vec<EdgeInst>]) {
+    let mut extra_used = vec![0usize; local.len()];
+    for sat in 0..topology.sat_slots.slots() {
+        if !topology.sat_slots.is_active(sat) {
+            continue;
+        }
+        let kind = topology.sat_kinds[sat];
+        if !extra_edge_kind(kind) {
+            continue;
+        }
+        let workload = topology.sat_wl[sat] as usize;
+        if !topology.wl_slots.is_active(workload) {
+            continue;
+        }
+        let namespace = topology.wl_ns[workload] as usize;
+        if namespace >= extra_used.len() || extra_used[namespace] >= EXTRA_EDGES_PER_NS {
+            continue;
+        }
+        if kind == KindId::INGRESS {
+            for other in children(&topology.wl_sat_range, &topology.block_sats, workload) {
+                if extra_used[namespace] >= EXTRA_EDGES_PER_NS {
+                    break;
+                }
+                if other != sat
+                    && topology.sat_slots.is_active(other)
+                    && topology.sat_kinds[other] == KindId::SERVICE
+                {
+                    local[namespace].push(EdgeInst {
+                        a: Endpoint::sat(sat as u32),
+                        b: Endpoint::sat(other as u32),
+                    });
+                    extra_used[namespace] += 1;
+                }
+            }
+            continue;
+        }
+        for pod in children(&topology.wl_pod_range, &topology.block_cells, workload) {
+            if extra_used[namespace] >= EXTRA_EDGES_PER_NS {
+                break;
+            }
+            if topology.pod_slots.is_active(pod) {
+                local[namespace].push(EdgeInst {
+                    a: Endpoint::sat(sat as u32),
+                    b: Endpoint::cell(pod as u32),
+                });
+                extra_used[namespace] += 1;
+            }
+        }
+    }
 }
 
 fn rebuild_aggregates(topology: &Topology, aggregates: &mut Aggregates) {
