@@ -257,6 +257,12 @@ mod tests {
             "icons/file_tree.svg",
             "icons/terminal_alt.svg",
             "icons/info.svg",
+            "icons/star.svg",
+            "icons/server.svg",
+            "icons/magnifying_glass.svg",
+            "icons/box.svg",
+            "icons/forward_arrow.svg",
+            "icons/settings.svg",
         ] {
             assert!(
                 Assets.load(icon).expect("loads").is_some(),

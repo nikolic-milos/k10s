@@ -20,23 +20,28 @@ use std::sync::Arc;
 use gpui::{App, AppContext as _, Context, Entity, FocusHandle, Subscription, Window};
 
 use k10s_core::Level;
-use k10s_map::{MapView, Picked};
+use k10s_map::{MapView, OverlayFrame, OverlayKind, Picked};
 
 use crate::dock::Dock;
 use crate::editor::{self, EditorView};
-use crate::finder::{FileFinderView, FinderEvent, PathPickerView, PickerEvent, PickerMode};
+use crate::finder::{
+    ClusterFinderEvent, ClusterFinderView, FileFinderView, FinderEvent, PathPickerView,
+    PickerEvent, PickerMode,
+};
 use crate::fs;
 use crate::hosting::Tab;
 use crate::launch::LaunchView;
 use crate::modal::ModalSlot;
+use crate::overlay::{self, next_overlay};
 use crate::palette::{PaletteEvent, PaletteView};
 use crate::pane::Pane;
 use crate::provider::{
-    Detail, LaunchProvider, LogStop, NullLaunchProvider, ProviderSlot, ReadProvider, UsageOutcome,
+    Detail, LaunchProvider, LogStop, NullLaunchProvider, OverlayOutcome, PostureOutcome,
+    ProviderSlot, ReadProvider, UsageOutcome,
 };
 use crate::selection::Selection;
 use crate::tag::ItemTag;
-use crate::ui::{DockSizes, Viewport};
+use crate::ui::Viewport;
 
 /// Where the user's config files live; the app resolves the platform paths and
 /// the workspace only opens what it is handed.
@@ -80,6 +85,7 @@ pub struct Workspace {
     pub(crate) picker: ModalSlot<PathPickerView>,
     pub(crate) picker_purpose: PickerPurpose,
     pub(crate) finder: ModalSlot<FileFinderView>,
+    pub(crate) cluster_finder: ModalSlot<ClusterFinderView>,
     pub(crate) scratch_counter: usize,
     pub(crate) status_note: Option<String>,
     pub(crate) connected: bool,
@@ -99,9 +105,11 @@ pub struct Workspace {
     // inspector stops showing it.
     pub(crate) usage: Option<UsageOutcome>,
     pub(crate) usage_stop: Option<LogStop>,
+    pub(crate) posture: Option<PostureOutcome>,
+    pub(crate) overlay_kind: Option<OverlayKind>,
+    pub(crate) overlay_generation: u64,
     pub(crate) fetch_generation: u64,
     pub(crate) viewport: Viewport,
-    pub(crate) dock_size_override: Option<DockSizes>,
     _pick_subscription: Subscription,
 }
 
@@ -155,6 +163,7 @@ impl Workspace {
             picker: ModalSlot::default(),
             picker_purpose: PickerPurpose::Open,
             finder: ModalSlot::default(),
+            cluster_finder: ModalSlot::default(),
             scratch_counter: 0,
             status_note: None,
             connected,
@@ -167,12 +176,14 @@ impl Workspace {
             log: None,
             usage: None,
             usage_stop: None,
+            posture: None,
+            overlay_kind: None,
+            overlay_generation: 0,
             fetch_generation: 0,
             viewport: Viewport {
                 width: 1600.0,
                 height: 1000.0,
             },
-            dock_size_override: None,
             _pick_subscription: pick_subscription,
         }
     }
@@ -191,6 +202,7 @@ impl Workspace {
         self.fetch_generation += 1;
         self.events = None;
         self.log = None;
+        self.posture = None;
         self.sync_usage_poll(cx);
         if !self.connected {
             return;
@@ -229,6 +241,30 @@ impl Workspace {
                 }),
             );
             self.land_detail(rx, generation, |this, detail| this.log = Some(detail), cx);
+        }
+
+        if wants_log {
+            let namespace = namespace.to_string();
+            let name = selection.name.to_string();
+            let (tx, rx) = futures::channel::oneshot::channel();
+            self.slot.fetch_pod_posture(
+                &namespace,
+                &name,
+                Box::new(move |outcome| {
+                    let _ = tx.send(outcome);
+                }),
+            );
+            cx.spawn(async move |this, cx| {
+                if let Ok(outcome) = rx.await {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.fetch_generation == generation {
+                            this.posture = Some(outcome);
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .detach();
         }
     }
 
@@ -298,6 +334,103 @@ impl Workspace {
         .detach();
     }
 
+    pub(crate) fn cycle_overlay(&mut self, cx: &mut Context<Self>) {
+        self.set_overlay_kind(next_overlay(self.overlay_kind), cx);
+    }
+
+    pub(crate) fn set_overlay_kind(&mut self, kind: Option<OverlayKind>, cx: &mut Context<Self>) {
+        self.overlay_kind = kind;
+        self.refresh_overlay(cx);
+    }
+
+    pub(crate) fn refresh_overlay(&mut self, cx: &mut Context<Self>) {
+        self.overlay_generation += 1;
+        let Some(kind) = self.overlay_kind else {
+            self.map
+                .update(cx, |map, cx| map.set_overlay(OverlayFrame::default(), cx));
+            cx.notify();
+            return;
+        };
+        if !self.connected {
+            self.map.update(cx, |map, cx| {
+                map.set_overlay(
+                    OverlayFrame {
+                        kind: Some(kind),
+                        marks: Vec::new(),
+                    },
+                    cx,
+                );
+            });
+            self.status_note = Some(format!(
+                "{} overlay needs a cluster",
+                kind.badge().to_ascii_lowercase()
+            ));
+            cx.notify();
+            return;
+        }
+        let generation = self.overlay_generation;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.slot.fetch_overlay(
+            kind,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        cx.spawn(async move |this, cx| {
+            if let Ok(outcome) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.overlay_generation == generation {
+                        this.apply_overlay(kind, outcome, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn apply_overlay(
+        &mut self,
+        kind: OverlayKind,
+        outcome: OverlayOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.map.read(cx).snapshot();
+        let (frame, note) = match outcome {
+            OverlayOutcome::Ready {
+                stamps,
+                note,
+                truncated,
+            } => {
+                let frame = overlay::resolve_frame(kind, &stamps, &snapshot);
+                let note = if truncated && note.is_none() {
+                    Some("overlay truncated; not every object was stamped".to_string())
+                } else {
+                    note
+                };
+                (frame, note)
+            }
+            OverlayOutcome::Denied(what) => (
+                OverlayFrame {
+                    kind: Some(kind),
+                    marks: Vec::new(),
+                },
+                Some(format!("{what}: access denied for this account")),
+            ),
+            OverlayOutcome::Failed(why) => (
+                OverlayFrame {
+                    kind: Some(kind),
+                    marks: Vec::new(),
+                },
+                Some(why),
+            ),
+        };
+        self.map.update(cx, |map, cx| map.set_overlay(frame, cx));
+        if let Some(note) = note {
+            self.status_note = Some(note);
+        }
+        cx.notify();
+    }
+
     pub fn map_focus_handle(&self, cx: &App) -> FocusHandle {
         self.map.read(cx).focus_handle()
     }
@@ -335,6 +468,7 @@ impl Workspace {
         // handle this records is the one from before any of them opened.
         self.close_palette(window, cx);
         self.close_finder(window, cx);
+        self.close_cluster_finder(window, cx);
         self.close_picker(window, cx);
         self.picker_purpose = purpose;
         let fs = self.fs.clone();
@@ -391,6 +525,7 @@ impl Workspace {
         self.close_palette(window, cx);
         self.close_picker(window, cx);
         self.close_finder(window, cx);
+        self.close_cluster_finder(window, cx);
         let fs = self.fs.clone();
         let view = cx.new(|cx| FileFinderView::new(fs, root, cx));
         let subscription = cx.subscribe_in(
@@ -406,6 +541,43 @@ impl Workspace {
             },
         );
         self.finder.open(view, subscription, window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_cluster_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cluster_finder.close(window, cx) {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn open_cluster_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench {
+            return;
+        }
+        self.close_palette(window, cx);
+        self.close_picker(window, cx);
+        self.close_finder(window, cx);
+        self.close_cluster_finder(window, cx);
+        let snapshot = self.map.read(cx).snapshot();
+        let map = self.map.clone();
+        let view = cx.new(|cx| ClusterFinderView::new(map, snapshot, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &ClusterFinderEvent, window, cx| match event {
+                ClusterFinderEvent::Dismissed => this.close_cluster_finder(window, cx),
+                ClusterFinderEvent::Confirmed(uid) => {
+                    let uid = uid.clone();
+                    this.close_cluster_finder(window, cx);
+                    let found = this.map.update(cx, |map, cx| map.reveal(&uid, window, cx));
+                    if !found {
+                        this.status_note = Some("that object is not on the map".to_string());
+                        cx.notify();
+                    }
+                }
+            },
+        );
+        self.cluster_finder.open(view, subscription, window, cx);
         cx.notify();
     }
 

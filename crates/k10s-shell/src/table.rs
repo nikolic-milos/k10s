@@ -158,6 +158,15 @@ impl TableState {
             .map(|index| &self.page.rows[*index])
     }
 
+    pub fn selected_cell(&self, column: &str) -> Option<&str> {
+        let index = self
+            .page
+            .columns
+            .iter()
+            .position(|candidate| candidate.name == column)?;
+        self.selected_row()?.cells.get(index).map(String::as_str)
+    }
+
     pub fn move_selection(&mut self, delta: i64) {
         if self.visible.is_empty() {
             return;
@@ -339,6 +348,20 @@ mod tests {
             "u2",
             "the row moved, the selection did not"
         );
+    }
+
+    #[test]
+    fn a_selected_cell_is_resolved_by_column_name_after_rows_move() {
+        let mut table = TableState::new();
+        table.set_viewport(10);
+        table.set_page(page(&[
+            ("u1", &["api", "Ready"]),
+            ("u2", &["worker", "NotReady"]),
+        ]));
+        table.move_selection(1);
+
+        assert_eq!(table.selected_cell("Ready"), Some("NotReady"));
+        assert_eq!(table.selected_cell("missing"), None);
     }
 
     #[test]

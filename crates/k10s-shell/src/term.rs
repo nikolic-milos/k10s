@@ -1,29 +1,32 @@
-//! The embedded terminal: an exec session rendered as a cell grid.
+//! The embedded terminal: an exec or attach session rendered as a cell grid.
 //!
 //! The VT machinery is `alacritty_terminal` -- the ROADMAP forbids writing a
 //! parser -- fed raw bytes from an [`ExecSession`] behind the provider seam.
 //! All terminal logic lives in the pure [`TerminalState`] (grid from bytes,
-//! resize, cursor) and the pure [`key_bytes`] input encoding, both tested
-//! with no window and no transport; the gpui view is a thin shell that
-//! paints the visible grid as monospace rows and forwards keystrokes. The
-//! grid keeps no scrollback: what the screen holds is what exists, which is
-//! also its memory bound. The `Terminal` key context captures everything
-//! except the item-management chords (see `keybindings()`), so plain letters
-//! and escape reach the remote shell instead of dispatching commands.
+//! resize, cursor, bounded history) and the pure [`key_bytes`] input encoding,
+//! both tested with no window and no transport; the gpui view is a thin shell
+//! that paints the visible grid as monospace rows and forwards keystrokes.
+//! Cell foreground and background from the grid reach [`StyledText`] as
+//! highlight runs. Scrollback is alacritty's own history, capped at
+//! [`SCROLLBACK`] lines, so a noisy session cannot grow without bound. The
+//! `Terminal` key context captures everything except the item-management
+//! chords (see `keybindings()`), so plain letters and escape reach the remote
+//! shell instead of dispatching commands.
 
 use std::rc::Rc;
 
 use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, point_to_viewport};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 
 use gpui::{
     Context, FocusHandle, FontStyle, FontWeight, HighlightStyle, IntoElement, KeyDownEvent,
-    Keystroke, ParentElement, Render, Role, SharedString, StrikethroughStyle, Styled, StyledText,
-    TextRun, UnderlineStyle, Window, canvas, div, font, prelude::*, px, rgb,
+    Keystroke, ParentElement, Render, Role, ScrollWheelEvent, SharedString, StrikethroughStyle,
+    Styled, StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, prelude::*, px, rgb,
 };
 use k10s_theme::ShellTheme;
 
@@ -31,6 +34,11 @@ use crate::provider::{ExecEvent, ExecRequest, ExecSession, ReadProvider};
 use crate::ui::{
     CONTENT_PADDING, PANEL_FOOTER_HEIGHT, PANEL_HEADER_HEIGHT, Viewport, panel_header,
 };
+
+/// How many lines of history the grid keeps above the visible screen. The
+/// bound is the memory ceiling: a session that prints forever still occupies
+/// a fixed number of cells.
+pub const SCROLLBACK: usize = 5000;
 
 pub struct TerminalState {
     term: Term<VoidListener>,
@@ -91,11 +99,13 @@ impl TerminalStyle {
 
 impl TerminalState {
     pub fn new(cols: u16, rows: u16) -> TerminalState {
+        Self::with_history(cols, rows, SCROLLBACK)
+    }
+
+    fn with_history(cols: u16, rows: u16, scrolling_history: usize) -> TerminalState {
         let (cols, rows) = (cols.max(2), rows.max(2));
         let config = Config {
-            // No scrollback: the visible screen is the whole buffer, and
-            // the whole memory bound.
-            scrolling_history: 0,
+            scrolling_history,
             ..Config::default()
         };
         let size = TermSize::new(cols as usize, rows as usize);
@@ -129,14 +139,14 @@ impl TerminalState {
         (self.cols, self.rows)
     }
 
-    // The visible screen as text rows, trailing blanks trimmed. Colors and
-    // attributes are parsed (they must not corrupt the text) but not yet
-    // carried to the painter; that is stated in the ROADMAP, not hidden.
+    // The visible screen as text rows, trailing blanks trimmed. Used by tests
+    // that only care that bytes became characters; the painter reads
+    // [`TerminalState::styled_lines`], which carries each cell's fg/bg.
     pub fn lines(&self) -> Vec<String> {
         let grid = self.term.grid();
         (0..self.rows as usize)
             .map(|row| {
-                let line = &grid[Line(row as i32)];
+                let line = &grid[self.display_line(row)];
                 let mut text: String = (0..self.cols as usize)
                     .map(|col| {
                         let c = line[Column(col)].c;
@@ -153,17 +163,18 @@ impl TerminalState {
 
     fn styled_lines(&self, shell: &ShellTheme, show_cursor: bool) -> Vec<TerminalLine> {
         let grid = self.term.grid();
-        let cursor = self.cursor();
+        let cursor = point_to_viewport(grid.display_offset(), grid.cursor.point)
+            .map(|point| (point.line, point.column.0));
         (0..self.rows as usize)
             .map(|row| {
-                let line = &grid[Line(row as i32)];
+                let line = &grid[self.display_line(row)];
                 let end = (0..self.cols as usize)
                     .rfind(|column| {
                         let cell = &line[Column(*column)];
                         let style = terminal_style(cell, shell);
                         (!matches!(cell.c, '\0' | ' '))
                             || style.background != shell.terminal_background
-                            || (show_cursor && cursor == (row, *column))
+                            || (show_cursor && cursor == Some((row, *column)))
                     })
                     .map_or(0, |column| column + 1);
                 let mut text = String::with_capacity(end);
@@ -179,7 +190,7 @@ impl TerminalState {
                         text.extend(zerowidth);
                     }
                     let mut style = terminal_style(cell, shell);
-                    if show_cursor && cursor == (row, column) {
+                    if show_cursor && cursor == Some((row, column)) {
                         style.foreground = shell.terminal_background;
                         style.background = shell.cursor;
                     }
@@ -197,10 +208,51 @@ impl TerminalState {
             .collect()
     }
 
+    fn display_line(&self, row: usize) -> Line {
+        Line(row as i32 - self.term.grid().display_offset() as i32)
+    }
+
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    // True when the viewport actually moved, so the view knows to repaint.
+    pub fn scroll_delta(&mut self, lines: i32) -> bool {
+        if lines == 0 {
+            return false;
+        }
+        let before = self.display_offset();
+        self.term.scroll_display(Scroll::Delta(lines));
+        before != self.display_offset()
+    }
+
+    pub fn scroll_page(&mut self, toward_history: bool) -> bool {
+        let before = self.display_offset();
+        self.term.scroll_display(if toward_history {
+            Scroll::PageUp
+        } else {
+            Scroll::PageDown
+        });
+        before != self.display_offset()
+    }
+
+    pub fn scroll_to_bottom(&mut self) -> bool {
+        let before = self.display_offset();
+        self.term.scroll_display(Scroll::Bottom);
+        before != self.display_offset()
+    }
+
     // (row, column) of the cursor on the visible screen.
     pub fn cursor(&self) -> (usize, usize) {
         let point = self.term.grid().cursor.point;
-        (point.line.0.max(0) as usize, point.column.0)
+        match point_to_viewport(self.term.grid().display_offset(), point) {
+            Some(point) => (point.line, point.column.0),
+            None => (point.line.0.max(0) as usize, point.column.0),
+        }
     }
 }
 
@@ -382,11 +434,41 @@ impl TerminalView {
         )
     }
 
+    /// Attach to the container's running process: same view as exec, stdin
+    /// only, no TTY command. The flag rides on [`ExecRequest`] so the
+    /// transport trait stays as it is.
+    pub fn attach(
+        provider: Rc<dyn ReadProvider>,
+        request: ExecRequest,
+        cx: &mut Context<Self>,
+    ) -> TerminalView {
+        let title = format!("attach {}", request.pod).into();
+        Self::with_transport(
+            title,
+            move |on_event| provider.start_exec(&request, on_event),
+            cx,
+        )
+    }
+
     /// The user's own shell in the same view: the transport is the only
     /// difference between a local terminal and a cluster exec.
     #[cfg(unix)]
     pub fn local(cx: &mut Context<Self>) -> TerminalView {
         Self::with_transport("terminal".into(), crate::pty::spawn_local_shell, cx)
+    }
+
+    #[cfg(unix)]
+    pub fn command(
+        title: String,
+        program: String,
+        args: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> TerminalView {
+        Self::with_transport(
+            title.into(),
+            move |on_event| crate::pty::spawn_command(program, args, on_event),
+            cx,
+        )
     }
 
     // A PTY is the one transport this build does not open on Windows yet; the
@@ -401,6 +483,25 @@ impl TerminalView {
                     "the local terminal needs a PTY, which this build does not open on this \
                      platform yet"
                         .to_string(),
+                ));
+                Box::new(crate::provider::NullExecSession)
+            },
+            cx,
+        )
+    }
+
+    #[cfg(not(unix))]
+    pub fn command(
+        title: String,
+        _: String,
+        _: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> TerminalView {
+        Self::with_transport(
+            title.into(),
+            |on_event| {
+                on_event(ExecEvent::Failed(
+                    "local machine commands are not available on this platform".to_string(),
                 ));
                 Box::new(crate::provider::NullExecSession)
             },
@@ -549,13 +650,44 @@ impl Render for TerminalView {
                 .absolute()
                 .size_full(),
             )
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, _| {
-                if let Some(session) = &this.session
-                    && let Some(bytes) = key_bytes(&event.keystroke)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let keystroke = &event.keystroke;
+                if keystroke.modifiers.shift
+                    && !keystroke.modifiers.control
+                    && !keystroke.modifiers.alt
                 {
-                    // No notify: the echo comes back as output and paints
-                    // then, so a quiet session paints nothing.
+                    match keystroke.key.as_str() {
+                        "pageup" => {
+                            if this.state.scroll_page(true) {
+                                cx.notify();
+                            }
+                            return;
+                        }
+                        "pagedown" => {
+                            if this.state.scroll_page(false) {
+                                cx.notify();
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(session) = &this.session
+                    && let Some(bytes) = key_bytes(keystroke)
+                {
+                    // Jump to the live screen so what is typed is what is
+                    // seen; the echo still paints the next output, so a
+                    // quiet session still paints nothing on the write.
+                    this.state.scroll_to_bottom();
                     session.write(&bytes);
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                let row = k10s_theme::typography(cx).line_height();
+                let delta = f32::from(event.delta.pixel_delta(px(row)).y);
+                let lines = -(delta / row).round() as i32;
+                if this.state.scroll_delta(lines) {
+                    cx.notify();
                 }
             }))
             .child(panel_header(&theme, &fonts, self.title.clone()))

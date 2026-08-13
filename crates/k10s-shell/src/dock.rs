@@ -1,13 +1,29 @@
 //! Dock state: an openable side container of tabbed panels.
 //!
 //! A dock is layout policy, not rendering: which panels it holds, which one is
-//! active, whether it is open. The tab arithmetic underneath is [`Pane`], shared
-//! with the centre row; what a dock adds is the open flag and the two rules that
-//! depend on it -- being handed work shows the dock, and running out of panels
-//! shuts it. Generic over the panel type so every rule here is a unit test: the
-//! workspace instantiates it with entity-backed panels and only does gpui on top.
+//! active, whether it is open, and how wide or tall a drag asked it to be. The
+//! tab arithmetic underneath is [`Pane`], shared with the centre row; what a
+//! dock adds is the open flag and the two rules that depend on it -- being
+//! handed work shows the dock, and running out of panels shuts it. Generic over
+//! the panel type so every rule here is a unit test: the workspace instantiates
+//! it with entity-backed panels and only does gpui on top.
+//!
+//! Mouse-drag sizes land in the same fields settings already load
+//! (`left_dock_width`, `right_dock_width`, `bottom_dock_height`). The drag
+//! math is pure; chrome writes the result into [`crate::settings::Settings`].
 
 use crate::pane::Pane;
+use crate::settings::Settings;
+use crate::ui::{DockSizes, MAX_DOCK_SIZE, MIN_DOCK_SIZE, STATUS_BAR_HEIGHT, Viewport};
+
+/// Which edge of the window a dock sits on. The same three names settings
+/// uses for the sizes a drag writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockEdge {
+    Left,
+    Right,
+    Bottom,
+}
 
 #[derive(Debug)]
 pub struct Dock<T> {
@@ -110,9 +126,46 @@ impl<T> Dock<T> {
     }
 }
 
+/// Where a dock edge lands when it is dragged to a point. Pure, because the
+/// clamps are the whole of it: a drag past either bound has to stop rather than
+/// let a dock eat the window or collapse to a line nobody can grab again.
+pub fn dragged_dock_sizes(
+    mut sizes: DockSizes,
+    edge: DockEdge,
+    position_x: f32,
+    position_y: f32,
+    viewport: Viewport,
+) -> DockSizes {
+    match edge {
+        DockEdge::Left => sizes.left = position_x.clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE),
+        DockEdge::Right => {
+            sizes.right = (viewport.width - position_x).clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
+        }
+        DockEdge::Bottom => {
+            // The bottom dock is measured from the top of the status bar, not
+            // from the bottom of the window: the bar is below it and does not
+            // move.
+            let body_bottom = viewport.height - STATUS_BAR_HEIGHT;
+            sizes.bottom = (body_bottom - position_y).clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
+        }
+    }
+    sizes
+}
+
+/// Copy the dragged edge into the settings field that edge already uses.
+pub fn apply_dock_size(settings: &mut Settings, sizes: DockSizes, edge: DockEdge) {
+    match edge {
+        DockEdge::Left => settings.left_dock_width = sizes.left,
+        DockEdge::Right => settings.right_dock_width = sizes.right,
+        DockEdge::Bottom => settings.bottom_dock_height = sizes.bottom,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
+    use crate::ui::{DockSizes, MAX_DOCK_SIZE, MIN_DOCK_SIZE, STATUS_BAR_HEIGHT, Viewport};
 
     #[test]
     fn a_dock_opens_when_handed_work_and_shuts_when_emptied() {
@@ -234,5 +287,91 @@ mod tests {
         assert!(dock.remove(4).is_none());
         assert!(dock.is_open(), "a no-op removal must not shut the dock");
         assert_eq!(dock.len(), 1);
+    }
+
+    #[test]
+    fn a_dragged_dock_edge_stops_at_its_bounds() {
+        let viewport = Viewport {
+            width: 1600.0,
+            height: 1000.0,
+        };
+        let start = DockSizes {
+            left: 300.0,
+            right: 300.0,
+            bottom: 200.0,
+        };
+
+        let left = dragged_dock_sizes(start, DockEdge::Left, 420.0, 0.0, viewport);
+        assert_eq!(left.left, 420.0);
+        assert_eq!(
+            (left.right, left.bottom),
+            (start.right, start.bottom),
+            "dragging one edge moves one edge"
+        );
+
+        let right = dragged_dock_sizes(start, DockEdge::Right, 1200.0, 0.0, viewport);
+        assert_eq!(right.right, 400.0);
+
+        let bottom = dragged_dock_sizes(start, DockEdge::Bottom, 0.0, 700.0, viewport);
+        assert_eq!(bottom.bottom, 1000.0 - STATUS_BAR_HEIGHT - 700.0);
+
+        for (edge, x, y) in [
+            (DockEdge::Left, -5000.0, 0.0),
+            (DockEdge::Right, 9000.0, 0.0),
+            (DockEdge::Bottom, 0.0, 9000.0),
+        ] {
+            let squashed = dragged_dock_sizes(start, edge, x, y, viewport);
+            let measured = match edge {
+                DockEdge::Left => squashed.left,
+                DockEdge::Right => squashed.right,
+                DockEdge::Bottom => squashed.bottom,
+            };
+            assert_eq!(
+                measured, MIN_DOCK_SIZE,
+                "a dock dragged shut stops at a size that can still be grabbed"
+            );
+        }
+        for (edge, x, y) in [
+            (DockEdge::Left, 9000.0, 0.0),
+            (DockEdge::Right, -9000.0, 0.0),
+            (DockEdge::Bottom, 0.0, -9000.0),
+        ] {
+            let stretched = dragged_dock_sizes(start, edge, x, y, viewport);
+            let measured = match edge {
+                DockEdge::Left => stretched.left,
+                DockEdge::Right => stretched.right,
+                DockEdge::Bottom => stretched.bottom,
+            };
+            assert_eq!(measured, MAX_DOCK_SIZE, "a dock cannot eat the window");
+        }
+    }
+
+    #[test]
+    fn a_drag_writes_the_same_fields_settings_already_load() {
+        let mut settings = Settings::default();
+        let left = settings.left_dock_width;
+        let right = settings.right_dock_width;
+        let bottom = settings.bottom_dock_height;
+        let sizes = DockSizes {
+            left: 400.0,
+            right: 500.0,
+            bottom: 180.0,
+        };
+
+        apply_dock_size(&mut settings, sizes, DockEdge::Left);
+        assert_eq!(settings.left_dock_width, 400.0);
+        assert_eq!(settings.right_dock_width, right);
+        assert_eq!(settings.bottom_dock_height, bottom);
+
+        apply_dock_size(&mut settings, sizes, DockEdge::Right);
+        assert_eq!(settings.left_dock_width, 400.0);
+        assert_eq!(settings.right_dock_width, 500.0);
+        assert_eq!(settings.bottom_dock_height, bottom);
+
+        apply_dock_size(&mut settings, sizes, DockEdge::Bottom);
+        assert_eq!(settings.left_dock_width, 400.0);
+        assert_eq!(settings.right_dock_width, 500.0);
+        assert_eq!(settings.bottom_dock_height, 180.0);
+        assert_ne!(left, 400.0, "the default was not already the dragged size");
     }
 }

@@ -18,6 +18,7 @@ pub const TAB_HEIGHT: f32 = 32.0;
 pub const PANEL_HEADER_HEIGHT: f32 = 32.0;
 pub const TOOLBAR_HEIGHT: f32 = 36.0;
 pub const STATUS_BAR_HEIGHT: f32 = 30.0;
+pub const ACTIVITY_BAR_WIDTH: f32 = 40.0;
 pub const PANEL_FOOTER_HEIGHT: f32 = 24.0;
 
 pub const LIST_ROW_HEIGHT: f32 = 28.0;
@@ -185,6 +186,37 @@ pub fn icon_button(
         })))
 }
 
+/// A rail-sized icon button: the activity bar's hit target is larger than a
+/// title-bar control so a cluster of them can be clicked without aiming.
+pub fn rail_button(
+    id: impl Into<gpui::ElementId>,
+    icon: &'static str,
+    label: &'static str,
+    active: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(32.0))
+        .rounded(px(6.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .when(active, |button| {
+            button.bg(rgb(theme.shell.element_selected))
+        })
+        .hover(|button| button.bg(rgb(theme.shell.element_hover)))
+        .child(svg().path(icon).size(px(18.0)).text_color(rgb(if active {
+            theme.shell.text
+        } else {
+            theme.shell.text_muted
+        })))
+}
+
 /// The hover tooltip an icon button shows: the action's name and, when one
 /// exists, its keybinding -- Zed's `Tooltip::for_action` shape.
 pub struct Tooltip {
@@ -252,8 +284,14 @@ impl Render for Tooltip {
     }
 }
 
-pub fn panel_header(theme: &Theme, fonts: &Typography, title: impl Into<SharedString>) -> Div {
+pub fn panel_header(
+    theme: &Theme,
+    fonts: &Typography,
+    title: impl Into<SharedString>,
+) -> Stateful<Div> {
+    let title = title.into();
     div()
+        .id(title.clone())
         .h(px(PANEL_HEADER_HEIGHT))
         .flex_none()
         .px(px(12.0))
@@ -266,11 +304,13 @@ pub fn panel_header(theme: &Theme, fonts: &Typography, title: impl Into<SharedSt
         .text_color(rgb(theme.shell.text))
         .whitespace_nowrap()
         .overflow_hidden()
-        .child(title.into())
+        .role(gpui::Role::Label)
+        .child(title)
 }
 
-pub fn toolbar(theme: &Theme) -> Div {
+pub fn toolbar(theme: &Theme) -> Stateful<Div> {
     div()
+        .id("toolbar")
         .h(px(TOOLBAR_HEIGHT))
         .flex_none()
         .px(px(10.0))
@@ -279,6 +319,7 @@ pub fn toolbar(theme: &Theme) -> Div {
         .bg(rgb(theme.shell.toolbar_background))
         .border_b_1()
         .border_color(rgb(theme.shell.border))
+        .role(gpui::Role::Toolbar)
 }
 
 pub fn key_hint(

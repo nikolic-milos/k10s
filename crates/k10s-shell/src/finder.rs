@@ -1,6 +1,6 @@
-//! Opening things by path or by fuzzy name: Zed's two open flows.
+//! Opening things by path, by fuzzy file name, or by cluster object.
 //!
-//! Both read the disk on the background executor and think on the UI thread.
+//! Both file flows read the disk on the background executor and think on the UI thread.
 //! The path picker lists a directory once and then filters that listing on
 //! every keystroke -- re-reading the folder per character is how a picker
 //! freezes on a network mount -- and the file finder scans once when it opens.
@@ -32,18 +32,23 @@
 //! listed matches are all capped, every cap is stated in the modal, and
 //! unreadable folders are counted rather than dropped. Both are state machines
 //! over the `Fs` seam under thin palette-shaped views, pure on every keystroke,
-//! and both answer through events the workspace routes.
+//! and both answer through events the workspace routes. Cluster search reuses
+//! [`crate::reveal::MapIndex`]: the index is built when the sheet opens, a
+//! keystroke only ranks, and confirm asks the map to reveal.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    Context, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, Role, SharedString,
-    Styled, StyledText, Window, div, prelude::*, px, rgb,
+    App, Context, Entity, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, Role,
+    SharedString, Styled, StyledText, Window, div, prelude::*, px, rgb,
 };
+use k10s_core::SceneSnapshot;
+use k10s_map::MapView;
 
 use crate::fs::{DirEntry, Fs};
 use crate::palette::fuzzy_match;
+use crate::reveal::ClusterFinder;
 use crate::ui::{MODAL_MAX_HEIGHT, MODAL_WIDTH};
 use crate::{CancelInput, CommitInput, DeleteInputChar, PickParent, RowDown, RowUp};
 
@@ -563,27 +568,37 @@ impl Render for PathPickerView {
                     .overflow_hidden()
                     .child(SharedString::from(format!("{}▌", self.state.input))),
             )
-            .children(rows.into_iter().map(|(at, name, is_dir)| {
-                let mut row = div()
-                    .px(px(12.0))
-                    .h(px(24.0))
-                    .flex_none()
+            .child(
+                div()
+                    .id("path-picker-rows")
                     .flex()
-                    .items_center()
-                    .text_size(px(fonts.small()))
-                    .font_family(fonts.buffer_family.clone())
-                    .text_color(if is_dir {
-                        rgb(theme.shell.text_accent)
-                    } else {
-                        rgb(theme.shell.text)
-                    })
-                    .whitespace_nowrap()
-                    .overflow_hidden();
-                if at == selected {
-                    row = row.bg(rgb(theme.shell.element_selected));
-                }
-                row.child(SharedString::from(name))
-            }))
+                    .flex_col()
+                    .role(Role::ListBox)
+                    .aria_label("Paths")
+                    .children(rows.into_iter().map(|(at, name, is_dir)| {
+                        let mut row = div()
+                            .id(("path-picker-row", at))
+                            .px(px(12.0))
+                            .h(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .text_size(px(fonts.small()))
+                            .font_family(fonts.buffer_family.clone())
+                            .text_color(if is_dir {
+                                rgb(theme.shell.text_accent)
+                            } else {
+                                rgb(theme.shell.text)
+                            })
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .role(Role::ListBoxOption);
+                        if at == selected {
+                            row = row.bg(rgb(theme.shell.element_selected));
+                        }
+                        row.child(SharedString::from(name))
+                    })),
+            )
             .children(self.state.note.clone().map(|note| {
                 div()
                     .px(px(12.0))
@@ -900,30 +915,243 @@ impl Render for FileFinderView {
                     .overflow_hidden()
                     .child(SharedString::from(format!("{}▌", self.query))),
             )
-            .children(rows.into_iter().map(|row| {
-                let mut line = div()
-                    .px(px(12.0))
-                    .h(px(24.0))
-                    .flex_none()
+            .child(
+                div()
+                    .id("file-finder-rows")
                     .flex()
-                    .items_center()
+                    .flex_col()
+                    .role(Role::ListBox)
+                    .aria_label("Files")
+                    .children(rows.into_iter().map(|row| {
+                        let mut line = div()
+                            .id(("file-finder-row", row.at))
+                            .px(px(12.0))
+                            .h(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .text_size(px(fonts.small()))
+                            .font_family(fonts.buffer_family.clone())
+                            .text_color(rgb(theme.shell.text))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .role(Role::ListBoxOption);
+                        if row.at == selected {
+                            line = line.bg(rgb(theme.shell.element_selected));
+                        }
+                        let accent: gpui::HighlightStyle = gpui::HighlightStyle {
+                            color: Some(rgb(theme.shell.text_accent).into()),
+                            ..Default::default()
+                        };
+                        line.child(
+                            StyledText::new(SharedString::from(row.text))
+                                .with_highlights(row.hits.into_iter().map(|hit| (hit, accent))),
+                        )
+                    })),
+            )
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .border_t_1()
+                    .border_color(rgb(theme.shell.border_variant))
                     .text_size(px(fonts.small()))
-                    .font_family(fonts.buffer_family.clone())
-                    .text_color(rgb(theme.shell.text))
-                    .whitespace_nowrap()
-                    .overflow_hidden();
-                if row.at == selected {
-                    line = line.bg(rgb(theme.shell.element_selected));
-                }
-                let accent: gpui::HighlightStyle = gpui::HighlightStyle {
-                    color: Some(rgb(theme.shell.text_accent).into()),
-                    ..Default::default()
-                };
-                line.child(
-                    StyledText::new(SharedString::from(row.text))
-                        .with_highlights(row.hits.into_iter().map(|hit| (hit, accent))),
-                )
+                    .text_color(rgb(theme.shell.text_muted))
+                    .child(SharedString::from(status)),
+            )
+    }
+}
+
+pub enum ClusterFinderEvent {
+    Dismissed,
+    Confirmed(std::sync::Arc<str>),
+}
+
+pub struct ClusterFinderView {
+    focus: FocusHandle,
+    map: Entity<MapView>,
+    state: ClusterFinder,
+}
+
+impl gpui::EventEmitter<ClusterFinderEvent> for ClusterFinderView {}
+
+impl ClusterFinderView {
+    pub fn new(
+        map: Entity<MapView>,
+        snapshot: std::sync::Arc<SceneSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> ClusterFinderView {
+        ClusterFinderView {
+            focus: cx.focus_handle(),
+            map,
+            state: ClusterFinder::open(snapshot),
+        }
+    }
+
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
+    fn sync(&mut self, cx: &App) {
+        let snapshot = self.map.read(cx).snapshot();
+        self.state.sync(snapshot);
+    }
+
+    fn confirm(&mut self, cx: &mut Context<Self>) {
+        if let Some(candidate) = self.state.confirm() {
+            cx.emit(ClusterFinderEvent::Confirmed(candidate.uid.clone()));
+        }
+    }
+}
+
+impl Render for ClusterFinderView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync(cx);
+        let theme = k10s_theme::active(cx).clone();
+        let fonts = k10s_theme::typography(cx).clone();
+        let first = self
+            .state
+            .selected()
+            .saturating_sub(VISIBLE_ROWS.saturating_sub(1))
+            .min(
+                self.state
+                    .hits()
+                    .len()
+                    .saturating_sub(VISIBLE_ROWS.min(self.state.hits().len())),
+            );
+        struct Row {
+            at: usize,
+            text: String,
+            hits: Vec<std::ops::Range<usize>>,
+        }
+        let rows: Vec<Row> = self
+            .state
+            .hits()
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(VISIBLE_ROWS)
+            .filter_map(|(at, hit)| {
+                self.state
+                    .index()
+                    .candidates()
+                    .get(hit.candidate)
+                    .map(|candidate| Row {
+                        at,
+                        text: candidate.label.clone(),
+                        hits: hit.hits.clone(),
+                    })
+            })
+            .collect();
+        let selected = self.state.selected();
+        let status = {
+            let mut parts = vec![format!(
+                "{} of {} objects",
+                self.state.hits().len(),
+                self.state.index().candidates().len()
+            )];
+            if let Some(error) = self.state.error() {
+                parts.push(error.to_string());
+            } else if self.state.hits().is_empty() && !self.state.query().is_empty() {
+                parts.push("no matches".to_string());
+            }
+            parts.join("  ·  ")
+        };
+        div()
+            .id("cluster-finder")
+            .key_context("Palette")
+            .track_focus(&self.focus)
+            .w(px(MODAL_WIDTH))
+            .max_w_full()
+            .max_h(px(MODAL_MAX_HEIGHT))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(theme.shell.elevated_surface_background))
+            .border_1()
+            .border_color(rgb(theme.shell.border_variant))
+            .rounded(px(8.0))
+            .shadow_lg()
+            .font_family(fonts.ui_family.clone())
+            .role(Role::Dialog)
+            .aria_label("Cluster finder")
+            .on_action(cx.listener(|this, _: &RowUp, _, cx| {
+                this.state.select_up();
+                cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &RowDown, _, cx| {
+                this.state.select_down();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &CommitInput, _, cx| {
+                this.confirm(cx);
+            }))
+            .on_action(cx.listener(|_, _: &CancelInput, _, cx| {
+                cx.emit(ClusterFinderEvent::Dismissed);
+            }))
+            .on_action(cx.listener(|this, _: &DeleteInputChar, _, cx| {
+                this.sync(cx);
+                this.state.pop_char();
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let keystroke = &event.keystroke;
+                if keystroke.modifiers.control || keystroke.modifiers.alt {
+                    return;
+                }
+                if let Some(key_char) = &keystroke.key_char {
+                    this.sync(cx);
+                    this.state.push_char(key_char);
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .border_b_1()
+                    .border_color(rgb(theme.shell.border_variant))
+                    .text_size(px(fonts.ui_size))
+                    .text_color(rgb(theme.shell.text))
+                    .font_family(fonts.buffer_family.clone())
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(SharedString::from(format!("{}▌", self.state.query()))),
+            )
+            .child(
+                div()
+                    .id("cluster-finder-rows")
+                    .flex()
+                    .flex_col()
+                    .role(Role::ListBox)
+                    .aria_label("Cluster objects")
+                    .children(rows.into_iter().map(|row| {
+                        let mut line = div()
+                            .id(("cluster-finder-row", row.at))
+                            .px(px(12.0))
+                            .h(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .text_size(px(fonts.small()))
+                            .font_family(fonts.buffer_family.clone())
+                            .text_color(rgb(theme.shell.text))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .role(Role::ListBoxOption);
+                        if row.at == selected {
+                            line = line.bg(rgb(theme.shell.element_selected));
+                        }
+                        let accent: gpui::HighlightStyle = gpui::HighlightStyle {
+                            color: Some(rgb(theme.shell.text_accent).into()),
+                            ..Default::default()
+                        };
+                        line.child(
+                            StyledText::new(SharedString::from(row.text))
+                                .with_highlights(row.hits.into_iter().map(|hit| (hit, accent))),
+                        )
+                    })),
+            )
             .child(
                 div()
                     .px(px(12.0))

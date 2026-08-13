@@ -57,11 +57,34 @@ pub enum BrowseEvent {
         kind: k10s_core::KindId,
         name: String,
     },
+    OpenLocalCommand(LocalCommand),
     StartForward(ForwardRequest),
     OpenExec {
         namespace: String,
         pod: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalCommand {
+    pub title: String,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TalosRead {
+    Dmesg,
+    Services,
+}
+
+impl TalosRead {
+    fn command(self) -> &'static str {
+        match self {
+            TalosRead::Dmesg => "dmesg",
+            TalosRead::Services => "service",
+        }
+    }
 }
 
 // The built-in kinds whose spec.selector selects pods, so a merged log
@@ -379,6 +402,41 @@ impl BrowseView {
         }));
     }
 
+    fn talos_selected(&mut self, read: TalosRead, cx: &mut Context<Self>) {
+        let Phase::Table {
+            source: TableSource::Nodes,
+            status,
+            ..
+        } = &mut self.phase
+        else {
+            return;
+        };
+        let Some(row) = self.table.selected_row() else {
+            return;
+        };
+        let os = self.table.selected_cell("OS").unwrap_or_default();
+        if !contains_ascii_folded(os, "talos") {
+            return;
+        }
+        let address = self.table.selected_cell("Address").unwrap_or_default();
+        if address.is_empty() {
+            *status = Some("this Talos node reports no reachable node address".to_string());
+            cx.notify();
+            return;
+        }
+        if !talosctl_available() {
+            *status =
+                Some("talosctl is not on PATH; install it to open machine diagnostics".to_string());
+            cx.notify();
+            return;
+        }
+        cx.emit(BrowseEvent::OpenLocalCommand(talos_command(
+            row.name.as_str(),
+            address,
+            read,
+        )));
+    }
+
     fn back(&mut self, cx: &mut Context<Self>) {
         match &self.phase {
             Phase::Table { .. } => {
@@ -593,6 +651,12 @@ impl Render for BrowseView {
             .on_action(cx.listener(|this, _: &ExecRow, _, cx| {
                 this.exec_selected(cx);
             }))
+            .on_action(cx.listener(|this, _: &crate::TalosDmesg, _, cx| {
+                this.talos_selected(TalosRead::Dmesg, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TalosServices, _, cx| {
+                this.talos_selected(TalosRead::Services, cx);
+            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 this.fetch(cx);
                 cx.notify();
@@ -750,10 +814,72 @@ impl Render for BrowseView {
                                 if kind.kind == "Pod" || kind.kind == "Service" {
                                     hints.push_str(" · F forward");
                                 }
+                            } else if self
+                                .table
+                                .selected_cell("OS")
+                                .is_some_and(|os| contains_ascii_folded(os, "talos"))
+                            {
+                                hints.push_str(" · D dmesg · S services");
                             }
                             hints
                         }
                     }),
             )
+    }
+}
+
+fn talos_command(node: &str, address: &str, read: TalosRead) -> LocalCommand {
+    LocalCommand {
+        title: format!("talos {} {node}", read.command()),
+        program: "talosctl".to_string(),
+        args: vec![
+            "--nodes".to_string(),
+            address.to_string(),
+            read.command().to_string(),
+        ],
+    }
+}
+
+fn contains_ascii_folded(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[cfg(unix)]
+fn talosctl_available() -> bool {
+    crate::pty::command_on_path("talosctl")
+}
+
+#[cfg(not(unix))]
+fn talosctl_available() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn talos_commands_keep_the_node_target_as_one_argv_value() {
+        let command = talos_command(
+            "control-plane-1",
+            "10.0.0.7;printf should-not-run",
+            TalosRead::Dmesg,
+        );
+
+        assert_eq!(command.program, "talosctl");
+        assert_eq!(
+            command.args,
+            ["--nodes", "10.0.0.7;printf should-not-run", "dmesg"]
+        );
+        assert!(!command.args.iter().any(|arg| arg == "-c"));
+    }
+
+    #[test]
+    fn service_inventory_uses_the_read_only_singular_cli_command() {
+        let command = talos_command("worker-1", "10.0.0.8", TalosRead::Services);
+        assert_eq!(command.args, ["--nodes", "10.0.0.8", "service"]);
     }
 }

@@ -51,6 +51,31 @@ pub fn spawn_shell(
     }
 }
 
+pub fn spawn_command(
+    program: String,
+    args: Vec<String>,
+    on_event: Box<dyn Fn(ExecEvent) + Send + Sync>,
+) -> Box<dyn ExecSession> {
+    spawn_shell(Shell::new(program, args), on_event)
+}
+
+pub fn command_on_path(program: &str) -> bool {
+    if program.is_empty() || program.contains('/') {
+        return false;
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| executable(directory.join(program)))
+}
+
+fn executable(path: std::path::PathBuf) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 struct LocalSession {
     // Resize needs `&mut Pty`; everything else works on dup'd fds.
     pty: Mutex<Pty>,
@@ -293,5 +318,27 @@ mod tests {
             ExecEvent::Ended(_) | ExecEvent::Output(_) => {}
             ExecEvent::Denied(_) => panic!("a local shell has no RBAC to deny"),
         }
+    }
+
+    #[test]
+    fn path_lookup_requires_an_executable_regular_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "k10s-path-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable_path = root.join("talosctl");
+        std::fs::write(&executable_path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(executable(executable_path.clone()));
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!executable(executable_path.clone()));
+
+        std::fs::remove_file(executable_path).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 }

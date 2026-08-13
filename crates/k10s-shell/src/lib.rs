@@ -20,7 +20,8 @@
 //! `Typing`), with text-typing keystrokes -- plain and shifted -- suppressed
 //! while an input mode is capturing. Panels and items render on notify only:
 //! zero paints at idle is a gated invariant and the shell must never be the
-//! reason it fails.
+//! reason it fails. The left edge is a thin activity rail of chrome icons;
+//! clicking one opens the matching dock or item. Brand glyphs stay on the map.
 //!
 //! [`Workspace`] is one type described by five modules, split by what each is
 //! about rather than by what it is made of: `workspace` holds the state and the
@@ -31,6 +32,7 @@
 //! the docks -- are their own modules precisely so they can be tested without a
 //! window.
 
+pub mod attribution;
 pub mod browse;
 pub mod config_schema;
 pub mod diff;
@@ -53,6 +55,7 @@ pub mod provider;
 #[cfg(unix)]
 pub mod pty;
 pub mod reveal;
+pub mod saved_views;
 pub mod settings;
 pub mod table;
 pub mod term;
@@ -63,6 +66,7 @@ pub mod ui;
 // hosts and the seams it reads through -- everything a consumer needs from here
 // is re-exported below under the name it has always had.
 mod actions;
+mod activity;
 mod bindings;
 mod chrome;
 mod cluster;
@@ -73,6 +77,7 @@ mod editor_io;
 mod editor_io_test;
 mod hosting;
 mod modal;
+mod overlay;
 mod pane;
 mod render;
 mod saves;
@@ -89,10 +94,11 @@ pub use provider::{
     Connection, ContainersOutcome, ContextRow, DemoOutcome, DescribeRequest, Detail, DocOutcome,
     EventRow, ExecEvent, ExecRequest, ExecSession, ForwardOutcome, ForwardRequest, ForwardRow,
     ForwardState, KindRow, LaunchProvider, LogChunk, LogRequest, LogStop, ManifestOutcome,
-    Millicores, NullExecSession, NullLaunchProvider, NullProvider, ProviderFactory, ProviderSlot,
-    ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome, SchemaSource,
-    SchemaTextOutcome, TableColumn, TableOutcome, TablePage, TableRow, UsageOutcome, UsageRequest,
-    UsageSample, UsageSource, UsageTarget, WorkloadLogRequest,
+    Millicores, NullExecSession, NullLaunchProvider, NullProvider, OverlayOutcome, OverlayStamp,
+    PodPostureView, PostureOutcome, ProviderFactory, ProviderSlot, ReadProvider, Reply,
+    ScanOutcome, ScanRequest, SchemaCatalogOutcome, SchemaSource, SchemaTextOutcome, TableColumn,
+    TableOutcome, TablePage, TableRow, UsageOutcome, UsageRequest, UsageSample, UsageSource,
+    UsageTarget, WorkloadLogRequest,
 };
 pub use selection::{LogTarget, Selection};
 pub use workspace::{ConfigPaths, Workspace};

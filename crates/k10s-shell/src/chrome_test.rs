@@ -205,6 +205,35 @@ fn a_workload_says_how_much_of_it_the_numbers_cover() {
 }
 
 #[test]
+fn posture_lines_report_isolation_and_named_ports_not_a_traffic_verdict() {
+    let view = crate::provider::PodPostureView {
+        ingress_isolated: true,
+        ingress_policies: 2,
+        ingress_names: vec!["prod/ingress-a".into()],
+        ingress_truncated: true,
+        egress_isolated: false,
+        egress_policies: 0,
+        egress_names: Vec::new(),
+        egress_truncated: false,
+        ports: vec!["http TCP 80".into()],
+        completeness: String::new(),
+    };
+    let lines = posture_lines(&view);
+    assert!(lines[0].contains("isolated by 2 policies"), "{lines:?}");
+    assert!(lines[0].contains("prod/ingress-a"), "{lines:?}");
+    assert_eq!(lines[1], "Egress: default allow (no selecting policy)");
+    assert_eq!(lines[2], "Ports: http TCP 80");
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("an allow or deny needs a source, protocol, and destination port")
+    );
+    assert!(
+        !lines.iter().any(|line| line == "Allow" || line == "Deny"),
+        "isolation is not a verdict: {lines:?}"
+    );
+}
+
+#[test]
 fn the_shell_renders_units_the_same_way_the_data_plane_does() {
     // The seam mirrors the newtypes, so the rendering is pinned on both
     // sides; if either drifts, one of the two suites says so.
@@ -220,63 +249,4 @@ fn the_shell_renders_units_the_same_way_the_data_plane_does() {
     assert_eq!(Bytes(1024).to_string(), "1Ki");
     assert_eq!(Bytes(1024 * 1024).to_string(), "1Mi");
     assert_eq!(Bytes(1024 * 1024 * 1024).to_string(), "1.0Gi");
-}
-
-#[test]
-fn a_dragged_dock_edge_stops_at_its_bounds() {
-    let viewport = ui::Viewport {
-        width: 1600.0,
-        height: 1000.0,
-    };
-    let start = DockSizes {
-        left: 300.0,
-        right: 300.0,
-        bottom: 200.0,
-    };
-
-    let left = dragged_dock_sizes(start, DockEdge::Left, 420.0, 0.0, viewport);
-    assert_eq!(left.left, 420.0);
-    assert_eq!(
-        (left.right, left.bottom),
-        (start.right, start.bottom),
-        "dragging one edge moves one edge"
-    );
-
-    // The right dock is measured inward from the right of the window.
-    let right = dragged_dock_sizes(start, DockEdge::Right, 1200.0, 0.0, viewport);
-    assert_eq!(right.right, 400.0);
-
-    // And the bottom upward from the top of the status bar.
-    let bottom = dragged_dock_sizes(start, DockEdge::Bottom, 0.0, 700.0, viewport);
-    assert_eq!(bottom.bottom, 1000.0 - STATUS_BAR_HEIGHT - 700.0);
-
-    for (edge, x, y) in [
-        (DockEdge::Left, -5000.0, 0.0),
-        (DockEdge::Right, 9000.0, 0.0),
-        (DockEdge::Bottom, 0.0, 9000.0),
-    ] {
-        let squashed = dragged_dock_sizes(start, edge, x, y, viewport);
-        let measured = match edge {
-            DockEdge::Left => squashed.left,
-            DockEdge::Right => squashed.right,
-            DockEdge::Bottom => squashed.bottom,
-        };
-        assert_eq!(
-            measured, MIN_DOCK_SIZE,
-            "a dock dragged shut stops at a size that can still be grabbed"
-        );
-    }
-    for (edge, x, y) in [
-        (DockEdge::Left, 9000.0, 0.0),
-        (DockEdge::Right, -9000.0, 0.0),
-        (DockEdge::Bottom, 0.0, -9000.0),
-    ] {
-        let stretched = dragged_dock_sizes(start, edge, x, y, viewport);
-        let measured = match edge {
-            DockEdge::Left => stretched.left,
-            DockEdge::Right => stretched.right,
-            DockEdge::Bottom => stretched.bottom,
-        };
-        assert_eq!(measured, MAX_DOCK_SIZE, "a dock cannot eat the window");
-    }
 }
