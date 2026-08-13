@@ -333,6 +333,10 @@ pub struct SceneIds {
 /// stays engine-only, and the ids cost one reference bump per snapshot clone.
 #[derive(Debug, Clone, Default)]
 pub struct SceneSnapshot {
+    /// Changes only when object identity changes, and never aliases another
+    /// world built later in the same process. UID caches can ignore
+    /// health-only publishes without surviving a cluster switch.
+    pub identity_rev: u64,
     pub scene: SceneData,
     pub ids: Arc<SceneIds>,
 }
