@@ -274,18 +274,20 @@ pub fn from_flux(inventory: &flux::Inventory) -> Frame {
 }
 
 /// PolicyReport findings keyed by resource uid. Pass and skip do not stamp.
+/// Namespace and name stay on the stamp so a snapshot that lost the uid can
+/// still join the same way Prometheus does.
 pub fn from_policy_reports(inventory: &policy::Inventory) -> Frame {
     if !inventory.served {
         return Frame::empty("PolicyReport CRDs are not served by this cluster");
     }
     let stamps: Vec<Stamp> = inventory
-        .tints()
+        .resource_tints()
         .into_iter()
-        .map(|(uid, tint)| Stamp {
-            uid,
-            namespace: String::new(),
-            name: String::new(),
-            tint: Some(tint),
+        .map(|mark| Stamp {
+            uid: mark.uid,
+            namespace: mark.namespace,
+            name: mark.name,
+            tint: Some(mark.tint),
             samples: Vec::new(),
             label: None,
         })
@@ -497,6 +499,32 @@ mod tests {
                 "cadvisor CPU is not a mesh observation: {expr}"
             );
         }
+    }
+
+    #[test]
+    fn policy_report_stamps_keep_the_resource_name() {
+        let inventory = policy::Inventory {
+            served: true,
+            reports: vec![policy::Report {
+                namespace: "prod".into(),
+                name: "pods".into(),
+                results: vec![policy::Finding {
+                    policy: "require-labels".into(),
+                    result: "fail".into(),
+                    severity: Severity::Err,
+                    resource_name: "api-0".into(),
+                    resource_kind: "Pod".into(),
+                    resource_uid: "uid-api".into(),
+                }],
+            }],
+            truncated: false,
+        };
+        let frame = from_policy_reports(&inventory);
+        assert_eq!(frame.stamps.len(), 1);
+        assert_eq!(frame.stamps[0].uid, "uid-api");
+        assert_eq!(frame.stamps[0].namespace, "prod");
+        assert_eq!(frame.stamps[0].name, "api-0");
+        assert_eq!(frame.stamps[0].tint, Some(Severity::Err));
     }
 
     #[test]
