@@ -1,10 +1,12 @@
 //! Finding a thing on the map by name and published scene fields.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
 use k10s_core::{BUILTIN_KINDS, BUILTIN_REASONS, KindId, Level, ReasonId, SceneSnapshot, Severity};
+use k10s_map::{OverlayFrame, OverlayKind};
 
 use crate::palette::fuzzy_score;
 
@@ -42,12 +44,32 @@ enum StatusPredicate {
 }
 
 #[derive(Debug, Default)]
+struct OverlayIndex {
+    kind: Option<OverlayKind>,
+    uids: HashSet<String>,
+}
+
+impl OverlayIndex {
+    fn from_frame(frame: &OverlayFrame) -> OverlayIndex {
+        OverlayIndex {
+            kind: frame.kind,
+            uids: frame.marks.iter().map(|mark| mark.uid.clone()).collect(),
+        }
+    }
+
+    fn stamps(&self, kind: OverlayKind, uid: &str) -> bool {
+        self.kind == Some(kind) && self.uids.contains(uid)
+    }
+}
+
+#[derive(Debug, Default)]
 struct CompiledQuery {
     fuzzy: String,
     kinds: Vec<KindId>,
     namespaces: Vec<String>,
     statuses: Vec<StatusPredicate>,
     uids: Vec<String>,
+    overlays: Vec<OverlayKind>,
 }
 
 impl CompiledQuery {
@@ -71,8 +93,14 @@ impl CompiledQuery {
                             .ok_or_else(|| format!("unknown built-in status: {value}"))?,
                     ),
                     "uid" => compiled.uids.push(value.to_string()),
-                    "label" | "overlay" => {
-                        return Err(format!("{qualifier}: is not indexed yet"));
+                    "overlay" => compiled.overlays.push(
+                        OverlayKind::parse(value)
+                            .ok_or_else(|| format!("unknown overlay: {value}"))?,
+                    ),
+                    "label" => {
+                        // A SceneSnapshot has names and health, not Kubernetes
+                        // labels, so this qualifier cannot become a silent fuzzy.
+                        return Err("label: is not on the published scene".to_string());
                     }
                     _ => return Err(format!("unsupported qualifier: {qualifier}:")),
                 }
@@ -94,6 +122,7 @@ impl CompiledQuery {
         candidate: &Candidate,
         meta: CandidateMeta,
         snapshot: &SceneSnapshot,
+        overlay: &OverlayIndex,
     ) -> bool {
         self.kinds
             .iter()
@@ -107,6 +136,11 @@ impl CompiledQuery {
                 meta.status(candidate.level, snapshot)
                     .is_some_and(|status| predicate.matches(status))
             })
+            && (self.overlays.is_empty()
+                || self
+                    .overlays
+                    .iter()
+                    .any(|kind| overlay.stamps(*kind, candidate.uid.as_ref())))
     }
 
     fn is_unfiltered(&self) -> bool {
@@ -115,6 +149,7 @@ impl CompiledQuery {
             && self.namespaces.is_empty()
             && self.statuses.is_empty()
             && self.uids.is_empty()
+            && self.overlays.is_empty()
     }
 }
 
@@ -314,7 +349,9 @@ impl MapIndex {
     ) -> Result<Vec<Hit>, String> {
         let query = CompiledQuery::compile(query)?;
         let mut scratch = RankScratch::default();
-        Ok(scratch.rank(self, snapshot, &query, limit).to_vec())
+        Ok(scratch
+            .rank(self, snapshot, &query, &OverlayIndex::default(), limit)
+            .to_vec())
     }
 }
 
@@ -336,6 +373,7 @@ impl RankScratch {
         index: &MapIndex,
         snapshot: &SceneSnapshot,
         query: &CompiledQuery,
+        overlay: &OverlayIndex,
         limit: usize,
     ) -> &'a [Hit] {
         self.ranked.clear();
@@ -355,7 +393,12 @@ impl RankScratch {
         let roots_fill_limit = query.is_unfiltered();
 
         for (candidate_index, candidate) in index.candidates.iter().enumerate() {
-            if !query.matches(candidate, index.metadata[candidate_index], snapshot) {
+            if !query.matches(
+                candidate,
+                index.metadata[candidate_index],
+                snapshot,
+                overlay,
+            ) {
                 continue;
             }
             let Some(score) = fuzzy_score(&query.fuzzy, &candidate.label) else {
@@ -442,11 +485,13 @@ pub struct ClusterFinder {
     snapshot: Arc<SceneSnapshot>,
     identity_rev: u64,
     scene_rev: u64,
+    overlay: OverlayIndex,
     query: String,
     scratch: RankScratch,
     hit_count: usize,
     error: Option<String>,
     tracks_health: bool,
+    tracks_overlay: bool,
     selected: usize,
 }
 
@@ -457,11 +502,13 @@ impl ClusterFinder {
             identity_rev: snapshot.identity_rev,
             scene_rev: snapshot.rev,
             snapshot,
+            overlay: OverlayIndex::default(),
             query: String::new(),
             scratch: RankScratch::default(),
             hit_count: 0,
             error: None,
             tracks_health: false,
+            tracks_overlay: false,
             selected: 0,
         };
         finder.requery();
@@ -482,10 +529,23 @@ impl ClusterFinder {
         self.identity_rev = snapshot.identity_rev;
         self.scene_rev = snapshot.rev;
         self.snapshot = snapshot;
-        if identity_changed || self.tracks_health {
+        if identity_changed || self.tracks_health || self.tracks_overlay {
             self.requery();
         }
         identity_changed
+    }
+
+    /// Overlay stamps land after first paint. A query that names one reranks
+    /// when this table changes, the same way a status query reranks on health.
+    pub fn set_overlay(&mut self, frame: OverlayFrame) {
+        let next = OverlayIndex::from_frame(&frame);
+        if next.kind == self.overlay.kind && next.uids == self.overlay.uids {
+            return;
+        }
+        self.overlay = next;
+        if self.tracks_overlay {
+            self.requery();
+        }
     }
 
     pub fn query(&self) -> &str {
@@ -546,14 +606,22 @@ impl ClusterFinder {
             Ok(query) => {
                 self.error = None;
                 self.tracks_health = !query.statuses.is_empty();
+                self.tracks_overlay = !query.overlays.is_empty();
                 self.hit_count = self
                     .scratch
-                    .rank(&self.index, &self.snapshot, &query, CLUSTER_FINDER_LIMIT)
+                    .rank(
+                        &self.index,
+                        &self.snapshot,
+                        &query,
+                        &self.overlay,
+                        CLUSTER_FINDER_LIMIT,
+                    )
                     .len();
             }
             Err(error) => {
                 self.error = Some(error);
                 self.tracks_health = false;
+                self.tracks_overlay = false;
                 self.hit_count = 0;
             }
         }
@@ -773,7 +841,7 @@ mod tests {
         let mut finder = ClusterFinder::open(snapshot);
         for query in [
             "label:app=api",
-            "overlay:metrics",
+            "overlay:grafana",
             "owner:api",
             "kind:",
             "kind:not-a-kubernetes-kind",
@@ -805,6 +873,45 @@ mod tests {
         assert_eq!(
             finder.confirm().map(|candidate| candidate.uid.as_ref()),
             Some("pod-prod-api-api-0")
+        );
+    }
+
+    #[test]
+    fn overlay_qualifier_matches_stamped_uids_of_the_active_kind() {
+        let snapshot = scene(&[("prod", &[("api", &["api-0", "api-1"])])]);
+        let mut finder = ClusterFinder::open(Arc::new(snapshot));
+        finder.set_query("overlay:policy".to_string());
+        assert!(
+            finder.hits().is_empty(),
+            "an overlay query with no stamps is not every object"
+        );
+
+        finder.set_overlay(OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: vec![k10s_map::OverlayMark {
+                uid: "pod-prod-api-api-1".into(),
+                tint: None,
+                sparkline: None,
+                label: None,
+            }],
+        });
+        assert_eq!(
+            finder.confirm().map(|candidate| candidate.uid.as_ref()),
+            Some("pod-prod-api-api-1")
+        );
+
+        finder.set_query("overlay:metrics".to_string());
+        assert!(
+            finder.hits().is_empty(),
+            "a metrics query must not reuse policy stamps"
+        );
+        finder.set_query("overlay:grafana".to_string());
+        assert!(
+            finder
+                .error()
+                .is_some_and(|error| error.contains("unknown overlay")),
+            "{:?}",
+            finder.error()
         );
     }
 
