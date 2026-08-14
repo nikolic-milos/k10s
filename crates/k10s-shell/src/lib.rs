@@ -35,6 +35,7 @@
 pub mod attribution;
 pub mod browse;
 pub mod config_schema;
+pub mod day2;
 pub mod diff;
 pub mod diff_gate;
 #[cfg(test)]
@@ -50,6 +51,7 @@ pub mod fs;
 pub mod item;
 pub mod keymap;
 pub mod launch;
+pub mod lists;
 pub mod palette;
 pub mod provider;
 #[cfg(unix)]
@@ -91,14 +93,14 @@ pub use bindings::{input_suppressors, keybindings};
 pub use item::{Item, ItemHandle};
 pub use provider::{
     ApplyOutcome, ApplyRequest, Bytes, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest,
-    Connection, ContainersOutcome, ContextRow, DemoOutcome, DescribeRequest, Detail, DocOutcome,
-    EventRow, ExecEvent, ExecRequest, ExecSession, ForwardOutcome, ForwardRequest, ForwardRow,
-    ForwardState, KindRow, LaunchProvider, LogChunk, LogRequest, LogStop, ManifestOutcome,
-    Millicores, NullExecSession, NullLaunchProvider, NullProvider, OverlayOutcome, OverlayStamp,
-    PodPostureView, PostureOutcome, ProviderFactory, ProviderSlot, ReadProvider, Reply,
-    ScanOutcome, ScanRequest, SchemaCatalogOutcome, SchemaSource, SchemaTextOutcome, TableColumn,
-    TableOutcome, TablePage, TableRow, UsageOutcome, UsageRequest, UsageSample, UsageSource,
-    UsageTarget, WorkloadLogRequest,
+    Connection, ContainersOutcome, ContextRow, Day2Op, Day2Outcome, Day2Request, DemoOutcome,
+    DescribeRequest, Detail, DocOutcome, EventRow, ExecEvent, ExecRequest, ExecSession,
+    ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, KindRow, LaunchProvider, LogChunk,
+    LogRequest, LogStop, ManifestOutcome, Millicores, NullExecSession, NullLaunchProvider,
+    NullProvider, OverlayOutcome, OverlayStamp, PodPostureView, PostureOutcome, ProviderFactory,
+    ProviderSlot, ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome,
+    SchemaSource, SchemaTextOutcome, TableColumn, TableOutcome, TablePage, TableRow, UsageOutcome,
+    UsageRequest, UsageSample, UsageSource, UsageTarget, WorkloadLogRequest,
 };
 pub use selection::{LogTarget, Selection};
 pub use workspace::{ConfigPaths, Workspace};

@@ -53,6 +53,7 @@ use kube::Client;
 use kube::api::{ListParams, Request};
 use serde::Deserialize;
 
+use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::describe::is_secret;
 use crate::discover::KindTarget;
 use crate::read::{Fetched, classify, collection_path};
@@ -418,9 +419,57 @@ pub(crate) async fn fetch_releases(
     })
 }
 
+/// One row per release, using the running revision. History stays on
+/// [`Release::revisions`]; a table is not a document, so it does not pad every
+/// stored revision onto the screen. Cells are the inventory fields only:
+/// [`Revision`] still has nowhere for values or manifests.
+pub fn table_page(releases: &Releases) -> TablePage {
+    let columns = ["Name", "Namespace", "Revision", "Status", "Chart"]
+        .iter()
+        .map(|name| TableColumn {
+            name: name.to_string(),
+            wide: false,
+        })
+        .collect();
+    let rows = releases
+        .releases
+        .iter()
+        .filter_map(|release| {
+            let revision = release.current()?;
+            Some(TableRow {
+                cells: vec![
+                    release.name.clone(),
+                    release.namespace.clone(),
+                    revision.revision.to_string(),
+                    revision.status.clone(),
+                    chart_label(revision),
+                ],
+                name: release.name.clone(),
+                namespace: Some(release.namespace.clone()),
+                uid: format!("{}/{}", release.namespace, release.name),
+            })
+        })
+        .collect();
+    TablePage {
+        columns,
+        rows,
+        truncated: releases.truncated,
+        continue_token: None,
+    }
+}
+
+fn chart_label(revision: &Revision) -> String {
+    match (revision.chart.as_str(), revision.chart_version.as_str()) {
+        ("", "") => "chart unnamed".to_string(),
+        (name, "") => name.to_string(),
+        (name, version) => format!("{name}-{version}"),
+    }
+}
+
 /// The inventory as a document, rendered here for the same reason a describe is:
-/// the shell's text item shows lines, and one deterministic rendering is what
-/// makes it gateable by a test rather than by a screenshot.
+/// one deterministic rendering is what makes it gateable by a test rather than
+/// by a screenshot. The shell lists releases as a table; this stays for the
+/// history a table does not show.
 pub fn render(releases: &Releases) -> Vec<String> {
     let mut lines = Vec::new();
     if releases.releases.is_empty() && releases.unreadable == 0 {
@@ -484,11 +533,7 @@ pub fn render(releases: &Releases) -> Vec<String> {
             .max()
             .unwrap_or(0);
         for revision in &release.revisions {
-            let chart = match (revision.chart.as_str(), revision.chart_version.as_str()) {
-                ("", "") => "chart unnamed".to_string(),
-                (name, "") => name.to_string(),
-                (name, version) => format!("{name}-{version}"),
-            };
+            let chart = chart_label(revision);
             let mut line = format!(
                 "  rev {:<4} {:<width$}  {chart}",
                 revision.revision, revision.status,

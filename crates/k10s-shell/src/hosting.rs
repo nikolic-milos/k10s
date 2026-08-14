@@ -17,12 +17,14 @@ use k10s_map::MapView;
 
 use crate::browse::{BrowseEvent, BrowseView, LocalCommand};
 use crate::config_schema;
+use crate::day2::Day2View;
 use crate::diff;
 use crate::editor::{self, EditorEvent, EditorView};
 use crate::files::{FilesEvent, FilesView};
 use crate::finder::PickerMode;
 use crate::forwards::ForwardsView;
 use crate::item::{Item, ItemHandle};
+use crate::lists::{InventoryEvent, InventoryView};
 use crate::provider::{
     DescribeRequest, ExecRequest, ForwardRequest, LogRequest, WorkloadLogRequest,
 };
@@ -322,16 +324,11 @@ impl Workspace {
             }
             ActivityId::Find => self.open_cluster_finder(window, cx),
             ActivityId::Releases => {
-                if self
-                    .center
-                    .active()
-                    .is_some_and(|tab| tab.tag == ItemTag::Releases)
-                {
-                    self.show_map(window, cx);
-                } else {
-                    self.open_releases(window, cx);
-                }
+                self.toggle_center_list(ItemTag::Releases, window, cx, Self::open_releases)
             }
+            ActivityId::Argo => self.toggle_center_list(ItemTag::Argo, window, cx, Self::open_argo),
+            ActivityId::Flux => self.toggle_center_list(ItemTag::Flux, window, cx, Self::open_flux),
+            ActivityId::Day2 => self.toggle_center_list(ItemTag::Day2, window, cx, Self::open_day2),
             ActivityId::Forwards => {
                 if self.bottom_showing(&ItemTag::Forwards) {
                     self.bottom.set_open(false);
@@ -370,11 +367,59 @@ impl Workspace {
                 _ => None,
             })
             .flatten();
+        let center = match self.center.active().map(|tab| &tab.tag) {
+            Some(ItemTag::Releases) => Some(crate::activity::CenterSlot::Releases),
+            Some(ItemTag::Argo) => Some(crate::activity::CenterSlot::Argo),
+            Some(ItemTag::Flux) => Some(crate::activity::CenterSlot::Flux),
+            Some(ItemTag::Day2) => Some(crate::activity::CenterSlot::Day2),
+            _ => None,
+        };
         RailState {
             map_active,
             left,
             bottom,
+            center,
             inspector_open: self.inspector_open,
+        }
+    }
+
+    fn toggle_center_list(
+        &mut self,
+        tag: ItemTag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        open: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>),
+    ) {
+        if self.center.active().is_some_and(|tab| tab.tag == tag) {
+            self.show_map(window, cx);
+        } else {
+            open(self, window, cx);
+        }
+    }
+
+    fn subscribe_inventory(
+        &mut self,
+        view: &Entity<InventoryView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            view,
+            window,
+            |this, _, event: &InventoryEvent, window, cx| match event {
+                InventoryEvent::NotServed { tag, what } => {
+                    this.close_tagged(tag, window, cx);
+                    this.status_note = Some(format!("{what} is not served by this cluster"));
+                    cx.notify();
+                }
+            },
+        )
+    }
+
+    fn close_tagged(&mut self, tag: &ItemTag, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.center.find(|tab| &tab.tag == tag) {
+            self.center.remove(index);
+            self.activate_center(0, window, cx);
         }
     }
 
@@ -386,11 +431,54 @@ impl Workspace {
             Place::Center,
             window,
             cx,
-            |this, _, cx| {
+            |this, window, cx| {
                 let provider = this.provider();
-                (cx.new(|cx| TextView::releases(provider, cx)), None)
+                let view = cx.new(|cx| InventoryView::helm(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
             },
         );
+    }
+
+    pub(crate) fn open_argo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Argo,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| InventoryView::argo(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_flux(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Flux,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| InventoryView::flux(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_day2(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(ItemTag::Day2, Place::Center, window, cx, |this, _, cx| {
+            let provider = this.provider();
+            let selection = this.selection.clone();
+            (
+                cx.new(|cx| Day2View::new(provider, selection.as_ref(), cx)),
+                None,
+            )
+        });
     }
 
     pub(crate) fn open_doc(

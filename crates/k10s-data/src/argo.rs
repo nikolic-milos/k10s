@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::apply::FIELD_MANAGER;
+use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::discover::KindTarget;
 use crate::read::{Fetched, classify, collection_path};
 
@@ -755,9 +756,68 @@ fn plural(count: usize, word: &str) -> String {
     format!("{word}s")
 }
 
+/// Native list rows. `None` when the group is not served, so a UI stays
+/// invisible rather than opening an empty pane. An empty `Some` is a cluster
+/// that has the CRDs and no Applications.
+pub fn table_page(inventory: &Inventory) -> Option<TablePage> {
+    if !inventory.served {
+        return None;
+    }
+    let columns = ["Kind", "Name", "Namespace", "Sync", "Health", "Destination"]
+        .iter()
+        .map(|name| TableColumn {
+            name: name.to_string(),
+            wide: false,
+        })
+        .collect();
+    let mut rows =
+        Vec::with_capacity(inventory.applications.len() + inventory.application_sets.len());
+    for app in &inventory.applications {
+        let uid = if app.uid.is_empty() {
+            format!("{}/{}", app.namespace, app.name)
+        } else {
+            app.uid.clone()
+        };
+        rows.push(TableRow {
+            cells: vec![
+                APPLICATION.to_string(),
+                app.name.clone(),
+                app.namespace.clone(),
+                app.sync.clone(),
+                app.health.clone(),
+                dest_label(&app.destination),
+            ],
+            name: app.name.clone(),
+            namespace: Some(app.namespace.clone()),
+            uid,
+        });
+    }
+    for set in &inventory.application_sets {
+        rows.push(TableRow {
+            cells: vec![
+                APPLICATION_SET.to_string(),
+                set.name.clone(),
+                set.namespace.clone(),
+                String::new(),
+                String::new(),
+                dest_label(&set.destination),
+            ],
+            name: set.name.clone(),
+            namespace: Some(set.namespace.clone()),
+            uid: format!("applicationset/{}/{}", set.namespace, set.name),
+        });
+    }
+    Some(TablePage {
+        columns,
+        rows,
+        truncated: inventory.truncated,
+        continue_token: None,
+    })
+}
+
 /// The inventory as a document, rendered here for the same reason a describe is:
-/// the shell's text item shows lines, and one deterministic rendering is what
-/// makes it gateable by a test rather than by a screenshot.
+/// one deterministic rendering is what makes it gateable by a test rather than
+/// by a screenshot.
 pub fn render(inventory: &Inventory) -> Vec<String> {
     if !inventory.served {
         return Vec::new();

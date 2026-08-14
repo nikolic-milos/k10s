@@ -21,6 +21,7 @@ use k10s_core::{Capability, KindId};
 use crate::apply::{self, ApplyOutcome, ApplyRequest};
 use crate::argo;
 use crate::browse::{self, TablePage};
+use crate::day2;
 use crate::describe::{self, DescribeRequest, Described};
 use crate::discover::KindTarget;
 use crate::exec::{ExecEvent, ExecRequest, ExecSession, ExecTransport, KubeExecTransport};
@@ -270,6 +271,68 @@ impl Reader {
         self.handle.spawn(async move {
             reply(helm::fetch_releases(&client, &targets, namespace.as_deref()).await);
         });
+    }
+
+    /// Argo Applications already published on the cluster. Absence is
+    /// [`argo::Inventory::served`] = false, not an error.
+    pub fn fetch_argo(&self, reply: impl FnOnce(Fetched<argo::Inventory>) + Send + 'static) {
+        let client = self.client.clone();
+        let targets = self.targets.clone();
+        self.handle.spawn(async move {
+            reply(argo::fetch_inventory(&client, &targets, None).await);
+        });
+    }
+
+    /// Flux CRs already published on the cluster. Absence is
+    /// [`flux::Inventory::served`] = false, not an error.
+    pub fn fetch_flux(&self, reply: impl FnOnce(Fetched<flux::Inventory>) + Send + 'static) {
+        let client = self.client.clone();
+        self.handle.spawn(async move {
+            reply(flux::fetch(&client, None).await);
+        });
+    }
+
+    /// Scale, rollout, delete, evict, cordon, drain, debug. Caps are filled
+    /// here from the probe so a caller cannot skip the gate; confirm still
+    /// lives on the request, so the first press never touches the wire.
+    pub fn day2(
+        &self,
+        kind: KindId,
+        mut call: day2::Day2Call,
+        reply: impl FnOnce(day2::Day2Outcome) + Send + 'static,
+    ) {
+        let Some(target) = self.target(kind) else {
+            reply(day2::Day2Outcome::Failed {
+                why: "this kind is not served by the connected cluster".to_string(),
+            });
+            return;
+        };
+        call.set_caps(self.caps_for(kind));
+        if let day2::Day2Call::Rollout(request) = &mut call
+            && let day2::RolloutAction::Restart { restarted_at } = &mut request.action
+            && restarted_at.is_empty()
+        {
+            let elapsed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            *restarted_at = flux::rfc3339(elapsed.as_secs(), elapsed.subsec_nanos());
+        }
+        let client = self.client.clone();
+        self.handle.spawn(async move {
+            reply(day2::run(&client, &target, &call).await);
+        });
+    }
+
+    fn caps_for(&self, kind: KindId) -> day2::Caps {
+        // The probe answers list/watch, not patch/delete/create. Forbidden
+        // list is enough to keep the wire untouched; anything else is tried
+        // and a 403 still arrives as Denied.
+        let allowed = !matches!(self.verdicts.get(&kind), Some(Capability::Forbidden));
+        day2::Caps {
+            patch: allowed,
+            delete: allowed,
+            create: allowed,
+        }
     }
 
     pub fn fetch_node_table(&self, reply: impl FnOnce(Fetched<TablePage>) + Send + 'static) {

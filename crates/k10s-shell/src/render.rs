@@ -23,9 +23,9 @@ use crate::workspace::{PickerPurpose, Workspace};
 use crate::{
     AttachSelection, ChooseCluster, ClearSelection, CloseItem, DescribeSelection, EditSelection,
     ExecSelection, FindCluster, FindFile, LoadSavedView, LogsSelection, NewFile, NextItem,
-    OpenBrowser, OpenFile, OpenFolder, OpenForwards, OpenKeymap, OpenNodes, OpenPalette,
-    OpenReleases, OpenSettings, PrevItem, Quit, ShowStarmap, ToggleBottomDock, ToggleInspector,
-    ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    OpenArgo, OpenBrowser, OpenDay2, OpenFile, OpenFlux, OpenFolder, OpenForwards, OpenKeymap,
+    OpenNodes, OpenPalette, OpenReleases, OpenSettings, PrevItem, Quit, ShowStarmap,
+    ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
 
 impl Render for Workspace {
@@ -354,6 +354,15 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenReleases, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Releases, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenArgo, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Argo, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenFlux, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Flux, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenDay2, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Day2, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 this.toggle_terminal(window, cx);

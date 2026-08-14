@@ -930,6 +930,45 @@ fn classify(error: &kube::Error, what: &'static str) -> Day2Outcome {
     }
 }
 
+/// One day-2 click, named so the shell cannot invent rollback: [`RolloutAction::Undo`]
+/// still fails inside [`rollout`], and nothing here offers it as a first-class call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Day2Call {
+    Scale(ScaleRequest),
+    Rollout(RolloutRequest),
+    Delete(DeleteRequest),
+    Evict(EvictRequest),
+    Cordon(CordonRequest),
+    Drain(DrainRequest),
+    Debug(DebugRequest),
+}
+
+impl Day2Call {
+    pub fn set_caps(&mut self, caps: Caps) {
+        match self {
+            Day2Call::Scale(request) => request.caps = caps,
+            Day2Call::Rollout(request) => request.caps = caps,
+            Day2Call::Delete(request) => request.caps = caps,
+            Day2Call::Evict(request) => request.caps = caps,
+            Day2Call::Cordon(request) => request.caps = caps,
+            Day2Call::Drain(request) => request.caps = caps,
+            Day2Call::Debug(request) => request.caps = caps,
+        }
+    }
+}
+
+pub async fn run(client: &Client, target: &KindTarget, call: &Day2Call) -> Day2Outcome {
+    match call {
+        Day2Call::Scale(request) => scale(client, target, request).await,
+        Day2Call::Rollout(request) => rollout(client, target, request).await,
+        Day2Call::Delete(request) => delete(client, target, request).await,
+        Day2Call::Evict(request) => evict(client, target, request).await,
+        Day2Call::Cordon(request) => cordon(client, target, request).await,
+        Day2Call::Drain(request) => drain(client, target, request).await,
+        Day2Call::Debug(request) => debug(client, target, request).await,
+    }
+}
+
 fn message_of(status: &Status, what: &'static str) -> String {
     if status.message.is_empty() {
         return format!(

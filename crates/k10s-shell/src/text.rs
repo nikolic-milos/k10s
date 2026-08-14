@@ -335,10 +335,6 @@ fn kubelet_stamped(bytes: &[u8]) -> bool {
 
 enum Source {
     Doc(DescribeRequest),
-    // Helm's stored releases. A document rather than a list view because that is
-    // what it is: an inventory with a history under each entry, read-only, with
-    // the same scrolling and regex search every other document here has.
-    Releases,
     Logs(LogSource),
 }
 
@@ -384,24 +380,6 @@ impl TextView {
             title: format!("describe {}", request.name).into(),
             state: TextState::new(usize::MAX),
             source: Source::Doc(request),
-            status: Some("loading...".to_string()),
-            searching: false,
-            input: String::new(),
-            show_timestamps: true,
-            generation: 0,
-            viewport: Viewport::default(),
-        };
-        view.reload(cx);
-        view
-    }
-
-    pub fn releases(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> TextView {
-        let mut view = TextView {
-            focus: cx.focus_handle(),
-            provider,
-            title: "helm releases".into(),
-            state: TextState::new(usize::MAX),
-            source: Source::Releases,
             status: Some("loading...".to_string()),
             searching: false,
             input: String::new(),
@@ -484,9 +462,8 @@ impl TextView {
         self.focus.clone()
     }
 
-    // Both documents this view can hold arrive the same way and are shown the
-    // same way; only the question differs, which is why the two live in one
-    // branch rather than in two copies of the spawn below.
+    // Documents this view holds arrive the same way and are shown the
+    // same way; only the question differs.
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
@@ -496,7 +473,6 @@ impl TextView {
         });
         match &self.source {
             Source::Doc(request) => self.provider.fetch_describe(request, reply),
-            Source::Releases => self.provider.fetch_releases(reply),
             Source::Logs(_) => {
                 self.start_follow(cx);
                 return;

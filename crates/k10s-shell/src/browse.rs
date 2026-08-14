@@ -197,6 +197,10 @@ impl BrowseView {
                         *loading = false;
                         match outcome {
                             TableOutcome::Table(page) => this.table.set_page(page),
+                            TableOutcome::Absent => {
+                                this.table.set_page(TablePage::default());
+                                *status = Some("not served by this cluster".to_string());
+                            }
                             TableOutcome::Denied(what) => {
                                 this.table.set_page(TablePage::default());
                                 *status = Some(format!("{what}: access denied for this account"));
@@ -253,6 +257,9 @@ impl BrowseView {
                         *loading = false;
                         match outcome {
                             TableOutcome::Table(page) => this.table.append_page(page),
+                            TableOutcome::Absent => {
+                                *status = Some("not served by this cluster".to_string());
+                            }
                             TableOutcome::Denied(what) => {
                                 *status = Some(format!("{what}: access denied for this account"));
                             }
