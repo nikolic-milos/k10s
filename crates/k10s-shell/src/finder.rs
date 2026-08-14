@@ -993,8 +993,9 @@ impl ClusterFinderView {
     }
 
     fn sync(&mut self, cx: &App) {
-        let snapshot = self.map.read(cx).snapshot();
-        self.state.sync(snapshot);
+        let map = self.map.read(cx);
+        self.state.sync(map.snapshot());
+        self.state.set_overlay(map.overlay().clone());
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {

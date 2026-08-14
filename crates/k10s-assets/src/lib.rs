@@ -261,6 +261,9 @@ mod tests {
             "icons/server.svg",
             "icons/magnifying_glass.svg",
             "icons/box.svg",
+            "icons/git_branch.svg",
+            "icons/pull_request.svg",
+            "icons/tool_hammer.svg",
             "icons/forward_arrow.svg",
             "icons/settings.svg",
         ] {

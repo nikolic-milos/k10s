@@ -527,6 +527,12 @@ impl MapView {
         cx.notify();
     }
 
+    /// The stamps the finder can index. Search reads this table, not the
+    /// paint walk, so an overlay query does not wait on a frame.
+    pub fn overlay(&self) -> &OverlayFrame {
+        &self.overlay
+    }
+
     // The map's commands, invoked by the workspace's action handlers: the
     // handlers live on the workspace element so the map's per-paint element
     // build stays lean enough for the allocation ratchet to mean something.
