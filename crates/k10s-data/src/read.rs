@@ -203,10 +203,10 @@ impl Reader {
         });
     }
 
-    // The one mutating method in the crate. Dry run and apply are the same
-    // request with one query parameter between them, which is why they are one
-    // method: a caller cannot reach the apply without having been able to reach
-    // the dry run.
+    // Server-side apply. Dry run and apply are the same request with one query
+    // parameter between them, which is why they are one method: a caller cannot
+    // reach the apply without having been able to reach the dry run. Day-2
+    // clicks are a different method; they are not documents.
     pub fn apply(&self, request: ApplyRequest, reply: impl FnOnce(ApplyOutcome) + Send + 'static) {
         let client = self.client.clone();
         let targets = self.targets.clone();

@@ -13,6 +13,8 @@
 #
 #   KUBECONFIG=/path/to/kubeconfig cargo test -p k10s-data --test live_cluster \
 #     -- --ignored --nocapture --test-threads=1
+#   KUBECONFIG=/path/to/kubeconfig cargo test -p k10s-data --test live_adapters \
+#     -- --ignored --nocapture --test-threads=1
 #
 # Two of these objects are created with a *client-side* apply and must stay that
 # way. `kubectl apply` writes the object it sent into a

@@ -587,9 +587,10 @@ read_provider! {
     /// call with confirm=false never touches the wire.
     fn run_day2(&self, request: &Day2Request, reply: Reply<Day2Outcome>);
     fn fetch_manifest(&self, request: &DescribeRequest, reply: Reply<ManifestOutcome>);
-    /// The one mutating method on the seam. Dry run and apply differ by one
-    /// field of the request, so a caller cannot reach the second without being
-    /// able to reach the first.
+    /// Server-side apply. Dry run and apply differ by one field of the
+    /// request, so a caller cannot reach the second without being able to
+    /// reach the first. Day-2 clicks are [`ReadProvider::run_day2`]; they
+    /// are not documents.
     fn apply(&self, request: &ApplyRequest, reply: Reply<ApplyOutcome>);
     fn fetch_schema_catalog(&self, reply: Reply<SchemaCatalogOutcome>);
     fn fetch_schema_document(&self, url: &str, reply: Reply<SchemaTextOutcome>);
