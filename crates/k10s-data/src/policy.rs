@@ -51,6 +51,15 @@ pub struct Finding {
     pub resource_uid: String,
 }
 
+/// Worst failing finding for one scene object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceTint {
+    pub uid: String,
+    pub namespace: String,
+    pub name: String,
+    pub tint: Severity,
+}
+
 /// What a fetch held, or the reason it held nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Inventory {
@@ -68,10 +77,19 @@ impl Inventory {
     /// Worst finding per resource uid, for OverlayMark.tint.
     /// Pass and skip do not stamp. An empty uid cannot be joined to a scene object.
     pub fn tints(&self) -> Vec<(String, Severity)> {
+        self.resource_tints()
+            .into_iter()
+            .map(|mark| (mark.uid, mark.tint))
+            .collect()
+    }
+
+    /// Same rollup as [`Inventory::tints`], with the name the snapshot can
+    /// still resolve when the uid is not on the published scene.
+    pub fn resource_tints(&self) -> Vec<ResourceTint> {
         if !self.served {
             return Vec::new();
         }
-        let mut by_uid: BTreeMap<String, Severity> = BTreeMap::new();
+        let mut by_uid: BTreeMap<String, ResourceTint> = BTreeMap::new();
         for report in &self.reports {
             for finding in &report.results {
                 if finding.resource_uid.is_empty() {
@@ -82,11 +100,16 @@ impl Inventory {
                 };
                 by_uid
                     .entry(finding.resource_uid.clone())
-                    .and_modify(|held| *held = held.rollup(tint))
-                    .or_insert(tint);
+                    .and_modify(|held| held.tint = held.tint.rollup(tint))
+                    .or_insert(ResourceTint {
+                        uid: finding.resource_uid.clone(),
+                        namespace: report.namespace.clone(),
+                        name: finding.resource_name.clone(),
+                        tint,
+                    });
             }
         }
-        by_uid.into_iter().collect()
+        by_uid.into_values().collect()
     }
 }
 
