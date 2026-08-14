@@ -82,6 +82,11 @@
 //! Both client-side applies must stay client-side. Server-side apply writes no
 //! `last-applied-configuration`, so a fixture created with `--server-side`
 //! quietly turns two three-way comparisons into two-way ones that still pass.
+//!
+//! Helm, Argo, Flux, overlays, and day-2 live in `live_adapters.rs`. That file
+//! is the other half of the write path: apply is a document, day-2 is a named
+//! click, and this suite still deletes fixtures through kube so a failed
+//! assertion cannot leave a half-applied day-2 behind its own cleanup.
 
 use std::time::Duration;
 
@@ -204,9 +209,9 @@ fn sent(payload: &k10s_edit::Payload) -> &str {
         .expect("these fixtures prune cleanly; a blocked payload is never sent")
 }
 
-// This crate has exactly one mutating method and it is `apply`, so a test that
-// needs an object *gone* has to ask kube directly. That asymmetry is the design
-// and not an oversight: nothing in the shipped data plane deletes anything.
+// A test that needs an object gone without going through day-2's confirm gate
+// asks kube directly. That keeps cleanup off the path under test: apply is the
+// document write, day-2 is the named click, and this file is about apply.
 fn delete_if_present(name: &str) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
