@@ -97,6 +97,51 @@ fn nothing_a_release_carries_beyond_its_inventory_survives_the_decode() {
         !rendered.contains("SUPERSECRET"),
         "the manifest, the values and the notes are dropped at the boundary: {rendered}"
     );
+    let page = table_page(&releases);
+    let cells = page.rows[0].cells.join(" ");
+    assert!(
+        !cells.contains("SUPERSECRET"),
+        "the table is the same inventory, so it has nowhere for them either: {cells}"
+    );
+}
+
+#[test]
+fn the_table_is_one_row_per_release_from_the_running_revision() {
+    let json = release_json("ingress-nginx", 4, "deployed");
+    let stored = decode(&as_the_api_server_sends_it(&json)).expect("decodes");
+    let older = Revision {
+        revision: 3,
+        status: "superseded".to_string(),
+        ..stored.revision.clone()
+    };
+    let page = table_page(&Releases {
+        releases: vec![Release {
+            name: stored.name.clone(),
+            namespace: stored.namespace.clone(),
+            revisions: vec![stored.revision.clone(), older],
+        }],
+        truncated: true,
+        unreadable: 0,
+    });
+    assert_eq!(
+        page.columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Name", "Namespace", "Revision", "Status", "Chart"]
+    );
+    assert_eq!(page.rows.len(), 1, "history is not a second row");
+    assert_eq!(
+        page.rows[0].cells,
+        [
+            "ingress-nginx",
+            "prod",
+            "4",
+            "deployed",
+            "ingress-nginx-4.11.3"
+        ]
+    );
+    assert!(page.truncated);
 }
 
 #[test]

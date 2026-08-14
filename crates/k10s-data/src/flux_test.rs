@@ -253,6 +253,52 @@ fn reconcile_now_sets_the_annotation_flux_already_honours() {
 }
 
 #[test]
+fn an_unserved_flux_inventory_has_no_table() {
+    assert!(
+        table_page(&Inventory::default()).is_none(),
+        "every group 404 is absence, not an empty list"
+    );
+}
+
+#[test]
+fn a_denied_flux_kind_is_a_labelled_row_not_an_empty_pane() {
+    let page = table_page(&Inventory {
+        git_repositories: KindSet::Denied,
+        ..Inventory::default()
+    })
+    .expect("Denied is served, so the table exists");
+    let text = page
+        .rows
+        .iter()
+        .flat_map(|row| row.cells.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("access denied for this account"),
+        "a 403 stays labelled: {text}"
+    );
+    assert!(text.contains("GitRepository"), "{text}");
+}
+
+#[test]
+fn a_served_flux_fixture_is_one_row_per_object() {
+    let git = resource_from(Kind::GitRepository, "v1", git_json());
+    let page = table_page(&Inventory {
+        git_repositories: KindSet::Served {
+            items: vec![git],
+            truncated: false,
+            unreadable: 0,
+        },
+        ..Inventory::default()
+    })
+    .expect("a served kind is a table");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].name, "podinfo");
+    assert_eq!(page.rows[0].cells[0], "GitRepository");
+    assert_eq!(page.rows[0].cells[3], "Ready");
+}
+
+#[test]
 fn a_missing_flux_group_renders_as_not_installed_rather_than_empty() {
     let lines = render(&Inventory::default());
     assert!(!Inventory::default().served());

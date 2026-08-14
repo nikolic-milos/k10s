@@ -17,6 +17,7 @@ use kube::Client;
 use kube::api::{ListParams, Patch, PatchParams, Request};
 use serde::Deserialize;
 
+use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::read::{Fetched, classify};
 
 pub const RECONCILE_REQUESTED_AT: &str = "reconcile.fluxcd.io/requestedAt";
@@ -726,6 +727,82 @@ fn ready_label(status: &str) -> String {
         "" => "no Ready condition".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Native list rows. `None` when every Flux group answered 404, so a UI stays
+/// invisible rather than opening an empty pane. A denied kind is a labelled
+/// row, not absence: collapsing those would say Flux is missing when the
+/// account was refused.
+pub fn table_page(inventory: &Inventory) -> Option<TablePage> {
+    if !inventory.served() {
+        return None;
+    }
+    let columns = ["Kind", "Name", "Namespace", "Ready", "Suspended", "Source"]
+        .iter()
+        .map(|name| TableColumn {
+            name: name.to_string(),
+            wide: false,
+        })
+        .collect();
+    let mut rows = Vec::new();
+    let mut truncated = false;
+    for (set, kind) in inventory.sets() {
+        match set {
+            KindSet::NotServed => {}
+            KindSet::Denied => {
+                rows.push(TableRow {
+                    cells: vec![
+                        kind.as_str().to_string(),
+                        String::new(),
+                        String::new(),
+                        "access denied for this account".to_string(),
+                        String::new(),
+                        String::new(),
+                    ],
+                    name: kind.as_str().to_string(),
+                    namespace: None,
+                    uid: format!("denied:{}", kind.as_str()),
+                });
+            }
+            KindSet::Served {
+                items,
+                truncated: cap,
+                ..
+            } => {
+                truncated |= *cap;
+                for item in items {
+                    let uid = if item.uid.is_empty() {
+                        format!("{}/{}/{}", item.kind.as_str(), item.namespace, item.name)
+                    } else {
+                        item.uid.clone()
+                    };
+                    rows.push(TableRow {
+                        cells: vec![
+                            item.kind.as_str().to_string(),
+                            item.name.clone(),
+                            item.namespace.clone(),
+                            ready_label(&item.ready),
+                            if item.suspended {
+                                "suspended".to_string()
+                            } else {
+                                String::new()
+                            },
+                            item.source_ref.clone(),
+                        ],
+                        name: item.name.clone(),
+                        namespace: Some(item.namespace.clone()),
+                        uid,
+                    });
+                }
+            }
+        }
+    }
+    Some(TablePage {
+        columns,
+        rows,
+        truncated,
+        continue_token: None,
+    })
 }
 
 /// The inventory as a document, rendered here for the same reason a describe

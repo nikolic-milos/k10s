@@ -336,6 +336,41 @@ fn a_sync_patch_is_operation_sync_on_the_application_not_under_spec() {
 }
 
 #[test]
+fn an_unserved_inventory_has_no_table_so_the_pane_stays_invisible() {
+    assert!(
+        table_page(&Inventory::unserved()).is_none(),
+        "served=false is absence, not an empty list"
+    );
+    let empty = table_page(&Inventory {
+        served: true,
+        ..Inventory::default()
+    })
+    .expect("CRDs with no Applications are a served empty table");
+    assert!(empty.rows.is_empty());
+}
+
+#[test]
+fn the_table_lists_applications_from_the_fixture() {
+    let app = application_from_value(application_json()).unwrap();
+    let set = applicationset_from_value(applicationset_json()).unwrap();
+    let page = table_page(&Inventory {
+        applications: vec![app],
+        application_sets: vec![set],
+        truncated: true,
+        served: true,
+        patchable: true,
+    })
+    .expect("served inventory is a table");
+    assert_eq!(page.rows.len(), 2);
+    assert_eq!(page.rows[0].cells[0], "Application");
+    assert_eq!(page.rows[0].name, "guestbook");
+    assert_eq!(page.rows[0].cells[3], "OutOfSync");
+    assert_eq!(page.rows[0].cells[4], "Degraded");
+    assert_eq!(page.rows[1].cells[0], "ApplicationSet");
+    assert!(page.truncated);
+}
+
+#[test]
 fn an_unserved_inventory_renders_nothing_and_a_served_empty_one_says_what_it_looked_at() {
     assert!(render(&Inventory::unserved()).is_empty());
     let lines = render(&Inventory {

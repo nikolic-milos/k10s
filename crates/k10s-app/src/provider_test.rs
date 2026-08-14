@@ -33,7 +33,7 @@ fn a_describe_maps_its_document_and_keeps_denial_and_failure_labels() {
 }
 
 #[test]
-fn a_release_inventory_renders_on_this_side_of_the_seam() {
+fn a_release_inventory_crosses_as_a_table() {
     let releases = k10s_data::helm::Releases {
         releases: vec![k10s_data::helm::Release {
             name: "ingress".to_string(),
@@ -51,11 +51,77 @@ fn a_release_inventory_renders_on_this_side_of_the_seam() {
         truncated: false,
         unreadable: 0,
     };
-    let expected = k10s_data::helm::render(&releases);
     match releases_outcome(Fetched::Ok(releases)) {
-        k10s_shell::DocOutcome::Doc { title, lines } => {
-            assert_eq!(title, "helm releases");
-            assert_eq!(lines, expected);
+        k10s_shell::TableOutcome::Table(page) => {
+            assert_eq!(
+                page.rows[0].cells,
+                ["ingress", "infra", "3", "deployed", "ingress-nginx-4.11.0"]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        releases_outcome(Fetched::Denied {
+            what: "helm releases"
+        }),
+        k10s_shell::TableOutcome::Denied("helm releases")
+    ));
+}
+
+#[test]
+fn gitops_absence_is_invisible_and_a_denial_stays_labelled() {
+    assert!(matches!(
+        argo_outcome(Fetched::Ok(k10s_data::argo::Inventory::default())),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        flux_outcome(Fetched::Ok(k10s_data::flux::Inventory::default())),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        argo_outcome(Fetched::Denied {
+            what: "argo applications"
+        }),
+        k10s_shell::TableOutcome::Denied("argo applications")
+    ));
+    let denied_flux = k10s_data::flux::Inventory {
+        git_repositories: k10s_data::flux::KindSet::Denied,
+        ..k10s_data::flux::Inventory::default()
+    };
+    match flux_outcome(Fetched::Ok(denied_flux)) {
+        k10s_shell::TableOutcome::Table(page) => {
+            let text = page
+                .rows
+                .iter()
+                .flat_map(|row| row.cells.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                text.contains("access denied for this account"),
+                "Denied is labelled, not Absent: {text}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_day2_needs_confirm_crosses_the_summary_and_not_a_write() {
+    match day2_outcome(k10s_data::day2::Day2Outcome::NeedsConfirm {
+        blast: k10s_data::day2::Blast::Replicas { from: 3, to: 0 },
+        summary: "scale api from 3 to 0 replicas".to_string(),
+    }) {
+        k10s_shell::Day2Outcome::NeedsConfirm { summary } => {
+            assert_eq!(summary, "scale api from 3 to 0 replicas");
+        }
+        other => panic!("{other:?}"),
+    }
+    match day2_outcome(k10s_data::day2::Day2Outcome::Denied {
+        what: "scale",
+        why: "this account cannot patch".to_string(),
+    }) {
+        k10s_shell::Day2Outcome::Denied { what, why } => {
+            assert_eq!((what, why.as_str()), ("scale", "this account cannot patch"));
         }
         other => panic!("{other:?}"),
     }

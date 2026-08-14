@@ -94,13 +94,33 @@ impl k10s_shell::ReadProvider for PlaneProvider {
             .fetch_describe(request, move |fetched| reply(describe_outcome(fetched)));
     }
 
-    // Helm's release inventory, rendered on this side of the seam like a
-    // describe is: the shell shows lines and holds no release payload of its
-    // own, which is what keeps a payload that can carry secret material from
-    // living in a view's state.
-    fn fetch_releases(&self, reply: k10s_shell::Reply<k10s_shell::DocOutcome>) {
+    // Helm's release inventory as a table. The shell never holds a release
+    // payload: columns are identity, revision, status, chart, and nothing
+    // that could carry values or a manifest.
+    fn fetch_releases(&self, reply: k10s_shell::Reply<k10s_shell::TableOutcome>) {
         self.reader
             .fetch_releases(None, move |fetched| reply(releases_outcome(fetched)));
+    }
+
+    fn fetch_argo(&self, reply: k10s_shell::Reply<k10s_shell::TableOutcome>) {
+        self.reader
+            .fetch_argo(move |fetched| reply(argo_outcome(fetched)));
+    }
+
+    fn fetch_flux(&self, reply: k10s_shell::Reply<k10s_shell::TableOutcome>) {
+        self.reader
+            .fetch_flux(move |fetched| reply(flux_outcome(fetched)));
+    }
+
+    fn run_day2(
+        &self,
+        request: &k10s_shell::Day2Request,
+        reply: k10s_shell::Reply<k10s_shell::Day2Outcome>,
+    ) {
+        let call = day2_call(request);
+        self.reader.day2(request.kind, call, move |outcome| {
+            reply(day2_outcome(outcome))
+        });
     }
 
     fn fetch_manifest(
@@ -435,14 +455,128 @@ fn describe_outcome(fetched: Fetched<k10s_data::describe::Described>) -> k10s_sh
     }
 }
 
-fn releases_outcome(fetched: Fetched<k10s_data::helm::Releases>) -> k10s_shell::DocOutcome {
+fn releases_outcome(fetched: Fetched<k10s_data::helm::Releases>) -> k10s_shell::TableOutcome {
     match fetched {
-        Fetched::Ok(releases) => k10s_shell::DocOutcome::Doc {
-            title: "helm releases".to_string(),
-            lines: k10s_data::helm::render(&releases),
+        Fetched::Ok(releases) => table_outcome(Fetched::Ok(k10s_data::helm::table_page(&releases))),
+        Fetched::Denied { what } => k10s_shell::TableOutcome::Denied(what),
+        Fetched::Failed { why, .. } => k10s_shell::TableOutcome::Failed(why),
+    }
+}
+
+fn argo_outcome(fetched: Fetched<k10s_data::argo::Inventory>) -> k10s_shell::TableOutcome {
+    match fetched {
+        Fetched::Ok(inventory) => match k10s_data::argo::table_page(&inventory) {
+            Some(page) => table_outcome(Fetched::Ok(page)),
+            None => k10s_shell::TableOutcome::Absent,
         },
-        Fetched::Denied { what } => k10s_shell::DocOutcome::Denied(what),
-        Fetched::Failed { why, .. } => k10s_shell::DocOutcome::Failed(why),
+        Fetched::Denied { what } => k10s_shell::TableOutcome::Denied(what),
+        Fetched::Failed { why, .. } => k10s_shell::TableOutcome::Failed(why),
+    }
+}
+
+fn flux_outcome(fetched: Fetched<k10s_data::flux::Inventory>) -> k10s_shell::TableOutcome {
+    match fetched {
+        Fetched::Ok(inventory) => match k10s_data::flux::table_page(&inventory) {
+            Some(page) => table_outcome(Fetched::Ok(page)),
+            None => k10s_shell::TableOutcome::Absent,
+        },
+        Fetched::Denied { what } => k10s_shell::TableOutcome::Denied(what),
+        Fetched::Failed { why, .. } => k10s_shell::TableOutcome::Failed(why),
+    }
+}
+
+fn day2_call(request: &k10s_shell::Day2Request) -> k10s_data::day2::Day2Call {
+    use k10s_data::day2::{
+        Caps, CordonRequest, Day2Call, DebugRequest, DeleteRequest, DrainRequest, EvictRequest,
+        RolloutAction, RolloutRequest, ScaleRequest,
+    };
+    // Caps are filled on the Reader from the probe. A zeroed value here is
+    // overwritten before the wire is considered.
+    let caps = Caps::default();
+    let namespace = request.namespace.clone();
+    let name = request.name.clone();
+    let confirm = request.confirm;
+    match &request.op {
+        k10s_shell::Day2Op::Scale { current, replicas } => Day2Call::Scale(ScaleRequest {
+            namespace,
+            name,
+            current: *current,
+            replicas: *replicas,
+            confirm,
+            caps,
+        }),
+        k10s_shell::Day2Op::Restart => Day2Call::Rollout(RolloutRequest {
+            namespace,
+            name,
+            action: RolloutAction::Restart {
+                restarted_at: String::new(),
+            },
+            confirm,
+            caps,
+        }),
+        k10s_shell::Day2Op::Pause => Day2Call::Rollout(RolloutRequest {
+            namespace,
+            name,
+            action: RolloutAction::Pause,
+            confirm,
+            caps,
+        }),
+        k10s_shell::Day2Op::Resume => Day2Call::Rollout(RolloutRequest {
+            namespace,
+            name,
+            action: RolloutAction::Resume,
+            confirm,
+            caps,
+        }),
+        k10s_shell::Day2Op::Delete => Day2Call::Delete(DeleteRequest {
+            namespace,
+            name,
+            grace_period_seconds: None,
+            confirm,
+            caps,
+        }),
+        k10s_shell::Day2Op::Evict => Day2Call::Evict(EvictRequest {
+            namespace: namespace.unwrap_or_default(),
+            name,
+            grace_period_seconds: None,
+            confirm,
+            caps,
+        }),
+        k10s_shell::Day2Op::Cordon { unschedulable } => Day2Call::Cordon(CordonRequest {
+            name,
+            unschedulable: *unschedulable,
+            confirm,
+            caps,
+        }),
+        k10s_shell::Day2Op::Drain { force } => Day2Call::Drain(DrainRequest {
+            name,
+            force: *force,
+            confirm,
+            caps,
+        }),
+        k10s_shell::Day2Op::Debug => Day2Call::Debug(DebugRequest {
+            namespace: namespace.unwrap_or_default(),
+            name,
+            image: "busybox".to_string(),
+            confirm,
+            caps,
+        }),
+    }
+}
+
+fn day2_outcome(outcome: k10s_data::day2::Day2Outcome) -> k10s_shell::Day2Outcome {
+    use k10s_data::day2::Day2Outcome;
+    match outcome {
+        Day2Outcome::Applied(applied) => k10s_shell::Day2Outcome::Applied {
+            summary: applied.summary,
+            truncated: applied.truncated,
+        },
+        Day2Outcome::Denied { what, why } => k10s_shell::Day2Outcome::Denied { what, why },
+        Day2Outcome::Rejected { message } => k10s_shell::Day2Outcome::Rejected { message },
+        Day2Outcome::Failed { why } => k10s_shell::Day2Outcome::Failed { why },
+        Day2Outcome::NeedsConfirm { summary, .. } => {
+            k10s_shell::Day2Outcome::NeedsConfirm { summary }
+        }
     }
 }
 

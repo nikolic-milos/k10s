@@ -129,8 +129,42 @@ pub struct TablePage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableOutcome {
     Table(TablePage),
+    /// The adapter is not on this cluster. The view stays invisible rather
+    /// than opening an empty pane that looks broken.
+    Absent,
     Denied(&'static str),
     Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Day2Op {
+    Scale { current: i32, replicas: i32 },
+    Restart,
+    Pause,
+    Resume,
+    Delete,
+    Evict,
+    Cordon { unschedulable: bool },
+    Drain { force: bool },
+    Debug,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Day2Request {
+    pub kind: KindId,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub op: Day2Op,
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Day2Outcome {
+    Applied { summary: String, truncated: bool },
+    Denied { what: &'static str, why: String },
+    Rejected { message: String },
+    Failed { why: String },
+    NeedsConfirm { summary: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,10 +574,18 @@ read_provider! {
     fn fetch_table(&self, kind: KindId, continue_token: Option<String>, reply: Reply<TableOutcome>);
     fn fetch_node_table(&self, reply: Reply<TableOutcome>);
     fn fetch_describe(&self, request: &DescribeRequest, reply: Reply<DocOutcome>);
-    /// Helm's stored releases, as a document. Rendered on the far side of the
-    /// seam like a describe is, for the same reason: one deterministic rendering
-    /// a test can gate, and a shell that holds no release payload of its own.
-    fn fetch_releases(&self, reply: Reply<DocOutcome>);
+    /// Helm's stored releases as a table. Values and manifests never cross:
+    /// the far side reduces a release to inventory columns before it answers.
+    fn fetch_releases(&self, reply: Reply<TableOutcome>);
+    /// Argo Applications. [`TableOutcome::Absent`] means the group is not
+    /// served, so the view stays invisible rather than opening an empty pane.
+    fn fetch_argo(&self, reply: Reply<TableOutcome>);
+    /// Flux CRs. Absent is the same rule as Argo.
+    fn fetch_flux(&self, reply: Reply<TableOutcome>);
+    /// Scale, rollout, delete, evict, cordon, drain, debug. Caps are applied
+    /// on the far side of the seam so a caller cannot skip the gate. The first
+    /// call with confirm=false never touches the wire.
+    fn run_day2(&self, request: &Day2Request, reply: Reply<Day2Outcome>);
     fn fetch_manifest(&self, request: &DescribeRequest, reply: Reply<ManifestOutcome>);
     /// The one mutating method on the seam. Dry run and apply differ by one
     /// field of the request, so a caller cannot reach the second without being
@@ -617,8 +659,22 @@ impl ReadProvider for NullProvider {
         reply(DocOutcome::Failed(NO_CLUSTER.to_string()));
     }
 
-    fn fetch_releases(&self, reply: Reply<DocOutcome>) {
-        reply(DocOutcome::Failed(NO_CLUSTER.to_string()));
+    fn fetch_releases(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_argo(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_flux(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn run_day2(&self, _: &Day2Request, reply: Reply<Day2Outcome>) {
+        reply(Day2Outcome::Failed {
+            why: NO_CLUSTER.to_string(),
+        });
     }
 
     fn fetch_manifest(&self, _: &DescribeRequest, reply: Reply<ManifestOutcome>) {

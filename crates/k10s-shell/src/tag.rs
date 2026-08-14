@@ -30,6 +30,9 @@ pub enum ItemTag {
     Forwards,
     Files,
     Releases,
+    Argo,
+    Flux,
+    Day2,
     Doc(String),
     Edit(String),
     Diff(String),
@@ -57,6 +60,9 @@ impl ItemTag {
             | ItemTag::Nodes
             | ItemTag::Forwards
             | ItemTag::Releases
+            | ItemTag::Argo
+            | ItemTag::Flux
+            | ItemTag::Day2
             | ItemTag::Doc(_)
             | ItemTag::Diff(_)
             | ItemTag::Logs(_)
@@ -91,6 +97,9 @@ mod tests {
             (ItemTag::Nodes, OnAdopt::Retire),
             (ItemTag::Forwards, OnAdopt::Retire),
             (ItemTag::Releases, OnAdopt::Retire),
+            (ItemTag::Argo, OnAdopt::Retire),
+            (ItemTag::Flux, OnAdopt::Retire),
+            (ItemTag::Day2, OnAdopt::Retire),
             (ItemTag::Doc("uid/name".into()), OnAdopt::Retire),
             (ItemTag::Diff("uid/name".into()), OnAdopt::Retire),
             (ItemTag::Logs("prod/pod-1".into()), OnAdopt::Retire),

@@ -12,6 +12,9 @@ pub(crate) enum ActivityId {
     Nodes,
     Find,
     Releases,
+    Argo,
+    Flux,
+    Day2,
     Forwards,
     Terminal,
     Inspector,
@@ -70,6 +73,27 @@ pub(crate) const ACTIVITIES: &[Activity] = &[
         group: ActivityGroup::Primary,
     },
     Activity {
+        id: ActivityId::Argo,
+        icon: "icons/git_branch.svg",
+        label: "Argo CD",
+        element_id: "activity-argo",
+        group: ActivityGroup::Primary,
+    },
+    Activity {
+        id: ActivityId::Flux,
+        icon: "icons/pull_request.svg",
+        label: "Flux",
+        element_id: "activity-flux",
+        group: ActivityGroup::Primary,
+    },
+    Activity {
+        id: ActivityId::Day2,
+        icon: "icons/tool_hammer.svg",
+        label: "Day-2",
+        element_id: "activity-day2",
+        group: ActivityGroup::Primary,
+    },
+    Activity {
         id: ActivityId::Forwards,
         icon: "icons/forward_arrow.svg",
         label: "Port forwards",
@@ -111,11 +135,20 @@ pub(crate) enum BottomSlot {
     Forwards,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CenterSlot {
+    Releases,
+    Argo,
+    Flux,
+    Day2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct RailState {
     pub map_active: bool,
     pub left: Option<LeftSlot>,
     pub bottom: Option<BottomSlot>,
+    pub center: Option<CenterSlot>,
     pub inspector_open: bool,
 }
 
@@ -125,7 +158,10 @@ pub(crate) fn lit(id: ActivityId, state: RailState) -> bool {
         ActivityId::Resources => state.left == Some(LeftSlot::Resources),
         ActivityId::Nodes => state.left == Some(LeftSlot::Nodes),
         ActivityId::Find => false,
-        ActivityId::Releases => false,
+        ActivityId::Releases => state.center == Some(CenterSlot::Releases),
+        ActivityId::Argo => state.center == Some(CenterSlot::Argo),
+        ActivityId::Flux => state.center == Some(CenterSlot::Flux),
+        ActivityId::Day2 => state.center == Some(CenterSlot::Day2),
         ActivityId::Forwards => state.bottom == Some(BottomSlot::Forwards),
         ActivityId::Terminal => state.bottom == Some(BottomSlot::Terminal),
         ActivityId::Inspector => state.inspector_open,
@@ -159,7 +195,7 @@ mod tests {
             icons.push(slot.icon);
             elements.push(slot.element_id);
         }
-        assert_eq!(ids.len(), 9);
+        assert_eq!(ids.len(), 12);
     }
 
     #[test]
