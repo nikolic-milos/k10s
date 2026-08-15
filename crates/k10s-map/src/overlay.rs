@@ -6,7 +6,7 @@
 //! keyed by uid, and only for what is already being drawn.
 
 use gpui::{Corners, Pixels, Window, point, px, quad, size, transparent_black};
-use k10s_atlas::{Camera, Level, LodPolicy, Rect};
+use k10s_atlas::{Camera, Level, LodPolicy, Rect, StageBlend, WorkloadPresentation};
 use k10s_core::{SceneSnapshot, Severity};
 use k10s_theme::{MapTheme, Point as UnitPoint, Series, scale_alpha, sparkline};
 
@@ -125,17 +125,19 @@ impl OverlayFrame {
         self.kind.is_none() && self.marks.is_empty()
     }
 
-    /// Stamps for marks whose objects are already on screen at this camera.
+    /// Stamps for marks whose objects the walk is already drawing.
     ///
     /// Walks the overlay table, not the scene. A uid the snapshot does not
-    /// carry, or a rect the camera has culled, is skipped: missing overlay,
-    /// not a default colour. Sparkline geometry is unit-space points scaled
-    /// onto the card; tint is a severity the painter reads from the theme.
+    /// carry, a rect the camera has culled, or geometry the current
+    /// [`StageBlend::walk_stage`] hid is skipped: missing overlay, not a
+    /// default colour. Sparkline geometry is unit-space points scaled onto
+    /// the card; tint is a severity the painter reads from the theme.
     pub fn visible_stamps(
         &self,
         scene: &SceneSnapshot,
         camera: Camera,
         policy: &LodPolicy,
+        blend: StageBlend,
         vw: f32,
         vh: f32,
     ) -> Vec<OverlayStamp> {
@@ -143,12 +145,13 @@ impl OverlayFrame {
             return Vec::new();
         }
         let visible = camera.visible_world(vw, vh);
+        let stage = blend.walk_stage();
         let mut stamps = Vec::new();
         for mark in &self.marks {
             let Some(located) = scene.locate(&mark.uid) else {
                 continue;
             };
-            if !object_is_drawn(scene, policy, camera.zoom, &visible, located) {
+            if !object_is_drawn(scene, policy, camera, stage, vw, vh, &visible, located) {
                 continue;
             }
             let (x, y) = camera.w2s(located.rect.x, located.rect.y, vw, vh);
@@ -198,7 +201,10 @@ const ISLAND_RADIUS: f32 = 0.34;
 fn object_is_drawn(
     scene: &SceneSnapshot,
     policy: &LodPolicy,
-    zoom: f32,
+    camera: Camera,
+    stage: u8,
+    vw: f32,
+    vh: f32,
     visible: &Rect,
     located: k10s_core::Located,
 ) -> bool {
@@ -207,15 +213,49 @@ fn object_is_drawn(
     }
     match located.level {
         Level::Region => true,
-        Level::Block => scene
+        Level::Block => owning_block(scene, located).is_some_and(|block| {
+            policy.workload_presentation(block.inner.w, camera.zoom, stage)
+                != WorkloadPresentation::Hidden
+        }),
+        Level::Cell => owning_block(scene, located).is_some_and(|block| {
+            let presentation = policy.workload_presentation(block.inner.w, camera.zoom, stage);
+            presentation.cells_shown()
+                && !policy.cells_aggregated(
+                    block.children.len(),
+                    block
+                        .inner
+                        .intersection_fraction(&camera.visible_world(vw, vh)),
+                )
+        }),
+        Level::Sat => {
+            let Some(block) = owning_block(scene, located) else {
+                return false;
+            };
+            let Some(sat) = scene.sats.get(located.slot) else {
+                return false;
+            };
+            stage >= 2
+                && (policy.block_painted(block.inner.w, camera.zoom) || policy.stress_curves)
+                && policy.sat_painted(sat.rect.w, camera.zoom)
+        }
+    }
+}
+
+fn owning_block(
+    scene: &SceneSnapshot,
+    located: k10s_core::Located,
+) -> Option<&k10s_core::WorkloadNode> {
+    match located.level {
+        Level::Block => scene.blocks.get(located.slot),
+        Level::Cell => scene
             .blocks
-            .get(located.slot)
-            .is_some_and(|block| policy.block_painted(block.inner.w, zoom)),
-        Level::Cell => policy.stage_for_zoom(zoom) >= 2,
+            .iter()
+            .find(|block| block.children.contains(&(located.slot as u32))),
         Level::Sat => scene
-            .sats
-            .get(located.slot)
-            .is_some_and(|sat| policy.sat_painted(sat.rect.w, zoom)),
+            .blocks
+            .iter()
+            .find(|block| block.sats.contains(&(located.slot as u32))),
+        Level::Region => None,
     }
 }
 
@@ -422,6 +462,20 @@ mod tests {
         }
     }
 
+    fn settled(camera: Camera) -> StageBlend {
+        StageBlend::settled(policy().stage_for_zoom(camera.zoom))
+    }
+
+    fn stamps(
+        frame: &OverlayFrame,
+        scene: &SceneSnapshot,
+        camera: Camera,
+        vw: f32,
+        vh: f32,
+    ) -> Vec<OverlayStamp> {
+        frame.visible_stamps(scene, camera, &policy(), settled(camera), vw, vh)
+    }
+
     fn series_two() -> Series {
         Series {
             name: "cpu".into(),
@@ -490,7 +544,7 @@ mod tests {
                 label: Some("OutOfSync".into()),
             }],
         };
-        let stamps = frame.visible_stamps(&scene, looking_at_near(), &policy(), 400.0, 300.0);
+        let stamps = stamps(&frame, &scene, looking_at_near(), 400.0, 300.0);
         assert!(stamps.is_empty());
     }
 
@@ -514,7 +568,7 @@ mod tests {
                 },
             ],
         };
-        let stamps = frame.visible_stamps(&scene, looking_at_near(), &policy(), 400.0, 300.0);
+        let stamps = stamps(&frame, &scene, looking_at_near(), 400.0, 300.0);
         assert_eq!(stamps.len(), 1);
         assert_eq!(stamps[0].tint, Some(Severity::Warn));
         assert!(stamps[0].island);
@@ -533,7 +587,7 @@ mod tests {
                 label: None,
             }],
         };
-        let stamps = frame.visible_stamps(&scene, looking_at_near(), &policy(), 400.0, 300.0);
+        let stamps = stamps(&frame, &scene, looking_at_near(), 400.0, 300.0);
         assert_eq!(stamps.len(), 1);
         assert_eq!(stamps[0].tint, None);
     }
@@ -557,11 +611,98 @@ mod tests {
             cy: 10.0,
             zoom: 1.0,
         };
-        let stamps = frame.visible_stamps(&scene, camera, &policy(), 400.0, 300.0);
+        let stamps = stamps(&frame, &scene, camera, 400.0, 300.0);
         assert!(
             stamps.is_empty(),
             "a card below block_min_px is not already being drawn"
         );
+    }
+
+    #[test]
+    fn a_card_is_not_stamped_when_the_walk_is_still_at_stage_zero() {
+        let scene = scene_two_islands();
+        let frame = OverlayFrame {
+            kind: Some(OverlayKind::Metrics),
+            marks: vec![OverlayMark {
+                uid: "wl-api".into(),
+                tint: Some(Severity::Ok),
+                sparkline: None,
+                label: None,
+            }],
+        };
+        let camera = Camera {
+            cx: 50.0,
+            cy: 40.0,
+            zoom: 0.05,
+        };
+        assert!(
+            policy().block_painted(80.0, camera.zoom),
+            "the old zoom-only gate would have stamped this card"
+        );
+        let hidden = frame.visible_stamps(
+            &scene,
+            camera,
+            &policy(),
+            StageBlend::settled(0),
+            800.0,
+            600.0,
+        );
+        assert!(
+            hidden.is_empty(),
+            "walk_stage 0 hides the card the walk has not drawn"
+        );
+        let fading = frame.visible_stamps(
+            &scene,
+            camera,
+            &policy(),
+            StageBlend {
+                from: 0,
+                to: 2,
+                t: 0.25,
+            },
+            800.0,
+            600.0,
+        );
+        assert!(
+            fading.is_empty(),
+            "a fade that has not crossed 0.5 still walks stage 0"
+        );
+    }
+
+    #[test]
+    fn a_pod_is_not_stamped_until_the_walk_shows_cells() {
+        let scene = scene_two_islands();
+        let frame = OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: vec![OverlayMark {
+                uid: "pod-api".into(),
+                tint: Some(Severity::Err),
+                sparkline: None,
+                label: None,
+            }],
+        };
+        let camera = looking_at_near();
+        let at_cards = frame.visible_stamps(
+            &scene,
+            camera,
+            &policy(),
+            StageBlend::settled(1),
+            800.0,
+            600.0,
+        );
+        assert!(
+            at_cards.is_empty(),
+            "stage 1 draws the card, not the pods inside it"
+        );
+        let at_pods = frame.visible_stamps(
+            &scene,
+            camera,
+            &policy(),
+            StageBlend::settled(2),
+            800.0,
+            600.0,
+        );
+        assert_eq!(at_pods.len(), 1);
     }
 
     #[test]
@@ -604,7 +745,7 @@ mod tests {
             cy: 40.0,
             zoom: 1.0,
         };
-        let stamps = frame.visible_stamps(&scene, camera, &policy(), 800.0, 600.0);
+        let stamps = stamps(&frame, &scene, camera, 800.0, 600.0);
         assert_eq!(stamps.len(), 1);
         assert!(!stamps[0].island);
         assert_eq!(stamps[0].spark.len(), 2);

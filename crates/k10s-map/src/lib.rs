@@ -1412,7 +1412,7 @@ fn paint_map(
     if !overlay.marks.is_empty() {
         let vw = f32::from(bounds.size.width);
         let vh = f32::from(bounds.size.height);
-        let stamps = overlay.visible_stamps(scene, camera, lod(), vw, vh);
+        let stamps = overlay.visible_stamps(scene, camera, lod(), blend, vw, vh);
         overlay::paint_stamps(
             &stamps,
             (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),
