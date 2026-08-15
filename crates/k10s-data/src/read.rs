@@ -108,6 +108,7 @@ pub struct Reader {
     handle: tokio::runtime::Handle,
     targets: Arc<[KindTarget]>,
     verdicts: Arc<HashMap<KindId, Capability>>,
+    caps: Arc<HashMap<KindId, day2::Caps>>,
     forwards: ForwardRegistry,
     netpol: Arc<Mutex<Option<(Instant, netpol::Inventory)>>>,
 }
@@ -121,6 +122,7 @@ impl Reader {
         client: Client,
         targets: Vec<KindTarget>,
         verdicts: &[(KindId, Capability)],
+        caps: &[(KindId, day2::Caps)],
     ) -> Reader {
         let handle = tokio::runtime::Handle::current();
         Reader {
@@ -132,6 +134,7 @@ impl Reader {
             handle,
             targets: targets.into(),
             verdicts: Arc::new(verdicts.iter().copied().collect()),
+            caps: Arc::new(caps.iter().copied().collect()),
             netpol: Arc::new(Mutex::new(None)),
         }
     }
@@ -324,15 +327,7 @@ impl Reader {
     }
 
     fn caps_for(&self, kind: KindId) -> day2::Caps {
-        // The probe answers list/watch, not patch/delete/create. Forbidden
-        // list is enough to keep the wire untouched; anything else is tried
-        // and a 403 still arrives as Denied.
-        let allowed = !matches!(self.verdicts.get(&kind), Some(Capability::Forbidden));
-        day2::Caps {
-            patch: allowed,
-            delete: allowed,
-            create: allowed,
-        }
+        self.caps.get(&kind).copied().unwrap_or_default()
     }
 
     pub fn fetch_node_table(&self, reply: impl FnOnce(Fetched<TablePage>) + Send + 'static) {

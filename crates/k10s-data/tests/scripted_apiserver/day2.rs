@@ -1013,3 +1013,49 @@ fn debug_without_create_never_fires() {
     assert_eq!(what, "debug");
     assert!(script.seen().is_empty(), "{:?}", script.seen());
 }
+
+#[test]
+fn a_reader_who_can_list_cannot_scale_and_does_not_touch_the_wire() {
+    use k10s_core::KindId;
+    use k10s_data::day2::Day2Call;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "PATCH",
+        "/apis/apps/v1/namespaces/prod/deployments/web/scale?",
+        200,
+        ok_json(),
+    );
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.day2(
+        KindId::DEPLOYMENT,
+        Day2Call::Scale(ScaleRequest {
+            namespace: Some("prod".to_string()),
+            name: "web".to_string(),
+            current: 1,
+            replicas: 2,
+            confirm: true,
+            caps: Caps::default(),
+        }),
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    );
+    match wait(&rx) {
+        Day2Outcome::Denied { what, .. } => assert_eq!(what, "scale"),
+        other => panic!("list/watch must not grant scale: {other:?}"),
+    }
+    assert!(
+        script.requests_for("/deployments/web/scale").is_empty(),
+        "the probe must keep the scale off the wire: {:?}",
+        script.requests_for("/scale")
+    );
+    drop(runtime);
+}
