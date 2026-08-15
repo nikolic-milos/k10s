@@ -1,4 +1,4 @@
-//! The read-only Kubernetes data plane.
+//! The Kubernetes data plane: reads, apply, and named day-2 writes.
 //!
 //! Everything here reaches the cluster through the API server with an
 //! ordinary kubeconfig: no operator, agent, CRD, or in-cluster footprint of
@@ -398,6 +398,7 @@ pub async fn sync_from(
 
     let mut events = assembled.events;
     let verdict_list = verdicts(&discovered, &watch_set, &access);
+    let caps_list = day2_caps(&discovered, &access);
     for (kind, verdict) in &verdict_list {
         events.push(IngestEvent::Capability {
             kind: *kind,
@@ -419,7 +420,12 @@ pub async fn sync_from(
 
     let snapshot = catalog.clone();
     let inspector = inspect::Inspector::new(client.clone());
-    let reader = read::Reader::new(client.clone(), discovered.targets.clone(), &verdict_list);
+    let reader = read::Reader::new(
+        client.clone(),
+        discovered.targets.clone(),
+        &verdict_list,
+        &caps_list,
+    );
     tokio::spawn(forward_live(rx, store, catalog, projection, sink, metrics));
 
     Ok(Sync {
@@ -591,6 +597,16 @@ pub fn verdicts(
             },
         ));
     }
+    out.sort_by_key(|(kind, _)| kind.0);
+    out
+}
+
+fn day2_caps(discovered: &Discovered, access: &Access) -> Vec<(KindId, day2::Caps)> {
+    let mut out: Vec<(KindId, day2::Caps)> = discovered
+        .targets
+        .iter()
+        .map(|target| (target.id, access.day2_caps(target)))
+        .collect();
     out.sort_by_key(|(kind, _)| kind.0);
     out
 }

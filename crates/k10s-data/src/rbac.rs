@@ -196,6 +196,36 @@ impl Access {
             _ => Capability::Watchable,
         }
     }
+
+    /// Patch, delete, and create as the rules review named them.
+    ///
+    /// List/watch is a different question: a reader who can list Deployments
+    /// still cannot scale them. Incomplete or unanswered rules stay a maybe,
+    /// so the click is attempted and a 403 still arrives as Denied.
+    pub fn day2_caps(&self, target: &KindTarget) -> crate::day2::Caps {
+        crate::day2::Caps {
+            patch: self.allows_verb(target, "patch"),
+            delete: self.allows_verb(target, "delete"),
+            create: self.allows_verb(target, "create"),
+        }
+    }
+
+    pub fn allows_verb(&self, target: &KindTarget, verb: &str) -> bool {
+        if self.degraded {
+            return true;
+        }
+        if self.per_namespace.iter().any(|(_, rules)| {
+            rules.allows(target.group(), target.plural(), verb)
+                || rules.is_incomplete()
+                || rules.is_unanswered()
+        }) {
+            return true;
+        }
+        if self.per_namespace.is_empty() {
+            return !matches!(self.verdict(target), Capability::Forbidden);
+        }
+        false
+    }
 }
 
 pub async fn probe(client: &Client, targets: &[WatchTarget], namespaces: &[String]) -> Access {
@@ -582,6 +612,57 @@ mod tests {
         assert_eq!(access.scope_for(&pods()), WatchScope::All);
         assert_eq!(access.scope_for(&nodes()), WatchScope::All);
         assert_eq!(access.verdict(&pods()), Capability::Watchable);
+        let caps = access.day2_caps(&pods());
+        assert!(
+            caps.patch && caps.delete && caps.create,
+            "unprobed day-2 still tries the wire: {caps:?}"
+        );
+    }
+
+    #[test]
+    fn day2_caps_come_from_patch_delete_create_not_list_watch() {
+        let mut access = Access::default();
+        access
+            .cluster_wide
+            .insert(KindId::DEPLOYMENT, Answer::Allowed);
+        access.per_namespace.push((
+            "g2".into(),
+            ruleset(
+                vec![rule(
+                    &["apps"],
+                    &["deployments"],
+                    &["get", "list", "watch"],
+                    &[],
+                )],
+                false,
+            ),
+        ));
+        let deploy = target(
+            "apps",
+            "Deployment",
+            "deployments",
+            true,
+            KindId::DEPLOYMENT,
+        );
+        let caps = access.day2_caps(&deploy);
+        assert!(
+            !caps.patch && !caps.delete && !caps.create,
+            "a reader who can list must not be told they can scale: {caps:?}"
+        );
+
+        let mut admin = Access::default();
+        admin
+            .cluster_wide
+            .insert(KindId::DEPLOYMENT, Answer::Allowed);
+        admin.per_namespace.push((
+            "g2".into(),
+            ruleset(vec![rule(&["*"], &["*"], &["*"], &[])], false),
+        ));
+        let admin_caps = admin.day2_caps(&deploy);
+        assert!(
+            admin_caps.patch && admin_caps.delete && admin_caps.create,
+            "star verbs grant the day-2 clicks: {admin_caps:?}"
+        );
     }
 
     #[test]
