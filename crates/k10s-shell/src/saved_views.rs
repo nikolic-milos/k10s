@@ -42,6 +42,7 @@ pub enum ViewError {
     NotJson(String),
     ForbiddenField(&'static str),
     MissingName,
+    UnknownLayout(String),
 }
 
 impl std::fmt::Display for ViewError {
@@ -52,6 +53,9 @@ impl std::fmt::Display for ViewError {
                 write!(f, "saved view must not carry {field}")
             }
             ViewError::MissingName => write!(f, "saved view has no name"),
+            ViewError::UnknownLayout(name) => {
+                write!(f, "saved view layout must be spread or dense, not {name}")
+            }
         }
     }
 }
@@ -71,6 +75,15 @@ pub fn parse_view(text: &str) -> Result<SavedView, ViewError> {
         .ok_or(ViewError::MissingName)?
         .to_string();
     let camera = value.get("camera").unwrap_or(&Value::Null);
+    let layout = value
+        .get("layout")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(name) = layout.as_deref()
+        && !matches!(name, "spread" | "dense")
+    {
+        return Err(ViewError::UnknownLayout(name.to_string()));
+    }
     Ok(SavedView {
         name,
         camera: CameraPose {
@@ -83,10 +96,7 @@ pub fn parse_view(text: &str) -> Result<SavedView, ViewError> {
             .get("overlay")
             .and_then(Value::as_str)
             .map(str::to_string),
-        layout: value
-            .get("layout")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        layout,
     })
 }
 
@@ -106,6 +116,38 @@ impl SavedView {
             zoom: self.camera.zoom,
         }
         .clamped()
+    }
+
+    /// What loading this view actually does. Overlay and camera apply;
+    /// filter and layout are kept on the file so a later apply has
+    /// somewhere to read them, and named here so the status line does
+    /// not pretend they already changed the scene.
+    pub fn load_status(&self) -> String {
+        let mut dropped = Vec::new();
+        if self.filter.is_constrained() {
+            dropped.push("filter");
+        }
+        if self.layout.is_some() {
+            dropped.push("layout");
+        }
+        if dropped.is_empty() {
+            format!("loaded view {}", self.name)
+        } else {
+            format!(
+                "loaded view {} ({} not applied)",
+                self.name,
+                dropped.join(" and ")
+            )
+        }
+    }
+}
+
+impl MapFilter {
+    pub fn is_constrained(&self) -> bool {
+        !self.namespaces.is_empty()
+            || !self.kinds.is_empty()
+            || !self.label_selector.is_empty()
+            || self.health.is_some()
     }
 }
 
@@ -194,10 +236,29 @@ mod tests {
         assert_eq!(view.filter.health, Some(HealthFilter::Unhealthy));
         assert_eq!(view.overlay.as_deref(), Some("policy"));
         assert_eq!(view.overlay_kind(), Some(k10s_map::OverlayKind::Policy));
+        assert_eq!(view.layout.as_deref(), Some("dense"));
         let camera = view.camera_target();
         assert_eq!(camera.cx, 10.0);
         assert_eq!(camera.cy, 20.0);
         assert_eq!(camera.zoom, 4.0);
+        assert_eq!(
+            view.load_status(),
+            "loaded view prod errors (filter and layout not applied)"
+        );
+    }
+
+    #[test]
+    fn an_unknown_layout_is_refused() {
+        match parse_view(r#"{"name":"x","layout":"by-node"}"#) {
+            Err(ViewError::UnknownLayout(name)) => assert_eq!(name, "by-node"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_camera_only_view_does_not_claim_a_dropped_axis() {
+        let view = parse_view(r#"{"name":"home","camera":{"x":1,"y":2,"zoom":3}}"#).unwrap();
+        assert_eq!(view.load_status(), "loaded view home");
     }
 
     #[test]
