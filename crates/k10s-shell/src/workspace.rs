@@ -358,7 +358,7 @@ impl Workspace {
             map.fly_to(target, k10s_atlas::Motion::reduced_when(cx.reduce_motion()));
             cx.notify();
         });
-        self.status_note = Some(format!("loaded view {}", view.name));
+        self.status_note = Some(view.load_status());
         cx.notify();
     }
 
