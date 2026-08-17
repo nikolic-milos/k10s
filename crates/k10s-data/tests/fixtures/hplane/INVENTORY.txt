@@ -1,0 +1,221 @@
+k10s H-plane lab inventory
+recorded: 2026-08-15
+cluster: rootless k3s v1.36.2+k3s1
+kubeconfig: /home/Losmi/.rancher/k3s/k3s.yaml (not modified)
+kubectl: /home/Losmi/.rancher/k3s/data/current/bin/kubectl (absolute path; bin dir never on PATH)
+contexts (unchanged): default (current), reader@k10s-lab, nometrics@k10s-lab
+
+================================================================
+BEFORE APPLY
+================================================================
+
+nodes
+NAME        STATUS   ROLES           AGE   VERSION        INTERNAL-IP   EXTERNAL-IP   OS-IMAGE     KERNEL-VERSION          CONTAINER-RUNTIME
+archlinux   Ready    control-plane   34h   v1.36.2+k3s1   10.41.0.100   <none>        Arch Linux   7.1.8-arch1-3 (amd64)   containerd://2.3.2-k3s2
+
+node detail
+name: archlinux
+roles: control-plane
+kubelet: v1.36.2+k3s1
+os: Arch Linux
+kernel: 7.1.8-arch1-3
+runtime: containerd://2.3.2-k3s2
+internalIP: 10.41.0.100
+capacity.cpu: 16
+capacity.memory: 32625948Ki
+capacity.pods: 110
+condition MemoryPressure=False reason=KubeletHasSufficientMemory
+condition DiskPressure=False reason=KubeletHasNoDiskPressure
+condition PIDPressure=False reason=KubeletHasSufficientPID
+condition Ready=True reason=KubeletReady
+
+namespaces
+NAME              STATUS   AGE
+default           Active   34h
+g2                Active   34h
+kube-node-lease   Active   34h
+kube-public       Active   34h
+kube-system       Active   34h
+
+matching api-resources
+filter: cilium|kyverno|velero|cnpg|vault|bao|external-secret|argo|kargo|flux|policyreport|grafana|loki|tempo|prom|otel|alertmanager|hubble|headlamp|openbao|harbor
+result: none
+
+all services
+NAMESPACE     NAME             TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)                      AGE
+default       kubernetes       ClusterIP      10.43.0.1       <none>        443/TCP                      34h
+kube-system   kube-dns         ClusterIP      10.43.0.10      <none>        53/UDP,53/TCP,9153/TCP       34h
+kube-system   metrics-server   ClusterIP      10.43.237.196   <none>        443/TCP                      34h
+kube-system   traefik          LoadBalancer   10.43.127.185   127.0.0.1     80:30917/TCP,443:31142/TCP   34h
+
+helm release secrets (type=helm.sh/release.v1, label owner=helm)
+NAMESPACE     NAME                                TYPE                 RELEASE       STATUS     VERSION
+kube-system   sh.helm.release.v1.traefik-crd.v1   helm.sh/release.v1   traefik-crd   deployed   1
+kube-system   sh.helm.release.v1.traefik.v1       helm.sh/release.v1   traefik       deployed   1
+
+gateway.networking.k8s.io
+served: yes (k3s Traefik, already present; not a lab install)
+kinds: BackendTLSPolicy, GatewayClass, Gateway, GRPCRoute, HTTPRoute, ListenerSet, ReferenceGrant, TLSRoute (all v1)
+objects: none
+
+metrics-server
+APIService v1beta1.metrics.k8s.io: Available=True, service kube-system/metrics-server
+deployment kube-system/metrics-server: 1/1 Ready (rancher/mirrored-metrics-server:v0.8.1)
+
+admission webhooks
+validatingwebhookconfigurations: none
+mutatingwebhookconfigurations: none
+
+================================================================
+AFTER APPLY (fixtures/hplane/apply.sh)
+================================================================
+
+node
+archlinux Ready control-plane v1.36.2+k3s1 (unchanged)
+/readyz: ok
+/livez: ok
+no extra pods, PVCs, or Secrets in k10s-hplane (CRDs and sample objects only)
+
+namespaces
+NAME              STATUS
+default           Active
+g2                Active   (untouched: web, forward-probe, usage-probe, settings, api-token, declared-token, widget/sprocket)
+k10s-hplane       Active   (lab fixture namespace only)
+kube-node-lease   Active
+kube-public       Active
+kube-system       Active
+
+matching api-resources after
+filter as above, plus opentelemetry (the substring "otel" does not match "opentelemetry")
+
+NAME                        SHORTNAMES   APIVERSION                      NAMESPACED   KIND
+ciliumnetworkpolicies       cnp          cilium.io/v2                    true         CiliumNetworkPolicy
+externalsecrets                          external-secrets.io/v1          true         ExternalSecret
+secretstores                             external-secrets.io/v1          true         SecretStore
+stages                                   kargo.akuity.io/v1alpha1        true         Stage
+clusterpolicies             cpol         kyverno.io/v1                   false        ClusterPolicy
+policies                    pol          kyverno.io/v1                   true         Policy
+opentelemetrycollectors                  opentelemetry.io/v1beta1        true         OpenTelemetryCollector
+clusters                                 postgresql.cnpg.io/v1           true         Cluster
+vaultconnections                         secrets.hashicorp.com/v1beta1   true         VaultConnection
+backups                                  velero.io/v1                    true         Backup
+
+still absent after apply (filter hits that were not installed)
+argo, flux, policyreport/wgpolicyk8s.io, grafana, loki, tempo, prom/monitoring.coreos.com,
+alertmanager, hubble, headlamp, openbao/bao, harbor
+
+all services after (unchanged)
+NAMESPACE     NAME             TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)
+default       kubernetes       ClusterIP      10.43.0.1       <none>        443/TCP
+kube-system   kube-dns         ClusterIP      10.43.0.10      <none>        53/UDP,53/TCP,9153/TCP
+kube-system   metrics-server   ClusterIP      10.43.237.196   <none>        443/TCP
+kube-system   traefik          LoadBalancer   10.43.127.185   127.0.0.1     80:30917/TCP,443:31142/TCP
+
+helm after (unchanged)
+kube-system/sh.helm.release.v1.traefik-crd.v1  traefik-crd  deployed  v1
+kube-system/sh.helm.release.v1.traefik.v1      traefik      deployed  v1
+deployments kube-system/traefik and kube-system/metrics-server still 1/1
+
+gateway.networking.k8s.io after
+still served; same eight kinds; still no Gateway objects
+
+metrics-server after
+APIService Available=True; deploy 1/1
+
+lab CRDs applied (label k10s.dev/hplane-fixture=true)
+backups.velero.io
+ciliumnetworkpolicies.cilium.io
+clusterpolicies.kyverno.io
+clusters.postgresql.cnpg.io
+externalsecrets.external-secrets.io
+opentelemetrycollectors.opentelemetry.io
+policies.kyverno.io
+secretstores.external-secrets.io
+stages.kargo.akuity.io
+vaultconnections.secrets.hashicorp.com
+
+lab sample objects
+ClusterPolicy/k10s-hplane-clusterpolicy
+k10s-hplane/Policy/k10s-hplane-policy
+k10s-hplane/Backup/k10s-hplane-backup
+k10s-hplane/Cluster/k10s-hplane-cnpg
+k10s-hplane/SecretStore/k10s-hplane-store
+k10s-hplane/ExternalSecret/k10s-hplane-external  (references only; no secret data)
+k10s-hplane/Stage/k10s-hplane-stage
+k10s-hplane/VaultConnection/k10s-hplane-vault
+k10s-hplane/CiliumNetworkPolicy/k10s-hplane-cnp
+k10s-hplane/OpenTelemetryCollector/k10s-hplane-otel
+
+groups served after apply
+gateway.networking.k8s.io     yes (pre-existing Traefik)
+cilium.io                     yes (CRD only)
+kyverno.io                    yes (CRD only)
+velero.io                     yes (CRD only)
+postgresql.cnpg.io            yes (CRD only)
+external-secrets.io           yes (CRD only)
+kargo.akuity.io               yes (CRD only)
+secrets.hashicorp.com         yes (CRD only)
+opentelemetry.io              yes (CRD only)
+monitoring.coreos.com         no  (Prometheus Operator CRDs skipped; they are huge)
+argoproj.io                   no
+source.toolkit.fluxcd.io      no
+wgpolicyk8s.io                no
+
+================================================================
+REVERT SPOT-CHECK
+================================================================
+
+deleted one sample: k10s-hplane/Backup/k10s-hplane-backup
+confirmed gone
+re-ran apply.sh
+backup restored; CRDs and other samples unchanged
+node still Ready; /readyz ok; /livez ok
+full revert.sh was not run so the lab stays applied for live_hplane.rs
+
+================================================================
+REFUSED TO INSTALL
+================================================================
+
+Cilium agent, Hubble, kube-proxy replacement, any CNI change
+Kyverno controller and any admission webhook
+Velero controller
+CloudNativePG operator (no Pods, no PVCs)
+External Secrets operator (no generated Secrets)
+Kargo controller
+Vault / OpenBao / Vault Secrets Operator
+OpenTelemetry operator or collector Pod
+kube-prometheus-stack, Grafana, Loki, Tempo
+Prometheus Operator CRDs (monitoring.coreos.com): skipped as too large
+Headlamp
+Argo CD, Flux, Harbor
+any Helm chart, any large image set
+nothing in namespace g2, Traefik, or metrics-server
+
+================================================================
+CANARY ROUND (2026-08-15, second pass)
+================================================================
+
+every sample now carries a planted canary annotation:
+  k10s.lab/canary: PLANTED-live-canary       (most samples)
+  k10s.lab/canary: password-PLANTED-not-real (cnpg; trips the password grep)
+  k10s.lab/canary: AKIAPLANTEDFAKEKEY0000    (velero; trips the AKIA grep)
+  k10s.lab/tokenSecret: PLANTED-live-canary  (vault; trips the tokenSecret grep)
+
+samples/web-plane.yaml adds, riding on CRDs k3s Traefik already serves:
+  k10s-hplane/Service/hplane-dns              (was ad-hoc; now a fixture)
+  k10s-hplane/IngressRoute/hplane-dns         (was ad-hoc; now a fixture)
+  k10s-hplane/Middleware/k10s-hplane-mw       (basicAuth names hplane-basic-auth)
+  GatewayClass/k10s-lab                       (controller does not exist; inert)
+  k10s-hplane/Gateway/k10s-hplane-gw
+  k10s-hplane/HTTPRoute/k10s-hplane-route
+  k10s-hplane/ListenerSet/k10s-hplane-listeners
+  k10s-hplane/ReferenceGrant/k10s-hplane-grant
+  k10s-hplane/Ingress/k10s-hplane-ingress     (tls names the canary Secret)
+  k10s-hplane/Secret/k10s-hplane-tls-canary   (planted non-PEM bytes; an
+                                               adapter that fetched it would
+                                               surface PLANTED and fail)
+
+live_hplane.rs asserts the chain lists and no PLANTED token ever surfaces.
+kubectl warns "failed to find any PEM data" on the canary Secret: expected.
+Traefik reconciles the Ingress and logs a bad-cert error for it: expected,
+lab-only, serves its default certificate instead.

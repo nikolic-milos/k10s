@@ -1,0 +1,16 @@
+# Lab fixture only. No Velero will run this backup.
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: k10s-hplane-backup
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: AKIAPLANTEDFAKEKEY0000
+spec:
+  includedNamespaces:
+  - k10s-hplane
+  ttl: 24h0m0s
+  snapshotVolumes: false
+  defaultVolumesToFsBackup: false

@@ -15,6 +15,9 @@ pub(crate) enum ActivityId {
     Argo,
     Flux,
     Day2,
+    Observe,
+    Policy,
+    Ecosystem,
     Forwards,
     Terminal,
     Inspector,
@@ -94,6 +97,27 @@ pub(crate) const ACTIVITIES: &[Activity] = &[
         group: ActivityGroup::Primary,
     },
     Activity {
+        id: ActivityId::Observe,
+        icon: "icons/sparkle.svg",
+        label: "Grafana queries",
+        element_id: "activity-observe",
+        group: ActivityGroup::Primary,
+    },
+    Activity {
+        id: ActivityId::Policy,
+        icon: "icons/lock.svg",
+        label: "Policy",
+        element_id: "activity-policy",
+        group: ActivityGroup::Primary,
+    },
+    Activity {
+        id: ActivityId::Ecosystem,
+        icon: "icons/blocks.svg",
+        label: "Ecosystem",
+        element_id: "activity-ecosystem",
+        group: ActivityGroup::Primary,
+    },
+    Activity {
         id: ActivityId::Forwards,
         icon: "icons/forward_arrow.svg",
         label: "Port forwards",
@@ -141,6 +165,9 @@ pub(crate) enum CenterSlot {
     Argo,
     Flux,
     Day2,
+    Observe,
+    Policy,
+    Ecosystem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -162,6 +189,9 @@ pub(crate) fn lit(id: ActivityId, state: RailState) -> bool {
         ActivityId::Argo => state.center == Some(CenterSlot::Argo),
         ActivityId::Flux => state.center == Some(CenterSlot::Flux),
         ActivityId::Day2 => state.center == Some(CenterSlot::Day2),
+        ActivityId::Observe => state.center == Some(CenterSlot::Observe),
+        ActivityId::Policy => state.center == Some(CenterSlot::Policy),
+        ActivityId::Ecosystem => state.center == Some(CenterSlot::Ecosystem),
         ActivityId::Forwards => state.bottom == Some(BottomSlot::Forwards),
         ActivityId::Terminal => state.bottom == Some(BottomSlot::Terminal),
         ActivityId::Inspector => state.inspector_open,
@@ -195,7 +225,7 @@ mod tests {
             icons.push(slot.icon);
             elements.push(slot.element_id);
         }
-        assert_eq!(ids.len(), 12);
+        assert_eq!(ids.len(), 15);
     }
 
     #[test]

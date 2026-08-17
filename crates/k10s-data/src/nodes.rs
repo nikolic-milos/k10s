@@ -150,7 +150,9 @@ async fn load_on(client: &Client, node: &str, budgets: Option<&[BlockedBudget]>)
     Some(load)
 }
 
-// A budget that currently blocks eviction: `status.disruptionsAllowed == 0`.
+// A budget that currently blocks eviction: `status.disruptionsAllowed == 0`,
+// or a status the controller has not computed yet -- the eviction API reads
+// an unset disruptionsAllowed as the Go zero value and blocks on it.
 // Only these are held; a budget with headroom cannot block anything.
 struct BlockedBudget {
     namespace: String,
@@ -183,17 +185,21 @@ async fn fetch_blocked_budgets(client: &Client) -> Option<Vec<BlockedBudget>> {
     Some(
         list.items
             .into_iter()
-            .filter(|pdb| {
-                pdb.status
-                    .as_ref()
-                    .is_some_and(|status| status.disruptions_allowed == 0)
-            })
+            .filter(blocks_eviction)
             .map(|pdb| BlockedBudget {
                 namespace: pdb.metadata.namespace.unwrap_or_default(),
                 selector: pdb.spec.and_then(|spec| spec.selector),
             })
             .collect(),
     )
+}
+
+// Missing status or missing disruptionsAllowed counts as 0: only a budget the
+// controller has computed headroom for is exempt.
+fn blocks_eviction(pdb: &PodDisruptionBudget) -> bool {
+    pdb.status
+        .as_ref()
+        .is_none_or(|status| status.disruptions_allowed.unwrap_or(0) == 0)
 }
 
 // policy/v1 semantics: a nil selector selects no pods, an empty one selects

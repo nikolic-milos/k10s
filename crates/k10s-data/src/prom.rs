@@ -372,6 +372,21 @@ pub(crate) fn refuse_expr(expr: &str) -> Option<String> {
     if expr.trim().is_empty() {
         return Some("the PromQL expression is empty; it is not sent".to_string());
     }
+    // Grafana variables ($var, $__rate_interval, ${var}) are not PromQL and
+    // nothing here can expand them. `$1` in a label_replace replacement and
+    // a `$` regex anchor are plain PromQL and must pass.
+    let mut rest = expr;
+    while let Some(position) = rest.find('$') {
+        rest = &rest[position + 1..];
+        let next = rest.bytes().next();
+        if matches!(next, Some(b'{') | Some(b'_')) || next.is_some_and(|b| b.is_ascii_alphabetic())
+        {
+            return Some(
+                "$ is Grafana's engine (variables, $__rate_interval), not PromQL we can send"
+                    .to_string(),
+            );
+        }
+    }
     None
 }
 

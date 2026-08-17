@@ -34,6 +34,24 @@ fn install_panic_hook() {
 
 const WORLD_CONTROL_CAPACITY: usize = 64;
 
+/// The app's asset chain: the map's embedded glyphs first (so shell chrome
+/// can name a brand mask by its `icons/tools/...` key), then the embedded
+/// brand/font table, then the vendored Zed icon set.
+struct AppAssets;
+
+impl gpui::AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some(bytes) = k10s_map::embedded_icon(path) {
+            return Ok(Some(std::borrow::Cow::Borrowed(bytes)));
+        }
+        k10s_assets::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        k10s_assets::Assets.list(path)
+    }
+}
+
 fn main() {
     let process_started = std::time::Instant::now();
     install_panic_hook();
@@ -229,7 +247,7 @@ fn main() {
         .map(|startup| startup.present_probe(!choose_on_launch));
     let startup_window = startup;
     gpui_platform::application()
-        .with_assets(k10s_assets::Assets)
+        .with_assets(AppAssets)
         .run(move |cx| {
             if let Some(startup) = &startup_window {
                 startup.application_ready();

@@ -533,9 +533,9 @@ fn resolve_role(
 }
 
 fn role_ref_group_ok(role_ref: &RoleRef) -> bool {
-    match role_ref.api_group.as_str() {
-        "" | RBAC_GROUP => true,
-        _ => false,
+    match role_ref.api_group.as_deref() {
+        None | Some("") | Some(RBAC_GROUP) => true,
+        Some(_) => false,
     }
 }
 

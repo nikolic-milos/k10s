@@ -45,7 +45,7 @@ fn cluster_role(name: &str, rules: Vec<PolicyRule>) -> ClusterRole {
 
 fn role_ref(kind: &str, name: &str) -> RoleRef {
     RoleRef {
-        api_group: RBAC_GROUP.to_string(),
+        api_group: Some(RBAC_GROUP.to_string()),
         kind: kind.to_string(),
         name: name.to_string(),
     }

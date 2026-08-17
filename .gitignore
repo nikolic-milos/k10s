@@ -1,14 +1,6 @@
 /target
 /.tmp
-# The designer handoff: the rules PDF, the 2000px logo originals and the upstream
-# font packages. What the product actually ships is vendored, downscaled and
-# licence-carrying under crates/k10s-assets/assets/, so nothing here is needed to
-# build -- and none of it belongs in a clone.
 /ui
-# Local cluster credentials and the lab scratch beside them. k10s never writes
-# these -- it reads the kubeconfig the environment already names -- but a lab
-# that stands a cluster up next to the checkout does, and a leaked kubeconfig is
-# a cluster, not a file.
 kubeconfig
 kubeconfig-*
 *.kubeconfig
@@ -16,5 +8,5 @@ kubeconfig-*
 .env.*
 *.pem
 *.key
-# Local agent instructions. Not a product file, and it does not belong in a clone.
 /AGENTS.md
+*.pristine

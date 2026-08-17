@@ -22,25 +22,42 @@ use std::sync::LazyLock;
 use crate::{Appearance, MapTheme, ShellTheme, SyntaxTheme, Theme};
 
 // Vendor marks: the colour a tool is recognised by is that tool's property,
-// not ours, so the dark themes carry the logo values unchanged. Every one of
-// them clears 3:1 on the k10s-dark canvas already.
-const VENDOR_TOOLS: [u32; 35] = [
-    0x9e96b8, 0x017cee, 0xef7b4d, 0x1287b1, 0xffcc01, 0xf24c53, 0x8cb3bf, 0xac6199, 0x419eda,
-    0x49bda5, 0x0e83c8, 0x5468ff, 0xf46800, 0x60b932, 0x466bb0, 0x66cfe3, 0xd24939, 0x9c9a9b,
-    0xafafaf, 0x8cb3bf, 0x326ce5, 0x8ca4ab, 0xc72e49, 0x47a248, 0x4479a1, 0x27aae1, 0x009639,
-    0x8c8c8c, 0x4169e1, 0xe6522c, 0xff6600, 0xff4438, 0x8c8c8c, 0x24a1c1, 0xffec6e,
+// not ours, so `one-dark` carries the logo values unchanged and `contrast.rs`
+// records each shortfall with its measured ratio. A tool glyph is painted on
+// the island fill and on the card header, never on the raw map background,
+// so those two surfaces are the canvases every mark is measured against.
+const VENDOR_TOOLS: [u32; k10s_core::BUILTIN_TOOL_COUNT as usize] = [
+    0x9e96b8, 0x017cee, 0xef7b4d, 0x1287b1, 0xf8c517, 0xffcc01, 0xf24c53, 0x8cb3bf, 0xac6199,
+    0x419eda, 0x00aec7, 0x49bda5, 0x0e83c8, 0x5468ff, 0xf46800, 0x60b932, 0xfff200, 0x466bb0,
+    0x66cfe3, 0xd24939, 0x9c9a9b, 0xe59655, 0xafafaf, 0x8cb3bf, 0x326ce5, 0xe87e5b, 0xf15b2b,
+    0x8ca4ab, 0xc72e49, 0x47a248, 0x4479a1, 0x27aae1, 0x009639, 0x336d5c, 0x8c8c8c, 0x4169e1,
+    0xe6522c, 0xff6600, 0xff4438, 0x8c8c8c, 0x84e194, 0x24a1c1, 0xffec6e, 0x239de0,
 ];
 
-// The same marks on a white canvas, where most of them vanish -- Airflow's
-// yellow measures 1.09:1 on the light map background. Each was darkened along
-// its own hue and saturation, and only as far as it had to go, so the tool
-// stays recognisable and stays visible; the fourteen that already cleared are
+// The k10s-dark canvases hide four of the marks: Istio, MinIO, OpenBao and
+// PostgreSQL fall under 3:1 on the card header (OpenBao measures 2.39:1
+// there), and the brand themes carry no waivers. Each of the four is lifted
+// along its own hue and saturation, and only as far as it had to go; the
+// forty that already cleared are untouched.
+const VENDOR_TOOLS_ON_DARK: [u32; k10s_core::BUILTIN_TOOL_COUNT as usize] = [
+    0x9e96b8, 0x017cee, 0xef7b4d, 0x1287b1, 0xf8c517, 0xffcc01, 0xf24c53, 0x8cb3bf, 0xac6199,
+    0x419eda, 0x00aec7, 0x49bda5, 0x0e83c8, 0x5468ff, 0xf46800, 0x60b932, 0xfff200, 0x4c72b8,
+    0x66cfe3, 0xd24939, 0x9c9a9b, 0xe59655, 0xafafaf, 0x8cb3bf, 0x326ce5, 0xe87e5b, 0xf15b2b,
+    0x8ca4ab, 0xd13752, 0x47a248, 0x4479a1, 0x27aae1, 0x009639, 0x3b7e6a, 0x8c8c8c, 0x426ae1,
+    0xe6522c, 0xff6600, 0xff4438, 0x8c8c8c, 0x84e194, 0x24a1c1, 0xffec6e, 0x239de0,
+];
+
+// The same marks on the light canvases, where most of them vanish -- Vault's
+// yellow measures 1.02:1 on the card header. Each was darkened along its own
+// hue and saturation, and only as far as it had to go, so the tool stays
+// recognisable and stays visible; the fourteen that already cleared are
 // untouched.
-const VENDOR_TOOLS_ON_LIGHT: [u32; 35] = [
-    0x8d84ac, 0x017cee, 0xeb5a21, 0x1287b1, 0xa78500, 0xf24c53, 0x5a91a2, 0xac6199, 0x298fd1,
-    0x379985, 0x0e83c8, 0x5468ff, 0xe56100, 0x509b2a, 0x466bb0, 0x2096ac, 0xd24939, 0x8c898a,
-    0x898989, 0x5a91a2, 0x326ce5, 0x708e97, 0xc72e49, 0x449b45, 0x4479a1, 0x1b92c4, 0x009639,
-    0x898989, 0x4169e1, 0xe6522c, 0xe85d00, 0xff3f33, 0x898989, 0x2194b2, 0x9c8700,
+const VENDOR_TOOLS_ON_LIGHT: [u32; k10s_core::BUILTIN_TOOL_COUNT as usize] = [
+    0x897fa9, 0x017cee, 0xea5115, 0x1287b1, 0xa48005, 0xa28100, 0xf1444c, 0x578c9d, 0xac6199,
+    0x288bcc, 0x0092a7, 0x359380, 0x0e83c8, 0x5468ff, 0xdd5e00, 0x4d9528, 0x8e8700, 0x466bb0,
+    0x1f91a7, 0xd24939, 0x878486, 0xca6c1f, 0x848484, 0x578c9d, 0x326ce5, 0xe1592c, 0xef4914,
+    0x6b8a93, 0xc72e49, 0x429643, 0x4479a1, 0x1b8ebf, 0x009639, 0x336d5c, 0x848484, 0x4169e1,
+    0xe6522c, 0xe15a00, 0xff2f22, 0x848484, 0x259839, 0x2090ad, 0x988400, 0x1c8cca,
 ];
 
 /// The default. Neutrals on hue 248 at 8% saturation, from `#141417` at the
@@ -80,7 +97,7 @@ pub static K10S_DARK: LazyLock<Theme> = LazyLock::new(|| Theme {
             0x86b6f0, 0xb98cf0, 0x71c9d4, 0x8ad2a7, 0xdcae76, 0x62c98d, 0x9391a4, 0xc79bf2,
             0x9fd68c, 0x7bb4f5, 0xe0c98d, 0x64c9d6, 0xb5b2c2,
         ],
-        tool_colors: VENDOR_TOOLS,
+        tool_colors: VENDOR_TOOLS_ON_DARK,
         pod_severity: [0x7fd3a0, 0xdcb46e, 0xef7c8a, 0x9391a4],
         workload_fill: [0x1b2822, 0x2a2419, 0x2c1d21, 0x22212a],
         workload_border: [
@@ -444,12 +461,25 @@ mod tests {
     #[test]
     fn a_vendor_mark_is_only_moved_when_the_canvas_hides_it() {
         assert_eq!(
-            VENDOR_TOOLS[20], VENDOR_TOOLS_ON_LIGHT[20],
-            "Kubernetes blue already clears 3:1 on white, so it is untouched"
+            VENDOR_TOOLS[24], VENDOR_TOOLS_ON_LIGHT[24],
+            "Kubernetes blue already clears 3:1 on every light canvas, so it is untouched"
         );
         assert_ne!(
-            VENDOR_TOOLS[4], VENDOR_TOOLS_ON_LIGHT[4],
-            "Airflow's yellow measures 1.09:1 on the light canvas and must move"
+            VENDOR_TOOLS[5], VENDOR_TOOLS_ON_LIGHT[5],
+            "ClickHouse yellow measures 1.23:1 on the light card header and must move"
+        );
+        assert_ne!(
+            VENDOR_TOOLS[6], VENDOR_TOOLS_ON_LIGHT[6],
+            "Consul red clears 3:1 on the light map background but measures 2.87:1 on the \
+             card header the glyph is actually painted on, so it must move"
+        );
+        assert_eq!(
+            VENDOR_TOOLS[24], VENDOR_TOOLS_ON_DARK[24],
+            "Kubernetes blue already clears 3:1 on every k10s-dark canvas, so it is untouched"
+        );
+        assert_ne!(
+            VENDOR_TOOLS[33], VENDOR_TOOLS_ON_DARK[33],
+            "OpenBao green measures 2.39:1 on the k10s-dark card header and must lift"
         );
     }
 }

@@ -23,9 +23,10 @@ use crate::workspace::{PickerPurpose, Workspace};
 use crate::{
     AttachSelection, ChooseCluster, ClearSelection, CloseItem, DescribeSelection, EditSelection,
     ExecSelection, FindCluster, FindFile, LoadSavedView, LogsSelection, NewFile, NextItem,
-    OpenArgo, OpenBrowser, OpenDay2, OpenFile, OpenFlux, OpenFolder, OpenForwards, OpenKeymap,
-    OpenNodes, OpenPalette, OpenReleases, OpenSettings, PrevItem, Quit, ShowStarmap,
-    ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    OpenArgo, OpenBrowser, OpenDay2, OpenEcosystem, OpenFile, OpenFlux, OpenFolder, OpenForwards,
+    OpenHarbor, OpenKeymap, OpenMesh, OpenNodes, OpenObserve, OpenPalette, OpenPolicy,
+    OpenReleases, OpenSettings, OpenTraces, PrevItem, Quit, ShowStarmap, ToggleBottomDock,
+    ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
 
 impl Render for Workspace {
@@ -363,6 +364,24 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenDay2, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Day2, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenObserve, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Observe, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenPolicy, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Policy, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenHarbor, window, cx| {
+                this.open_harbor(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenMesh, window, cx| {
+                this.open_mesh(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenTraces, window, cx| {
+                this.open_traces(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenEcosystem, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Ecosystem, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 this.toggle_terminal(window, cx);

@@ -29,6 +29,14 @@ pub fn keybindings() -> Vec<KeyBinding> {
     // project tree are Browse too, and nothing there listens for it: a default
     // that does nothing where it is offered teaches the wrong keystroke.
     let forwards = Some("Forwards");
+    // The Helm inventory is a Browse list plus three release commands.
+    // v/u/shift-v live here rather than in Browse for the same reason `x`
+    // lives in Forwards: every other Browse view ignores them, and a default
+    // that does nothing where it is offered teaches the wrong keystroke.
+    let releases = Some("Releases");
+    // The ecosystem pane is a Browse-shaped table plus a family column; its
+    // own context keeps tab/shift-tab from stealing focus travel elsewhere.
+    let ecosystem = Some("Ecosystem");
     let doc = Some("Doc");
     let typing = Some("Typing");
     let editor = Some("Editor");
@@ -48,6 +56,15 @@ pub fn keybindings() -> Vec<KeyBinding> {
         // letter here is either a map command or something the terminal has to be
         // able to type.
         KeyBinding::new("shift-h", OpenReleases, workspace),
+        KeyBinding::new("shift-g", OpenObserve, workspace),
+        KeyBinding::new("shift-p", OpenPolicy, workspace),
+        KeyBinding::new("shift-r", OpenHarbor, workspace),
+        KeyBinding::new("shift-i", OpenMesh, workspace),
+        KeyBinding::new("shift-t", OpenTraces, workspace),
+        KeyBinding::new("shift-e", OpenEcosystem, workspace),
+        KeyBinding::new("v", RevealHelm, releases),
+        KeyBinding::new("u", HelmRollback, releases),
+        KeyBinding::new("shift-v", HelmDiff, releases),
         KeyBinding::new("d", DescribeSelection, workspace),
         KeyBinding::new("l", LogsSelection, workspace),
         KeyBinding::new("s", ExecSelection, workspace),
@@ -77,6 +94,17 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("x", StopForward, forwards),
         KeyBinding::new("/", EnterFilter, browse),
         KeyBinding::new("escape", Back, browse),
+        KeyBinding::new("up", RowUp, ecosystem),
+        KeyBinding::new("down", RowDown, ecosystem),
+        KeyBinding::new("pageup", RowPageUp, ecosystem),
+        KeyBinding::new("pagedown", RowPageDown, ecosystem),
+        KeyBinding::new("home", RowHome, ecosystem),
+        KeyBinding::new("end", RowEnd, ecosystem),
+        KeyBinding::new("tab", NextFamily, ecosystem),
+        KeyBinding::new("shift-tab", PrevFamily, ecosystem),
+        KeyBinding::new("r", Refresh, ecosystem),
+        KeyBinding::new("/", EnterFilter, ecosystem),
+        KeyBinding::new("escape", Back, ecosystem),
         KeyBinding::new("up", DocScrollUp, doc),
         KeyBinding::new("down", DocScrollDown, doc),
         KeyBinding::new("pageup", DocPageUp, doc),
@@ -381,6 +409,31 @@ mod tests {
             "the resource browser and the project tree are Browse too, and a default \
              that does nothing there teaches the wrong keystroke"
         );
+    }
+
+    #[test]
+    fn helm_release_commands_are_offered_only_where_something_listens_for_them() {
+        let bindings = keybindings();
+        let named = |context: &str| -> BTreeSet<String> {
+            scoped_to(&bindings, context)
+                .map(|binding| binding.action().name().to_string())
+                .collect()
+        };
+        for action in [
+            "k10s_shell::RevealHelm",
+            "k10s_shell::HelmRollback",
+            "k10s_shell::HelmDiff",
+        ] {
+            assert!(
+                named("Releases").contains(action),
+                "the Helm inventory is the only view that listens for {action}"
+            );
+            assert!(
+                !named("Browse").contains(action),
+                "every other Browse view ignores {action}, and a default that does \
+                 nothing there teaches the wrong keystroke"
+            );
+        }
     }
 
     #[test]

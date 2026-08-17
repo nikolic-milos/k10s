@@ -144,6 +144,30 @@ fn an_expression_past_eight_kib_is_not_sent() {
 }
 
 #[test]
+fn a_dollar_variable_is_grafana_and_is_not_sent() {
+    let why =
+        refuse_expr(r#"sum(rate(up{namespace="$namespace"}[$__rate_interval]))"#).expect("refused");
+    assert!(why.contains("Grafana"), "{why}");
+    assert!(
+        refuse_expr(r#"up{ns="${var}"}"#).is_some(),
+        "braced form too"
+    );
+    assert!(refuse_expr("sum(rate(up[5m]))").is_none());
+}
+
+#[test]
+fn a_capture_group_and_a_regex_anchor_are_promql_not_grafana() {
+    assert!(
+        refuse_expr(r#"label_replace(up, "host", "$1", "instance", "(.*):.*")"#).is_none(),
+        "label_replace replacements use $1"
+    );
+    assert!(
+        refuse_expr(r#"up{job=~".*api$"}"#).is_none(),
+        "a regex end anchor is not a Grafana variable"
+    );
+}
+
+#[test]
 fn series_past_256_are_counted_not_kept() {
     let items: Vec<String> = (0..MAX_SERIES + 3)
         .map(|i| format!(r#"{{"metric":{{"i":"{i}"}},"value":[1,"1"]}}"#))

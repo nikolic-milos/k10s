@@ -486,6 +486,96 @@ fn a_usage_sample_crosses_typed_and_every_label_survives() {
 }
 
 #[test]
+fn policy_harbor_and_mesh_absence_hide_the_pane() {
+    assert!(matches!(
+        policy_outcome(Fetched::Ok(k10s_data::policy::Inventory::default())),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        harbor_outcome(Fetched::Ok(k10s_data::harbor::Inventory::default())),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        mesh_outcome(k10s_data::mesh::MeshInventory::default()),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        grafana_outcome(Fetched::Ok(k10s_data::read::GrafanaCatalog {
+            dashboards: Vec::new(),
+            extra_hits: Vec::new(),
+            truncated: false,
+            browser_base: None,
+            served: false,
+        })),
+        k10s_shell::GrafanaOutcome::Absent
+    ));
+    assert!(matches!(
+        prom_outcome(Fetched::Ok(None)),
+        k10s_shell::PromOutcome::Absent
+    ));
+    assert!(matches!(
+        loki_outcome(Fetched::Ok(None)),
+        k10s_shell::LokiOutcome::Absent
+    ));
+    assert!(matches!(
+        trace_outcome(Fetched::Ok(None)),
+        k10s_shell::TraceOutcome::Absent
+    ));
+}
+
+#[test]
+fn a_helm_rollback_report_keeps_the_not_helm_rollback_note() {
+    let report = k10s_data::helm_reveal::RollbackReport {
+        note: k10s_data::helm_reveal::NOT_HELM_ROLLBACK,
+        documents: Vec::new(),
+    };
+    match helm_rollback_outcome(Fetched::Ok(report)) {
+        k10s_shell::HelmRollbackOutcome::Report { note, lines } => {
+            assert_eq!(note, k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
+            assert_eq!(lines[0], k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
+    let catalog = k10s_data::read::GrafanaCatalog {
+        dashboards: vec![k10s_data::grafana::Dashboard {
+            uid: "node".to_string(),
+            title: "Node".to_string(),
+            panels: vec![k10s_data::grafana::Panel {
+                id: 2,
+                title: "CPU".to_string(),
+                kind: k10s_data::grafana::PanelKind::Timeseries,
+                queries: vec![k10s_data::grafana::PanelQuery {
+                    ref_id: "A".to_string(),
+                    expr: "rate(cpu[1m])".to_string(),
+                    dialect: k10s_data::grafana::QueryDialect::PromQL,
+                    datasource: None,
+                }],
+                transformed: false,
+            }],
+            truncated: false,
+        }],
+        extra_hits: Vec::new(),
+        truncated: false,
+        browser_base: Some("http://grafana.mon.svc:3000".to_string()),
+        served: true,
+    };
+    match grafana_outcome(Fetched::Ok(catalog)) {
+        k10s_shell::GrafanaOutcome::Catalog { panels, .. } => {
+            assert_eq!(panels[0].expr, "rate(cpu[1m])");
+            assert_eq!(
+                panels[0].browser_url.as_deref(),
+                Some("http://grafana.mon.svc:3000/d/node?viewPanel=2")
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn inspect_details_become_event_rows_with_their_counts() {
     let detail = adapt(k10s_data::inspect::InspectDetail::Events(vec![
         k10s_data::inspect::EventLine {
@@ -503,6 +593,189 @@ fn inspect_details_become_event_rows_with_their_counts() {
             assert_eq!(rows[0].reason, "BackOff");
             assert_eq!(rows[0].count, 12);
         }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn policy_findings_sharing_a_resource_get_distinct_row_uids() {
+    let finding = |policy: &str, uid: &str| k10s_data::policy::Finding {
+        policy: policy.to_string(),
+        result: "fail".to_string(),
+        severity: k10s_core::Severity::Warn,
+        resource_name: "api".to_string(),
+        resource_kind: "Deployment".to_string(),
+        resource_uid: uid.to_string(),
+    };
+    let inventory = k10s_data::policy::Inventory {
+        served: true,
+        reports: vec![k10s_data::policy::Report {
+            namespace: "prod".to_string(),
+            name: "polr-api".to_string(),
+            results: vec![
+                finding("require-limits", "uid-1"),
+                finding("disallow-latest", "uid-1"),
+                finding("require-probes", ""),
+                finding("require-labels", ""),
+            ],
+        }],
+        truncated: false,
+        partly_denied: false,
+    };
+    match policy_outcome(Fetched::Ok(inventory)) {
+        k10s_shell::TableOutcome::Table(page) => {
+            let mut uids: Vec<&str> = page.rows.iter().map(|row| row.uid.as_str()).collect();
+            uids.sort_unstable();
+            let before = uids.len();
+            uids.dedup();
+            assert_eq!(uids.len(), before, "every finding keeps its own row uid");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_harbor_project_without_fetched_repos_counts_them_under_repository_not_artifacts() {
+    let inventory = k10s_data::harbor::Inventory {
+        served: true,
+        projects: vec![k10s_data::harbor::Project {
+            name: "library".to_string(),
+            public: true,
+            repo_count: 7,
+            repositories: Vec::new(),
+        }],
+        truncated: false,
+        unreadable: 0,
+    };
+    match harbor_outcome(Fetched::Ok(inventory)) {
+        k10s_shell::TableOutcome::Table(page) => {
+            // Columns are Project, Visibility, Repository, Artifacts, Scan.
+            assert_eq!(page.rows[0].cells[2], "(7 repositories)");
+            assert_eq!(page.rows[0].cells[3], "");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_harbor_repo_scan_cell_reports_the_worst_artifact_not_the_first() {
+    let scan = |severity: &str, mapped: k10s_core::Severity, critical: u32, total: u32| {
+        k10s_data::harbor::ArtifactScan {
+            digest: format!("sha256:{severity}"),
+            tags: Vec::new(),
+            scan: Some(k10s_data::harbor::ScanOverview {
+                status: "Success".to_string(),
+                severity: severity.to_string(),
+                mapped,
+                total,
+                fixable: 0,
+                critical,
+                high: 0,
+                medium: 0,
+                low: 0,
+            }),
+        }
+    };
+    let inventory = k10s_data::harbor::Inventory {
+        served: true,
+        projects: vec![k10s_data::harbor::Project {
+            name: "library".to_string(),
+            public: false,
+            repo_count: 1,
+            repositories: vec![k10s_data::harbor::Repository {
+                name: "api".to_string(),
+                artifact_count: 2,
+                pull_count: 0,
+                artifacts: vec![
+                    scan("Low", k10s_core::Severity::Warn, 0, 3),
+                    scan("Critical", k10s_core::Severity::Err, 2, 9),
+                ],
+            }],
+        }],
+        truncated: false,
+        unreadable: 0,
+    };
+    match harbor_outcome(Fetched::Ok(inventory)) {
+        k10s_shell::TableOutcome::Table(page) => {
+            assert_eq!(page.rows[0].cells[4], "Critical (9)");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn unreadable_harbor_rows_mark_the_listing_as_partial() {
+    let inventory = k10s_data::harbor::Inventory {
+        served: true,
+        projects: vec![k10s_data::harbor::Project {
+            name: "library".to_string(),
+            public: true,
+            repo_count: 1,
+            repositories: Vec::new(),
+        }],
+        truncated: false,
+        unreadable: 2,
+    };
+    match harbor_outcome(Fetched::Ok(inventory)) {
+        k10s_shell::TableOutcome::Table(page) => assert!(page.truncated),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_denied_mesh_group_stays_visible_next_to_the_one_that_answered() {
+    use k10s_data::mesh::{GroupState, MeshInventory, MeshKind, MeshObject};
+
+    let object = MeshObject {
+        kind: MeshKind::VirtualService,
+        namespace: "prod".to_string(),
+        name: "api".to_string(),
+        hosts: vec!["api.prod".to_string()],
+        destinations: Vec::new(),
+        gateways: Vec::new(),
+    };
+
+    // Istio answered with rows; the linkerd denial makes the page partial.
+    match mesh_outcome(MeshInventory {
+        istio: GroupState::Served,
+        linkerd: GroupState::Denied,
+        objects: vec![object],
+        truncated: false,
+    }) {
+        k10s_shell::TableOutcome::Table(page) => assert!(page.truncated),
+        other => panic!("{other:?}"),
+    }
+
+    // With nothing to show, the sibling's denial is the whole answer.
+    assert!(matches!(
+        mesh_outcome(MeshInventory {
+            istio: GroupState::Served,
+            linkerd: GroupState::Denied,
+            objects: Vec::new(),
+            truncated: false,
+        }),
+        k10s_shell::TableOutcome::Denied("mesh")
+    ));
+    match mesh_outcome(MeshInventory {
+        istio: GroupState::Served,
+        linkerd: GroupState::Failed {
+            why: "timed out".to_string(),
+        },
+        objects: Vec::new(),
+        truncated: false,
+    }) {
+        k10s_shell::TableOutcome::Failed(why) => assert_eq!(why, "timed out"),
+        other => panic!("{other:?}"),
+    }
+
+    // Both groups served and simply empty stays an ordinary empty table.
+    match mesh_outcome(MeshInventory {
+        istio: GroupState::Served,
+        linkerd: GroupState::Served,
+        objects: Vec::new(),
+        truncated: false,
+    }) {
+        k10s_shell::TableOutcome::Table(page) => assert!(!page.truncated),
         other => panic!("{other:?}"),
     }
 }

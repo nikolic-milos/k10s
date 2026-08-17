@@ -30,9 +30,10 @@ use crate::ui::{
 };
 use crate::workspace::Workspace;
 use crate::{
-    ChooseCluster, FindCluster, LoadSavedView, OpenArgo, OpenBrowser, OpenDay2, OpenFlux,
-    OpenForwards, OpenNodes, OpenPalette, OpenReleases, OpenSettings, Quit, ToggleBottomDock,
-    ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    ChooseCluster, FindCluster, LoadSavedView, OpenArgo, OpenBrowser, OpenDay2, OpenEcosystem,
+    OpenFlux, OpenForwards, OpenHarbor, OpenMesh, OpenNodes, OpenObserve, OpenPalette, OpenPolicy,
+    OpenReleases, OpenSettings, OpenTraces, Quit, ToggleBottomDock, ToggleInspector,
+    ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
 
 pub(crate) use crate::dock::DockEdge;
@@ -438,6 +439,9 @@ impl Workspace {
                 ActivityId::Argo => window.dispatch_action(Box::new(OpenArgo), cx),
                 ActivityId::Flux => window.dispatch_action(Box::new(OpenFlux), cx),
                 ActivityId::Day2 => window.dispatch_action(Box::new(OpenDay2), cx),
+                ActivityId::Observe => window.dispatch_action(Box::new(OpenObserve), cx),
+                ActivityId::Policy => window.dispatch_action(Box::new(OpenPolicy), cx),
+                ActivityId::Ecosystem => window.dispatch_action(Box::new(OpenEcosystem), cx),
                 ActivityId::Forwards => window.dispatch_action(Box::new(OpenForwards), cx),
                 ActivityId::Terminal => window.dispatch_action(Box::new(ToggleTerminal), cx),
                 ActivityId::Inspector => window.dispatch_action(Box::new(ToggleInspector), cx),
@@ -456,6 +460,11 @@ impl Workspace {
                     ActivityId::Argo => ui::Tooltip::with_binding(label, &OpenArgo, window),
                     ActivityId::Flux => ui::Tooltip::with_binding(label, &OpenFlux, window),
                     ActivityId::Day2 => ui::Tooltip::with_binding(label, &OpenDay2, window),
+                    ActivityId::Observe => ui::Tooltip::with_binding(label, &OpenObserve, window),
+                    ActivityId::Policy => ui::Tooltip::with_binding(label, &OpenPolicy, window),
+                    ActivityId::Ecosystem => {
+                        ui::Tooltip::with_binding(label, &OpenEcosystem, window)
+                    }
                     ActivityId::Forwards => ui::Tooltip::with_binding(label, &OpenForwards, window),
                     ActivityId::Terminal => {
                         ui::Tooltip::with_binding(label, &ToggleTerminal, window)
@@ -877,13 +886,19 @@ impl Workspace {
                     .child(entry(7, "Argo CD", Box::new(OpenArgo)))
                     .child(entry(8, "Flux", Box::new(OpenFlux)))
                     .child(entry(9, "Day-2", Box::new(OpenDay2)))
-                    .child(entry(10, "Terminal", Box::new(ToggleTerminal)))
+                    .child(entry(10, "Grafana queries", Box::new(OpenObserve)))
+                    .child(entry(11, "Policy", Box::new(OpenPolicy)))
+                    .child(entry(12, "Ecosystem", Box::new(OpenEcosystem)))
+                    .child(entry(13, "Harbor", Box::new(OpenHarbor)))
+                    .child(entry(14, "Mesh", Box::new(OpenMesh)))
+                    .child(entry(15, "Traces", Box::new(OpenTraces)))
+                    .child(entry(16, "Terminal", Box::new(ToggleTerminal)))
                     .child(separator())
-                    .child(entry(11, "Toggle Left Dock", Box::new(ToggleLeftDock)))
-                    .child(entry(12, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
-                    .child(entry(13, "Toggle Inspector", Box::new(ToggleRightDock)))
+                    .child(entry(17, "Toggle Left Dock", Box::new(ToggleLeftDock)))
+                    .child(entry(18, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
+                    .child(entry(19, "Toggle Inspector", Box::new(ToggleRightDock)))
                     .child(separator())
-                    .child(entry(14, "Quit", Box::new(Quit))),
+                    .child(entry(20, "Quit", Box::new(Quit))),
             )
     }
 

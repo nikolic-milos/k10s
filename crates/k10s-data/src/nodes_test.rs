@@ -245,6 +245,29 @@ fn pdb_selectors_follow_policy_v1_semantics_including_the_nil_empty_split() {
 }
 
 #[test]
+fn a_budget_without_a_computed_status_still_blocks_eviction() {
+    use k8s_openapi::api::policy::v1::PodDisruptionBudgetStatus;
+
+    let with_allowed = |allowed: Option<i32>| PodDisruptionBudget {
+        status: Some(PodDisruptionBudgetStatus {
+            disruptions_allowed: allowed,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(blocks_eviction(&with_allowed(Some(0))));
+    assert!(!blocks_eviction(&with_allowed(Some(1))));
+    assert!(
+        blocks_eviction(&with_allowed(None)),
+        "eviction reads an unset disruptionsAllowed as 0 and blocks on it"
+    );
+    assert!(
+        blocks_eviction(&PodDisruptionBudget::default()),
+        "no status at all means the controller has not granted headroom"
+    );
+}
+
+#[test]
 fn a_used_over_allocatable_cell_carries_the_percentage() {
     assert_eq!(counted(1500, Some(4000), fmt_cpu), "1500m/4 (38%)");
     assert_eq!(counted(12, Some(110), |n| n.to_string()), "12/110 (11%)");

@@ -1,0 +1,24 @@
+# Lab fixture only. CRD so postgresql.cnpg.io is served. No CNPG operator.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusters.postgresql.cnpg.io
+  labels:
+    k10s.dev/hplane-fixture: "true"
+spec:
+  group: postgresql.cnpg.io
+  scope: Namespaced
+  names:
+    plural: clusters
+    singular: cluster
+    kind: Cluster
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        x-kubernetes-preserve-unknown-fields: true
+    additionalPrinterColumns:
+    - { name: Age, type: date, jsonPath: .metadata.creationTimestamp }

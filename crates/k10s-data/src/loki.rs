@@ -149,6 +149,20 @@ fn reject_query(query: &str) -> Result<(), String> {
             query.len()
         ));
     }
+    // Grafana variables ($var, $__interval, ${var}) are not LogQL and
+    // nothing here can expand them. A `$` regex anchor (`|~ "error$"`) or a
+    // `$1` in label_replace is plain LogQL and must pass.
+    let mut rest = query;
+    while let Some(position) = rest.find('$') {
+        rest = &rest[position + 1..];
+        let next = rest.bytes().next();
+        if matches!(next, Some(b'{') | Some(b'_')) || next.is_some_and(|b| b.is_ascii_alphabetic())
+        {
+            return Err(
+                "$ is Grafana's engine (variables, $__interval), not LogQL we can send".to_string(),
+            );
+        }
+    }
     Ok(())
 }
 

@@ -22,8 +22,10 @@
 //! than the foreground they recede from, which is a palette relation rather
 //! than a WCAG one.
 //!
-//! `one-dark` is transcribed from Zed and fourteen of its pairs do not clear
-//! their floor. Rather than quietly excluding it, each shortfall is recorded
+//! `one-dark` is transcribed from Zed and thirty-three of its pairs do not
+//! clear their floor -- most of them vendor tool marks, which that theme
+//! carries at their logo values on canvases the logos were never designed
+//! for. Rather than quietly excluding it, each shortfall is recorded
 //! below with the ratio it actually measures. A waiver that drifts fails, and a
 //! waiver that starts passing fails too, so the list can only shrink. The two
 //! brand themes carry none, and a test asserts that separately.
@@ -287,8 +289,23 @@ fn audit(theme: &Theme) -> Vec<Pair> {
     for (index, color) in map.kind_colors.iter().enumerate() {
         check(format!("map kind[{index}]"), *color, map.bg, Floor::Ui);
     }
+    // A tool glyph is painted on the island fill (the medallion) and on the
+    // card header (the detailed card), never on the raw map background. The
+    // painted header is `card_header_fill` shaded toward `bg`, so measuring
+    // against the unshaded fill is the conservative bound in both appearances.
     for (index, color) in map.tool_colors.iter().enumerate() {
-        check(format!("map tool[{index}]"), *color, map.bg, Floor::Ui);
+        check(
+            format!("map tool[{index}] on ns_fill"),
+            *color,
+            map.ns_fill,
+            Floor::Ui,
+        );
+        check(
+            format!("map tool[{index}] on header"),
+            *color,
+            map.card_header_fill,
+            Floor::Ui,
+        );
     }
     for (index, color) in map.pod_severity.iter().enumerate() {
         check(
@@ -365,10 +382,29 @@ const ONE_DARK_SHORTFALLS: &[(&str, f64)] = &[
     ("syntax line_number", 1.97),
     ("border_focused on editor", 2.47),
     ("map kind[6]", 1.60),
-    ("map tool[14]", 2.66),
-    ("map tool[20]", 2.94),
-    ("map tool[22]", 2.61),
-    ("map tool[28]", 2.89),
+    ("map tool[1] on header", 2.71),
+    ("map tool[3] on header", 2.71),
+    ("map tool[8] on ns_fill", 2.94),
+    ("map tool[8] on header", 2.60),
+    ("map tool[12] on header", 2.70),
+    ("map tool[13] on ns_fill", 2.86),
+    ("map tool[13] on header", 2.54),
+    ("map tool[17] on ns_fill", 2.38),
+    ("map tool[17] on header", 2.11),
+    ("map tool[19] on ns_fill", 2.83),
+    ("map tool[19] on header", 2.51),
+    ("map tool[24] on ns_fill", 2.63),
+    ("map tool[24] on header", 2.33),
+    ("map tool[28] on ns_fill", 2.33),
+    ("map tool[28] on header", 2.07),
+    ("map tool[30] on ns_fill", 2.68),
+    ("map tool[30] on header", 2.38),
+    ("map tool[32] on header", 2.87),
+    ("map tool[33] on ns_fill", 2.08),
+    ("map tool[33] on header", 1.84),
+    ("map tool[35] on ns_fill", 2.58),
+    ("map tool[35] on header", 2.29),
+    ("map tool[36] on header", 2.96),
 ];
 
 #[test]
