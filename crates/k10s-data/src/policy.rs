@@ -1,10 +1,15 @@
-//! PolicyReport / ClusterPolicyReport from Kyverno or Gatekeeper.
+//! Policy reports from Kyverno, Gatekeeper, or anything else that publishes
+//! the shared report CRDs.
 //!
-//! Both engines publish the same `wgpolicyk8s.io` CRDs. This module reads those
-//! documents as JSON, because the group is not in `k8s-openapi` and installing
-//! a typed CRD client would be an install. A 404 means the CRDs are not served
-//! and the overlay stays off; a 403 is a labelled denial. Caps bound how many
-//! reports and findings we hold, and say so when they bite.
+//! `wgpolicyk8s.io` still ships PolicyReport / ClusterPolicyReport. Current
+//! documents name `v1beta1`; older clusters still serve `v1alpha2`. Kyverno
+//! 1.15+ can also write `openreports.io/v1alpha1` Report / ClusterReport
+//! (the successor group). This module probes both groups and the versions
+//! each document names. A 404 means that group is not served; the overlay
+//! stays off only when neither group answers. A 403 is a labelled denial.
+//! Caps bound how many reports and findings we hold, and say so when they
+//! bite. Findings are JSON, not a typed CRD client: installing one would
+//! be an install.
 
 use std::collections::BTreeMap;
 
@@ -17,8 +22,14 @@ use k10s_core::Severity;
 
 use crate::read::Fetched;
 
-const POLICY_REPORTS: &str = "/apis/wgpolicyk8s.io/v1alpha2/policyreports";
-const CLUSTER_POLICY_REPORTS: &str = "/apis/wgpolicyk8s.io/v1alpha2/clusterpolicyreports";
+const WGPOLICY_GROUP: &str = "wgpolicyk8s.io";
+const OPENREPORTS_GROUP: &str = "openreports.io";
+const WGPOLICY_NAMESPACED: &str = "policyreports";
+const WGPOLICY_CLUSTER: &str = "clusterpolicyreports";
+const OPENREPORTS_NAMESPACED: &str = "reports";
+const OPENREPORTS_CLUSTER: &str = "clusterreports";
+const WGPOLICY_FALLBACKS: &[&str] = &["v1beta1", "v1alpha2", "v1alpha1"];
+const OPENREPORTS_FALLBACKS: &[&str] = &["v1alpha1"];
 
 const PAGE_LIMIT: u32 = 200;
 pub const MAX_PAGE_BYTES: usize = 8 << 20;
@@ -67,6 +78,9 @@ pub struct Inventory {
     pub served: bool,
     pub reports: Vec<Report>,
     pub truncated: bool,
+    /// Some report group answered 403 while another one listed. The kept
+    /// reports are shown; the denial must stay visible next to them.
+    pub partly_denied: bool,
 }
 
 impl Inventory {
@@ -124,11 +138,34 @@ pub fn map_severity(raw: &str) -> Severity {
     }
 }
 
-/// List namespaced PolicyReports and cluster-scoped ClusterPolicyReports.
+/// List PolicyReports and OpenReports. Either group answering is enough.
 pub async fn fetch_reports(client: &Client) -> Fetched<Inventory> {
-    let namespaced = list_kind(client, POLICY_REPORTS).await;
-    let cluster = list_kind(client, CLUSTER_POLICY_REPORTS).await;
-    combine(namespaced, cluster)
+    let mut outcomes = Vec::new();
+    match list_group(
+        client,
+        WGPOLICY_GROUP,
+        WGPOLICY_NAMESPACED,
+        WGPOLICY_CLUSTER,
+        WGPOLICY_FALLBACKS,
+    )
+    .await
+    {
+        Ok(pair) => outcomes.extend(pair),
+        Err(failed) => return failed,
+    }
+    match list_group(
+        client,
+        OPENREPORTS_GROUP,
+        OPENREPORTS_NAMESPACED,
+        OPENREPORTS_CLUSTER,
+        OPENREPORTS_FALLBACKS,
+    )
+    .await
+    {
+        Ok(pair) => outcomes.extend(pair),
+        Err(failed) => return failed,
+    }
+    combine_all(outcomes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +179,124 @@ enum ListOutcome {
     Failed(String),
 }
 
-async fn list_kind(client: &Client, path: &'static str) -> ListOutcome {
+enum GroupAnswer {
+    Served(Vec<String>),
+    NotServed,
+    Denied,
+    Failed(String),
+}
+
+fn after_group(error: &kube::Error) -> GroupAnswer {
+    if let kube::Error::Api(response) = error {
+        if matches!(response.code, 401 | 403) {
+            return GroupAnswer::Denied;
+        }
+        if response.code == 404 {
+            return GroupAnswer::NotServed;
+        }
+    }
+    GroupAnswer::Failed(crate::connect::describe(
+        error as &(dyn std::error::Error + 'static),
+    ))
+}
+
+fn order_versions(preferred: &str, versions: Vec<String>, fallbacks: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    if !preferred.is_empty() {
+        out.push(preferred.to_string());
+    }
+    for version in versions {
+        if version.is_empty() || out.iter().any(|have| have == &version) {
+            continue;
+        }
+        out.push(version);
+    }
+    for fallback in fallbacks {
+        if !out.iter().any(|have| have == fallback) {
+            out.push((*fallback).to_string());
+        }
+    }
+    out
+}
+
+fn collection_url(group: &str, version: &str, plural: &str) -> String {
+    format!("/apis/{group}/{version}/{plural}")
+}
+
+async fn probe_group(client: &Client, group: &str) -> GroupAnswer {
+    let request = match http::Request::get(format!("/apis/{group}")).body(Vec::new()) {
+        Ok(request) => request,
+        Err(error) => return GroupAnswer::Failed(error.to_string()),
+    };
+    match client.request::<WireGroup>(request).await {
+        Ok(document) => GroupAnswer::Served(order_versions(
+            &document.preferred.version,
+            document
+                .versions
+                .into_iter()
+                .map(|item| item.version)
+                .collect(),
+            if group == WGPOLICY_GROUP {
+                WGPOLICY_FALLBACKS
+            } else {
+                OPENREPORTS_FALLBACKS
+            },
+        )),
+        Err(error) => after_group(&error),
+    }
+}
+
+async fn list_group(
+    client: &Client,
+    group: &str,
+    namespaced: &str,
+    cluster: &str,
+    fallbacks: &[&str],
+) -> Result<[ListOutcome; 2], Fetched<Inventory>> {
+    let versions = match probe_group(client, group).await {
+        GroupAnswer::NotServed => {
+            return Ok([ListOutcome::NotServed, ListOutcome::NotServed]);
+        }
+        GroupAnswer::Denied => return Ok([ListOutcome::Denied, ListOutcome::Denied]),
+        GroupAnswer::Failed(why) => {
+            return Err(Fetched::Failed {
+                what: "policy reports",
+                why,
+            });
+        }
+        GroupAnswer::Served(versions) => {
+            if versions.is_empty() {
+                fallbacks
+                    .iter()
+                    .map(|version| (*version).to_string())
+                    .collect()
+            } else {
+                versions
+            }
+        }
+    };
+    Ok([
+        list_kind_versions(client, group, namespaced, &versions).await,
+        list_kind_versions(client, group, cluster, &versions).await,
+    ])
+}
+
+async fn list_kind_versions(
+    client: &Client,
+    group: &str,
+    plural: &str,
+    versions: &[String],
+) -> ListOutcome {
+    for version in versions {
+        match list_kind(client, &collection_url(group, version, plural)).await {
+            ListOutcome::NotServed => continue,
+            other => return other,
+        }
+    }
+    ListOutcome::NotServed
+}
+
+async fn list_kind(client: &Client, path: &str) -> ListOutcome {
     let mut reports = Vec::new();
     let mut token: Option<String> = None;
     let mut truncated = false;
@@ -203,42 +357,52 @@ fn after_list(error: &kube::Error) -> ListOutcome {
     ))
 }
 
-fn combine(namespaced: ListOutcome, cluster: ListOutcome) -> Fetched<Inventory> {
-    use ListOutcome::*;
-    match (namespaced, cluster) {
-        (Denied, _) | (_, Denied) => Fetched::Denied {
-            what: "policy reports",
-        },
-        (Failed(why), _) | (_, Failed(why)) => Fetched::Failed {
-            what: "policy reports",
-            why,
-        },
-        (NotServed, NotServed) => Fetched::Ok(Inventory::unserved()),
-        (Items { reports, truncated }, NotServed) | (NotServed, Items { reports, truncated }) => {
-            Fetched::Ok(finalize(Inventory {
-                served: true,
-                reports,
-                truncated,
-            }))
-        }
-        (
-            Items {
-                reports: mut namespaced,
-                truncated: t1,
-            },
-            Items {
-                reports: cluster,
-                truncated: t2,
-            },
-        ) => {
-            namespaced.extend(cluster);
-            Fetched::Ok(finalize(Inventory {
-                served: true,
-                reports: namespaced,
-                truncated: t1 || t2,
-            }))
+fn combine_all(outcomes: Vec<ListOutcome>) -> Fetched<Inventory> {
+    let mut reports = Vec::new();
+    let mut truncated = false;
+    let mut any_items = false;
+    let mut any_denied = false;
+    let mut failure: Option<String> = None;
+    for outcome in outcomes {
+        match outcome {
+            ListOutcome::Items {
+                reports: more,
+                truncated: page_truncated,
+            } => {
+                any_items = true;
+                truncated |= page_truncated;
+                reports.extend(more);
+            }
+            ListOutcome::Denied => any_denied = true,
+            ListOutcome::Failed(why) => {
+                failure.get_or_insert(why);
+            }
+            ListOutcome::NotServed => {}
         }
     }
+    // One group's denial or failure must not discard another group's
+    // answered reports. Only when nothing answered does the whole fetch
+    // carry that state.
+    if !any_items {
+        if any_denied {
+            return Fetched::Denied {
+                what: "policy reports",
+            };
+        }
+        if let Some(why) = failure {
+            return Fetched::Failed {
+                what: "policy reports",
+                why,
+            };
+        }
+        return Fetched::Ok(Inventory::unserved());
+    }
+    Fetched::Ok(finalize(Inventory {
+        served: true,
+        reports,
+        truncated,
+        partly_denied: any_denied,
+    }))
 }
 
 fn finalize(mut inventory: Inventory) -> Inventory {
@@ -286,13 +450,14 @@ fn ingest_items(
     (reports, truncated)
 }
 
-/// Parse one PolicyReport or ClusterPolicyReport document.
+/// Parse one PolicyReport, ClusterPolicyReport, Report, or ClusterReport.
 pub fn parse_report(value: &Value) -> Report {
     let meta = value.get("metadata").unwrap_or(&Value::Null);
+    let scope = value.get("scope");
     let mut results = Vec::new();
     if let Some(array) = value.get("results").and_then(Value::as_array) {
         for item in array {
-            expand_result(item, &mut results);
+            expand_result(item, scope, &mut results);
             if results.len() >= MAX_FINDINGS {
                 break;
             }
@@ -305,14 +470,14 @@ pub fn parse_report(value: &Value) -> Report {
     }
 }
 
-fn expand_result(value: &Value, into: &mut Vec<Finding>) {
+fn expand_result(value: &Value, scope: Option<&Value>, into: &mut Vec<Finding>) {
     let policy = clip(str_field(value, "policy"));
     let result = clip(str_field(value, "result"));
     let severity_raw = str_field(value, "severity");
     let severity = finding_severity(&result, severity_raw);
     let resources = match value.get("resources").and_then(Value::as_array) {
-        Some(array) => array.as_slice(),
-        None => &[],
+        Some(array) if !array.is_empty() => array.as_slice(),
+        _ => scope.map(std::slice::from_ref).unwrap_or(&[]),
     };
     if resources.is_empty() {
         into.push(Finding {
@@ -380,6 +545,20 @@ fn parse_list(text: &str) -> Result<WireList, PageError> {
         return Err(PageError::TooLarge);
     }
     serde_json::from_str(text).map_err(|error| PageError::NotJson(error.to_string()))
+}
+
+#[derive(Deserialize, Default)]
+struct WireGroup {
+    #[serde(default)]
+    versions: Vec<WireGroupVersion>,
+    #[serde(default, rename = "preferredVersion")]
+    preferred: WireGroupVersion,
+}
+
+#[derive(Deserialize, Default)]
+struct WireGroupVersion {
+    #[serde(default)]
+    version: String,
 }
 
 #[derive(Deserialize, Default)]

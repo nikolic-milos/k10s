@@ -1,0 +1,14 @@
+# Lab fixture only. No CNPG operator, so no Pods or PVCs are created.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: k10s-hplane-cnpg
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: password-PLANTED-not-real
+spec:
+  instances: 1
+  storage:
+    size: 1Gi

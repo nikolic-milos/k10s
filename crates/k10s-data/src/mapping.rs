@@ -329,6 +329,13 @@ const TOOL_ALIASES: &[(&str, &str)] = &[
     ("envoyproxy", "envoy"),
     ("hashicorpvault", "vault"),
     ("rabbit", "rabbitmq"),
+    ("hubble", "cilium"),
+    ("ciliumtetragon", "tetragon"),
+    ("falcosecurity", "falco"),
+    ("cnpg", "postgres"),
+    ("cloudnativepg", "postgres"),
+    ("postgresqlcnpg", "postgres"),
+    ("tempo", "opentelemetry"),
 ];
 
 pub fn stage_meta(kind: KindId, role: Role, meta: &ObjectMeta) -> Option<Staged> {

@@ -118,7 +118,7 @@ fn the_table_is_one_row_per_release_from_the_running_revision() {
         releases: vec![Release {
             name: stored.name.clone(),
             namespace: stored.namespace.clone(),
-            revisions: vec![stored.revision.clone(), older],
+            revisions: vec![stored.revision, older],
         }],
         truncated: true,
         unreadable: 0,

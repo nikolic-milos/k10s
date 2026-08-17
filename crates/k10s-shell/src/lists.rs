@@ -1,9 +1,10 @@
-//! Helm, Argo, and Flux as native tables.
+//! Helm, Argo, Flux, policy, Harbor, and declared mesh as native tables.
 //!
 //! These adapters already fetch on the data plane. This view is the same
 //! [`TableState`] machine browse and nodes use, over pages those fetches
 //! already produce. Helm is always a pane: a cluster without release Secrets
-//! is an empty list, not absence. Argo and Flux that are not served emit
+//! is an empty list, not absence. Values stay off this table: a key on a
+//! Helm row starts a reveal. Adapters that are not served emit
 //! [`InventoryEvent::NotServed`] so the workspace can take the pane down
 //! rather than leave an empty broken one. A 403 stays a labelled status.
 
@@ -20,8 +21,8 @@ use crate::table::TableState;
 use crate::tag::ItemTag;
 use crate::ui::{LIST_ROW_HEIGHT, PANEL_HEADER_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
-    CancelInput, CommitInput, DeleteInputChar, EnterFilter, Refresh, RowDown, RowEnd, RowHome,
-    RowPageDown, RowPageUp, RowUp,
+    CancelInput, CommitInput, DeleteInputChar, EnterFilter, HelmDiff, HelmRollback, OpenRow,
+    Refresh, RevealHelm, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
 };
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
@@ -32,6 +33,9 @@ pub enum InventoryKind {
     Helm,
     Argo,
     Flux,
+    Policy,
+    Harbor,
+    Mesh,
 }
 
 impl InventoryKind {
@@ -40,6 +44,9 @@ impl InventoryKind {
             InventoryKind::Helm => ItemTag::Releases,
             InventoryKind::Argo => ItemTag::Argo,
             InventoryKind::Flux => ItemTag::Flux,
+            InventoryKind::Policy => ItemTag::Policy,
+            InventoryKind::Harbor => ItemTag::Harbor,
+            InventoryKind::Mesh => ItemTag::Mesh,
         }
     }
 
@@ -48,6 +55,9 @@ impl InventoryKind {
             InventoryKind::Helm => "helm releases",
             InventoryKind::Argo => "argo",
             InventoryKind::Flux => "flux",
+            InventoryKind::Policy => "policy",
+            InventoryKind::Harbor => "harbor",
+            InventoryKind::Mesh => "mesh",
         }
     }
 
@@ -56,6 +66,9 @@ impl InventoryKind {
             InventoryKind::Helm => "no Helm releases are stored in this cluster",
             InventoryKind::Argo => "no Argo CD Applications are in this cluster",
             InventoryKind::Flux => "no Flux objects are stored in this cluster",
+            InventoryKind::Policy => "no policy reports are in this cluster",
+            InventoryKind::Harbor => "no Harbor projects are in this cluster",
+            InventoryKind::Mesh => "no declared mesh objects are in this cluster",
         }
     }
 
@@ -64,13 +77,35 @@ impl InventoryKind {
             InventoryKind::Helm => "Helm",
             InventoryKind::Argo => "Argo CD",
             InventoryKind::Flux => "Flux",
+            InventoryKind::Policy => "Policy reports",
+            InventoryKind::Harbor => "Harbor",
+            InventoryKind::Mesh => "Mesh",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryEvent {
-    NotServed { tag: ItemTag, what: &'static str },
+    NotServed {
+        tag: ItemTag,
+        what: &'static str,
+    },
+    RevealRelease {
+        namespace: Option<String>,
+        name: String,
+        revision: u32,
+    },
+    DiffRelease {
+        namespace: Option<String>,
+        name: String,
+        from: u32,
+        to: u32,
+    },
+    RollbackRelease {
+        namespace: Option<String>,
+        name: String,
+        revision: u32,
+    },
 }
 
 pub struct InventoryView {
@@ -81,6 +116,7 @@ pub struct InventoryView {
     loading: bool,
     status: Option<String>,
     filtering: bool,
+    armed: Option<String>,
     generation: u64,
     viewport: Viewport,
 }
@@ -100,6 +136,18 @@ impl InventoryView {
         InventoryView::open(InventoryKind::Flux, provider, cx)
     }
 
+    pub fn policy(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> InventoryView {
+        InventoryView::open(InventoryKind::Policy, provider, cx)
+    }
+
+    pub fn harbor(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> InventoryView {
+        InventoryView::open(InventoryKind::Harbor, provider, cx)
+    }
+
+    pub fn mesh(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> InventoryView {
+        InventoryView::open(InventoryKind::Mesh, provider, cx)
+    }
+
     fn open(
         kind: InventoryKind,
         provider: Rc<dyn ReadProvider>,
@@ -113,6 +161,7 @@ impl InventoryView {
             loading: true,
             status: None,
             filtering: false,
+            armed: None,
             generation: 0,
             viewport: Viewport::default(),
         };
@@ -133,6 +182,7 @@ impl InventoryView {
         let generation = self.generation;
         self.loading = true;
         self.status = None;
+        self.armed = None;
         let (tx, rx) = futures::channel::oneshot::channel();
         let reply = Box::new(move |outcome| {
             let _ = tx.send(outcome);
@@ -141,6 +191,9 @@ impl InventoryView {
             InventoryKind::Helm => self.provider.fetch_releases(reply),
             InventoryKind::Argo => self.provider.fetch_argo(reply),
             InventoryKind::Flux => self.provider.fetch_flux(reply),
+            InventoryKind::Policy => self.provider.fetch_policy(reply),
+            InventoryKind::Harbor => self.provider.fetch_harbor(reply),
+            InventoryKind::Mesh => self.provider.fetch_mesh(reply),
         }
         cx.spawn(async move |this, cx| {
             if let Ok(outcome) = rx.await {
@@ -190,6 +243,81 @@ impl InventoryView {
         crumb
     }
 
+    fn selected_release(&self) -> Option<(Option<String>, String, u32)> {
+        if self.kind != InventoryKind::Helm {
+            return None;
+        }
+        let revision = self.table.selected_cell("Revision")?.parse().ok()?;
+        let row = self.table.selected_row()?;
+        Some((row.namespace.clone(), row.name.clone(), revision))
+    }
+
+    fn emit_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some((namespace, name, revision)) = self.selected_release() else {
+            return;
+        };
+        self.armed = None;
+        cx.emit(InventoryEvent::RevealRelease {
+            namespace,
+            name,
+            revision,
+        });
+    }
+
+    fn emit_diff(&mut self, cx: &mut Context<Self>) {
+        let Some((namespace, name, revision)) = self.selected_release() else {
+            return;
+        };
+        self.armed = None;
+        if revision <= 1 {
+            self.status = Some(format!(
+                "{name} revision {revision} has no previous revision to diff"
+            ));
+            cx.notify();
+            return;
+        }
+        cx.emit(InventoryEvent::DiffRelease {
+            namespace,
+            name,
+            from: revision - 1,
+            to: revision,
+        });
+    }
+
+    fn emit_rollback(&mut self, cx: &mut Context<Self>) {
+        let Some((namespace, name, revision)) = self.selected_release() else {
+            return;
+        };
+        let key = format!("{}/{name}/{revision}", namespace.as_deref().unwrap_or(""));
+        if self.armed.as_deref() == Some(key.as_str()) {
+            self.armed = None;
+            cx.emit(InventoryEvent::RollbackRelease {
+                namespace,
+                name,
+                revision,
+            });
+            return;
+        }
+        self.armed = Some(key);
+        self.status = Some(format!(
+            "press u again to apply {name} revision {revision}: not helm rollback (hooks will not run)"
+        ));
+        cx.notify();
+    }
+
+    fn disarm(&mut self) {
+        if self.armed.take().is_some() {
+            self.status = None;
+        }
+    }
+
+    fn hint(&self) -> &'static str {
+        match self.kind {
+            InventoryKind::Helm => "v reveal · shift-v diff · u rollback · / filter · r refresh",
+            _ => "/ filter · r refresh · esc close filter",
+        }
+    }
+
     fn resize(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
         if !self.viewport.update(width, height) {
             return;
@@ -222,7 +350,15 @@ impl Render for InventoryView {
 
         div()
             .id("inventory-view")
-            .key_context(if self.filtering { "Typing" } else { "Browse" })
+            .key_context(if self.filtering {
+                "Typing"
+            } else if self.kind == InventoryKind::Helm {
+                // Browse plus the release commands: only the Helm inventory
+                // listens for v/u/shift-v, so only it offers them.
+                "Browse Releases"
+            } else {
+                "Browse"
+            })
             .track_focus(&self.focus)
             .size_full()
             .relative()
@@ -248,28 +384,46 @@ impl Render for InventoryView {
                 .size_full(),
             )
             .on_action(cx.listener(|this, _: &RowUp, _, cx| {
+                this.disarm();
                 this.table.move_selection(-1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowDown, _, cx| {
+                this.disarm();
                 this.table.move_selection(1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowPageUp, _, cx| {
+                this.disarm();
                 this.table.page_by(-1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowPageDown, _, cx| {
+                this.disarm();
                 this.table.page_by(1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowHome, _, cx| {
+                this.disarm();
                 this.table.select_first();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowEnd, _, cx| {
+                this.disarm();
                 this.table.select_last();
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenRow, _, cx| {
+                this.emit_reveal(cx);
+            }))
+            .on_action(cx.listener(|this, _: &RevealHelm, _, cx| {
+                this.emit_reveal(cx);
+            }))
+            .on_action(cx.listener(|this, _: &HelmDiff, _, cx| {
+                this.emit_diff(cx);
+            }))
+            .on_action(cx.listener(|this, _: &HelmRollback, _, cx| {
+                this.emit_rollback(cx);
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 this.fetch(cx);
@@ -306,6 +460,7 @@ impl Render for InventoryView {
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                this.disarm();
                 let delta = f32::from(event.delta.pixel_delta(px(LIST_ROW_HEIGHT)).y);
                 this.table
                     .move_selection(-(delta / LIST_ROW_HEIGHT).round() as i64);
@@ -361,6 +516,7 @@ impl Render for InventoryView {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                        this.disarm();
                                         this.table.select_visible_offset(offset);
                                         cx.notify();
                                     }),
@@ -400,7 +556,7 @@ impl Render for InventoryView {
                     .text_color(rgb(theme.shell.text_muted))
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .child("/ filter · r refresh · esc close filter"),
+                    .child(self.hint()),
             )
     }
 }

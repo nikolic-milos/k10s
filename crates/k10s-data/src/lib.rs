@@ -11,22 +11,32 @@
 //! The `kube::Client` seam is a `tower` service, which is what lets
 //! `tests/scripted_apiserver.rs` be the API server.
 
+pub mod alertmanager;
 pub mod apply;
 pub mod argo;
 pub mod assemble;
 pub mod browse;
+pub mod cilium;
+pub mod cilium_control;
+pub mod cnpg;
 pub mod connect;
 pub mod day2;
 pub mod describe;
 pub mod discover;
+pub mod eso;
 pub mod exec;
+pub mod falco;
 pub mod flux;
 pub mod forward;
+pub mod gateway;
 pub mod grafana;
 pub mod harbor;
 pub mod helm;
 pub mod helm_reveal;
+pub mod ingress;
 pub mod inspect;
+pub mod kargo;
+pub mod kyverno;
 pub mod logs;
 pub mod loki;
 pub mod manifest;
@@ -39,17 +49,23 @@ pub mod netpol;
 pub mod nodes;
 pub mod oci;
 pub mod openapi;
+pub mod otel;
 pub mod overlay;
 pub mod policy;
 mod projection;
 pub mod prom;
+pub mod proxies;
 pub mod pss;
 pub mod rbac;
 pub mod rbac_index;
 pub mod reach;
 pub mod read;
 pub mod talos;
+pub mod tetragon;
 pub mod traces;
+pub mod traefik;
+pub mod vault;
+pub mod velero;
 pub mod watch;
 
 use std::collections::HashMap;

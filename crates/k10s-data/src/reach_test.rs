@@ -87,6 +87,104 @@ fn loki_and_tempo_and_harbor_have_their_own_ports() {
     assert_eq!(match_service(ToolKind::Tempo, &tempo).unwrap().port, 3200);
     let harbor = service("harbor-core", "harbor", &[], &[(80, "http")]);
     assert_eq!(match_service(ToolKind::Harbor, &harbor).unwrap().port, 80);
+    let alertmanager = service("alertmanager-operated", "monitoring", &[], &[(9093, "web")]);
+    assert_eq!(
+        match_service(ToolKind::Alertmanager, &alertmanager)
+            .unwrap()
+            .port,
+        9093
+    );
+}
+
+#[test]
+fn alertmanager_binds_9093_by_number_when_no_port_name_helps() {
+    let alertmanager = service(
+        "alertmanager",
+        "monitoring",
+        &[],
+        &[(8080, "admin"), (9093, "metrics")],
+    );
+    let hit = match_service(ToolKind::Alertmanager, &alertmanager).expect("alertmanager");
+    assert_eq!(
+        hit.port, 9093,
+        "the well-known number, not list position, picks Alertmanager's port"
+    );
+}
+
+#[test]
+fn a_collector_bind_prefers_the_ports_health_can_actually_answer_on() {
+    // otel::health() refuses the OTLP receiver (4318) and internal metrics
+    // (8888); a standard collector Service exposing them next to the
+    // health_check extension must bind 13133 or discovery can never answer
+    // health.
+    let svc = service(
+        "otel-collector",
+        "observability",
+        &[],
+        &[
+            (4317, "otlp-grpc"),
+            (4318, "otlp-http"),
+            (8888, "metrics"),
+            (13133, "health-check"),
+        ],
+    );
+    let hit = match_service(ToolKind::OtelCollector, &svc).expect("collector");
+    assert_eq!(
+        hit.port, 13133,
+        "the data-plane ports are refused by otel::health(); they must not outrank 13133"
+    );
+    let bound = Bound {
+        kind: ToolKind::OtelCollector,
+        found: Some(hit.clone()),
+        transport: Transport::Proxy {
+            namespace: hit.namespace,
+            service: hit.name,
+            port: hit.port,
+        },
+        auth: ToolAuth::Anonymous,
+    };
+    assert!(
+        crate::otel::health_path(&bound).is_ok(),
+        "the discovered bind must be a port health_path accepts"
+    );
+
+    let zpages_only = service(
+        "otel-collector",
+        "observability",
+        &[],
+        &[(4318, "otlp-http"), (55679, "zpages")],
+    );
+    let hit = match_service(ToolKind::OtelCollector, &zpages_only).expect("collector");
+    assert_eq!(
+        hit.port, 55679,
+        "zpages outranks OTLP HTTP for the same reason"
+    );
+}
+
+#[test]
+fn a_collector_without_the_extensions_still_binds_and_health_says_why() {
+    // A Service that genuinely lacks health_check and zpages keeps its bind on
+    // the OTLP port; health() then answers a labelled Failed, not Absent.
+    let svc = service(
+        "otel-collector",
+        "observability",
+        &[],
+        &[(4317, "otlp-grpc"), (4318, "otlp-http")],
+    );
+    let hit = match_service(ToolKind::OtelCollector, &svc).expect("collector");
+    assert_eq!(hit.port, 4318);
+    let bound = Bound {
+        kind: ToolKind::OtelCollector,
+        found: Some(hit.clone()),
+        transport: Transport::Proxy {
+            namespace: hit.namespace,
+            service: hit.name,
+            port: hit.port,
+        },
+        auth: ToolAuth::Anonymous,
+    };
+    let why = crate::otel::health_path(&bound).expect_err("OTLP is not a health signal");
+    assert!(why.contains("OTLP"), "{why}");
 }
 
 #[test]
@@ -191,4 +289,50 @@ fn join_and_split_http_cover_the_localhost_client() {
         split_http_body(denied),
         Fetched::Denied { what: "url" }
     ));
+}
+
+#[tokio::test]
+async fn a_settings_url_dripping_bytes_is_cut_off_at_one_total_deadline() {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+        // Each byte lands well inside a per-read window; only a deadline on
+        // the whole exchange stops this. The iteration cap keeps a failing
+        // run from hanging the suite.
+        for _ in 0..500 {
+            if stream.write_all(b"x").is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let fetched = plaintext_http_get_until(
+        &format!("http://{addr}"),
+        "",
+        &ToolAuth::Anonymous,
+        deadline,
+    )
+    .await;
+    match fetched {
+        Fetched::Failed { what: "url", why } => {
+            assert!(why.contains("did not answer"), "{why}");
+        }
+        other => panic!("a drip past the deadline is Failed, not {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the fetch outlived its deadline: {:?}",
+        started.elapsed()
+    );
+    server.join().unwrap();
 }

@@ -21,6 +21,13 @@ Kubernetes icon set; no attribution required.
 
 `tools/*.svg` are unmodified brand icons from the simple-icons project
 (v16.27.0), <https://github.com/simple-icons/simple-icons>, released under
-CC0 1.0. The trademarks and logos they depict remain the property of their
-respective owners; k10s uses them only to identify workloads running those
-tools, with no affiliation or endorsement implied.
+CC0 1.0, except the original masks named below. All trademarks and project
+names the `tools/` icons identify — whether drawn from simple-icons or as
+original k10s masks — remain the property of their respective owners; k10s
+uses them only to identify workloads running those tools, with no
+affiliation or endorsement implied.
+
+`headlamp.svg`, `kargo.svg`, `kyverno.svg`, `loki.svg`, `tetragon.svg` and
+`velero.svg` (under `tools/`) are original k10s minimal monochrome masks,
+not derived from those projects' logos; no attribution required. Those
+slugs were absent from simple-icons 16.27.0.

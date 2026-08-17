@@ -268,6 +268,33 @@ fn a_query_longer_than_eight_kibibytes_is_refused_not_truncated() {
 }
 
 #[test]
+fn a_dollar_variable_is_grafana_and_is_not_sent() {
+    let err = instant_form(&InstantQuery {
+        query: r#"{app="$app"} |= "error""#.into(),
+        time_ns: None,
+        limit: 10,
+    })
+    .expect_err("refused");
+    assert!(err.contains("Grafana"), "{err}");
+    instant_form(&InstantQuery {
+        query: r#"{app="api"} |= "error""#.into(),
+        time_ns: None,
+        limit: 10,
+    })
+    .expect("plain LogQL is sent");
+}
+
+#[test]
+fn a_regex_end_anchor_is_logql_not_grafana() {
+    instant_form(&InstantQuery {
+        query: r#"{app="api"} |~ "timeout$""#.into(),
+        time_ns: None,
+        limit: 10,
+    })
+    .expect("a $ regex anchor is everyday LogQL and must be sent");
+}
+
+#[test]
 fn a_denied_fetch_stays_denied_rather_than_becoming_an_empty_log_panel() {
     assert!(matches!(
         finish(Fetched::Denied { what: "loki" }),

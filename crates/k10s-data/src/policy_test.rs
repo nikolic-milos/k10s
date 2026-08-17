@@ -79,6 +79,7 @@ fn inventory(reports: Vec<Value>) -> Inventory {
     let (parsed, truncated) = ingest_items(reports, 0, 0);
     finalize(Inventory {
         served: true,
+        partly_denied: false,
         reports: parsed,
         truncated,
     })
@@ -164,6 +165,7 @@ fn an_empty_uid_cannot_tint_and_an_unserved_inventory_stays_invisible() {
     assert!(report.results[0].resource_uid.is_empty());
     let served = Inventory {
         served: true,
+        partly_denied: false,
         reports: vec![report],
         truncated: false,
     };
@@ -183,27 +185,99 @@ fn a_404_is_not_served_and_a_403_is_denied() {
 }
 
 #[test]
-fn both_kinds_missing_is_invisible_and_a_denial_wins() {
+fn both_kinds_missing_is_invisible_and_a_lone_denial_is_denied() {
     assert_eq!(
-        combine(ListOutcome::NotServed, ListOutcome::NotServed),
+        combine_all(vec![ListOutcome::NotServed, ListOutcome::NotServed]),
         Fetched::Ok(Inventory::unserved())
     );
     let ready = ListOutcome::Items {
         reports: vec![parse_report(&cluster_report())],
         truncated: false,
     };
-    match combine(ready.clone(), ListOutcome::NotServed) {
+    match combine_all(vec![ready, ListOutcome::NotServed]) {
         Fetched::Ok(inventory) => {
             assert!(inventory.served);
             assert_eq!(inventory.reports.len(), 1);
+            assert!(!inventory.partly_denied);
         }
         other => panic!("a served kind is visible, got {other:?}"),
     }
     assert_eq!(
-        combine(ready, ListOutcome::Denied),
+        combine_all(vec![ListOutcome::Denied, ListOutcome::NotServed]),
         Fetched::Denied {
             what: "policy reports"
         }
+    );
+}
+
+#[test]
+fn one_denied_group_keeps_the_other_groups_reports() {
+    let ready = ListOutcome::Items {
+        reports: vec![parse_report(&cluster_report())],
+        truncated: false,
+    };
+    match combine_all(vec![ready, ListOutcome::Denied]) {
+        Fetched::Ok(inventory) => {
+            assert!(inventory.served);
+            assert_eq!(
+                inventory.reports.len(),
+                1,
+                "the answered group's reports must not be discarded"
+            );
+            assert!(
+                inventory.partly_denied,
+                "the denial stays visible next to the kept reports"
+            );
+        }
+        other => panic!("answered reports survive a sibling denial, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_openreports_scope_is_the_resource_when_results_omit_resources() {
+    let report = parse_report(&json!({
+        "apiVersion": "openreports.io/v1alpha1",
+        "kind": "Report",
+        "metadata": { "name": "pod-app", "namespace": "prod" },
+        "scope": {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "name": "api",
+            "namespace": "prod",
+            "uid": "pod-api"
+        },
+        "results": [{
+            "policy": "require-app",
+            "result": "fail",
+            "severity": "medium",
+            "rule": "check-app-label"
+        }]
+    }));
+    assert_eq!(report.namespace, "prod");
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].resource_kind, "Pod");
+    assert_eq!(report.results[0].resource_name, "api");
+    assert_eq!(report.results[0].resource_uid, "pod-api");
+    assert_eq!(report.results[0].severity, Severity::Warn);
+}
+
+#[test]
+fn versions_prefer_the_group_document_then_current_fallbacks() {
+    assert_eq!(
+        order_versions(
+            "v1beta1",
+            vec!["v1alpha2".into(), "v1beta1".into()],
+            WGPOLICY_FALLBACKS
+        ),
+        vec![
+            "v1beta1".to_string(),
+            "v1alpha2".to_string(),
+            "v1alpha1".to_string()
+        ]
+    );
+    assert_eq!(
+        order_versions("", Vec::new(), OPENREPORTS_FALLBACKS),
+        vec!["v1alpha1".to_string()]
     );
 }
 
@@ -220,6 +294,7 @@ fn a_result_without_a_severity_word_falls_back_to_the_result_word() {
     assert_eq!(report.results[1].severity, Severity::Unknown);
     let tints = Inventory {
         served: true,
+        partly_denied: false,
         reports: vec![report],
         truncated: false,
     }

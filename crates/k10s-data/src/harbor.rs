@@ -568,7 +568,23 @@ pub fn render(inventory: &Inventory) -> Vec<String> {
         ));
         for repo in &project.repositories {
             let mut line = format!("  {}", repo.name);
-            if let Some(scan) = repo.artifacts.iter().find_map(|a| a.scan.as_ref())
+            // The worst scan across the repo's artifacts, not whichever
+            // Harbor listed first — same rule as the table cell.
+            let worst = repo
+                .artifacts
+                .iter()
+                .filter_map(|artifact| artifact.scan.as_ref())
+                .max_by_key(|scan| {
+                    (
+                        scan.mapped,
+                        scan.critical,
+                        scan.high,
+                        scan.medium,
+                        scan.low,
+                        scan.total,
+                    )
+                });
+            if let Some(scan) = worst
                 && !scan.severity.is_empty()
             {
                 line.push_str(&format!(

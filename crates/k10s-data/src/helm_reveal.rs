@@ -507,13 +507,16 @@ fn unified(left_title: &str, left: &str, right_title: &str, right: &str) -> Stri
 fn edits<'a>(a: &'a [&str], b: &'a [&str]) -> Vec<Edit<'a>> {
     let n = a.len();
     let m = b.len();
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    // One flat (n+1)x(m+1) buffer: a Vec per row would be over a thousand
+    // allocations at MAX_DIFF_LINES.
+    let w = m + 1;
+    let mut dp = vec![0u32; (n + 1) * w];
     for i in 0..n {
         for j in 0..m {
-            dp[i + 1][j + 1] = if a[i] == b[j] {
-                dp[i][j] + 1
+            dp[(i + 1) * w + j + 1] = if a[i] == b[j] {
+                dp[i * w + j] + 1
             } else {
-                dp[i][j + 1].max(dp[i + 1][j])
+                dp[i * w + j + 1].max(dp[(i + 1) * w + j])
             };
         }
     }
@@ -525,7 +528,7 @@ fn edits<'a>(a: &'a [&str], b: &'a [&str]) -> Vec<Edit<'a>> {
             edits.push(Edit::Keep(a[i - 1]));
             i -= 1;
             j -= 1;
-        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i.saturating_sub(1)][j]) {
+        } else if j > 0 && (i == 0 || dp[i * w + j - 1] >= dp[i.saturating_sub(1) * w + j]) {
             edits.push(Edit::Ins(b[j - 1]));
             j -= 1;
         } else {

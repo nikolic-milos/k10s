@@ -5,9 +5,11 @@
 //! must not grow a per-object overlay lookup; stamp from a bounded side table
 //! keyed by uid, and only for what is already being drawn.
 
+use std::collections::HashMap;
+
 use gpui::{Corners, Pixels, Window, point, px, quad, size, transparent_black};
 use k10s_atlas::{Camera, Level, LodPolicy, Rect, StageBlend, WorkloadPresentation};
-use k10s_core::{SceneSnapshot, Severity};
+use k10s_core::{SceneSnapshot, Severity, SlotIds};
 use k10s_theme::{MapTheme, Point as UnitPoint, Series, scale_alpha, sparkline};
 
 use crate::PickPath;
@@ -141,17 +143,59 @@ impl OverlayFrame {
         vw: f32,
         vh: f32,
     ) -> Vec<OverlayStamp> {
+        self.visible_stamps_cached(
+            &mut StampCache::default(),
+            scene,
+            camera,
+            policy,
+            blend,
+            vw,
+            vh,
+        )
+    }
+
+    /// [`Self::visible_stamps`], resolving uids through `cache`. The cache is
+    /// rebuilt only when the marks were replaced ([`StampCache::invalidate`])
+    /// or the scene's identity changed, so a painted frame costs O(marks) and
+    /// never re-scans the id vectors.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn visible_stamps_cached(
+        &self,
+        cache: &mut StampCache,
+        scene: &SceneSnapshot,
+        camera: Camera,
+        policy: &LodPolicy,
+        blend: StageBlend,
+        vw: f32,
+        vh: f32,
+    ) -> Vec<OverlayStamp> {
         if self.marks.is_empty() {
             return Vec::new();
+        }
+        if !cache.valid || cache.identity_rev != scene.identity_rev {
+            cache.rebuild(&self.marks, scene);
         }
         let visible = camera.visible_world(vw, vh);
         let stage = blend.walk_stage();
         let mut stamps = Vec::new();
-        for mark in &self.marks {
-            let Some(located) = scene.locate(&mark.uid) else {
+        for (mark, cached) in self.marks.iter().zip(&cache.slots) {
+            let Some(cached) = *cached else {
                 continue;
             };
-            if !object_is_drawn(scene, policy, camera, stage, vw, vh, &visible, located) {
+            // Rects come from the live scene, not the cache: identity survives
+            // publishes that move geometry.
+            let Some(rect) = slot_rect(scene, cached.level, cached.slot) else {
+                continue;
+            };
+            let located = k10s_core::Located {
+                level: cached.level,
+                slot: cached.slot,
+                rect,
+            };
+            let block = cached.block.and_then(|slot| scene.blocks.get(slot));
+            if !object_is_drawn(
+                scene, policy, camera, stage, vw, vh, &visible, located, block,
+            ) {
                 continue;
             }
             let (x, y) = camera.w2s(located.rect.x, located.rect.y, vw, vh);
@@ -181,6 +225,112 @@ impl OverlayFrame {
     }
 }
 
+/// Where each mark's uid resolved, held across painted frames.
+///
+/// Keyed on [`SceneSnapshot::identity_rev`], which changes exactly when object
+/// identity does, so cached (level, slot) pairs survive health-only publishes
+/// and die on a cluster switch. The mark table itself has no revision; the
+/// owner must call [`StampCache::invalidate`] when it replaces the marks.
+#[derive(Debug, Default)]
+pub(crate) struct StampCache {
+    identity_rev: u64,
+    valid: bool,
+    slots: Vec<Option<CachedSlot>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedSlot {
+    level: Level,
+    slot: usize,
+    /// Owning block slot: the mark's own slot for a Block, the containing
+    /// block for a Cell or Sat, absent for regions and orphans.
+    block: Option<usize>,
+}
+
+impl StampCache {
+    pub(crate) fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    fn rebuild(&mut self, marks: &[OverlayMark], scene: &SceneSnapshot) {
+        // Tombstones hold the empty string; leaving them out keeps an empty
+        // mark uid unresolved, exactly as `SceneSnapshot::locate` answers it.
+        fn index(ids: &SlotIds) -> HashMap<&str, usize> {
+            let mut map = HashMap::with_capacity(ids.len());
+            for (slot, id) in ids.iter().enumerate() {
+                let uid = id.as_ref();
+                if !uid.is_empty() {
+                    // First slot wins, matching `locate`'s forward scan.
+                    map.entry(uid).or_insert(slot);
+                }
+            }
+            map
+        }
+        let sats = index(&scene.ids.sats);
+        let cells = index(&scene.ids.cells);
+        let blocks = index(&scene.ids.blocks);
+        let regions = index(&scene.ids.regions);
+        let mut cell_block = vec![None; scene.cells.len()];
+        let mut sat_block = vec![None; scene.sats.len()];
+        for (owner, block) in scene.blocks.iter().enumerate() {
+            for child in block.children.clone() {
+                if let Some(slot) = cell_block.get_mut(child as usize) {
+                    *slot = Some(owner);
+                }
+            }
+            for sat in block.sats.clone() {
+                if let Some(slot) = sat_block.get_mut(sat as usize) {
+                    *slot = Some(owner);
+                }
+            }
+        }
+        self.slots.clear();
+        self.slots.extend(marks.iter().map(|mark| {
+            let uid = mark.uid.as_str();
+            // Deepest-first, the same priority as `SceneSnapshot::locate`.
+            if let Some(&slot) = sats.get(uid) {
+                return Some(CachedSlot {
+                    level: Level::Sat,
+                    slot,
+                    block: sat_block.get(slot).copied().flatten(),
+                });
+            }
+            if let Some(&slot) = cells.get(uid) {
+                return Some(CachedSlot {
+                    level: Level::Cell,
+                    slot,
+                    block: cell_block.get(slot).copied().flatten(),
+                });
+            }
+            if let Some(&slot) = blocks.get(uid) {
+                return Some(CachedSlot {
+                    level: Level::Block,
+                    slot,
+                    block: Some(slot),
+                });
+            }
+            regions.get(uid).map(|&slot| CachedSlot {
+                level: Level::Region,
+                slot,
+                block: None,
+            })
+        }));
+        self.identity_rev = scene.identity_rev;
+        self.valid = true;
+    }
+}
+
+/// The rect `locate` would answer for a slot, read fresh from the scene.
+fn slot_rect(scene: &SceneSnapshot, level: Level, slot: usize) -> Option<Rect> {
+    match level {
+        Level::Sat => scene.sats.get(slot).map(|node| node.rect),
+        Level::Cell => scene.cells.get(slot).map(|node| node.rect),
+        // The card, not the halo, matching `locate`.
+        Level::Block => scene.blocks.get(slot).map(|node| node.inner),
+        Level::Region => scene.regions.get(slot).map(|node| node.rect),
+    }
+}
+
 /// One visible overlay stamp, in viewport pixels, ready to paint outside the walk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OverlayStamp {
@@ -198,6 +348,7 @@ const CARD_RADIUS: f32 = 0.14;
 const CARD_RADIUS_MAX_PX: f32 = 14.0;
 const ISLAND_RADIUS: f32 = 0.34;
 
+#[expect(clippy::too_many_arguments)]
 fn object_is_drawn(
     scene: &SceneSnapshot,
     policy: &LodPolicy,
@@ -207,17 +358,19 @@ fn object_is_drawn(
     vh: f32,
     visible: &Rect,
     located: k10s_core::Located,
+    // The owning block, resolved once at cache build, not per painted frame.
+    block: Option<&k10s_core::WorkloadNode>,
 ) -> bool {
     if !located.rect.intersects(visible) {
         return false;
     }
     match located.level {
         Level::Region => true,
-        Level::Block => owning_block(scene, located).is_some_and(|block| {
+        Level::Block => block.is_some_and(|block| {
             policy.workload_presentation(block.inner.w, camera.zoom, stage)
                 != WorkloadPresentation::Hidden
         }),
-        Level::Cell => owning_block(scene, located).is_some_and(|block| {
+        Level::Cell => block.is_some_and(|block| {
             let presentation = policy.workload_presentation(block.inner.w, camera.zoom, stage);
             presentation.cells_shown()
                 && !policy.cells_aggregated(
@@ -228,7 +381,7 @@ fn object_is_drawn(
                 )
         }),
         Level::Sat => {
-            let Some(block) = owning_block(scene, located) else {
+            let Some(block) = block else {
                 return false;
             };
             let Some(sat) = scene.sats.get(located.slot) else {
@@ -238,24 +391,6 @@ fn object_is_drawn(
                 && (policy.block_painted(block.inner.w, camera.zoom) || policy.stress_curves)
                 && policy.sat_painted(sat.rect.w, camera.zoom)
         }
-    }
-}
-
-fn owning_block(
-    scene: &SceneSnapshot,
-    located: k10s_core::Located,
-) -> Option<&k10s_core::WorkloadNode> {
-    match located.level {
-        Level::Block => scene.blocks.get(located.slot),
-        Level::Cell => scene
-            .blocks
-            .iter()
-            .find(|block| block.children.contains(&(located.slot as u32))),
-        Level::Sat => scene
-            .blocks
-            .iter()
-            .find(|block| block.sats.contains(&(located.slot as u32))),
-        Level::Region => None,
     }
 }
 
@@ -768,6 +903,203 @@ mod tests {
         assert_ne!(
             tint_fill(theme, Severity::Err),
             tint_fill(theme, Severity::Ok)
+        );
+    }
+
+    #[test]
+    fn a_warm_cache_trusts_its_slots_until_identity_rev_changes() {
+        let mut scene = scene_two_islands();
+        scene.identity_rev = 7;
+        let frame = OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: vec![OverlayMark {
+                uid: "ns-near".into(),
+                tint: Some(Severity::Warn),
+                sparkline: None,
+                label: None,
+            }],
+        };
+        let camera = looking_at_near();
+        let mut cache = StampCache::default();
+        let cold = frame.visible_stamps_cached(
+            &mut cache,
+            &scene,
+            camera,
+            &policy(),
+            settled(camera),
+            400.0,
+            300.0,
+        );
+        assert_eq!(cold.len(), 1);
+        // Tombstoning the uid without bumping identity_rev violates the
+        // identity contract; the cache must not pay per frame to notice.
+        scene.ids = Arc::new(ids(
+            &["", "ns-far"],
+            &["wl-api"],
+            &["pod-api"],
+            &["svc-api"],
+        ));
+        let warm = frame.visible_stamps_cached(
+            &mut cache,
+            &scene,
+            camera,
+            &policy(),
+            settled(camera),
+            400.0,
+            300.0,
+        );
+        assert_eq!(warm.len(), 1, "same identity_rev keeps the cached slot");
+        scene.identity_rev = 8;
+        let rebuilt = frame.visible_stamps_cached(
+            &mut cache,
+            &scene,
+            camera,
+            &policy(),
+            settled(camera),
+            400.0,
+            300.0,
+        );
+        assert!(
+            rebuilt.is_empty(),
+            "a new identity_rev re-resolves the mark"
+        );
+    }
+
+    #[test]
+    fn an_invalidated_cache_re_resolves_replaced_marks() {
+        let scene = scene_two_islands();
+        let camera = looking_at_near();
+        let region_frame = OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: vec![OverlayMark {
+                uid: "ns-near".into(),
+                tint: Some(Severity::Warn),
+                sparkline: None,
+                label: None,
+            }],
+        };
+        let mut cache = StampCache::default();
+        let first = region_frame.visible_stamps_cached(
+            &mut cache,
+            &scene,
+            camera,
+            &policy(),
+            settled(camera),
+            800.0,
+            600.0,
+        );
+        assert!(first[0].island);
+        let block_frame = OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: vec![OverlayMark {
+                uid: "wl-api".into(),
+                tint: Some(Severity::Err),
+                sparkline: None,
+                label: None,
+            }],
+        };
+        cache.invalidate();
+        let second = block_frame.visible_stamps_cached(
+            &mut cache,
+            &scene,
+            camera,
+            &policy(),
+            settled(camera),
+            800.0,
+            600.0,
+        );
+        assert_eq!(second.len(), 1);
+        assert!(
+            !second[0].island,
+            "the rebuilt cache resolves the block mark, not the stale region slot"
+        );
+    }
+
+    #[test]
+    fn a_warm_cache_reads_rects_from_the_live_scene() {
+        let scene = scene_two_islands();
+        let camera = looking_at_near();
+        let frame = OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: vec![OverlayMark {
+                uid: "ns-near".into(),
+                tint: Some(Severity::Warn),
+                sparkline: None,
+                label: None,
+            }],
+        };
+        let mut cache = StampCache::default();
+        let before = frame.visible_stamps_cached(
+            &mut cache,
+            &scene,
+            camera,
+            &policy(),
+            settled(camera),
+            800.0,
+            600.0,
+        );
+        let mut moved = scene;
+        moved.regions[0].rect = Rect::new(4.0, 4.0, 120.0, 80.0);
+        let after = frame.visible_stamps_cached(
+            &mut cache,
+            &moved,
+            camera,
+            &policy(),
+            settled(camera),
+            800.0,
+            600.0,
+        );
+        assert_ne!(
+            before[0].screen, after[0].screen,
+            "geometry moves under an unchanged identity"
+        );
+    }
+
+    #[test]
+    fn warm_stamps_agree_with_a_cold_resolve_at_every_level() {
+        let mut scene = scene_two_islands();
+        scene.identity_rev = 3;
+        let mark = |uid: &str| OverlayMark {
+            uid: uid.into(),
+            tint: Some(Severity::Warn),
+            sparkline: None,
+            label: None,
+        };
+        let frame = OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: vec![
+                mark("ns-near"),
+                mark("wl-api"),
+                mark("pod-api"),
+                mark("svc-api"),
+                mark("missing"),
+            ],
+        };
+        let camera = looking_at_near();
+        let cold = frame.visible_stamps(
+            &scene,
+            camera,
+            &policy(),
+            StageBlend::settled(2),
+            800.0,
+            600.0,
+        );
+        let mut cache = StampCache::default();
+        for _ in 0..2 {
+            let warm = frame.visible_stamps_cached(
+                &mut cache,
+                &scene,
+                camera,
+                &policy(),
+                StageBlend::settled(2),
+                800.0,
+                600.0,
+            );
+            assert_eq!(cold, warm);
+        }
+        assert!(
+            cold.len() >= 3,
+            "region, block, and pod all stamp at stage 2"
         );
     }
 

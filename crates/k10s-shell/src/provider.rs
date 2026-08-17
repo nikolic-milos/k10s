@@ -136,6 +136,163 @@ pub enum TableOutcome {
     Failed(String),
 }
 
+/// One ecosystem family's answer. [`TableOutcome::Absent`] means the family
+/// is not on this cluster and its row stays hidden; the id is the stable
+/// key the ecosystem pane joins its presentation onto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcosystemEntry {
+    pub id: &'static str,
+    pub outcome: TableOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPresence {
+    Ready,
+    /// The adapter is not on this cluster. The pane stays down.
+    Missing,
+    /// The tool is visible but this process cannot speak to it.
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObserveReach {
+    pub prometheus: ToolPresence,
+    pub loki: ToolPresence,
+    pub traces: ToolPresence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryDialect {
+    PromQL,
+    LogQL,
+    TraceQL,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrafanaPanelKind {
+    Timeseries,
+    Stat,
+    Gauge,
+    Table,
+    Logs,
+    Heatmap,
+    Bar,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrafanaPanelRow {
+    pub dashboard_uid: String,
+    pub dashboard_title: String,
+    pub panel_id: i64,
+    pub title: String,
+    pub kind: GrafanaPanelKind,
+    pub expr: String,
+    pub dialect: QueryDialect,
+    pub transformed: bool,
+    pub browser_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrafanaOutcome {
+    Catalog {
+        panels: Vec<GrafanaPanelRow>,
+        truncated: bool,
+    },
+    Absent,
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromSeriesView {
+    pub labels: String,
+    pub points: Vec<(i64, f64)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PromOutcome {
+    Series {
+        series: Vec<PromSeriesView>,
+        truncated: bool,
+        dropped_series: usize,
+    },
+    Absent,
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LokiOutcome {
+    Logs { lines: Vec<String>, truncated: bool },
+    Absent,
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanView {
+    pub id: String,
+    pub parent: String,
+    pub name: String,
+    pub service: String,
+    pub start_us: u64,
+    pub duration_us: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceOutcome {
+    Trace {
+        trace_id: String,
+        spans: Vec<SpanView>,
+    },
+    Absent,
+    Denied(&'static str),
+    Failed(String),
+}
+
+/// Bytes that just left a reveal Scratch. Open them into an editor scratch
+/// and drop this value. Never a table cell, a saved view, or a log line —
+/// which is why `Debug` below is written by hand to redact the payloads.
+#[derive(PartialEq, Eq)]
+pub struct HelmReveal {
+    pub name: String,
+    pub namespace: String,
+    pub revision: u32,
+    pub config: String,
+    pub chart_values: String,
+    pub manifest: String,
+}
+
+impl std::fmt::Debug for HelmReveal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HelmReveal")
+            .field("name", &self.name)
+            .field("namespace", &self.namespace)
+            .field("revision", &self.revision)
+            .field("config", &"[redacted]")
+            .field("chart_values", &"[redacted]")
+            .field("manifest", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HelmRevealOutcome {
+    Revealed(HelmReveal),
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelmRollbackOutcome {
+    Report { note: String, lines: Vec<String> },
+    Denied(&'static str),
+    Failed(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Day2Op {
     Scale { current: i32, replicas: i32 },
@@ -629,6 +786,47 @@ read_provider! {
     /// Isolation and named ports. Not an allow or deny: that needs a source,
     /// protocol, and destination port.
     fn fetch_pod_posture(&self, namespace: &str, name: &str, reply: Reply<PostureOutcome>);
+    /// Grafana dashboards reduced to queries. [`GrafanaOutcome::Absent`] hides
+    /// the Grafana pane.
+    fn fetch_grafana(&self, reply: Reply<GrafanaOutcome>);
+    fn probe_observe(&self, reply: Reply<ObserveReach>);
+    fn query_promql(&self, expr: String, reply: Reply<PromOutcome>);
+    fn query_loki(&self, query: String, reply: Reply<LokiOutcome>);
+    fn lookup_trace(&self, trace_id: String, reply: Reply<TraceOutcome>);
+    /// PolicyReport findings. Absent hides the pane.
+    fn fetch_policy(&self, reply: Reply<TableOutcome>);
+    /// Harbor projects. Absent hides the pane.
+    fn fetch_harbor(&self, reply: Reply<TableOutcome>);
+    /// Declared mesh inventory. Observed stays the overlay.
+    fn fetch_mesh(&self, reply: Reply<TableOutcome>);
+    /// Every ecosystem family the data plane can list, each reduced to its
+    /// own table. Absent families stay hidden; one denied or failed family
+    /// never hides the others.
+    fn fetch_ecosystem(&self, reply: Reply<Vec<EcosystemEntry>>);
+    /// Explicit reveal of one Helm revision. The answer is for a scratch
+    /// editor, never a table page.
+    fn reveal_helm(
+        &self,
+        namespace: Option<String>,
+        name: String,
+        revision: u32,
+        reply: Reply<HelmRevealOutcome>,
+    );
+    fn diff_helm(
+        &self,
+        namespace: Option<String>,
+        name: String,
+        from: u32,
+        to: u32,
+        reply: Reply<DocOutcome>,
+    );
+    fn rollback_helm(
+        &self,
+        namespace: Option<String>,
+        name: String,
+        revision: u32,
+        reply: Reply<HelmRollbackOutcome>,
+    );
 }
 
 pub struct NullProvider;
@@ -752,6 +950,64 @@ impl ReadProvider for NullProvider {
 
     fn fetch_pod_posture(&self, _: &str, _: &str, reply: Reply<PostureOutcome>) {
         reply(PostureOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_grafana(&self, reply: Reply<GrafanaOutcome>) {
+        reply(GrafanaOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn probe_observe(&self, reply: Reply<ObserveReach>) {
+        reply(ObserveReach {
+            prometheus: ToolPresence::Missing,
+            loki: ToolPresence::Missing,
+            traces: ToolPresence::Missing,
+        });
+    }
+
+    fn query_promql(&self, _: String, reply: Reply<PromOutcome>) {
+        reply(PromOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn query_loki(&self, _: String, reply: Reply<LokiOutcome>) {
+        reply(LokiOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn lookup_trace(&self, _: String, reply: Reply<TraceOutcome>) {
+        reply(TraceOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_policy(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_harbor(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_mesh(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_ecosystem(&self, reply: Reply<Vec<EcosystemEntry>>) {
+        reply(Vec::new());
+    }
+
+    fn reveal_helm(&self, _: Option<String>, _: String, _: u32, reply: Reply<HelmRevealOutcome>) {
+        reply(HelmRevealOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn diff_helm(&self, _: Option<String>, _: String, _: u32, _: u32, reply: Reply<DocOutcome>) {
+        reply(DocOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn rollback_helm(
+        &self,
+        _: Option<String>,
+        _: String,
+        _: u32,
+        reply: Reply<HelmRollbackOutcome>,
+    ) {
+        reply(HelmRollbackOutcome::Failed(NO_CLUSTER.to_string()));
     }
 }
 
@@ -918,5 +1174,67 @@ impl LaunchProvider for NullLaunchProvider {
 
     fn generate(&self, reply: Reply<DemoOutcome>) {
         reply(DemoOutcome::Failed(NO_LAUNCH.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn take<T: Send + 'static>(call: impl FnOnce(Reply<T>)) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        call(Box::new(move |value| {
+            let _ = tx.send(value);
+        }));
+        rx.recv().expect("NullProvider answers on this thread")
+    }
+
+    #[test]
+    fn null_provider_labels_the_new_surfaces_and_hides_observe_tools() {
+        let provider = NullProvider;
+        assert!(matches!(
+            take(|reply| provider.fetch_grafana(reply)),
+            GrafanaOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.fetch_policy(reply)),
+            TableOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.fetch_harbor(reply)),
+            TableOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.fetch_mesh(reply)),
+            TableOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.query_promql("up".into(), reply)),
+            PromOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.query_loki("{app=\"a\"}".into(), reply)),
+            LokiOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.lookup_trace("abc".into(), reply)),
+            TraceOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.reveal_helm(None, "ingress".into(), 1, reply)),
+            HelmRevealOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.diff_helm(None, "ingress".into(), 1, 2, reply)),
+            DocOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.rollback_helm(None, "ingress".into(), 1, reply)),
+            HelmRollbackOutcome::Failed(_)
+        ));
+        let reach = take(|reply| provider.probe_observe(reply));
+        assert_eq!(reach.prometheus, ToolPresence::Missing);
+        assert_eq!(reach.loki, ToolPresence::Missing);
+        assert_eq!(reach.traces, ToolPresence::Missing);
     }
 }

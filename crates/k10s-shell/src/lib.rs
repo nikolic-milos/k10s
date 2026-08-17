@@ -41,6 +41,7 @@ pub mod diff_gate;
 #[cfg(test)]
 mod diff_test;
 pub mod dock;
+pub mod ecosystem;
 pub mod editor;
 pub mod files;
 pub mod finder;
@@ -48,10 +49,12 @@ pub mod finder;
 mod finder_test;
 pub mod forwards;
 pub mod fs;
+pub mod helm_values;
 pub mod item;
 pub mod keymap;
 pub mod launch;
 pub mod lists;
+pub mod observe;
 pub mod palette;
 pub mod provider;
 #[cfg(unix)]
@@ -62,6 +65,7 @@ pub mod settings;
 pub mod table;
 pub mod term;
 pub mod text;
+pub mod traces;
 pub mod ui;
 
 // The shell's own parts. Private, because the crate's surface is the views it
@@ -94,13 +98,16 @@ pub use item::{Item, ItemHandle};
 pub use provider::{
     ApplyOutcome, ApplyRequest, Bytes, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest,
     Connection, ContainersOutcome, ContextRow, Day2Op, Day2Outcome, Day2Request, DemoOutcome,
-    DescribeRequest, Detail, DocOutcome, EventRow, ExecEvent, ExecRequest, ExecSession,
-    ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, KindRow, LaunchProvider, LogChunk,
-    LogRequest, LogStop, ManifestOutcome, Millicores, NullExecSession, NullLaunchProvider,
-    NullProvider, OverlayOutcome, OverlayStamp, PodPostureView, PostureOutcome, ProviderFactory,
-    ProviderSlot, ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome,
-    SchemaSource, SchemaTextOutcome, TableColumn, TableOutcome, TablePage, TableRow, UsageOutcome,
-    UsageRequest, UsageSample, UsageSource, UsageTarget, WorkloadLogRequest,
+    DescribeRequest, Detail, DocOutcome, EcosystemEntry, EventRow, ExecEvent, ExecRequest,
+    ExecSession, ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, GrafanaOutcome,
+    GrafanaPanelKind, GrafanaPanelRow, HelmReveal, HelmRevealOutcome, HelmRollbackOutcome, KindRow,
+    LaunchProvider, LogChunk, LogRequest, LogStop, LokiOutcome, ManifestOutcome, Millicores,
+    NullExecSession, NullLaunchProvider, NullProvider, ObserveReach, OverlayOutcome, OverlayStamp,
+    PodPostureView, PostureOutcome, PromOutcome, PromSeriesView, ProviderFactory, ProviderSlot,
+    QueryDialect, ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome,
+    SchemaSource, SchemaTextOutcome, SpanView, TableColumn, TableOutcome, TablePage, TableRow,
+    ToolPresence, TraceOutcome, UsageOutcome, UsageRequest, UsageSample, UsageSource, UsageTarget,
+    WorkloadLogRequest,
 };
 pub use selection::{LogTarget, Selection};
 pub use workspace::{ConfigPaths, Workspace};

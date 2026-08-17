@@ -1,0 +1,187 @@
+# Lab fixture only. Rides on the Gateway API, Ingress, and traefik.io CRDs
+# k3s Traefik already serves; apply.sh installs no CRD for these. The
+# GatewayClass names a controller that does not exist, so nothing reconciles
+# the Gateway chain. The TLS Secret holds planted non-PEM bytes: an adapter
+# that fetched it would surface PLANTED and fail live_hplane.rs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hplane-dns
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+    app.kubernetes.io/part-of: k10s-hplane
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 9153
+      protocol: TCP
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: hplane-dns
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+    app.kubernetes.io/part-of: k10s-hplane
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  entryPoints:
+    - web
+  routes:
+    - kind: Rule
+      match: Host(`hplane.k10s.lab`) && PathPrefix(`/dns`)
+      services:
+        - name: kube-dns
+          namespace: kube-system
+          port: 9153
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: k10s-hplane-mw
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  basicAuth:
+    secret: hplane-basic-auth
+    realm: k10s-lab
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: k10s-lab
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  controllerName: k10s.dev/lab-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: k10s-hplane-gw
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  gatewayClassName: k10s-lab
+  listeners:
+    - name: web
+      port: 8080
+      protocol: HTTP
+      hostname: gw.k10s.test
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: k10s-hplane-route
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  parentRefs:
+    - name: k10s-hplane-gw
+  hostnames:
+    - route.k10s.test
+  rules:
+    - backendRefs:
+        - name: hplane-dns
+          port: 9153
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: k10s-hplane-listeners
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  parentRef:
+    name: k10s-hplane-gw
+    kind: Gateway
+    group: gateway.networking.k8s.io
+  listeners:
+    - name: extra
+      port: 8443
+      protocol: HTTPS
+      hostname: extra.k10s.test
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: k10s-hplane-tls-canary
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: k10s-hplane-grant
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: default
+  to:
+    - group: ""
+      kind: Secret
+      name: k10s-hplane-tls-canary
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: k10s-hplane-ingress
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - ing.k10s.test
+      secretName: k10s-hplane-tls-canary
+  rules:
+    - host: ing.k10s.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hplane-dns
+                port:
+                  number: 9153
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k10s-hplane-tls-canary
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+type: kubernetes.io/tls
+data:
+  tls.crt: UExBTlRFRC1jZXJ0LWJ5dGVz
+  tls.key: UExBTlRFRC1rZXktYnl0ZXM=

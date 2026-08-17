@@ -299,37 +299,46 @@ static TOOL_GLYPHS: &[Glyph] = &[
     tool_glyph!("apacheairflow.svg"),
     tool_glyph!("argo.svg"),
     tool_glyph!("apachecassandra.svg"),
+    tool_glyph!("cilium.svg"),
     tool_glyph!("clickhouse.svg"),
     tool_glyph!("consul.svg"),
     tool_glyph!("elasticsearch.svg"),
     tool_glyph!("envoyproxy.svg"),
     tool_glyph!("etcd.svg"),
+    tool_glyph!("falco.svg"),
     tool_glyph!("fluentbit.svg"),
     tool_glyph!("fluentd.svg"),
     tool_glyph!("flux.svg"),
     tool_glyph!("grafana.svg"),
     tool_glyph!("harbor.svg"),
+    tool_glyph!("headlamp.svg"),
     tool_glyph!("istio.svg"),
     tool_glyph!("jaeger.svg"),
     tool_glyph!("jenkins.svg"),
     tool_glyph!("apachekafka.svg"),
+    tool_glyph!("kargo.svg"),
     tool_glyph!("keycloak.svg"),
     tool_glyph!("kibana.svg"),
     tool_glyph!("kubernetes.svg"),
+    tool_glyph!("kyverno.svg"),
+    tool_glyph!("loki.svg"),
     tool_glyph!("mariadb.svg"),
     tool_glyph!("minio.svg"),
     tool_glyph!("mongodb.svg"),
     tool_glyph!("mysql.svg"),
     tool_glyph!("natsdotio.svg"),
     tool_glyph!("nginx.svg"),
+    tool_glyph!("openbao.svg"),
     tool_glyph!("opentelemetry.svg"),
     tool_glyph!("postgresql.svg"),
     tool_glyph!("prometheus.svg"),
     tool_glyph!("rabbitmq.svg"),
     tool_glyph!("redis.svg"),
     tool_glyph!("temporal.svg"),
+    tool_glyph!("tetragon.svg"),
     tool_glyph!("traefikproxy.svg"),
     tool_glyph!("vault.svg"),
+    tool_glyph!("velero.svg"),
 ];
 
 const _: () = assert!(
@@ -340,6 +349,18 @@ const _: () = assert!(
 fn glyph_of(table: &'static [Glyph], idx: usize) -> (SharedString, &'static [u8]) {
     let (key, data) = table.get(idx).copied().unwrap_or(UNKNOWN_GLYPH);
     (SharedString::new_static(key), data)
+}
+
+/// The bytes behind a map glyph asset key, for chrome outside the map's
+/// paint path: the app's AssetSource consults this so an `svg()` element
+/// can name a brand mask by the same `icons/tools/...` key the map uses.
+pub fn embedded_icon(path: &str) -> Option<&'static [u8]> {
+    KIND_GLYPHS
+        .iter()
+        .chain(TOOL_GLYPHS)
+        .chain(std::iter::once(&UNKNOWN_GLYPH))
+        .find(|(key, _)| *key == path)
+        .map(|(_, data)| *data)
 }
 
 fn kind_icon(kind: KindId) -> (SharedString, &'static [u8]) {
@@ -385,7 +406,10 @@ pub struct MapView {
     summary: chrome::SummaryCache,
     chrome: gpui::Entity<chrome::Chrome>,
     chrome_state: Option<chrome::State>,
-    overlay: OverlayFrame,
+    // Behind an Rc so the canvas paint closure shares the frame instead of
+    // deep-cloning up to 512 marks' strings and series every painted frame.
+    overlay: Rc<OverlayFrame>,
+    overlay_cache: Rc<RefCell<overlay::StampCache>>,
     present_probe: PresentProbe,
 
     pacer: FramePacer,
@@ -482,7 +506,8 @@ impl MapView {
             summary: chrome::SummaryCache::default(),
             chrome: map_chrome,
             chrome_state: None,
-            overlay: OverlayFrame::default(),
+            overlay: Rc::new(OverlayFrame::default()),
+            overlay_cache: Rc::new(RefCell::new(overlay::StampCache::default())),
             present_probe: PresentProbe::default(),
             pacer: FramePacer::default(),
             fly: None,
@@ -520,10 +545,13 @@ impl MapView {
     /// overlay, not a hole. Replacing the frame notifies; identical frames do
     /// not.
     pub fn set_overlay(&mut self, overlay: OverlayFrame, cx: &mut Context<Self>) {
-        if self.overlay == overlay {
+        if *self.overlay == overlay {
             return;
         }
-        self.overlay = overlay;
+        self.overlay = Rc::new(overlay);
+        // New marks may resolve to different slots; the paint path trusts the
+        // stamp cache until told otherwise.
+        self.overlay_cache.borrow_mut().invalidate();
         cx.notify();
     }
 
@@ -982,7 +1010,8 @@ impl Render for MapView {
             gpui::CursorStyle::Arrow
         };
         let paint_scene = scene.clone();
-        let overlay = self.overlay.clone();
+        let overlay = Rc::clone(&self.overlay);
+        let overlay_cache = self.overlay_cache.clone();
 
         div()
             .id("starmap-view")
@@ -1101,6 +1130,7 @@ impl Render for MapView {
                             &text_cache,
                             marks,
                             &overlay,
+                            &overlay_cache,
                             edges_on,
                             churn_on,
                             hud_on,
@@ -1297,6 +1327,7 @@ fn paint_map(
     text_cache: &Rc<RefCell<TextCache>>,
     marks: Marks,
     overlay: &OverlayFrame,
+    overlay_cache: &Rc<RefCell<overlay::StampCache>>,
     edges_on: bool,
     churn_on: bool,
     hud_on: bool,
@@ -1412,7 +1443,15 @@ fn paint_map(
     if !overlay.marks.is_empty() {
         let vw = f32::from(bounds.size.width);
         let vh = f32::from(bounds.size.height);
-        let stamps = overlay.visible_stamps(scene, camera, lod(), blend, vw, vh);
+        let stamps = overlay.visible_stamps_cached(
+            &mut overlay_cache.borrow_mut(),
+            scene,
+            camera,
+            lod(),
+            blend,
+            vw,
+            vh,
+        );
         overlay::paint_stamps(
             &stamps,
             (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),

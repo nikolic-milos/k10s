@@ -505,6 +505,7 @@ mod tests {
     fn policy_report_stamps_keep_the_resource_name() {
         let inventory = policy::Inventory {
             served: true,
+            partly_denied: false,
             reports: vec![policy::Report {
                 namespace: "prod".into(),
                 name: "pods".into(),

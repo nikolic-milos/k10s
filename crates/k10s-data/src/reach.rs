@@ -51,6 +51,7 @@ pub enum ToolKind {
     Thanos,
     Harbor,
     OtelCollector,
+    Alertmanager,
 }
 
 impl ToolKind {
@@ -65,6 +66,7 @@ impl ToolKind {
             ToolKind::Thanos => "Thanos",
             ToolKind::Harbor => "Harbor",
             ToolKind::OtelCollector => "OpenTelemetry Collector",
+            ToolKind::Alertmanager => "Alertmanager",
         }
     }
 
@@ -79,6 +81,7 @@ impl ToolKind {
             ToolKind::Thanos => "thanos",
             ToolKind::Harbor => "harbor",
             ToolKind::OtelCollector => "otel-collector",
+            ToolKind::Alertmanager => "alertmanager",
         }
     }
 }
@@ -116,6 +119,7 @@ pub struct ReachSettings {
     pub thanos: ToolOverride,
     pub harbor: ToolOverride,
     pub otel: ToolOverride,
+    pub alertmanager: ToolOverride,
 }
 
 impl ReachSettings {
@@ -130,6 +134,7 @@ impl ReachSettings {
             ToolKind::Thanos => &self.thanos,
             ToolKind::Harbor => &self.harbor,
             ToolKind::OtelCollector => &self.otel,
+            ToolKind::Alertmanager => &self.alertmanager,
         }
     }
 }
@@ -290,9 +295,29 @@ const CATALOG: &[Fingerprint] = &[
         kind: ToolKind::OtelCollector,
         names: &["otel-collector", "opentelemetry-collector", "otelcol"],
         needles: &["opentelemetry", "otel-collector", "otelcol"],
-        ports: &[4318, 8888],
-        port_names: &["otlp-http", "metrics", "http"],
+        // otel::health() is the only wire operation on a collector bind, and
+        // it refuses the data-plane ports. The health_check extension (13133,
+        // answers on "/") and zpages (55679) must outrank OTLP HTTP (4318)
+        // and internal metrics (8888), which stay only so a Service without
+        // the extensions still binds and health() can label the Failed why.
+        ports: &[13133, 55679, 4318, 8888],
+        port_names: &[
+            "health-check",
+            "healthcheck",
+            "zpages",
+            "otlp-http",
+            "metrics",
+            "http",
+        ],
         probe_path: "",
+    },
+    Fingerprint {
+        kind: ToolKind::Alertmanager,
+        names: &["alertmanager", "alertmanager-operated", "alertmanager-main"],
+        needles: &["alertmanager"],
+        ports: &[9093],
+        port_names: &["http", "web", "alertmanager"],
+        probe_path: "-/ready",
     },
 ];
 
@@ -705,6 +730,18 @@ pub async fn tool_post(
 }
 
 async fn plaintext_http_get(base: &str, rest: &str, auth: &ToolAuth) -> Fetched<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
+    plaintext_http_get_until(base, rest, auth, deadline).await
+}
+
+/// One deadline bounds the whole exchange -- connect, write, and every read --
+/// so a server dripping bytes cannot hold the fetch open past it.
+async fn plaintext_http_get_until(
+    base: &str,
+    rest: &str,
+    auth: &ToolAuth,
+    deadline: tokio::time::Instant,
+) -> Fetched<Vec<u8>> {
     let Ok(url) = http::Uri::try_from(join_url(base, rest)) else {
         return Fetched::Failed {
             what: "url",
@@ -739,8 +776,8 @@ async fn plaintext_http_get(base: &str, rest: &str, auth: &ToolAuth) -> Fetched<
     }
     request.push_str("\r\n");
 
-    let connect = tokio::time::timeout(
-        PROBE_DEADLINE,
+    let connect = tokio::time::timeout_at(
+        deadline,
         tokio::net::TcpStream::connect((host.as_str(), port)),
     )
     .await;
@@ -761,11 +798,20 @@ async fn plaintext_http_get(base: &str, rest: &str, auth: &ToolAuth) -> Fetched<
     };
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    if let Err(error) = stream.write_all(request.as_bytes()).await {
-        return Fetched::Failed {
-            what: "url",
-            why: error.to_string(),
-        };
+    match tokio::time::timeout_at(deadline, stream.write_all(request.as_bytes())).await {
+        Err(_) => {
+            return Fetched::Failed {
+                what: "url",
+                why: "the settings URL did not answer within 4 seconds".to_string(),
+            };
+        }
+        Ok(Err(error)) => {
+            return Fetched::Failed {
+                what: "url",
+                why: error.to_string(),
+            };
+        }
+        Ok(Ok(())) => {}
     }
     let mut buf = Vec::new();
     loop {
@@ -776,11 +822,11 @@ async fn plaintext_http_get(base: &str, rest: &str, auth: &ToolAuth) -> Fetched<
             };
         }
         let mut chunk = [0u8; 8192];
-        match tokio::time::timeout(PROBE_DEADLINE, stream.read(&mut chunk)).await {
+        match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
             Err(_) => {
                 return Fetched::Failed {
                     what: "url",
-                    why: "the settings URL stopped sending within 4 seconds".to_string(),
+                    why: "the settings URL did not answer within 4 seconds".to_string(),
                 };
             }
             Ok(Ok(0)) => break,
