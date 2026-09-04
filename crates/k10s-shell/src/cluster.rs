@@ -399,7 +399,8 @@ pub(crate) fn swap_connection(
 // lists whatever is there and a typed path overrides it.
 pub(crate) fn kubeconfig_seed() -> std::path::PathBuf {
     let listed = std::env::var_os("KUBECONFIG");
-    let home = std::env::var_os("HOME");
+    // Windows spells the home directory USERPROFILE and sets no HOME.
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     crate::workspace::seed_dir(kubeconfig_dir(listed.as_deref(), home.as_deref()).as_deref())
 }
 
@@ -508,11 +509,12 @@ mod tests {
             Some(std::path::PathBuf::from("/etc/k8s")),
             "a variable pointing somewhere else is the whole reason it is set"
         );
+        // The list separator is the platform's, a colon here and a semicolon
+        // on Windows, so the list is joined the way kubectl would read it.
+        let merged = std::env::join_paths(["/etc/k8s/admin.conf", "/home/ana/.kube/config"])
+            .expect("two plain paths join");
         assert_eq!(
-            kubeconfig_dir(
-                Some(OsStr::new("/etc/k8s/admin.conf:/home/ana/.kube/config")),
-                None
-            ),
+            kubeconfig_dir(Some(merged.as_os_str()), None),
             Some(std::path::PathBuf::from("/etc/k8s")),
             "a merged list is led by the file kubectl calls primary"
         );
