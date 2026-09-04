@@ -96,6 +96,25 @@ fn selects_pods(kind: &str) -> bool {
     )
 }
 
+/// Which row actions a kind offers, stated once so the key that fires and the
+/// hint that advertises it cannot disagree. A shell needs a tty, so a pod;
+/// logs need pods to read, so a pod or a kind whose selector finds them; a
+/// forward needs a port, so a pod directly or a service through its selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowActions {
+    pub(crate) logs: bool,
+    pub(crate) shell: bool,
+    pub(crate) forward: bool,
+}
+
+pub(crate) fn row_actions(kind: &str) -> RowActions {
+    RowActions {
+        logs: kind == "Pod" || selects_pods(kind),
+        shell: kind == "Pod",
+        forward: kind == "Pod" || kind == "Service",
+    }
+}
+
 pub struct BrowseView {
     focus: FocusHandle,
     provider: Rc<dyn ReadProvider>,
@@ -345,12 +364,15 @@ impl BrowseView {
         let Some(namespace) = row.namespace.clone() else {
             return;
         };
+        if !row_actions(&kind.kind).logs {
+            return;
+        }
         if kind.kind == "Pod" {
             cx.emit(BrowseEvent::OpenLogs {
                 namespace,
                 pod: row.name.clone(),
             });
-        } else if selects_pods(&kind.kind) {
+        } else {
             cx.emit(BrowseEvent::OpenWorkloadLogs {
                 namespace,
                 kind: kind.id,
@@ -368,7 +390,7 @@ impl BrowseView {
         else {
             return;
         };
-        if kind.kind != "Pod" {
+        if !row_actions(&kind.kind).shell {
             return;
         }
         let Some(row) = self.table.selected_row() else {
@@ -393,7 +415,7 @@ impl BrowseView {
         else {
             return;
         };
-        if kind.kind != "Pod" && kind.kind != "Service" {
+        if !row_actions(&kind.kind).forward {
             return;
         }
         let Some(row) = self.table.selected_row() else {
@@ -812,13 +834,14 @@ impl Render for BrowseView {
                             }
                             if let TableSource::Kind(kind) = source {
                                 hints.push_str(" · y edit");
-                                if kind.kind == "Pod" || selects_pods(&kind.kind) {
+                                let actions = row_actions(&kind.kind);
+                                if actions.logs {
                                     hints.push_str(" · l logs");
                                 }
-                                if kind.kind == "Pod" {
+                                if actions.shell {
                                     hints.push_str(" · s shell");
                                 }
-                                if kind.kind == "Pod" || kind.kind == "Service" {
+                                if actions.forward {
                                     hints.push_str(" · F forward");
                                 }
                             } else if self
@@ -888,5 +911,53 @@ mod tests {
     fn service_inventory_uses_the_read_only_singular_cli_command() {
         let command = talos_command("worker-1", "10.0.0.8", TalosRead::Services);
         assert_eq!(command.args, ["--nodes", "10.0.0.8", "service"]);
+    }
+
+    // The policy the keys and the hints both read. A change here is a change
+    // to what a person can do from a row, and it must not happen twice.
+    #[test]
+    fn row_actions_follow_what_a_kind_can_answer() {
+        let all = RowActions {
+            logs: true,
+            shell: true,
+            forward: true,
+        };
+        let none = RowActions {
+            logs: false,
+            shell: false,
+            forward: false,
+        };
+        assert_eq!(row_actions("Pod"), all);
+        for workload in [
+            "Deployment",
+            "StatefulSet",
+            "DaemonSet",
+            "ReplicaSet",
+            "Job",
+        ] {
+            assert_eq!(
+                row_actions(workload),
+                RowActions { logs: true, ..none },
+                "{workload} selects pods, so its logs merge; nothing else applies"
+            );
+        }
+        assert_eq!(
+            row_actions("Service"),
+            RowActions {
+                forward: true,
+                ..none
+            },
+            "a service forwards through its selector and offers nothing else"
+        );
+        for other in [
+            "CronJob",
+            "ConfigMap",
+            "Secret",
+            "Namespace",
+            "Node",
+            "Ingress",
+        ] {
+            assert_eq!(row_actions(other), none, "{other}");
+        }
     }
 }
