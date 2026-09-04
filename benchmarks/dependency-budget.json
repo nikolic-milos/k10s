@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "maximum_packages": 830,
-  "maximum_external_packages": 817,
+  "maximum_packages": 832,
+  "maximum_external_packages": 819,
   "maximum_git_packages": 29,
   "allowed_git_sources": [
     "git+https://github.com/nikolic-milos/zed?rev=1997311daedbd90333b6710634d2cfbd81b33306#1997311daedbd90333b6710634d2cfbd81b33306",
