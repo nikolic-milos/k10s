@@ -3673,13 +3673,11 @@ dependencies = [
 name = "k10s-map"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "crossbeam-channel",
  "futures",
  "gpui",
  "k10s-atlas",
  "k10s-bench",
- "k10s-clustergen",
  "k10s-core",
  "k10s-theme",
  "serde",
@@ -3692,7 +3690,6 @@ name = "k10s-shell"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
- "crossbeam-channel",
  "futures",
  "gpui",
  "k10s-atlas",
