@@ -3639,6 +3639,8 @@ dependencies = [
  "futures",
  "http",
  "http-body-util",
+ "hyper-timeout",
+ "hyper-util",
  "k10s-core",
  "k10s-edit",
  "k10s-world",
@@ -3648,6 +3650,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tower-http",
 ]
 
 [[package]]

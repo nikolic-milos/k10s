@@ -22,14 +22,18 @@ http.workspace = true
 # Helm's release Secrets: base64 of gzip of JSON, both layers its own client's.
 base64.workspace = true
 flate2.workspace = true
+# The client is assembled in connect.rs from kube's own public layers, because
+# kube builds its connector behind a private function with TCP_NODELAY off and
+# that one socket option was measured at 44 ms of every cold start. All five
+# are already in the lock through kube-client.
+hyper-util.workspace = true
+hyper-timeout.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+http-body-util.workspace = true
 
 [dev-dependencies]
 k10s-world.workspace = true
-tower = { version = "0.5", features = ["util"] }
-# The scripted API server has to read request bodies to prove an apply sends
-# what it says it sends. Already in the lock through kube-client, so this costs
-# the dependency budget nothing.
-http-body-util = "0.1"
 # Test-only, and the reason is the live matrix: proving the write path end to end
 # means building the payload with the same prune the shell uses, and that prune
 # lives in the editor engine. The shipped data plane still knows nothing about

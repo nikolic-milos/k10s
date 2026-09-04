@@ -109,6 +109,15 @@ k8s-openapi = { version = "0.28", features = ["v1_36"] }
 # net exists for the port-forward listener on 127.0.0.1; nothing else in the
 # data plane opens a socket directly.
 tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+# The data plane assembles its own kube client from kube's public layers so
+# the connector can carry TCP_NODELAY, which kube 4.2 leaves off and hyper-util
+# defaults off. Every crate here is already in the lock through kube-client, so
+# this costs the dependency budget nothing; they become direct edges only.
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+hyper-timeout = "0.5"
+tower = { version = "0.5", features = ["util", "retry"] }
+tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip", "map-response-body"] }
+http-body-util = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
