@@ -60,6 +60,7 @@ pub mod rbac;
 pub mod rbac_index;
 pub mod reach;
 pub mod read;
+mod served;
 pub mod talos;
 pub mod tetragon;
 pub mod traces;

@@ -21,6 +21,7 @@ use serde_json::Value;
 use k10s_core::Severity;
 
 use crate::read::Fetched;
+use crate::served::{GroupAnswer, after_group};
 
 const WGPOLICY_GROUP: &str = "wgpolicyk8s.io";
 const OPENREPORTS_GROUP: &str = "openreports.io";
@@ -177,27 +178,6 @@ enum ListOutcome {
     NotServed,
     Denied,
     Failed(String),
-}
-
-enum GroupAnswer {
-    Served(Vec<String>),
-    NotServed,
-    Denied,
-    Failed(String),
-}
-
-fn after_group(error: &kube::Error) -> GroupAnswer {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return GroupAnswer::Denied;
-        }
-        if response.code == 404 {
-            return GroupAnswer::NotServed;
-        }
-    }
-    GroupAnswer::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
 }
 
 fn order_versions(preferred: &str, versions: Vec<String>, fallbacks: &[&str]) -> Vec<String> {
