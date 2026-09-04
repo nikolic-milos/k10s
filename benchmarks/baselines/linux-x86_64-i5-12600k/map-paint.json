@@ -10,7 +10,7 @@
       "cache": "cached",
       "allocations_per_paint": 71.000,
       "reallocations_per_paint": 79.000,
-      "bytes_per_paint": 1627124,
+      "bytes_per_paint": 1627140,
       "text_cache_hits": 11,
       "text_cache_misses": 0,
       "text_cache_evictions": 0
@@ -19,7 +19,7 @@
       "cache": "uncached-control",
       "allocations_per_paint": 74.000,
       "reallocations_per_paint": 79.000,
-      "bytes_per_paint": 1627268,
+      "bytes_per_paint": 1627284,
       "text_cache_hits": 0,
       "text_cache_misses": 11,
       "text_cache_evictions": 0

@@ -7,36 +7,36 @@
       "op": "read",
       "entries": 5001,
       "result": 111,
-      "iters": 270,
-      "samples": 270,
+      "iters": 335,
+      "samples": 335,
       "batch_size": 1,
-      "p50_rmad": 0.007373,
-      "p50_ns": 1111616.000,
-      "p99_ns": 1137459.000
+      "p50_rmad": 0.009830,
+      "p50_ns": 896010.000,
+      "p99_ns": 951442.000
     },
     {
       "scenario": "tree-5k",
       "op": "read-and-apply",
       "entries": 5001,
       "result": 111,
-      "iters": 108,
-      "samples": 108,
+      "iters": 134,
+      "samples": 134,
       "batch_size": 1,
-      "p50_rmad": 0.007050,
-      "p50_ns": 1113041.000,
-      "p99_ns": 1137847.000
+      "p50_rmad": 0.008815,
+      "p50_ns": 899072.000,
+      "p99_ns": 948633.000
     },
     {
       "scenario": "dir-2k",
       "op": "keystroke",
       "entries": 2000,
       "result": 299,
-      "iters": 375,
-      "samples": 375,
+      "iters": 435,
+      "samples": 435,
       "batch_size": 1,
-      "p50_rmad": 0.012764,
-      "p50_ns": 316992.000,
-      "p99_ns": 347137.000
+      "p50_rmad": 0.015038,
+      "p50_ns": 279089.000,
+      "p99_ns": 313749.000
     },
     {
       "scenario": "scan-5k",
@@ -46,33 +46,33 @@
       "iters": 20,
       "samples": 20,
       "batch_size": 1,
-      "p50_rmad": 0.000989,
-      "p50_ns": 41008167.000,
-      "p99_ns": 41082357.000
+      "p50_rmad": 0.000908,
+      "p50_ns": 38672162.000,
+      "p99_ns": 38882001.000
     },
     {
       "scenario": "scan-5k",
       "op": "keystroke",
       "entries": 1576,
       "result": 256,
-      "iters": 389,
-      "samples": 389,
+      "iters": 416,
+      "samples": 416,
       "batch_size": 1,
-      "p50_rmad": 0.013177,
-      "p50_ns": 305767.000,
-      "p99_ns": 350829.000
+      "p50_rmad": 0.010729,
+      "p50_ns": 285302.000,
+      "p99_ns": 337472.000
     },
     {
       "scenario": "map-50k",
       "op": "index",
       "entries": 51600,
       "result": 51600,
-      "iters": 193,
-      "samples": 193,
+      "iters": 227,
+      "samples": 227,
       "batch_size": 1,
-      "p50_rmad": 0.008511,
-      "p50_ns": 3105281.000,
-      "p99_ns": 3263966.000
+      "p50_rmad": 0.008189,
+      "p50_ns": 2650110.000,
+      "p99_ns": 2749365.000
     },
     {
       "scenario": "map-50k",
@@ -82,57 +82,57 @@
       "iters": 100,
       "samples": 100,
       "batch_size": 1,
-      "p50_rmad": 0.014786,
-      "p50_ns": 1556368.000,
-      "p99_ns": 1655114.000
+      "p50_rmad": 0.010384,
+      "p50_ns": 1673961.000,
+      "p99_ns": 1745001.000
     },
     {
       "scenario": "viewport-60",
       "op": "layers",
       "entries": 4518,
       "result": 200,
-      "iters": 2033,
-      "samples": 2033,
+      "iters": 2149,
+      "samples": 2149,
       "batch_size": 1,
-      "p50_rmad": 0.002312,
-      "p50_ns": 58825.000,
-      "p99_ns": 62634.000
+      "p50_rmad": 0.002183,
+      "p50_ns": 55430.000,
+      "p99_ns": 69555.000
     },
     {
       "scenario": "viewport-60",
       "op": "query-and-compose",
       "entries": 30,
       "result": 585,
-      "iters": 625,
-      "samples": 625,
+      "iters": 654,
+      "samples": 654,
       "batch_size": 1,
-      "p50_rmad": 0.007357,
-      "p50_ns": 190962.000,
-      "p99_ns": 201154.000
+      "p50_rmad": 0.007763,
+      "p50_ns": 182025.000,
+      "p99_ns": 208981.000
     },
     {
       "scenario": "diff-256k",
       "op": "diff-paint",
       "entries": 6787,
       "result": 2260,
-      "iters": 43778,
-      "samples": 3127,
-      "batch_size": 14,
-      "p50_rmad": 0.006892,
-      "p50_ns": 2725.857,
-      "p99_ns": 2965.643
+      "iters": 45928,
+      "samples": 5741,
+      "batch_size": 8,
+      "p50_rmad": 0.007782,
+      "p50_ns": 2586.250,
+      "p99_ns": 3246.000
     },
     {
       "scenario": "diff-256k",
       "op": "diff-fold",
       "entries": 6787,
       "result": 6787,
-      "iters": 118848,
-      "samples": 1857,
+      "iters": 124032,
+      "samples": 1938,
       "batch_size": 64,
-      "p50_rmad": 0.003187,
-      "p50_ns": 1004.922,
-      "p99_ns": 1056.391
+      "p50_rmad": 0.007639,
+      "p50_ns": 961.312,
+      "p99_ns": 1199.469
     }
   ]
 }

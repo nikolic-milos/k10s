@@ -666,3 +666,64 @@ reads 83.5 installed with 90.8 in the witness run — its home moved from
 73.5 to the mid-80s with more spread than it used to carry. Everything
 else re-recorded within the old gates. The workflow's kernel pin moves to
 7.1.8-arch1-3 with this recording.
+
+## 2026-09-04: re-recorded from d1b2371, after the Service and PVC edges and the Z0 cap landed
+
+The 2026-08-12 recording (80f4b18) predates five commits that changed what the
+suites count. Two of them are the whole structural story. `cbfaede` draws
+bounded Service and PVC edges from the published parent, so every generated
+scene now carries 4.1 to 5.0 times the edges it did: the platform scenes went
+338 to 1,609 at 4k, 1,763 to 8,332 at 25k and 3,478 to 16,559 at 50k, the
+workload fan-outs 1,999 to 9,917 at 50k, and the namespace fan-outs, which are
+mostly pods, 1.1 to 1.3 times. That is the `shapes` field and the `edges`
+counter in `world fan-out cull`. `5b10cb9` makes the LOD bands exclusive and
+names the Z0 region cap, so a dense region at the Z0 fit is 2 quads where it
+was 2,002 and a uniform Z1 region is 36 where it was 512. That is the `quads`
+counter in `atlas cull`, `atlas fan-out`, `world fan-out cull`, `map walk` and
+`map allocation`, and the `labels` counter at the Z2 wide namespace camera on
+the three larger platform scenes. Both are the shipped behaviour, so a gate
+that rejects them on every honest collection is a gate rejecting the wrong
+thing, and every suite was re-recorded.
+
+What those two commits cost, case-level, old to new, is recorded here because
+the refresh would otherwise hide it. A one-object structural publish patch is
+3.2 to 3.6 times what it was: `topology add` 68.7 to 221.8 us at 25k and 150.3
+to 488.4 us at 50k, `topology delete` 59.9 to 214.7 us and 132.9 to 475.4 us.
+The mechanism is named in the commit that caused it: a structural batch now
+calls `topology::rebuild_edges`, and there are 4.8 times as many edges to
+rebuild. At 20 Hz fully saturated that is about 1 percent of a core at 50k,
+still far from any budget, but it is the number ROADMAP §2.2 used to quote as
+147 us, and the incremental adjacency maintenance that section already names
+as the true O(change) work is what brings it back down. The flat edge rescans
+in the fan-out suites moved with the same count, 1.15 to 1.7 times on the
+cases whose edge counter multiplied. A second class moved without its counters
+moving: the small-camera `fit deepest wl` cases in `world fan-out cull` read
+113 to 211 ns at 25k namespace fan-out with quads and edges unchanged. The
+commits in the window that touch the per-frame path are `21bbb99` (one
+displayed primitive for paint, pick, hover, select and overlay) and `f243ebd`
+(camera repair once per frame); the shift is 0.1 us on a 0.2 us operation and
+was not traced further.
+
+Provenance: nine suites recorded from a clean build of d1b2371, twice, on an
+idle machine pinned to CPU 4, both runs after the tree was committed and
+before anything else was built. The two runs gate each other at 5,029 checks
+with one flag: `world fan-out cull` `ns-fanout 12000` `Z2 widest ns`
+`p50_flat_spatial_ns`, 5,314 in the installed run against 8,027 in the
+witness. A third targeted sample answered 5,905, so the installed number is
+the one two of three samples agree on and the witness carried this
+collection's one-case wobble, the same class this file has recorded three
+times. Kernel, microcode and toolchain are the recording's own, so the
+workflow's environment pin does not move.
+
+`atlas-fanout.json` alone is the witness run's file. The installed run's `C edge fan-out
+inside one visible region, 512 blocks` `degree=3000` case carried a p50 rMAD of 0.114,
+above the 0.10 ceiling the comparator applies to every current result, so a baseline
+taken from it would have been a median its own gate distrusts. The witness read 0.0999
+there with a median of 3,007 ns, a third targeted sample of the suite answered 3,060 ns
+at 0.110, and the installed run's 3,370 ns was the odd one out; that case and its
+`degree=6000` neighbour sit at the ceiling in every sample and are the noisiest cases in
+the nine suites. Gated against the installed baseline, the witness collection flags only the one world
+fan-out case named above. Gated the other way, the installed run's own `atlas fan-out`
+flags that C edge sweep at degree 3,000 (1.12x on the median, 1.15x on the flat edge
+rescan, and the ceiling) and one flat edge rescan at degree 12,000: the same noise seen
+from the slower side, and the reason the witness's file is the one installed.
