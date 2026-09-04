@@ -4,9 +4,10 @@
 # The nine headless suites in .github/workflows/performance.yml (and in
 # collect.sh) gate culls, walks, edits, and allocations. They are not the
 # running application. The scripted flight (`k10s --bench`) and process start
-# to first useful photon (`k10s --startup-bench`) are. Neither has a committed
-# baseline or a comparator suite entry. This script is that gate: it may only
-# run on the labelled perf host, and it does not refresh any baseline.
+# to first useful photon (`k10s --startup-bench`) are. Startup has a committed
+# baseline (app-manifest.json beside the headless one) and this script is its
+# gate; the flight still has neither. It may only run on the labelled perf
+# host, and it does not refresh any baseline.
 #
 # Default: print the contract, check the host, print the commands. Never
 # opens a window.
@@ -111,9 +112,32 @@ if ! command -v taskset >/dev/null 2>&1; then
     exit 2
 fi
 
-echo "k10s: running flight and startup benches on $EXPECTED_MACHINE (opens a window)"
+result_dir=${RESULT_DIR:-$root/target/app-benchmark-results}
+runs=${STARTUP_RUNS:-10}
+mkdir -p "$result_dir"
+reports=$result_dir/startup-reports.jsonl
+: > "$reports"
+
+echo "k10s: running the flight bench on $EXPECTED_MACHINE (opens a window)"
 taskset --cpu-list "$PERF_CPU" "$bin" --bench --json --machine "$EXPECTED_MACHINE" --churn 0
-taskset --cpu-list "$PERF_CPU" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --churn 0
-taskset --cpu-list "$PERF_CPU" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --objects 25000 --churn 0
-taskset --cpu-list "$PERF_CPU" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --objects 1000000 --churn 0
+
+# One process is one sample. The three launch shapes are interleaved so any
+# drift over the sampling spreads across all three cases equally. The binary
+# prints its human summary to stderr and the report to stdout; only the
+# report is kept.
+echo "k10s: sampling process start $runs times per launch shape (opens a window each time)"
+i=0
+while [ "$i" -lt "$runs" ]; do
+    i=$((i + 1))
+    taskset --cpu-list "$PERF_CPU" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --churn 0 | grep '^{' >> "$reports"
+    taskset --cpu-list "$PERF_CPU" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --objects 25000 --churn 0 | grep '^{' >> "$reports"
+    taskset --cpu-list "$PERF_CPU" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --objects 1000000 --churn 0 | grep '^{' >> "$reports"
+done
+
+# The aggregator refuses to report when a launch a person expects to be
+# immediate presents its useful frame past 100 ms, so a slow start fails
+# here rather than becoming a number the comparator then accepts.
+cargo run --locked -q -p k10s-bench --bin startup-aggregate -- --min-samples "$runs" < "$reports" > "$result_dir/startup.json"
+echo "k10s: startup.json written to $result_dir"
+cargo run --locked -q -p k10s-bench --bin compare -- "$root/benchmarks/baselines/$EXPECTED_MACHINE/app-manifest.json" "$result_dir"
 echo "k10s: flight/startup ran. do not copy these numbers into baselines/ to make a gate pass"

@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "label": "linux-x86_64-i5-12600k",
+    "recorded_at": "2026-09-04",
+    "os": "Arch Linux",
+    "kernel": "7.1.8-arch1-3",
+    "architecture": "x86_64",
+    "cpu": "12th Gen Intel(R) Core(TM) i5-12600K",
+    "governor": "intel_pstate powersave",
+    "turbo": true,
+    "cpu_affinity": 4,
+    "rustc": "1.97.1 (8bab26f4f 2026-07-14)"
+  },
+  "suites": [
+    {
+      "name": "startup",
+      "file": "startup.json",
+      "source_schema": 1,
+      "case_keys": [
+        "source",
+        "objects"
+      ],
+      "top_exact": [
+        "viewport",
+        "platform"
+      ],
+      "ceilings": [
+        {
+          "field": "first_presented_rmad",
+          "maximum": 0.15
+        },
+        {
+          "field": "useful_presented_rmad",
+          "maximum": 0.15
+        }
+      ],
+      "metrics": [
+        {
+          "field": "first_presented_p50_ms",
+          "maximum_ratio": 1.15,
+          "absolute_slack": 5.0,
+          "minimum_samples": 10
+        },
+        {
+          "field": "useful_presented_p50_ms",
+          "maximum_ratio": 1.15,
+          "absolute_slack": 5.0,
+          "minimum_samples": 10
+        },
+        {
+          "field": "window_built_p50_ms",
+          "maximum_ratio": 1.15,
+          "absolute_slack": 5.0,
+          "minimum_samples": 10
+        }
+      ]
+    }
+  ]
+}
