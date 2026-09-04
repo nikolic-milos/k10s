@@ -43,7 +43,7 @@ impl Projection {
         vec![IngestEvent::Resource(resource)]
     }
 
-    fn reconcile(&mut self, store: &Store, catalog: &mut Catalog) -> Vec<IngestEvent> {
+    pub(crate) fn reconcile(&mut self, store: &Store, catalog: &mut Catalog) -> Vec<IngestEvent> {
         let assembled = assemble::assemble(store, catalog);
         let next = resources(&assembled.events);
         let mut replaced = HashSet::new();

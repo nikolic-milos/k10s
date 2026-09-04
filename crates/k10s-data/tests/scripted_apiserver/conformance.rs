@@ -205,3 +205,131 @@ fn a_secret_is_requested_through_the_metadata_projection_and_a_pod_is_not() {
     assert_eq!(&*secret.name, "api-token");
     assert!(detail.is_empty());
 }
+
+fn synced_kinds(events: &[IngestEvent]) -> Vec<KindId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            IngestEvent::Synced { kind } => Some(*kind),
+            _ => None,
+        })
+        .collect()
+}
+
+// The first frame is geometry. A ConfigMap listing that never answers must not
+// hold the namespaces, workloads and pods a person opened the map to see.
+#[test]
+fn an_attachment_listing_that_never_answers_does_not_hold_the_first_frame() {
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script.route_hanging("GET", "/api/v1/configmaps?");
+    script_lists_except(&script, "/api/v1/configmaps?");
+
+    let started = std::time::Instant::now();
+    let sync = run(&script, options());
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "the sync waited on the hanging list: {took:?} against a 5 s timeout"
+    );
+    let report = &sync.report;
+    assert_eq!(
+        report.deferred,
+        vec![KindId::CONFIG_MAP],
+        "{:?}",
+        report.deferred
+    );
+    assert!(
+        report.unsettled.is_empty(),
+        "a deferred kind is not a timed-out one: {:?}",
+        report.unsettled
+    );
+    assert!(
+        !resources(&sync)
+            .iter()
+            .any(|r| r.kind == KindId::CONFIG_MAP),
+        "nothing of the hanging kind was published"
+    );
+    let synced = synced_kinds(&sync.events);
+    assert!(
+        !synced.contains(&KindId::CONFIG_MAP),
+        "Synced would claim a listing that never finished"
+    );
+    assert_eq!(
+        synced.len(),
+        report.kinds_watched - 1,
+        "every other kind is synced: {synced:?}"
+    );
+    assert_eq!(
+        report.assemble.instances, 2,
+        "the pods are in the first frame"
+    );
+}
+
+// A listing that finishes after the first publish lands as one batch and then
+// says so, rather than as one reconcile per object.
+#[test]
+fn a_late_attachment_listing_lands_as_one_batch_and_then_says_synced() {
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script.route_delayed(
+        "GET",
+        "/api/v1/configmaps?",
+        200,
+        list(
+            &[
+                meta("api-config", "uid-cm", Some("prod"), ""),
+                meta("web-config", "uid-cm-2", Some("prod"), ""),
+            ],
+            "ConfigMap",
+        ),
+        Duration::from_millis(400),
+    );
+    script_lists_except(&script, "/api/v1/configmaps?");
+
+    let (sync, live) = run_live(&script, options(), |live| {
+        synced_kinds(live).contains(&KindId::CONFIG_MAP)
+    });
+    assert_eq!(sync.report.deferred, vec![KindId::CONFIG_MAP]);
+    assert!(
+        !resources(&sync)
+            .iter()
+            .any(|r| r.kind == KindId::CONFIG_MAP),
+        "the first frame went out before the list answered"
+    );
+
+    // Two were listed; one is mounted by a pod. An attachment nothing
+    // references is not drawn, by the same rule the first frame applies, so
+    // the batch that lands is the referenced one and only that.
+    let arrived: Vec<&ResourceEvent> = live_resources(&live)
+        .into_iter()
+        .filter(|r| r.kind == KindId::CONFIG_MAP)
+        .collect();
+    let names: Vec<&str> = arrived.iter().map(|r| r.name.as_ref()).collect();
+    assert_eq!(
+        names,
+        vec!["api-config"],
+        "the mounted ConfigMap arrived live: {live:?}"
+    );
+    assert!(
+        arrived.iter().all(|r| r.op == Op::Added),
+        "a first listing is additions: {arrived:?}"
+    );
+    let last = live.last().expect("something arrived");
+    assert!(
+        matches!(last, IngestEvent::Synced { kind } if *kind == KindId::CONFIG_MAP),
+        "Synced closes the batch: {last:?}"
+    );
+    assert!(
+        live.iter().all(|event| match event {
+            IngestEvent::Resource(r) => r.kind == KindId::CONFIG_MAP,
+            IngestEvent::Synced { kind } => *kind == KindId::CONFIG_MAP,
+            _ => false,
+        }),
+        "nothing else moved: {live:?}"
+    );
+}

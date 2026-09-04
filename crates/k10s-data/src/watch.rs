@@ -30,6 +30,17 @@ pub enum Message {
     Desync { kind: KindId, reason: DesyncReason },
 }
 
+impl Message {
+    pub fn kind(&self) -> KindId {
+        match self {
+            Message::Apply { kind, .. }
+            | Message::Delete { kind, .. }
+            | Message::Settled { kind, .. }
+            | Message::Desync { kind, .. } => *kind,
+        }
+    }
+}
+
 pub fn desync_reason(err: &watcher::Error) -> DesyncReason {
     match err {
         watcher::Error::InitialListFailed(e)

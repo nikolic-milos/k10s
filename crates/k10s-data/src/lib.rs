@@ -68,13 +68,13 @@ pub mod vault;
 pub mod velero;
 pub mod watch;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, TrySendError};
-use k10s_core::{Capability, Catalog, DesyncReason, IngestEvent, KindId, Op};
+use k10s_core::{Capability, Catalog, DesyncReason, IngestEvent, KindId, Op, Role};
 
 use assemble::{AssembleStats, Store};
 use connect::{ConnectError, Connector, Env};
@@ -87,6 +87,10 @@ use watch::Message;
 pub type EventSink = Sender<IngestEvent>;
 
 pub const DEFAULT_EVENT_SINK_CAPACITY: usize = 8_192;
+
+/// How long the first publish waits for attached listings once the geometry
+/// has settled: three frames at 60 Hz.
+const ATTACHMENT_GRACE: Duration = Duration::from_millis(50);
 
 const INTERNAL_QUEUE: usize = DEFAULT_EVENT_SINK_CAPACITY;
 
@@ -131,6 +135,10 @@ pub struct ClusterReport {
     pub assemble: AssembleStats,
     pub desyncs: Vec<(KindId, DesyncReason)>,
     pub unsettled: Vec<KindId>,
+    /// Attached kinds whose listing had not finished when the geometry kinds
+    /// had. The first publish went ahead without them; their streams keep
+    /// running and each lands as one batch when its listing settles.
+    pub deferred: Vec<KindId>,
     pub connect_ms: f64,
     pub discover_ms: f64,
     pub probe_ms: f64,
@@ -374,10 +382,22 @@ pub async fn sync_from(
     let mut store = Store::new(pass_through.clone());
     let mut settled: Settled = HashMap::new();
     let deadline = Instant::now() + options.sync_timeout;
+    // The first frame is geometry: scopes, owners, instances. Attachments
+    // decorate it. Gating the first publish on every attached listing as well
+    // makes the slowest ConfigMap or Secret list the first frame, and on a
+    // cluster with thousands of either that is the frame. So the gate waits
+    // for the geometry kinds, or the deadline; attached kinds still listing
+    // are deferred, and forward_live folds each in as one batch, with one
+    // reconcile, when its listing settles.
+    let first_frame: HashSet<KindId> = watch_set
+        .iter()
+        .filter(|want| want.target.role != Role::Attached)
+        .map(|want| want.target.id)
+        .collect();
     loop {
         if expected
             .iter()
-            .all(|(kind, n)| streams_settled(&settled, *kind) >= *n)
+            .all(|(kind, n)| !first_frame.contains(kind) || streams_settled(&settled, *kind) >= *n)
         {
             break;
         }
@@ -397,13 +417,51 @@ pub async fn sync_from(
             &metrics,
         );
     }
+    // Attached listings that finish within a few frames of the geometry ride
+    // the first publish; on a quick server that is all of them, and the live
+    // channel stays quiet exactly as before. Deferral is for the ones that do
+    // not: a first frame that waits longer for its decoration than for its
+    // geometry is the situation it exists for.
+    let grace = Instant::now() + ATTACHMENT_GRACE;
+    loop {
+        if expected
+            .iter()
+            .all(|(kind, n)| streams_settled(&settled, *kind) >= *n)
+        {
+            break;
+        }
+        let remaining = grace
+            .min(deadline)
+            .saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let message = match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(m)) => m,
+            Ok(None) | Err(_) => break,
+        };
+        apply(
+            message,
+            &mut store,
+            &mut settled,
+            &mut report.desyncs,
+            &metrics,
+        );
+    }
     report.list_ms = ms(at_list);
     report.unsettled = expected
         .iter()
-        .filter(|(kind, n)| streams_settled(&settled, **kind) < **n)
+        .filter(|(kind, n)| first_frame.contains(kind) && streams_settled(&settled, **kind) < **n)
         .map(|(kind, _)| *kind)
         .collect();
     report.unsettled.sort_by_key(|k| k.0);
+    let deferred: HashSet<KindId> = expected
+        .iter()
+        .filter(|(kind, n)| !first_frame.contains(kind) && !kind_synced(&settled, **kind, **n))
+        .map(|(kind, _)| *kind)
+        .collect();
+    report.deferred = deferred.iter().copied().collect();
+    report.deferred.sort_by_key(|k| k.0);
     report.objects_held = store.len();
 
     let at_assemble = Instant::now();
@@ -442,7 +500,20 @@ pub async fn sync_from(
         &verdict_list,
         &caps_list,
     );
-    tokio::spawn(forward_live(rx, store, catalog, projection, sink, metrics));
+    tokio::spawn(forward_live(
+        rx,
+        store,
+        catalog,
+        projection,
+        sink,
+        metrics,
+        Deferred {
+            settled,
+            expected,
+            kinds: deferred,
+            deadline,
+        },
+    ));
 
     Ok(Sync {
         events,
@@ -523,6 +594,21 @@ fn apply(
     }
 }
 
+/// What the first publish left listing: attached kinds whose streams had not
+/// settled when the geometry had. Their objects are held until the kind
+/// settles and then applied as one batch with one reconcile, because the
+/// projection re-assembles on every structural change and a listing of ten
+/// thousand ConfigMaps must not cost ten thousand assemblies. The deadline is
+/// the sync timeout the gate itself honoured: past it, whatever is held is
+/// applied as it stands, which is exactly what a timed-out sync used to
+/// publish.
+struct Deferred {
+    settled: Settled,
+    expected: HashMap<KindId, usize>,
+    kinds: HashSet<KindId>,
+    deadline: Instant,
+}
+
 async fn forward_live(
     mut rx: tokio::sync::mpsc::Receiver<Message>,
     mut store: Store,
@@ -530,10 +616,48 @@ async fn forward_live(
     mut projection: Projection,
     sink: EventSink,
     metrics: Arc<IngestMetrics>,
+    mut deferred: Deferred,
 ) {
-    let mut settled: Settled = HashMap::new();
     let mut desyncs = Vec::new();
-    while let Some(message) = rx.recv().await {
+    let mut held: HashMap<KindId, Vec<Message>> = HashMap::new();
+    loop {
+        let message = if deferred.kinds.is_empty() {
+            rx.recv().await
+        } else {
+            match tokio::time::timeout_at(deferred.deadline.into(), rx.recv()).await {
+                Ok(message) => message,
+                Err(_) => {
+                    let kinds: Vec<KindId> = deferred.kinds.drain().collect();
+                    let events = release(
+                        &kinds,
+                        &mut held,
+                        &mut store,
+                        &mut catalog,
+                        &mut projection,
+                        &mut deferred,
+                        &mut desyncs,
+                        &metrics,
+                    );
+                    for event in events {
+                        if !send_live(&sink, event).await {
+                            return;
+                        }
+                        metrics.forwarded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+            }
+        };
+        let Some(message) = message else {
+            return;
+        };
+        let kind = message.kind();
+        if deferred.kinds.contains(&kind)
+            && matches!(message, Message::Apply { .. } | Message::Delete { .. })
+        {
+            held.entry(kind).or_default().push(message);
+            continue;
+        }
         let forward = match &message {
             Message::Desync { kind, reason } => Some(IngestEvent::Desync {
                 kind: *kind,
@@ -541,14 +665,34 @@ async fn forward_live(
             }),
             _ => None,
         };
-        let changed = apply(message, &mut store, &mut settled, &mut desyncs, &metrics);
-        let events = match forward {
+        let changed = apply(
+            message,
+            &mut store,
+            &mut deferred.settled,
+            &mut desyncs,
+            &metrics,
+        );
+        let mut events = match forward {
             Some(event) => vec![event],
             None => changed
                 .as_ref()
                 .map(|change| projection.project(&store, &mut catalog, change))
                 .unwrap_or_default(),
         };
+        let streams = deferred.expected.get(&kind).copied().unwrap_or(0);
+        if deferred.kinds.contains(&kind) && kind_synced(&deferred.settled, kind, streams) {
+            deferred.kinds.remove(&kind);
+            events.extend(release(
+                &[kind],
+                &mut held,
+                &mut store,
+                &mut catalog,
+                &mut projection,
+                &mut deferred,
+                &mut desyncs,
+                &metrics,
+            ));
+        }
         for event in events {
             if !send_live(&sink, event).await {
                 return;
@@ -556,6 +700,41 @@ async fn forward_live(
             metrics.forwarded.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Apply what the named deferred kinds held, in arrival order, then reconcile
+/// once. A kind whose listing completed says so with Synced; one released by
+/// the deadline does not, because it is incomplete and Synced would be a lie.
+#[allow(clippy::too_many_arguments)]
+fn release(
+    kinds: &[KindId],
+    held: &mut HashMap<KindId, Vec<Message>>,
+    store: &mut Store,
+    catalog: &mut Catalog,
+    projection: &mut Projection,
+    deferred: &mut Deferred,
+    desyncs: &mut Vec<(KindId, DesyncReason)>,
+    metrics: &IngestMetrics,
+) -> Vec<IngestEvent> {
+    let mut any = false;
+    for kind in kinds {
+        for message in held.remove(kind).unwrap_or_default() {
+            apply(message, store, &mut deferred.settled, desyncs, metrics);
+            any = true;
+        }
+    }
+    let mut events = if any {
+        projection.reconcile(store, catalog)
+    } else {
+        Vec::new()
+    };
+    for kind in kinds {
+        let streams = deferred.expected.get(kind).copied().unwrap_or(0);
+        if kind_synced(&deferred.settled, *kind, streams) {
+            events.push(IngestEvent::Synced { kind: *kind });
+        }
+    }
+    events
 }
 
 async fn send_live(sink: &EventSink, event: IngestEvent) -> bool {
