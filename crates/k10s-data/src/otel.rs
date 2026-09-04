@@ -26,6 +26,7 @@ use serde_json::Value;
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::reach::{Bound, ToolAuth, ToolKind, Transport, tool_get};
 use crate::read::Fetched;
+use crate::served::{ListErr, after_list};
 
 pub const MAX_COLLECTORS: usize = 2_000;
 pub const MAX_FIELD_CHARS: usize = 200;
@@ -180,12 +181,6 @@ pub(crate) enum GroupAnswer {
     Failed(String),
 }
 
-enum ListErr {
-    NotFound,
-    Denied,
-    Failed(String),
-}
-
 pub(crate) fn after_group(error: &kube::Error) -> GroupAnswer {
     if let kube::Error::Api(response) = error {
         if matches!(response.code, 401 | 403) {
@@ -196,20 +191,6 @@ pub(crate) fn after_group(error: &kube::Error) -> GroupAnswer {
         }
     }
     GroupAnswer::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
-}
-
-fn after_list(error: &kube::Error) -> ListErr {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return ListErr::Denied;
-        }
-        if response.code == 404 {
-            return ListErr::NotFound;
-        }
-    }
-    ListErr::Failed(crate::connect::describe(
         error as &(dyn std::error::Error + 'static),
     ))
 }

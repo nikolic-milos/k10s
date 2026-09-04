@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::read::Fetched;
+use crate::served::{GroupAnswer, ListErr, after_group, after_list, group_url, order_versions};
 
 pub const CILIUM_GROUP: &str = "cilium.io";
 pub const TETRAGON_GROUP: &str = "tetragon.io";
@@ -367,47 +368,6 @@ struct WireWorkload {
     namespace: String,
 }
 
-enum GroupAnswer {
-    Served(Vec<String>),
-    NotServed,
-    Denied,
-    Failed(String),
-}
-
-enum ListErr {
-    NotFound,
-    Denied,
-    Failed(String),
-}
-
-fn after_group(error: &kube::Error) -> GroupAnswer {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return GroupAnswer::Denied;
-        }
-        if response.code == 404 {
-            return GroupAnswer::NotServed;
-        }
-    }
-    GroupAnswer::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
-}
-
-fn after_list(error: &kube::Error) -> ListErr {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return ListErr::Denied;
-        }
-        if response.code == 404 {
-            return ListErr::NotFound;
-        }
-    }
-    ListErr::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
-}
-
 fn clipped(text: String) -> String {
     if text.chars().count() <= MAX_FIELD_CHARS {
         return text;
@@ -655,20 +615,6 @@ fn parse_podinfo(group: &str, version: &str, value: Value) -> Option<PodInfo> {
     from_podinfo(group, version, wire)
 }
 
-fn order_versions(preferred: &str, versions: Vec<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    if !preferred.is_empty() {
-        out.push(preferred.to_string());
-    }
-    for version in versions {
-        if version.is_empty() || out.iter().any(|have| have == &version) {
-            continue;
-        }
-        out.push(version);
-    }
-    out
-}
-
 fn versions_for(group_versions: &[String]) -> Vec<String> {
     let mut out = group_versions.to_vec();
     if !out.iter().any(|have| have == VERSION) {
@@ -686,10 +632,6 @@ fn collection_url(group: &str, version: &str, kind: Kind, namespace: Option<&str
     path.push('/');
     path.push_str(kind.plural());
     path
-}
-
-fn group_url(group: &str) -> String {
-    format!("/apis/{group}")
 }
 
 fn hooks_cell(policy: &DeclaredPolicy) -> String {

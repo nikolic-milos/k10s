@@ -29,6 +29,7 @@ use serde_json::Value;
 
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::read::Fetched;
+use crate::served::{GroupAnswer, ListErr, after_group, after_list, group_url, order_versions};
 
 pub const GROUP: &str = "kyverno.io";
 pub const CEL_GROUP: &str = "policies.kyverno.io";
@@ -457,47 +458,6 @@ struct WireCondition {
     status: String,
 }
 
-enum GroupAnswer {
-    Served(Vec<String>),
-    NotServed,
-    Denied,
-    Failed(String),
-}
-
-enum ListErr {
-    NotFound,
-    Denied,
-    Failed(String),
-}
-
-fn after_group(error: &kube::Error) -> GroupAnswer {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return GroupAnswer::Denied;
-        }
-        if response.code == 404 {
-            return GroupAnswer::NotServed;
-        }
-    }
-    GroupAnswer::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
-}
-
-fn after_list(error: &kube::Error) -> ListErr {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return ListErr::Denied;
-        }
-        if response.code == 404 {
-            return ListErr::NotFound;
-        }
-    }
-    ListErr::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
-}
-
 fn clipped(text: String) -> String {
     if text.chars().count() <= MAX_FIELD_CHARS {
         return text;
@@ -703,20 +663,6 @@ fn collect_items(
     (items, truncated, unreadable)
 }
 
-fn order_versions(preferred: &str, versions: Vec<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    if !preferred.is_empty() {
-        out.push(preferred.to_string());
-    }
-    for version in versions {
-        if version.is_empty() || out.iter().any(|have| have == &version) {
-            continue;
-        }
-        out.push(version);
-    }
-    out
-}
-
 fn versions_for(kind: Kind, group_versions: &[String]) -> Vec<String> {
     if kind.is_cleanup() {
         return group_versions
@@ -753,10 +699,6 @@ fn collection_url(kind: Kind, version: &str, namespace: Option<&str>) -> String 
     path.push('/');
     path.push_str(kind.plural());
     path
-}
-
-fn group_url(group: &str) -> String {
-    format!("/apis/{group}")
 }
 
 fn take_set(sets: &mut Vec<(Kind, KindSet)>, kind: Kind) -> KindSet {

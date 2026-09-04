@@ -47,6 +47,7 @@ use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::mesh::{ObservedReach, TelemetryExporter, TelemetryReason};
 use crate::prom::QueryResult;
 use crate::read::Fetched;
+use crate::served::{GroupAnswer, ListErr, after_group, after_list};
 
 #[path = "cilium_policy.rs"]
 mod cilium_policy;
@@ -285,50 +286,9 @@ struct WireListMeta {
     cont: String,
 }
 
-enum GroupAnswer {
-    Served(Vec<String>),
-    NotServed,
-    Denied,
-    Failed(String),
-}
-
-enum ListErr {
-    NotFound,
-    Denied,
-    Failed(String),
-}
-
 enum PageError {
     TooLarge,
     NotJson(String),
-}
-
-fn after_group(error: &kube::Error) -> GroupAnswer {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return GroupAnswer::Denied;
-        }
-        if response.code == 404 {
-            return GroupAnswer::NotServed;
-        }
-    }
-    GroupAnswer::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
-}
-
-fn after_list(error: &kube::Error) -> ListErr {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return ListErr::Denied;
-        }
-        if response.code == 404 {
-            return ListErr::NotFound;
-        }
-    }
-    ListErr::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
 }
 
 fn clipped(text: String) -> String {

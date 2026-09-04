@@ -26,6 +26,7 @@ use serde_json::Value;
 
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::read::{Fetched, classify};
+use crate::served::{GroupAnswer, ListErr, after_group, after_list, group_url, order_versions};
 
 /// Documented on Warehouse, Stage, and Promotion. A unique value (UUID or
 /// "now") triggers reconciliation when it changes.
@@ -329,47 +330,6 @@ struct WirePromotionStatus {
     phase: String,
 }
 
-enum GroupAnswer {
-    Served(Vec<String>),
-    NotServed,
-    Denied,
-    Failed(String),
-}
-
-enum ListErr {
-    NotFound,
-    Denied,
-    Failed(String),
-}
-
-fn after_group(error: &kube::Error) -> GroupAnswer {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return GroupAnswer::Denied;
-        }
-        if response.code == 404 {
-            return GroupAnswer::NotServed;
-        }
-    }
-    GroupAnswer::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
-}
-
-fn after_list(error: &kube::Error) -> ListErr {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return ListErr::Denied;
-        }
-        if response.code == 404 {
-            return ListErr::NotFound;
-        }
-    }
-    ListErr::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
-}
-
 fn clipped(text: String) -> String {
     if text.chars().count() <= MAX_FIELD_CHARS {
         return text;
@@ -520,20 +480,6 @@ fn parse_item(kind: Kind, version: &str, value: Value) -> Option<Resource> {
     from_wire(kind, version, wire)
 }
 
-fn order_versions(preferred: &str, versions: Vec<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    if !preferred.is_empty() {
-        out.push(preferred.to_string());
-    }
-    for version in versions {
-        if version.is_empty() || out.iter().any(|have| have == &version) {
-            continue;
-        }
-        out.push(version);
-    }
-    out
-}
-
 fn versions_for(kind: Kind, group_versions: &[String]) -> Vec<String> {
     let mut out = group_versions.to_vec();
     let fallback = kind.version().to_string();
@@ -568,10 +514,6 @@ fn object_collection_url(target: &Resource) -> String {
         None
     };
     collection_url(target.kind, version, namespace)
-}
-
-fn group_url(group: &str) -> String {
-    format!("/apis/{group}")
 }
 
 /// RFC3339 UTC from a Unix timestamp. Kargo accepts any unique string; this

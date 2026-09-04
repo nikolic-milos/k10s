@@ -28,6 +28,7 @@ use serde_json::Value;
 
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::read::Fetched;
+use crate::served::{GroupAnswer, ListErr, after_group, after_list, group_url};
 
 const PAGE_LIMIT: u32 = 200;
 const MAX_SCAN: usize = 2_000;
@@ -384,19 +385,6 @@ struct WireListMeta {
     cont: String,
 }
 
-enum GroupAnswer {
-    Served(Vec<String>),
-    NotServed,
-    Denied,
-    Failed(String),
-}
-
-enum ListErr {
-    NotFound,
-    Denied,
-    Failed(String),
-}
-
 enum CoreOutcome<T> {
     Ok { items: Vec<T>, truncated: bool },
     Denied,
@@ -416,34 +404,6 @@ fn clip(text: &str) -> String {
 
 fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-fn after_group(error: &kube::Error) -> GroupAnswer {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return GroupAnswer::Denied;
-        }
-        if response.code == 404 {
-            return GroupAnswer::NotServed;
-        }
-    }
-    GroupAnswer::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
-}
-
-fn after_list(error: &kube::Error) -> ListErr {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return ListErr::Denied;
-        }
-        if response.code == 404 {
-            return ListErr::NotFound;
-        }
-    }
-    ListErr::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
 }
 
 fn after_core(error: &kube::Error) -> CoreOutcome<()> {
@@ -684,10 +644,6 @@ fn order_versions(preferred: &str, versions: Vec<String>) -> Vec<String> {
         out.push(FALLBACK_VERSION.to_string());
     }
     out
-}
-
-fn group_url(group: &str) -> String {
-    format!("/apis/{group}")
 }
 
 /// `namespace` here is already gated on the resource's discovery
