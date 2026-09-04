@@ -62,8 +62,38 @@ pub struct ObserveView {
 
 impl EventEmitter<InventoryEvent> for ObserveView {}
 
+/// The query a pick opens with. The selection names a namespace and either a
+/// pod or the workload that owns one, and those are the two labels every
+/// kube-state and cAdvisor series carries, so scoping is a matter of writing
+/// down what was already picked. No selection is an empty box, not a guess at
+/// a cluster-wide expression somebody has to delete first.
+fn scoped_query(selection: Option<&crate::selection::Selection>) -> String {
+    let Some(selection) = selection else {
+        return String::new();
+    };
+    let mut matchers = Vec::new();
+    if let Some(namespace) = selection.namespace.as_deref() {
+        matchers.push(format!("namespace=\"{namespace}\""));
+    }
+    let name = selection.owner.as_deref().unwrap_or(&selection.name);
+    if !name.is_empty() {
+        matchers.push(format!("pod=~\"{name}.*\""));
+    }
+    if matchers.is_empty() {
+        return String::new();
+    }
+    format!(
+        "sum by (pod) (rate(container_cpu_usage_seconds_total{{{}}}[5m]))",
+        matchers.join(", ")
+    )
+}
+
 impl ObserveView {
-    pub fn new(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> ObserveView {
+    pub fn new(
+        provider: Rc<dyn ReadProvider>,
+        selection: Option<&crate::selection::Selection>,
+        cx: &mut Context<Self>,
+    ) -> ObserveView {
         let mut view = ObserveView {
             focus: cx.focus_handle(),
             provider,
@@ -73,7 +103,7 @@ impl ObserveView {
             prometheus: ToolPresence::Missing,
             loki: ToolPresence::Missing,
             results: TextState::new(crate::text::MAX_LOG_LINES),
-            query: String::new(),
+            query: scoped_query(selection),
             query_kind: QueryKind::Prom,
             typing: false,
             filtering: false,

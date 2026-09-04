@@ -149,10 +149,12 @@ impl Workspace {
                         "Log tail",
                         self.log.as_ref(),
                         |detail| {
-                            let Detail::Log(lines) = detail else {
+                            let Detail::Log(lines, note) = detail else {
                                 return Vec::new();
                             };
-                            lines.iter().rev().take(12).rev().cloned().collect()
+                            let mut rows: Vec<String> = note.iter().cloned().collect();
+                            rows.extend(lines.iter().rev().take(12).rev().cloned());
+                            rows
                         },
                     ));
                 }

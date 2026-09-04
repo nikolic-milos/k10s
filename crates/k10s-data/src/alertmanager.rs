@@ -46,6 +46,17 @@ pub struct Alert {
     pub alertname: String,
     pub namespace: String,
     pub name: String,
+    /// `labels.cluster`, as the rule's own `by()` produced it. Empty when the
+    /// rule dropped it, which is a fact about the alert -- never backfilled
+    /// from the kubeconfig, because this alert may not be about this cluster.
+    pub cluster: String,
+    /// `labels.pod`. Kept beside `name` because a pod-level alert and an
+    /// object-level one join to different things.
+    pub pod: String,
+    /// `annotations.summary`: the sentence whoever wrote the rule wrote.
+    pub summary: String,
+    /// `annotations.runbook_url`. A link to open, never a page to fetch.
+    pub runbook_url: String,
     pub starts_at: String,
     pub inhibited: bool,
     pub silenced_by: Vec<String>,
@@ -112,6 +123,8 @@ struct WireAlert {
     fingerprint: String,
     #[serde(default)]
     labels: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    annotations: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     status: WireAlertStatus,
     #[serde(default, rename = "startsAt")]
@@ -185,6 +198,17 @@ pub async fn fetch_silences(client: &Client, bound: &Bound) -> Fetched<Silences>
     finish(tool_get(client, bound, SILENCES).await, parse_silences)
 }
 
+/// An alert whose rule dropped `cluster` has no cluster context, and saying so
+/// is the honest cell. Filling it from the connected kubeconfig would assert
+/// that this alert is about this cluster, which is exactly what the missing
+/// label leaves unknown.
+fn cluster_cell(alert: &Alert) -> String {
+    if alert.cluster.is_empty() {
+        return "alert has no cluster context".to_string();
+    }
+    alert.cluster.clone()
+}
+
 /// Native list rows. `None` when the caller has no Bound: this module
 /// cannot invent presence. An empty `Some` is Alertmanager, quiet.
 pub fn table_page(alerts: Option<&Alerts>) -> Option<TablePage> {
@@ -196,6 +220,9 @@ pub fn table_page(alerts: Option<&Alerts>) -> Option<TablePage> {
         "Alertname",
         "Namespace",
         "Name",
+        "Pod",
+        "Cluster",
+        "Runbook",
         "Starts",
         "Inhibited",
         "Silenced",
@@ -221,6 +248,9 @@ pub fn table_page(alerts: Option<&Alerts>) -> Option<TablePage> {
                     alert.alertname.clone(),
                     alert.namespace.clone(),
                     alert.name.clone(),
+                    alert.pod.clone(),
+                    cluster_cell(alert),
+                    alert.runbook_url.clone(),
                     alert.starts_at.clone(),
                     if alert.inhibited {
                         "true".to_string()
@@ -406,6 +436,7 @@ fn alert_of(value: &Value) -> Option<Alert> {
         return None;
     }
     let label = |key: &str| wire.labels.get(key).map(String::as_str).unwrap_or("");
+    let annotation = |key: &str| wire.annotations.get(key).map(String::as_str).unwrap_or("");
     Some(Alert {
         fingerprint: clip(&wire.fingerprint),
         state: clip(&wire.status.state),
@@ -413,6 +444,10 @@ fn alert_of(value: &Value) -> Option<Alert> {
         alertname: clip(label("alertname")),
         namespace: clip(label("namespace")),
         name: clip(label("name")),
+        cluster: clip(label("cluster")),
+        pod: clip(label("pod")),
+        summary: clip(annotation("summary")),
+        runbook_url: clip(annotation("runbook_url")),
         starts_at: clip(&wire.starts_at),
         inhibited: !wire.status.inhibited_by.is_empty(),
         silenced_by: wire.status.silenced_by.iter().map(|id| clip(id)).collect(),

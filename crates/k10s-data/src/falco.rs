@@ -892,12 +892,19 @@ pub fn parse_resource(kind: CrKind, group: &str, version: &str, value: &Value) -
 fn field_from_output(fields: &Value, keys: &[&str]) -> String {
     for key in keys {
         match fields.get(*key) {
-            Some(Value::String(text)) if !text.is_empty() => return clip(text),
+            Some(Value::String(text)) if is_named(text) => return clip(text),
             Some(Value::Number(number)) => return clip(&number.to_string()),
             _ => {}
         }
     }
     String::new()
+}
+
+/// Falco writes `<NA>` for a field it could not resolve, so an event off a host
+/// process carries the placeholder rather than nothing. Treating it as text
+/// would pin a rule on a pod called `<NA>`; an unresolved field is absent.
+fn is_named(text: &str) -> bool {
+    !text.is_empty() && text != "<NA>"
 }
 
 fn priority_of(value: &Value) -> String {

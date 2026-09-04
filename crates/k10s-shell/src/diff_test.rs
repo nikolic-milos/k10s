@@ -846,6 +846,7 @@ fn line_at<'a>(conflict: &'a [Conflicted], armed: Option<Armed>) -> Line<'a> {
         conflict_truncated: false,
         identity: Identity::Same,
         status: None,
+        context: Some("prod-eu"),
     }
 }
 
@@ -859,8 +860,8 @@ fn the_armed_prompt_is_derived_so_no_status_can_overwrite_it() {
         ..line_at(&[], Some(Armed::Apply))
     });
     assert!(
-        armed.contains("ctrl-s again to apply this to the cluster"),
-        "the prompt stands for as long as the latch does: {armed}"
+        armed.contains("ctrl-s again to apply this to context prod-eu"),
+        "the prompt stands for as long as the latch does, and names where it lands: {armed}"
     );
     assert!(
         armed.ends_with("connected"),
@@ -943,4 +944,36 @@ fn row_colors_follow_the_classification_not_the_side_alone() {
         theme.shell.error
     );
     assert_eq!(color(Origin::Conflict, None), theme.shell.text_accent);
+}
+
+#[test]
+fn every_armed_write_names_the_context_it_would_land_in() {
+    let apply = status_line(line_at(&[], Some(Armed::Apply)));
+    assert!(
+        apply.contains("context prod-eu"),
+        "an apply says which cluster: {apply}"
+    );
+
+    let conflict = [Conflicted {
+        field: ".spec.replicas".to_string(),
+        manager: "hpa".to_string(),
+    }];
+    let force = status_line(line_at(&conflict, Some(Armed::Force)));
+    assert!(
+        force.contains("context prod-eu"),
+        "so does a force, which is the more dangerous of the two: {force}"
+    );
+
+    let in_cluster = status_line(Line {
+        context: None,
+        ..line_at(&[], Some(Armed::Apply))
+    });
+    assert!(
+        in_cluster.contains("in-cluster account"),
+        "an unnamed context is an answer, not a blank: {in_cluster}"
+    );
+    assert!(
+        !in_cluster.contains("to the cluster"),
+        "and never the old sentence that named nothing: {in_cluster}"
+    );
 }

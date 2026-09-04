@@ -37,6 +37,7 @@ pub enum Kind {
     Sync,
     Metrics,
     Policy,
+    Netpol,
     MeshDeclared,
     MeshObserved,
 }

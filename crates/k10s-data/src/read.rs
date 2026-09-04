@@ -865,7 +865,8 @@ async fn load_overlay(
     match kind {
         overlay::Kind::Sync => load_sync(client, targets).await,
         overlay::Kind::Metrics => load_metrics(client, settings).await,
-        overlay::Kind::Policy => load_policy(client, cache).await,
+        overlay::Kind::Policy => load_policy(client).await,
+        overlay::Kind::Netpol => load_netpol(client, cache).await,
         overlay::Kind::MeshDeclared => {
             Fetched::Ok(overlay::from_mesh_declared(&mesh::inventory(client).await))
         }
@@ -886,21 +887,22 @@ async fn load_sync(client: &Client, targets: &[KindTarget]) -> Fetched<overlay::
     }
 }
 
-async fn load_policy(
+async fn load_policy(client: &Client) -> Fetched<overlay::Frame> {
+    match policy::fetch_reports(client).await {
+        Fetched::Ok(inventory) => Fetched::Ok(overlay::from_policy_reports(&inventory)),
+        Fetched::Denied { what } => Fetched::Denied { what },
+        Fetched::Failed { what, why } => Fetched::Failed { what, why },
+    }
+}
+
+async fn load_netpol(
     client: &Client,
     cache: &Mutex<Option<(Instant, netpol::Inventory)>>,
 ) -> Fetched<overlay::Frame> {
-    match policy::fetch_reports(client).await {
-        Fetched::Ok(inventory) if inventory.served && !inventory.tints().is_empty() => {
-            Fetched::Ok(overlay::from_policy_reports(&inventory))
-        }
+    match cached_netpol(client, cache).await {
+        Fetched::Ok(inventory) => Fetched::Ok(overlay::from_netpol(&inventory)),
         Fetched::Denied { what } => Fetched::Denied { what },
         Fetched::Failed { what, why } => Fetched::Failed { what, why },
-        Fetched::Ok(_) => match cached_netpol(client, cache).await {
-            Fetched::Ok(inventory) => Fetched::Ok(overlay::from_netpol(&inventory)),
-            Fetched::Denied { what } => Fetched::Denied { what },
-            Fetched::Failed { what, why } => Fetched::Failed { what, why },
-        },
     }
 }
 

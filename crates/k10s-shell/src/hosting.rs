@@ -509,8 +509,9 @@ impl Workspace {
         self.open_item(ItemTag::Day2, Place::Center, window, cx, |this, _, cx| {
             let provider = this.provider();
             let selection = this.selection.clone();
+            let context = this.context.clone();
             (
-                cx.new(|cx| Day2View::new(provider, selection.as_ref(), cx)),
+                cx.new(|cx| Day2View::new(provider, selection.as_ref(), context, cx)),
                 None,
             )
         });
@@ -543,7 +544,8 @@ impl Workspace {
             cx,
             |this, window, cx| {
                 let provider = this.provider();
-                let view = cx.new(|cx| ObserveView::new(provider, cx));
+                let selection = this.selection.clone();
+                let view = cx.new(|cx| ObserveView::new(provider, selection.as_ref(), cx));
                 let subscription = this.subscribe_absence(&view, window, cx);
                 (view, Some(subscription))
             },
@@ -955,7 +957,8 @@ impl Workspace {
         }
         let provider = self.provider();
         let weak = editor.downgrade();
-        let view = cx.new(|cx| diff::DiffView::new(provider, weak, sources, dry_run, cx));
+        let context = self.context.clone();
+        let view = cx.new(|cx| diff::DiffView::new(provider, weak, sources, dry_run, context, cx));
         self.open_center(Tab::new(tag, view), window, cx);
     }
 

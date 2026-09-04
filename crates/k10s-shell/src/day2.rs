@@ -49,6 +49,8 @@ enum Phase {
 pub struct Day2View {
     focus: FocusHandle,
     provider: Rc<dyn ReadProvider>,
+    // Which kubeconfig context these writes land in, for the confirm sentence.
+    context: Option<String>,
     kinds: Vec<KindRow>,
     table: TableState,
     phase: Phase,
@@ -62,15 +64,26 @@ pub struct Day2View {
 }
 
 impl Day2View {
+    /// How a day-2 confirm names where the write lands. Shares its wording with
+    /// the editor's apply prompt on purpose: one sentence for one question.
+    pub(crate) fn write_target(&self) -> String {
+        match self.context.as_deref() {
+            Some(context) if !context.is_empty() => format!("context {context}"),
+            _ => "this cluster's in-cluster account".to_string(),
+        }
+    }
+
     pub fn new(
         provider: Rc<dyn ReadProvider>,
         selection: Option<&Selection>,
+        context: Option<String>,
         cx: &mut Context<Self>,
     ) -> Day2View {
         let kinds = provider.kinds();
         let mut view = Day2View {
             focus: cx.focus_handle(),
             provider,
+            context,
             kinds,
             table: TableState::new(),
             phase: Phase::Targets { loading: true },
@@ -267,7 +280,13 @@ impl Day2View {
                     this.status = Some(match outcome {
                         Day2Outcome::NeedsConfirm { summary } => {
                             this.armed = Some(op_uid);
-                            format!("{summary}  (enter again to confirm)")
+                            // The confirm names the cluster as well as the
+                            // object: the blast radius of a day-2 write is the
+                            // operation *and* where it lands.
+                            format!(
+                                "{summary} in {}  (enter again to confirm)",
+                                this.write_target()
+                            )
                         }
                         Day2Outcome::Applied { summary, truncated } => {
                             this.armed = None;

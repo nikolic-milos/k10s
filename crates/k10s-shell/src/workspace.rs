@@ -347,6 +347,22 @@ impl Workspace {
     /// Overlay through [`SavedView::overlay_kind`], camera through the same
     /// fly-to a click uses. Parse already refused secrets; this is the apply
     /// half, and it must not teleport.
+    /// `s` and `a` need a pod, and a map pick is often a workload or a
+    /// namespace. Saying which is missing beats a key that appears to do
+    /// nothing: every other refusal in this shell is a labelled state, and a
+    /// silent no-op reads as a broken binding.
+    pub(crate) fn note_needs_a_pod(&mut self, verb: &str, cx: &mut Context<Self>) {
+        let what = match self.selection.as_ref() {
+            Some(selection) => format!("a {} is selected", selection.kind),
+            None => "nothing is selected".to_string(),
+        };
+        self.status_note = Some(format!(
+            "{verb} runs in a container, so it needs a pod -- {what}. Pick a pod, or press l for \
+             this workload's merged logs."
+        ));
+        cx.notify();
+    }
+
     pub(crate) fn apply_saved_view(
         &mut self,
         view: crate::saved_views::SavedView,

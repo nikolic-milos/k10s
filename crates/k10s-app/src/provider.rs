@@ -564,7 +564,7 @@ fn adapt(detail: k10s_data::inspect::InspectDetail) -> k10s_shell::Detail {
                 })
                 .collect(),
         ),
-        InspectDetail::Log(tail) => k10s_shell::Detail::Log(tail.lines),
+        InspectDetail::Log(tail) => k10s_shell::Detail::Log(tail.lines, tail.note),
         InspectDetail::Denied { what } => k10s_shell::Detail::Denied(what),
         InspectDetail::Failed { why, .. } => k10s_shell::Detail::Failed(why),
     }
@@ -800,6 +800,7 @@ fn overlay_kind(kind: k10s_map::OverlayKind) -> k10s_data::overlay::Kind {
         k10s_map::OverlayKind::Sync => k10s_data::overlay::Kind::Sync,
         k10s_map::OverlayKind::Metrics => k10s_data::overlay::Kind::Metrics,
         k10s_map::OverlayKind::Policy => k10s_data::overlay::Kind::Policy,
+        k10s_map::OverlayKind::Netpol => k10s_data::overlay::Kind::Netpol,
         k10s_map::OverlayKind::MeshDeclared => k10s_data::overlay::Kind::MeshDeclared,
         k10s_map::OverlayKind::MeshObserved => k10s_data::overlay::Kind::MeshObserved,
     }

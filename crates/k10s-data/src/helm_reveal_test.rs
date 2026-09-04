@@ -282,6 +282,36 @@ fn a_kind_the_cluster_does_not_serve_is_skipped_rather_than_applied() {
 }
 
 #[test]
+fn a_stored_secret_document_is_never_applied_back_to_the_cluster() {
+    let manifest = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: api-tls\n\
+                    \ndata:\n  tls.key: c3VwZXJzZWNyZXQ=\n";
+    let planned = plan_rollback(
+        &[
+            target("", "v1", "Secret", "secrets", true, true),
+            target("", "v1", "ConfigMap", "configmaps", true, true),
+        ],
+        "prod",
+        manifest,
+    );
+    assert_eq!(planned.len(), 1);
+    let Planned::Skip { name, kind, why } = &planned[0] else {
+        panic!("a Secret document is skipped, not applied");
+    };
+    assert_eq!(name, "api-tls");
+    assert_eq!(kind, "Secret");
+    assert!(
+        why.contains("stored Secret document is not applied"),
+        "{why}"
+    );
+    assert!(
+        !planned.iter().any(
+            |step| matches!(step, Planned::Apply(request) if request.yaml.contains("tls.key"))
+        ),
+        "the values must not reach an apply payload"
+    );
+}
+
+#[test]
 fn helm_template_is_the_binary_on_path_or_a_labelled_absence() {
     assert_eq!(find_on_path("helm", ""), None);
     match helm_binary() {

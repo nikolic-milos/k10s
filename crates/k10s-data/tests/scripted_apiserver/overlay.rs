@@ -249,3 +249,43 @@ fn metrics_overlay_keeps_cadvisor_cpu_when_grafana_names_nothing() {
 
     drop(runtime);
 }
+
+/// The Policy overlay answers about PolicyReports and nothing else. It used to
+/// fall through to NetworkPolicy isolation whenever the reports were unserved
+/// or clean, so picking `POLICY` painted netpol tints under the policy legend.
+/// Isolation has its own overlay now; an unserved report group is a note.
+#[test]
+fn policy_overlay_never_answers_with_network_policy_isolation() {
+    let script = Script::default();
+    script_overlay_base(&script);
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+
+    let fetched = fetch_overlay(&sync, overlay::Kind::Policy);
+    let Fetched::Ok(frame) = fetched else {
+        panic!(
+            "an unserved report group is Ok with a note: {fetched:?}\n{:?}",
+            seen_paths(&script)
+        );
+    };
+    assert!(
+        frame.stamps.is_empty(),
+        "no reports are served, so nothing may be stamped: {:?}",
+        frame.stamps
+    );
+    assert_eq!(
+        frame.note.as_deref(),
+        Some("PolicyReport CRDs are not served by this cluster"),
+        "{:?}\n{:?}",
+        frame.note,
+        seen_paths(&script)
+    );
+    assert!(
+        script.requests_for("networkpolicies").is_empty(),
+        "the Policy overlay must not read NetworkPolicy: {:?}",
+        seen_paths(&script)
+    );
+
+    drop(runtime);
+}
