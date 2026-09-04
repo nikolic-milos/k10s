@@ -44,12 +44,17 @@ Run the nine commands in [the performance workflow](../.github/workflows/perform
 produce that directory. The full-paint benchmark is an isolated workspace because GPUI's
 `test-support` feature substantially expands the dependency graph.
 
-Those nine suites are not the running application. The one measurement that is the app is
-the scripted flight (`k10s --bench`) and process start to first useful photon
-(`k10s --startup-bench`). Neither has a committed baseline or a comparator suite entry.
-`benchmarks/check-flight-gate.sh` is the labelled-host check for that gate. It does not
-record a baseline. Do not refresh the headless numbers to stand in for it. Do not run
-`--run` on a desktop session you care about; the flight opens a real window.
+Those nine suites are not the running application. The two measurements that are the app
+are the scripted flight (`k10s --bench`) and process start to first useful photon
+(`k10s --startup-bench`). Startup has a committed baseline: `check-flight-gate.sh --run`
+samples each launch shape ten times on the labelled host, `startup-aggregate` folds the
+reports into cases, and `app-manifest.json` gates the first frame, the useful frame and the
+window at 1.15x plus 5 ms against them. The aggregator itself refuses to report when the
+chooser or the 25,000-object scene presents its useful frame past 100 ms, the point past
+which a launch stops reading as immediate; the million-object scene carries no absolute
+budget. The flight has neither a baseline nor a suite entry yet. Do not refresh the
+headless numbers to stand in for either. Do not run `--run` on a desktop session you care
+about; the flight and every startup sample open a real window.
 
 Do not refresh a baseline to make a regression pass. Update one only after explaining the expected
 structural or performance change, recording every suite on the labelled host under the manifest's
