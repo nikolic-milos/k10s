@@ -22,7 +22,6 @@ k10s-atlas.workspace = true
 k10s-core.workspace = true
 k10s-theme.workspace = true
 gpui.workspace = true
-arc-swap.workspace = true
 crossbeam-channel.workspace = true
 futures.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -31,7 +30,6 @@ serde_json.workspace = true
 [dev-dependencies]
 k10s-bench.workspace = true
 k10s-atlas = { workspace = true, features = ["testing"] }
-k10s-clustergen.workspace = true
 stats_alloc = "0.1.10"
 
 [[bench]]
