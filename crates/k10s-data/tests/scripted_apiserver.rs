@@ -107,6 +107,7 @@ struct Route {
     status: u16,
     body: String,
     hang: bool,
+    delay: Option<Duration>,
     used: bool,
 }
 #[derive(Default)]
@@ -133,6 +134,7 @@ impl Script {
             status,
             body: body.into(),
             hang: false,
+            delay: None,
             used: false,
         });
         self
@@ -153,6 +155,7 @@ impl Script {
             status,
             body: body.into(),
             hang: false,
+            delay: None,
             used: false,
         });
         self
@@ -169,6 +172,31 @@ impl Script {
             status: 0,
             body: String::new(),
             hang: true,
+            delay: None,
+            used: false,
+        });
+        self
+    }
+
+    // A route that answers late, like an API server serving a large list off
+    // a slow store. What a caller can prove against it is what the first
+    // publish did not wait for.
+    fn route_delayed(
+        &self,
+        method: &'static str,
+        matches: &str,
+        status: u16,
+        body: impl Into<String>,
+        delay: Duration,
+    ) -> &Self {
+        self.state.lock().expect("script lock").routes.push(Route {
+            method,
+            matches: matches.to_string(),
+            accept_contains: None,
+            status,
+            body: body.into(),
+            hang: false,
+            delay: Some(delay),
             used: false,
         });
         self
@@ -242,13 +270,14 @@ impl Service<http::Request<Body>> for Script {
                 }
                 Some(route) => {
                     route.used = true;
-                    Some((route.status, route.body.clone()))
+                    Some((route.status, route.body.clone(), route.delay))
                 }
                 None if path.contains("watch=true") => None,
                 None => Some((
                     404,
                     r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":404,"reason":"NotFound","message":"unscripted"}"#
                         .to_string(),
+                    None,
                 )),
             };
             (at, answer)
@@ -261,9 +290,12 @@ impl Service<http::Request<Body>> for Script {
             if let Some(seen) = shared.lock().expect("script lock").seen.get_mut(at) {
                 seen.body = read;
             }
-            let Some((status, response)) = answer else {
+            let Some((status, response, delay)) = answer else {
                 return std::future::pending().await;
             };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok(http::Response::builder()
                 .status(status)
                 .header(http::header::CONTENT_TYPE, "application/json")
@@ -442,27 +474,39 @@ fn pod_json(name: &str, uid: &str, crashing: bool) -> String {
     )
 }
 fn script_lists(script: &Script) {
-    script.route(
-        "GET",
-        "/api/v1/namespaces?",
-        200,
-        list(&[meta("prod", "uid-ns", None, "")], "Namespace"),
-    );
-    script.route(
-        "GET",
-        "/apis/apps/v1/deployments?",
-        200,
-        list(
-            &[meta(
-                "api",
-                "uid-dep",
-                Some("prod"),
-                r#","labels":{"app.kubernetes.io/name":"nginx"}"#,
-            )],
-            "Deployment",
-        ),
-    );
-    script.route(
+    script_lists_except(script, "");
+}
+
+// Every list of the ten-kind cluster but one, so a suite can script that one
+// itself: hanging, delayed, denied. `skip` is the exact `matches` string of
+// the route left out.
+fn script_lists_except(script: &Script, skip: &str) {
+    if skip != "/api/v1/namespaces?" {
+        script.route(
+            "GET",
+            "/api/v1/namespaces?",
+            200,
+            list(&[meta("prod", "uid-ns", None, "")], "Namespace"),
+        );
+    }
+    if skip != "/apis/apps/v1/deployments?" {
+        script.route(
+            "GET",
+            "/apis/apps/v1/deployments?",
+            200,
+            list(
+                &[meta(
+                    "api",
+                    "uid-dep",
+                    Some("prod"),
+                    r#","labels":{"app.kubernetes.io/name":"nginx"}"#,
+                )],
+                "Deployment",
+            ),
+        );
+    }
+    if skip != "/apis/apps/v1/replicasets?" {
+        script.route(
         "GET",
         "/apis/apps/v1/replicasets?",
         200,
@@ -476,52 +520,67 @@ fn script_lists(script: &Script) {
             "ReplicaSet",
         ),
     );
-    script.route("GET", "/apis/batch/v1/jobs?", 200, list(&[], "Job"));
-    script.route("GET", "/apis/batch/v1/cronjobs?", 200, list(&[], "CronJob"));
+    }
+    if skip != "/apis/batch/v1/jobs?" {
+        script.route("GET", "/apis/batch/v1/jobs?", 200, list(&[], "Job"));
+    }
+    if skip != "/apis/batch/v1/cronjobs?" {
+        script.route("GET", "/apis/batch/v1/cronjobs?", 200, list(&[], "CronJob"));
+    }
 
-    script.route(
-        "GET",
-        "/api/v1/pods?",
-        200,
-        list(
-            &[
-                pod_json("api-1", "uid-pod-1", true),
-                pod_json("api-2", "uid-pod-2", false),
-            ],
-            "Pod",
-        ),
-    );
-    script.route(
-        "GET",
-        "/api/v1/services?",
-        200,
-        list(&[SERVICE_JSON.to_string()], "Service"),
-    );
-    script.route(
-        "GET",
-        "/api/v1/configmaps?",
-        200,
-        list(
-            &[meta("api-config", "uid-cm", Some("prod"), "")],
-            "ConfigMap",
-        ),
-    );
-    script.route_accepting(
-        "GET",
-        "/api/v1/secrets?",
-        METADATA_LIST_ACCEPT,
-        200,
-        list(
-            &[meta("api-token", "uid-sec", Some("prod"), "")],
-            "PartialObjectMetadata",
-        ),
-    );
-    script.route(
-        "GET",
-        "/api/v1/persistentvolumeclaims?",
-        200,
-        list(&[CLAIM_JSON.to_string()], "PersistentVolumeClaim"),
-    );
+    if skip != "/api/v1/pods?" {
+        script.route(
+            "GET",
+            "/api/v1/pods?",
+            200,
+            list(
+                &[
+                    pod_json("api-1", "uid-pod-1", true),
+                    pod_json("api-2", "uid-pod-2", false),
+                ],
+                "Pod",
+            ),
+        );
+    }
+    if skip != "/api/v1/services?" {
+        script.route(
+            "GET",
+            "/api/v1/services?",
+            200,
+            list(&[SERVICE_JSON.to_string()], "Service"),
+        );
+    }
+    if skip != "/api/v1/configmaps?" {
+        script.route(
+            "GET",
+            "/api/v1/configmaps?",
+            200,
+            list(
+                &[meta("api-config", "uid-cm", Some("prod"), "")],
+                "ConfigMap",
+            ),
+        );
+    }
+    if skip != "/api/v1/secrets?" {
+        script.route_accepting(
+            "GET",
+            "/api/v1/secrets?",
+            METADATA_LIST_ACCEPT,
+            200,
+            list(
+                &[meta("api-token", "uid-sec", Some("prod"), "")],
+                "PartialObjectMetadata",
+            ),
+        );
+    }
+    if skip != "/api/v1/persistentvolumeclaims?" {
+        script.route(
+            "GET",
+            "/api/v1/persistentvolumeclaims?",
+            200,
+            list(&[CLAIM_JSON.to_string()], "PersistentVolumeClaim"),
+        );
+    }
 }
 const LIVE_BUDGET: Duration = Duration::from_secs(10);
 fn run_live(
