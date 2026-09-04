@@ -72,3 +72,12 @@ under a named Z0 region cap, which collapses a dense Z0 region from 2,002 quads 
 recording a one-object structural publish patch costs 488 us at 50k, because a structural
 batch rebuilds those edges; incremental adjacency maintenance is the open item that brings it
 down. Every refresh is explained in the commit that made it.
+
+Startup, recorded 2026-09-04 from a clean build of 2ebd33c with `check-flight-gate.sh --run`:
+ten samples per launch shape on the six P-cores, idle. The chooser presents its first and
+useful frame at 63.7 ms median and 73.0 max, the 25,000-object scene at 64.7 and 70.4, and the
+million-object scene its first frame at 69.9 and its useful frame at 229.9 ms with a 231.5 max;
+the window is built at 50 to 56 ms in all three. Relative deviation is under 0.02 on every
+case. `app-manifest.json` gates these at 1.15x plus 5 ms, and the aggregator holds the first
+two shapes at 100 ms absolutely.
+
