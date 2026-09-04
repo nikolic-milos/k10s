@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "mode": "startup",
+  "machine": "linux-x86_64-i5-12600k",
+  "platform": "x86_64-linux",
+  "viewport": [
+    1600.0,
+    1000.0
+  ],
+  "cases": [
+    {
+      "source": "generator",
+      "objects": 25000,
+      "samples": 10,
+      "first_presented_p50_ms": 64.71754999999999,
+      "first_presented_max_ms": 70.432329,
+      "first_presented_rmad": 0.012511312619219804,
+      "useful_presented_p50_ms": 64.71754999999999,
+      "useful_presented_max_ms": 70.432329,
+      "useful_presented_rmad": 0.012511312619219804,
+      "window_built_p50_ms": 52.3236345
+    },
+    {
+      "source": "generator",
+      "objects": 1000000,
+      "samples": 10,
+      "first_presented_p50_ms": 69.85904300000001,
+      "first_presented_max_ms": 72.115121,
+      "first_presented_rmad": 0.010727165271931929,
+      "useful_presented_p50_ms": 229.8526745,
+      "useful_presented_max_ms": 231.4643,
+      "useful_presented_rmad": 0.006985343996943553,
+      "window_built_p50_ms": 55.957322500000004
+    },
+    {
+      "source": "launch",
+      "objects": 0,
+      "samples": 10,
+      "first_presented_p50_ms": 63.69774199999999,
+      "first_presented_max_ms": 72.993272,
+      "first_presented_rmad": 0.015235218227986718,
+      "useful_presented_p50_ms": 63.69774199999999,
+      "useful_presented_max_ms": 72.993272,
+      "useful_presented_rmad": 0.015235218227986718,
+      "window_built_p50_ms": 49.902004500000004
+    }
+  ]
+}
