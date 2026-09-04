@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile": {
     "label": "linux-x86_64-i5-12600k",
-    "recorded_at": "2026-08-12",
+    "recorded_at": "2026-09-04",
     "os": "Arch Linux",
     "kernel": "7.1.8-arch1-3",
     "architecture": "x86_64",
