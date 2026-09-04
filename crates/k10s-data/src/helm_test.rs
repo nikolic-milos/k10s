@@ -343,3 +343,65 @@ fn a_history_renders_newest_first_with_its_chart_and_status() {
         "and the reason the obvious next thing is missing: {text}"
     );
 }
+
+#[test]
+fn a_pending_revision_does_not_present_as_the_running_release() {
+    let json = release_json("ingress-nginx", 4, "deployed");
+    let stored = decode(&as_the_api_server_sends_it(&json)).expect("decodes");
+    let interrupted = Revision {
+        revision: 5,
+        status: "pending-upgrade".to_string(),
+        ..stored.revision.clone()
+    };
+    let release = Release {
+        name: stored.name.clone(),
+        namespace: stored.namespace.clone(),
+        revisions: vec![interrupted, stored.revision],
+    };
+
+    assert_eq!(
+        release.latest().expect("a stored revision").revision,
+        5,
+        "the newest stored revision is still the top of the stack"
+    );
+    assert_eq!(
+        release.current().expect("a running revision").revision,
+        4,
+        "an interrupted upgrade leaves revision 4 serving traffic"
+    );
+
+    let page = table_page(&Releases {
+        releases: vec![release],
+        truncated: false,
+        unreadable: 0,
+    });
+    assert_eq!(page.rows[0].cells[2], "4", "the row is what is running");
+    assert_eq!(
+        page.rows[0].cells[3], "deployed (revision 5 pending-upgrade)",
+        "and it still names the revision Helm has not finished"
+    );
+}
+
+#[test]
+fn a_release_that_has_never_deployed_is_shown_rather_than_dropped() {
+    let json = release_json("ingress-nginx", 1, "pending-install");
+    let stored = decode(&as_the_api_server_sends_it(&json)).expect("decodes");
+    let release = Release {
+        name: stored.name.clone(),
+        namespace: stored.namespace.clone(),
+        revisions: vec![stored.revision],
+    };
+    assert!(
+        release.current().is_none(),
+        "nothing here has ever been marked deployed"
+    );
+
+    let page = table_page(&Releases {
+        releases: vec![release],
+        truncated: false,
+        unreadable: 0,
+    });
+    assert_eq!(page.rows.len(), 1, "a stuck release is the row to show");
+    assert_eq!(page.rows[0].cells[2], "1");
+    assert_eq!(page.rows[0].cells[3], "pending-install");
+}

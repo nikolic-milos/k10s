@@ -63,6 +63,10 @@ use crate::read::{Fetched, classify, collection_path};
 const RELEASE_TYPE: &str = "helm.sh/release.v1";
 const OWNER_SELECTOR: &str = "owner=helm";
 const PAYLOAD_KEY: &str = "release";
+// Helm's own word for the revision that is serving. Every other status --
+// superseded, failed, pending-upgrade, pending-install, pending-rollback,
+// uninstalling -- describes a revision that is not.
+const DEPLOYED: &str = "deployed";
 
 const PAGE_LIMIT: u32 = 200;
 // Helm keeps ten revisions per release by default and a cluster can hold many
@@ -113,11 +117,21 @@ pub struct Release {
 }
 
 impl Release {
-    /// The revision a cluster is actually running, which is the highest one
-    /// stored. Absent only for a release with no revisions, which this module
-    /// never builds.
-    pub fn current(&self) -> Option<&Revision> {
+    /// The newest stored revision, whatever Helm marked it. This is the top of
+    /// the stack, which is a different question from what is running.
+    pub fn latest(&self) -> Option<&Revision> {
         self.revisions.first()
+    }
+
+    /// The revision the cluster is actually running: the newest one Helm marked
+    /// `deployed`. An interrupted `helm upgrade` leaves a `pending-upgrade`
+    /// revision on top of the one still serving traffic, so the highest stored
+    /// revision answers the wrong question. `None` means this release has never
+    /// deployed -- a state to show, never a reason to drop the row.
+    pub fn current(&self) -> Option<&Revision> {
+        self.revisions
+            .iter()
+            .find(|revision| revision.status == DEPLOYED)
     }
 }
 
@@ -435,13 +449,14 @@ pub fn table_page(releases: &Releases) -> TablePage {
         .releases
         .iter()
         .filter_map(|release| {
-            let revision = release.current()?;
+            let latest = release.latest()?;
+            let revision = release.current().unwrap_or(latest);
             Some(TableRow {
                 cells: vec![
                     release.name.clone(),
                     release.namespace.clone(),
                     revision.revision.to_string(),
-                    revision.status.clone(),
+                    status_label(revision, latest),
                     chart_label(revision),
                 ],
                 name: release.name.clone(),
@@ -456,6 +471,21 @@ pub fn table_page(releases: &Releases) -> TablePage {
         truncated: releases.truncated,
         continue_token: None,
     }
+}
+
+/// What the row says about the release's state. When the newest stored revision
+/// is the one running, that is the whole answer. When it is not, both facts are
+/// named: an interrupted upgrade leaves a revision Helm will not roll forward
+/// past, and a row that printed only one of the two would be reporting either a
+/// revision that is not serving or a release that looks unremarkable.
+fn status_label(running: &Revision, latest: &Revision) -> String {
+    if running.revision == latest.revision {
+        return running.status.clone();
+    }
+    format!(
+        "{} (revision {} {})",
+        running.status, latest.revision, latest.status
+    )
 }
 
 fn chart_label(revision: &Revision) -> String {

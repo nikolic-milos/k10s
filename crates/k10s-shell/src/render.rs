@@ -448,11 +448,15 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ExecSelection, window, cx| {
                 if let Some((namespace, name)) = this.selection.as_ref().and_then(Selection::pod) {
                     this.open_terminal(namespace, name, window, cx);
+                } else {
+                    this.note_needs_a_pod("exec", cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &AttachSelection, window, cx| {
                 if let Some((namespace, name)) = this.selection.as_ref().and_then(Selection::pod) {
                     this.open_attach(namespace, name, window, cx);
+                } else {
+                    this.note_needs_a_pod("attach", cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &NextItem, window, cx| {

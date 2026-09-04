@@ -715,6 +715,16 @@ fn plan_one(targets: &[KindTarget], release_namespace: &str, doc: ManifestDoc) -
             ),
         };
     }
+    if crate::describe::is_secret(target) {
+        return Planned::Skip {
+            name: doc.name,
+            kind: doc.kind,
+            why: "a stored Secret document is not applied: its values are in the revision \
+                  payload, and writing them back would send secret material through the \
+                  apply path. Use `helm` for a release whose Secrets must move"
+                .to_string(),
+        };
+    }
     let namespace = if target.namespaced {
         let ns = doc
             .namespace

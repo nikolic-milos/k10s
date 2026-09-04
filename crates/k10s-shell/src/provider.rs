@@ -42,7 +42,10 @@ pub struct EventRow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Detail {
     Events(Vec<EventRow>),
-    Log(Vec<String>),
+    /// Tail lines, and why they are these lines: a crash tail names the
+    /// container that exited, so a quiet pane is never mistaken for a quiet
+    /// process.
+    Log(Vec<String>, Option<String>),
     Denied(&'static str),
     Failed(String),
 }

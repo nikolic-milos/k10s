@@ -282,7 +282,7 @@ fn an_alert_muted_by_a_time_interval_names_it() {
     let alerts = parse_alerts(json.as_bytes()).expect("muted alert");
     assert_eq!(alerts.items[0].muted_by, ["weekends", "nights"]);
     let page = table_page(Some(&alerts)).expect("rows");
-    assert_eq!(page.rows[0].cells[9], "weekends,nights");
+    assert_eq!(page.rows[0].cells[12], "weekends,nights");
 }
 
 #[test]
@@ -384,7 +384,7 @@ fn table_page_is_none_when_the_caller_has_no_bound() {
 fn table_page_is_some_for_a_quiet_alertmanager() {
     let page = table_page(Some(&Alerts::default())).expect("bound and quiet");
     assert!(page.rows.is_empty());
-    assert_eq!(page.columns.len(), 10);
+    assert_eq!(page.columns.len(), 13);
 }
 
 #[test]
@@ -394,8 +394,8 @@ fn table_page_one_row_per_alert() {
     assert_eq!(page.rows.len(), 2);
     assert_eq!(page.rows[0].name, "Watchdog");
     assert_eq!(page.rows[1].namespace.as_deref(), Some("prod"));
-    assert_eq!(page.rows[1].cells[7], "true");
-    assert_eq!(page.rows[1].cells[8], "silence-watchdog");
+    assert_eq!(page.rows[1].cells[10], "true");
+    assert_eq!(page.rows[1].cells[11], "silence-watchdog");
 }
 
 #[test]
@@ -508,4 +508,48 @@ fn an_empty_or_hostile_silence_id_is_not_sent() {
     assert!(silence_id_ok("../etc/passwd").is_err());
     assert!(silence_id_ok("id/extra").is_err());
     assert!(silence_id_ok("silence-watchdog").is_ok());
+}
+
+#[test]
+fn an_alert_keeps_the_identity_and_runbook_fields_it_arrived_with() {
+    let json = r#"[{
+      "fingerprint": "f-runbook",
+      "labels": {"alertname": "KubePodCrashLooping", "namespace": "prod",
+                 "pod": "api-7d9f", "cluster": "eu-1", "severity": "warning"},
+      "annotations": {"summary": "Pod is restarting",
+                      "runbook_url": "https://runbooks.example.com/KubePodCrashLooping"},
+      "status": {"state": "active"},
+      "startsAt": "2024-01-01T00:00:00Z"
+    }]"#;
+    let alerts = parse_alerts(json.as_bytes()).expect("v2 alert");
+    let alert = &alerts.items[0];
+    assert_eq!(alert.cluster, "eu-1");
+    assert_eq!(alert.pod, "api-7d9f");
+    assert_eq!(alert.summary, "Pod is restarting");
+    assert_eq!(
+        alert.runbook_url,
+        "https://runbooks.example.com/KubePodCrashLooping"
+    );
+
+    let page = table_page(Some(&alerts)).expect("rows");
+    assert_eq!(page.rows[0].cells[6], "api-7d9f");
+    assert_eq!(page.rows[0].cells[7], "eu-1");
+    assert_eq!(
+        page.rows[0].cells[8],
+        "https://runbooks.example.com/KubePodCrashLooping"
+    );
+}
+
+#[test]
+fn an_alert_whose_rule_dropped_cluster_says_so_rather_than_borrowing_one() {
+    let json = r#"[{
+      "fingerprint": "f-nocluster",
+      "labels": {"alertname": "TargetDown", "namespace": "prod"},
+      "status": {"state": "active"},
+      "startsAt": "2024-01-01T00:00:00Z"
+    }]"#;
+    let alerts = parse_alerts(json.as_bytes()).expect("v2 alert");
+    assert!(alerts.items[0].cluster.is_empty());
+    let page = table_page(Some(&alerts)).expect("rows");
+    assert_eq!(page.rows[0].cells[7], "alert has no cluster context");
 }
