@@ -33,6 +33,7 @@ EXPECTED_MACHINE=linux-x86_64-i5-12600k
 EXPECTED_GOVERNOR=powersave
 EXPECTED_NO_TURBO=0
 PERF_CPU=4
+STARTUP_CPUS=0-11
 
 run=false
 case "${1-}" in
@@ -88,9 +89,9 @@ bin=$root/target/release/k10s
 echo "commands (labelled host $EXPECTED_MACHINE, pinned to CPU $PERF_CPU):"
 echo "  cargo build --release --locked --bin k10s"
 echo "  taskset --cpu-list $PERF_CPU $bin --bench --json --machine $EXPECTED_MACHINE --churn 0"
-echo "  taskset --cpu-list $PERF_CPU $bin --startup-bench --json --machine $EXPECTED_MACHINE --churn 0"
-echo "  taskset --cpu-list $PERF_CPU $bin --startup-bench --json --machine $EXPECTED_MACHINE --objects 25000 --churn 0"
-echo "  taskset --cpu-list $PERF_CPU $bin --startup-bench --json --machine $EXPECTED_MACHINE --objects 1000000 --churn 0"
+echo "  taskset --cpu-list $STARTUP_CPUS $bin --startup-bench --json --machine $EXPECTED_MACHINE   (x10, the chooser)"
+echo "  taskset --cpu-list $STARTUP_CPUS $bin --startup-bench --json --machine $EXPECTED_MACHINE --objects 25000 --churn 0   (x10)"
+echo "  taskset --cpu-list $STARTUP_CPUS $bin --startup-bench --json --machine $EXPECTED_MACHINE --objects 1000000 --churn 0   (x10)"
 
 if [ "$host_ok" != true ]; then
     echo "$0: this is not the labelled perf host; refusing" >&2
@@ -124,14 +125,21 @@ taskset --cpu-list "$PERF_CPU" "$bin" --bench --json --machine "$EXPECTED_MACHIN
 # One process is one sample. The three launch shapes are interleaved so any
 # drift over the sampling spreads across all three cases equally. The binary
 # prints its human summary to stderr and the report to stdout; only the
-# report is kept.
+# report is kept. The bare launch takes no flag at all: any scene flag,
+# --churn included, names a generated scene, and the chooser is the point.
+#
+# Startup is pinned to the P-cores as a set, not to the one core the headless
+# suites use. Those suites time single-threaded nanosecond loops and pin to
+# keep them off an E-core; a start is the generator, the world and the
+# window on their own threads, and on one core they queue behind each other
+# and measure the queue. On this host the P-cores are CPUs 0 to 11.
 echo "k10s: sampling process start $runs times per launch shape (opens a window each time)"
 i=0
 while [ "$i" -lt "$runs" ]; do
     i=$((i + 1))
-    taskset --cpu-list "$PERF_CPU" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --churn 0 | grep '^{' >> "$reports"
-    taskset --cpu-list "$PERF_CPU" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --objects 25000 --churn 0 | grep '^{' >> "$reports"
-    taskset --cpu-list "$PERF_CPU" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --objects 1000000 --churn 0 | grep '^{' >> "$reports"
+    taskset --cpu-list "$STARTUP_CPUS" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" | grep '^{' >> "$reports"
+    taskset --cpu-list "$STARTUP_CPUS" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --objects 25000 --churn 0 | grep '^{' >> "$reports"
+    taskset --cpu-list "$STARTUP_CPUS" "$bin" --startup-bench --json --machine "$EXPECTED_MACHINE" --objects 1000000 --churn 0 | grep '^{' >> "$reports"
 done
 
 # The aggregator refuses to report when a launch a person expects to be
