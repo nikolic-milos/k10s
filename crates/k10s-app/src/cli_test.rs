@@ -52,6 +52,7 @@ fn every_flag_sets_its_field() {
         (&["--bench", "--json", "--machine", "m"], |a| a.json),
         (&["--help"], |a| a.help),
         (&["-h"], |a| a.help),
+        (&["--attribution"], |a| a.attribution),
         (&["--cluster"], |a| a.cluster),
         (&["--context", "prod"], |a| {
             a.context.as_deref() == Some("prod")
@@ -254,6 +255,11 @@ fn cluster_mode_has_no_synthetic_churn() {
 fn a_bare_command_line_is_the_only_one_the_launch_screen_answers_for() {
     assert!(!ok(&[]).scene_was_named());
     assert!(!ok(&["--layout", "spread"]).scene_was_named());
+    assert!(
+        !ok(&["--startup-bench", "--machine", "ci"]).scene_was_named(),
+        "a startup bench with nothing else said measures the launch screen itself, \
+         which is why its report's source is \"launch\""
+    );
     for argv in [
         vec!["--cluster"],
         vec!["--cluster", "--context", "prod"],
@@ -341,6 +347,12 @@ fn the_bench_refuses_a_cluster() {
         Err(ArgError::BenchWithCluster)
     );
     assert!(ArgError::BenchWithCluster.to_string().contains("generator"));
+    // The asymmetry is deliberate: a flight bench compares against baselines
+    // recorded on a fixed generated scene, while how long a cluster takes to
+    // reach its first useful frame is a real thing to measure.
+    let startup = ok(&["--startup-bench", "--cluster", "--machine", "ci"]);
+    assert!(startup.cluster && startup.startup_bench);
+    assert!(startup.scene_was_named());
 }
 
 #[test]
@@ -501,6 +513,41 @@ fn help_wins_over_validation() {
 }
 
 #[test]
+fn attribution_wins_over_validation() {
+    let args = ok(&["--attribution", "--json"]);
+    assert!(args.attribution);
+}
+
+#[test]
+fn a_name_that_is_not_a_name_is_refused_rather_than_probed() {
+    // `--namespace "$NS"` with `NS` unset is the way this happens, and an empty
+    // namespace would otherwise become a probe target and a line of warning
+    // copy about a namespace nobody typed.
+    for argv in [
+        vec!["--namespace", ""],
+        vec!["--namespace", "   "],
+        vec!["--cluster", "--context", ""],
+    ] {
+        assert!(
+            matches!(
+                parse_argv(&argv),
+                Err(ArgError::BadValue { expected, .. }) if expected == "a name"
+            ),
+            "{argv:?} should be refused"
+        );
+    }
+    assert_eq!(
+        ok(&["--namespace", "kube-system"]).namespaces,
+        vec!["kube-system".to_string()]
+    );
+    assert_eq!(
+        ok(&["--context=prod"]).context.as_deref(),
+        Some("prod"),
+        "the = form takes the same path"
+    );
+}
+
+#[test]
 fn usage_lists_every_flag() {
     for flag in [
         "--objects",
@@ -512,6 +559,7 @@ fn usage_lists_every_flag() {
         "--bench",
         "--startup-bench",
         "--json",
+        "--attribution",
         "--help",
         "--cluster",
         "--context",
@@ -528,6 +576,10 @@ fn usage_names_the_numeric_bounds_it_enforces() {
     for max in [MAX_SYNC_TIMEOUT_SECS, MAX_CHURN_PER_SEC] {
         assert!(USAGE.contains(&max.to_string()), "usage is missing {max}");
     }
+    assert!(
+        USAGE.contains(&MAX_OBJECTS.to_string()),
+        "usage is missing {MAX_OBJECTS}"
+    );
 }
 
 #[test]

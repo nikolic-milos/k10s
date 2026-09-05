@@ -81,17 +81,26 @@ impl ThemeRegistry {
     /// schema's completion list. Aliases are appended because the loader
     /// accepts them and a schema that flags a value the loader accepts is a
     /// worse lie than one that offers a deprecated name.
+    ///
+    /// Deduplicated the way [`get`](Self::get) resolves -- ignoring case --
+    /// because a user file that respells a shipped name shadows it rather than
+    /// adding a theme, and offering both spellings would promise a choice that
+    /// does not exist.
     pub fn names(&self) -> Vec<SharedString> {
         let mut names: Vec<SharedString> = Vec::new();
-        for theme in self.themes() {
-            if !names.iter().any(|seen| seen == &theme.name) {
-                names.push(theme.name.clone());
+        let push = |name: SharedString, names: &mut Vec<SharedString>| {
+            if !names
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(name.as_ref()))
+            {
+                names.push(name);
             }
+        };
+        for theme in self.themes() {
+            push(theme.name.clone(), &mut names);
         }
         for (alias, _) in ALIASES {
-            if !names.iter().any(|seen| seen.as_ref() == alias) {
-                names.push(alias.into());
-            }
+            push(alias.into(), &mut names);
         }
         names
     }
@@ -154,6 +163,33 @@ mod tests {
             registry.default_for(Appearance::Dark).shell.text,
             0xff0000,
             "shadowing a built-in name shadows it everywhere, including the default"
+        );
+    }
+
+    #[test]
+    fn a_respelt_name_completes_once_because_it_resolves_once() {
+        let mut registry = ThemeRegistry::builtin();
+        let before = registry.names().len();
+        let loaded = parse_family(
+            r##"{ "name": "Mine", "themes": [
+                 { "name": "K10S-Dark", "style": { "text": "#ff0000" } }
+               ] }"##,
+        );
+        registry.add_family(loaded.family.expect("a family"));
+
+        let names = registry.names();
+        assert_eq!(
+            names.len(),
+            before,
+            "a respelling shadows a theme rather than adding one: {names:?}"
+        );
+        for name in &names {
+            assert!(registry.get(name).is_some(), "{name} does not resolve");
+        }
+        assert_eq!(
+            registry.get("k10s-dark").expect("found").shell.text,
+            0xff0000,
+            "and the file a user wrote still wins"
         );
     }
 

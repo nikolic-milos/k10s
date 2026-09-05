@@ -1,7 +1,8 @@
 //! Which failures a watch can recover from and which stop it: a 410 is
 //! expired and recoverable where a 403 stops rather than retrying forever, a
 //! relist deletes what it did not list, and a malformed object is reported once
-//! without ending the stream. Every path still settles exactly once.
+//! per listing epoch without ending the stream. Every path still settles
+//! exactly once.
 
 use super::*;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -292,6 +293,86 @@ fn malformed_objects_are_reported_once_and_do_not_end_the_stream() {
         messages.last(),
         Some(Message::Settled { listed: true, .. })
     ));
+}
+
+#[test]
+fn a_malformed_object_is_reported_again_after_a_relist() {
+    let messages = runtime().block_on(collect(vec![
+        Signal::Undecodable,
+        Signal::Undecodable,
+        Signal::Error(DesyncReason::Expired),
+        Signal::Restarted,
+        Signal::Undecodable,
+        Signal::Undecodable,
+        Signal::Settled,
+    ]));
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| matches!(
+                m,
+                Message::Desync {
+                    reason: DesyncReason::Malformed,
+                    ..
+                }
+            ))
+            .count(),
+        2,
+        "each listing epoch reports its own garbage once: {messages:?}"
+    );
+}
+
+#[test]
+fn an_interrupted_listing_deletes_nothing_when_it_settles() {
+    let messages = runtime().block_on(collect(vec![
+        Signal::Restarted,
+        Signal::Apply(Box::new(stage_pod(&pod(Some("u1"))).expect("staged"))),
+        Signal::Apply(Box::new(stage_pod(&pod(Some("u2"))).expect("staged"))),
+        Signal::Settled,
+        Signal::Error(DesyncReason::Expired),
+        Signal::Restarted,
+        Signal::Apply(Box::new(stage_pod(&pod(Some("u1"))).expect("staged"))),
+        Signal::Error(DesyncReason::Closed),
+        Signal::Settled,
+    ]));
+    assert!(
+        messages
+            .iter()
+            .all(|m| !matches!(m, Message::Delete { .. })),
+        "a listing window that broke never saw u2, which is not the same as u2 being gone: \
+         {messages:?}"
+    );
+}
+
+#[test]
+fn only_the_kinds_with_a_typed_stream_are_watched_at_full_fidelity() {
+    use crate::discover::fidelity_of;
+
+    for (group, kind) in [("", "Pod"), ("", "Service"), ("", "PersistentVolumeClaim")] {
+        assert_eq!(
+            fidelity_of(group, kind),
+            Fidelity::Full,
+            "{group}/{kind} has a typed arm in one_stream"
+        );
+    }
+    for (group, kind) in [
+        ("", "Namespace"),
+        ("", "ConfigMap"),
+        ("", "Secret"),
+        ("apps", "Deployment"),
+        ("apps", "StatefulSet"),
+        ("apps", "DaemonSet"),
+        ("apps", "ReplicaSet"),
+        ("batch", "Job"),
+        ("batch", "CronJob"),
+    ] {
+        assert_eq!(
+            fidelity_of(group, kind),
+            Fidelity::Metadata,
+            "one_stream has no typed arm for {group}/{kind}: declaring it Full would watch it \
+             as metadata anyway and lose spec and status without saying so"
+        );
+    }
 }
 
 #[test]

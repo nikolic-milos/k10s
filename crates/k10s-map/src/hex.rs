@@ -66,12 +66,17 @@ pub fn for_each_center(visible: &Rect, r: f32, mut emit: impl FnMut(f32, f32)) -
     n
 }
 
+/// How many hexes `for_each_center` would emit, without emitting them.
+///
+/// The band is a rectangle of rows and columns, so the count is its area: the
+/// oracle asks this every frame a debug build paints and has no use for the
+/// centers themselves.
 pub fn visible_count(visible: &Rect, zoom: f32, suppressed: bool) -> usize {
     if suppressed {
         return 0;
     }
     let (r, _) = level(zoom);
-    for_each_center(visible, r, |_, _| {})
+    ring_count(ring_band(visible, effective_radius(visible, r)))
 }
 
 #[cfg(test)]
@@ -145,6 +150,11 @@ mod tests {
                 let n = for_each_center(&visible, r, |_, _| {});
                 assert!(n > 0, "{name} at zoom {zoom}: no backdrop");
                 assert!(n <= MAX_RINGS, "{name} at zoom {zoom}: {n} rings");
+                assert_eq!(
+                    n,
+                    visible_count(&visible, zoom, false),
+                    "{name} at zoom {zoom}: the counter left the enumerator"
+                );
                 let afford = ring_count(ring_band(&visible, r)).min(MAX_RINGS);
                 assert!(
                     4 * n >= 3 * afford,

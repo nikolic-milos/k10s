@@ -346,6 +346,50 @@ fn a_file_whose_name_is_not_utf8_still_opens() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_folder_whose_name_is_not_utf8_is_refused_rather_than_stepped_into_lossily() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name = std::ffi::OsStr::from_bytes(b"caf\xe9");
+    let fs = workspace_fs();
+    let mut state = PickerState::new(Path::new("/work"), PickerMode::OpenFile);
+    let dir = state.begin_listing().expect("a folder to read");
+    assert!(state.listed(&dir, Ok(vec![DirEntry::new(name, true)])));
+    state.refilter();
+
+    let refused = state.confirm(&fs);
+    assert!(
+        matches!(&refused, PickerAction::Reject(note) if note.contains("not text")),
+        "stepping in would list a path spelled with replacement characters: {refused:?}"
+    );
+
+    let typed = state.input.clone();
+    state.complete_selected();
+    assert_eq!(state.input, typed, "and tab must not type it either");
+    assert!(
+        state
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("not text")),
+        "the row says why: {:?}",
+        state.note
+    );
+
+    let mut folder = PickerState::new(Path::new("/work"), PickerMode::OpenFolder);
+    let dir = folder.begin_listing().expect("a folder to read");
+    assert!(folder.listed(&dir, Ok(vec![DirEntry::new(name, true)])));
+    folder.refilter();
+    folder.selected = folder
+        .matches
+        .iter()
+        .position(|index| folder.entries[*index].name == name)
+        .expect("the folder row");
+    assert_eq!(
+        folder.confirm(&fs),
+        PickerAction::Open(Path::new("/work").join(name))
+    );
+}
+
 #[test]
 fn a_path_that_exists_opens_while_its_folder_is_still_being_listed() {
     let fs = workspace_fs();
@@ -469,6 +513,11 @@ fn the_scan_states_a_depth_truncation_and_counts_unreadable_folders() {
     let fs = FakeFs::with_files(&[("/work/top.yaml", "t"), (deep.as_str(), "b")]);
     let scan = scan_root(&fs, Path::new("/work"));
     assert!(scan.files.iter().any(|file| file.label == "top.yaml"));
+    assert!(
+        !scan.files.iter().any(|file| file.label.contains("buried")),
+        "the subtree past the cap is the one that is not there: {:?}",
+        scan.files
+    );
     assert!(
         scan.capped,
         "a subtree dropped for depth is a truncation the modal must state"

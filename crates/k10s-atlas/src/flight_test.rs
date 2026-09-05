@@ -1,9 +1,12 @@
 //! What a scripted flight counts and when it gives up: an idle segment counts
 //! only window paints, a mid-flight resize is stamped rather than restarting,
-//! a scene with no blocks aborts instead of panicking, and the restart budget
-//! is a bound the flight honours.
+//! a scene with no blocks and a planner with no segments both abort instead of
+//! panicking, a segment whose zoom could not be flown is brought inside the
+//! range rather than sampled as NaN, and the restart budget is a bound the
+//! flight honours.
 
 use super::*;
+use crate::camera::{MAX_ZOOM, MIN_ZOOM};
 use crate::scene::{BlockNode, CellNode, Rect, RegionNode};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -440,6 +443,81 @@ fn a_scene_with_no_blocks_aborts_instead_of_panicking() {
             ),
             "{what} must abort with a reason, not panic in a paint pass"
         );
+    }
+}
+
+#[test]
+fn a_planner_that_returns_nothing_aborts_instead_of_panicking() {
+    let mut flight = Flight::new(|_: &FlightAnchors, _: f32, _: f32| Vec::new());
+    let scene = tiny_scene();
+    let mut stats = FrameStats::default();
+    let (vw, vh) = (1600.0, 1000.0);
+    let t0 = Instant::now();
+    let at = |s: f32| t0 + Duration::from_secs_f32(s);
+
+    assert!(matches!(
+        flight.frame(at(0.0), vw, vh, true, &scene, &mut stats),
+        FlightFrame::Camera(_)
+    ));
+    assert!(
+        matches!(
+            flight.frame(at(1.0), vw, vh, true, &scene, &mut stats),
+            FlightFrame::Aborted
+        ),
+        "an empty plan must abort with a reason, not panic in a paint pass"
+    );
+}
+
+#[test]
+fn a_segment_whose_zoom_is_impossible_still_flies_a_finite_camera() {
+    for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, 1e12] {
+        let mut flight = Flight::new(move |a: &FlightAnchors, _: f32, _: f32| {
+            vec![Segment {
+                name: "bad",
+                from: Camera { zoom: bad, ..a.fit },
+                to: Camera {
+                    cx: a.block_center.0,
+                    cy: a.block_center.1,
+                    zoom: 2.0,
+                },
+                dur: 1.0,
+                measure: false,
+                idle: false,
+            }]
+        });
+        let scene = tiny_scene();
+        let mut stats = FrameStats::default();
+        let (vw, vh) = (1600.0, 1000.0);
+        let t0 = Instant::now();
+        let at = |s: f32| t0 + Duration::from_secs_f32(s);
+
+        assert!(matches!(
+            flight.frame(at(0.0), vw, vh, true, &scene, &mut stats),
+            FlightFrame::Camera(_)
+        ));
+        for step in 0..4 {
+            let frame = flight.frame(
+                at(1.0 + step as f32 * 0.25),
+                vw,
+                vh,
+                true,
+                &scene,
+                &mut stats,
+            );
+            let FlightFrame::Camera(cam) = frame else {
+                panic!("a flight from a zoom of {bad} stopped flying at step {step}");
+            };
+            assert!(
+                cam.cx.is_finite() && cam.cy.is_finite() && cam.zoom.is_finite(),
+                "a segment starting at zoom {bad} sampled {cam:?}"
+            );
+            assert!(
+                (MIN_ZOOM * 0.99..=MAX_ZOOM).contains(&cam.zoom),
+                "a segment starting at zoom {bad} sampled a zoom of {}, outside the \
+                 range and by more than the log-space round trip at an endpoint",
+                cam.zoom
+            );
+        }
     }
 }
 

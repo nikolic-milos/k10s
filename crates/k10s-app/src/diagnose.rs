@@ -39,7 +39,7 @@ pub(crate) fn degradation_notes(
         notes.push(format!(
             "the rules review for {} got no answer, so denied kinds are still attempted \
              there and a real denial will show up as a stream error instead of an empty map",
-            report.namespaces_unanswered.join(", ")
+            preview(&report.namespaces_unanswered)
         ));
     }
     if !report.aggregated_discovery {
@@ -203,6 +203,52 @@ mod tests {
                 .iter()
                 .any(|n| n.starts_with("no namespace was checked")),
             "{unprobed:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_list_of_namespaces_is_previewed_rather_than_dumped() {
+        // These notes go to a terminal and to the launch screen, and a cluster
+        // with hundreds of namespaces must not turn either into a wall.
+        let names: Vec<String> = (0..9).map(|i| format!("team-{i}")).collect();
+        let notes = notes_for(
+            ClusterReport {
+                namespaces_unanswered: names,
+                ..readable()
+            },
+            Vec::new(),
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("team-5"), "{notes:?}");
+        assert!(notes[0].contains("and 3 more"), "{notes:?}");
+        assert!(!notes[0].contains("team-6"), "{notes:?}");
+    }
+
+    #[test]
+    fn an_empty_map_says_it_is_a_permissions_answer() {
+        // The highest-stakes sentence in this file: an empty map that is a
+        // denial must never read as an empty cluster.
+        let notes = notes_for(
+            ClusterReport {
+                assemble: AssembleStats {
+                    scopes: 0,
+                    unattached: 2,
+                    unknown_namespace: 3,
+                    owner_cycles: 1,
+                    ..Default::default()
+                },
+                aggregated_discovery: true,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert!(notes[0].starts_with("2 attachments"), "{notes:?}");
+        assert!(notes[1].starts_with("3 objects"), "{notes:?}");
+        assert!(notes[2].starts_with("1 objects"), "{notes:?}");
+        assert!(
+            notes[3].contains("This is a permissions answer"),
+            "{notes:?}"
         );
     }
 

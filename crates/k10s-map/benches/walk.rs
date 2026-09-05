@@ -157,6 +157,7 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
 
     let base = base_scene(spec);
     SceneSnapshot {
+        identity_rev: 1,
         ids: Default::default(),
         scene: SceneData {
             card_header: 26.0,

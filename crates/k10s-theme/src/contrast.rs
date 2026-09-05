@@ -15,8 +15,17 @@
 //!   decoration, and a 3:1 hairline is not a border, it is a fence; what a
 //!   separator must not be is invisible, which is exactly what this catches.
 //!
-//! `one-dark` is transcribed from Zed and fourteen of its pairs do not clear
-//! their floor. Rather than quietly excluding it, each shortfall is recorded
+//! Dim is out of that scope on purpose. SGR 2 is defined as recessive, so
+//! `terminal_dim_foreground` and `terminal_ansi_dim` -- like ansi slots 0 and 8
+//! below -- cannot be held to a reading floor without turning them into
+//! something that is not dim. What a theme owes them is that they stay dimmer
+//! than the foreground they recede from, which is a palette relation rather
+//! than a WCAG one.
+//!
+//! `one-dark` is transcribed from Zed and thirty-three of its pairs do not
+//! clear their floor -- most of them vendor tool marks, which that theme
+//! carries at their logo values on canvases the logos were never designed
+//! for. Rather than quietly excluding it, each shortfall is recorded
 //! below with the ratio it actually measures. A waiver that drifts fails, and a
 //! waiver that starts passing fails too, so the list can only shrink. The two
 //! brand themes carry none, and a test asserts that separately.
@@ -280,8 +289,23 @@ fn audit(theme: &Theme) -> Vec<Pair> {
     for (index, color) in map.kind_colors.iter().enumerate() {
         check(format!("map kind[{index}]"), *color, map.bg, Floor::Ui);
     }
+    // A tool glyph is painted on the island fill (the medallion) and on the
+    // card header (the detailed card), never on the raw map background. The
+    // painted header is `card_header_fill` shaded toward `bg`, so measuring
+    // against the unshaded fill is the conservative bound in both appearances.
     for (index, color) in map.tool_colors.iter().enumerate() {
-        check(format!("map tool[{index}]"), *color, map.bg, Floor::Ui);
+        check(
+            format!("map tool[{index}] on ns_fill"),
+            *color,
+            map.ns_fill,
+            Floor::Ui,
+        );
+        check(
+            format!("map tool[{index}] on header"),
+            *color,
+            map.card_header_fill,
+            Floor::Ui,
+        );
     }
     for (index, color) in map.pod_severity.iter().enumerate() {
         check(
@@ -358,10 +382,29 @@ const ONE_DARK_SHORTFALLS: &[(&str, f64)] = &[
     ("syntax line_number", 1.97),
     ("border_focused on editor", 2.47),
     ("map kind[6]", 1.60),
-    ("map tool[14]", 2.66),
-    ("map tool[20]", 2.94),
-    ("map tool[22]", 2.61),
-    ("map tool[28]", 2.89),
+    ("map tool[1] on header", 2.71),
+    ("map tool[3] on header", 2.71),
+    ("map tool[8] on ns_fill", 2.94),
+    ("map tool[8] on header", 2.60),
+    ("map tool[12] on header", 2.70),
+    ("map tool[13] on ns_fill", 2.86),
+    ("map tool[13] on header", 2.54),
+    ("map tool[17] on ns_fill", 2.38),
+    ("map tool[17] on header", 2.11),
+    ("map tool[19] on ns_fill", 2.83),
+    ("map tool[19] on header", 2.51),
+    ("map tool[24] on ns_fill", 2.63),
+    ("map tool[24] on header", 2.33),
+    ("map tool[28] on ns_fill", 2.33),
+    ("map tool[28] on header", 2.07),
+    ("map tool[30] on ns_fill", 2.68),
+    ("map tool[30] on header", 2.38),
+    ("map tool[32] on header", 2.87),
+    ("map tool[33] on ns_fill", 2.08),
+    ("map tool[33] on header", 1.84),
+    ("map tool[35] on ns_fill", 2.58),
+    ("map tool[35] on header", 2.29),
+    ("map tool[36] on header", 2.96),
 ];
 
 #[test]
@@ -422,6 +465,43 @@ fn every_shipped_theme_is_readable() {
             "{}: these waivers name pairs the audit no longer produces: {unused:?}",
             theme.name
         );
+    }
+}
+
+#[test]
+fn dim_recedes_from_the_foreground_it_is_dim_of() {
+    // The relation that replaces a reading floor for SGR 2. A "dim" token that
+    // drifted brighter than the text it recedes from would be unaudited by the
+    // pairs above and invisible to review, while being exactly backwards.
+    for theme in ThemeRegistry::builtin().themes() {
+        let shell = &theme.shell;
+        let background = shell.terminal_background;
+        // Measured against the canvas rather than by luminance, because dim on
+        // a light theme means closer to white and on a dark one closer to
+        // black; what it always means is less separated from the background.
+        let recedes =
+            |dim: u32, normal: u32| contrast(dim, background) < contrast(normal, background);
+        assert!(
+            recedes(shell.terminal_dim_foreground, shell.terminal_foreground),
+            "{}: terminal_dim_foreground is not dimmer than terminal_foreground",
+            theme.name
+        );
+        for (index, (dim, normal)) in shell
+            .terminal_ansi_dim
+            .iter()
+            .zip(shell.terminal_ansi.iter())
+            .enumerate()
+            // Slot 0 is the palette's black, which on a dark theme *is* the
+            // background: its dim form has to come up off the canvas to stay a
+            // colour at all, for the same reason the audit above skips it.
+            .skip(1)
+        {
+            assert!(
+                recedes(*dim, *normal),
+                "{}: ansi_dim[{index}] is not dimmer than ansi[{index}]",
+                theme.name
+            );
+        }
     }
 }
 

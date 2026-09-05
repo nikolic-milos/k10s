@@ -257,17 +257,29 @@ fn listing_keeps_every_source_and_a_broken_one_keeps_its_place_with_the_reason()
 
 #[test]
 fn a_credential_is_retired_before_it_expires_not_after() {
-    assert!(credential_is_fresh(None, 1_000_000));
-    assert!(credential_is_fresh(Some(1_000_000), 900_000));
+    assert!(credential_is_fresh(None, Some(1_000_000)));
+    assert!(credential_is_fresh(Some(1_000_000), Some(900_000)));
     assert!(
-        !credential_is_fresh(Some(1_000_000), 999_990),
+        !credential_is_fresh(Some(1_000_000), Some(999_990)),
         "10s of validity must not be handed out"
     );
-    assert!(!credential_is_fresh(Some(1_000_000), 1_000_001));
+    assert!(!credential_is_fresh(Some(1_000_000), Some(1_000_001)));
     assert!(!credential_is_fresh(
         Some(1_000_000),
-        1_000_000 - CREDENTIAL_SKEW_SECS
+        Some(1_000_000 - CREDENTIAL_SKEW_SECS)
     ));
+}
+
+#[test]
+fn a_clock_that_cannot_be_read_retires_every_credential() {
+    assert!(
+        !credential_is_fresh(Some(1_000_000), None),
+        "a machine whose clock reads before the epoch must rebuild, not trust a cache"
+    );
+    assert!(
+        !credential_is_fresh(None, None),
+        "an undated credential is only fresh while there is a clock to say so"
+    );
 }
 
 #[test]

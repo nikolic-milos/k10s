@@ -22,13 +22,17 @@ use crate::ui::{MAX_DOCK_SIZE, MIN_DOCK_SIZE};
 pub const SETTINGS_TEMPLATE: &str = "\
 // k10s settings. Comments and trailing commas are fine.
 // Every key completes with ctrl-space; unknown keys are flagged as you type.
+// This file is the settings UI: ctrl-, opens it as an editor tab, and saving
+// is what applies it. Theme can also be { mode, light, dark }; mode \"light\"
+// selects k10s-light (K10S_LIGHT). reduce_motion is honoured by map fly-to.
 {
   \"theme\": \"k10s-dark\",
   \"ui_font_family\": \"Inter\",
   \"ui_font_size\": 14,
   \"buffer_font_family\": \"Lilex\",
   \"buffer_font_size\": 15,
-  \"buffer_line_height\": 1.35
+  \"buffer_line_height\": 1.35,
+  \"reduce_motion\": false
 }
 ";
 
@@ -341,6 +345,7 @@ mod tests {
                 "\"Inter\"".to_string()
             }
             "experimental.theme_overrides" => "{}".to_string(),
+            "reduce_motion" => "true".to_string(),
             _ => "14".to_string(),
         };
         format!("{{ \"{key}\": {value} }}")

@@ -30,6 +30,17 @@ pub enum Message {
     Desync { kind: KindId, reason: DesyncReason },
 }
 
+impl Message {
+    pub fn kind(&self) -> KindId {
+        match self {
+            Message::Apply { kind, .. }
+            | Message::Delete { kind, .. }
+            | Message::Settled { kind, .. }
+            | Message::Desync { kind, .. } => *kind,
+        }
+    }
+}
+
 pub fn desync_reason(err: &watcher::Error) -> DesyncReason {
     match err {
         watcher::Error::InitialListFailed(e)
@@ -195,6 +206,7 @@ pub async fn drive(
         let send = match signal {
             Signal::Restarted => {
                 listing = Some(HashSet::new());
+                undecodable = 0;
                 continue;
             }
             Signal::Apply(staged) => {
@@ -238,7 +250,8 @@ pub async fn drive(
                 Message::Settled { kind, listed: true }
             }
             Signal::Error(reason) => {
-                let fatal = !reason.is_recoverable();
+                let fatal = should_stop(reason);
+                listing = None;
                 if tx.send(Message::Desync { kind, reason }).await.is_err() {
                     return;
                 }

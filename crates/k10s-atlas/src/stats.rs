@@ -255,7 +255,20 @@ pub struct FrameStats {
 }
 
 impl FrameStats {
+    /// Start a new measured segment: every window a percentile is taken over is
+    /// emptied, and the clock forgets the last frame.
+    ///
+    /// Forgetting it is the point. A segment boundary can follow a long idle or
+    /// a wait for the viewport to settle, and an interval measured from before
+    /// the reset is time the new segment did not spend -- it would arrive as
+    /// that segment's p99 and read as a stall nobody could find. One sample per
+    /// segment is the price, out of a window of two hundred and forty.
+    ///
+    /// `frames` is session-total on purpose and survives: the flight harness
+    /// counts idle paints by the difference across a segment, which a counter
+    /// that restarted would make meaningless.
     pub fn reset(&mut self) {
+        self.last_frame = None;
         self.intervals.clear();
         self.cpu.clear();
         self.spans.clear();
@@ -419,6 +432,26 @@ mod tests {
             text_us: 9.0 * scale,
             hud_us: 1.9 * scale,
         }
+    }
+
+    #[test]
+    fn a_new_segment_does_not_inherit_the_wait_before_it() {
+        let mut st = FrameStats::default();
+        let t0 = Instant::now();
+        st.begin_frame(t0, true);
+        st.begin_frame(t0 + ms(10), true);
+        st.reset();
+        st.begin_frame(t0 + ms(3_000), true);
+        st.begin_frame(t0 + ms(3_016), true);
+        st.begin_frame(t0 + ms(3_032), true);
+        let (p50, _, p99) = st.frame_percentiles();
+        assert!((p50 - 16.0).abs() < 0.5, "p50 {p50}");
+        assert!(
+            p99 < 100.0,
+            "the three seconds before the segment arrived as its p99: {p99}, and the \
+             frames are continuous so the idle-gap filter is not what excludes them"
+        );
+        assert_eq!(st.frames(), 5, "frames is session-total across a reset");
     }
 
     #[test]

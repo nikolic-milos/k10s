@@ -49,7 +49,11 @@ impl Feed {
     /// Forward one data plane's stream into the world until the plane is gone.
     /// The thread ends by itself when that plane's sink disconnects, which is what
     /// makes retiring a connection a drop followed by a join.
-    fn pump(self, stream: Receiver<IngestEvent>) -> std::thread::JoinHandle<()> {
+    ///
+    /// A thread that cannot be started is an answer, not a panic: the failed
+    /// spawn drops the stream receiver with the closure, so the plane the caller
+    /// is about to give up sees a disconnected sink rather than filling it.
+    fn pump(self, stream: Receiver<IngestEvent>) -> std::io::Result<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("k10s-feed".into())
             .spawn(move || {
@@ -59,7 +63,6 @@ impl Feed {
                     }
                 }
             })
-            .expect("the feed thread is spawned once per connection")
     }
 }
 
@@ -220,9 +223,17 @@ impl Service {
         if self.ctrl.send(WorldCtrl::Rebuild(sync.events)).is_err() {
             return ConnectOutcome::Failed(WORLD_GONE.to_string());
         }
+        let pump = match self.feed.clone().pump(stream) {
+            Ok(pump) => pump,
+            Err(error) => {
+                return ConnectOutcome::Failed(format!(
+                    "cannot start the feed thread for this cluster: {error}"
+                ));
+            }
+        };
         *current = Some(Attached {
             plane: Some(plane),
-            pump: Some(self.feed.clone().pump(stream)),
+            pump: Some(pump),
         });
         ConnectOutcome::Connected(Connection {
             context,
@@ -415,7 +426,9 @@ mod tests {
         // afterwards, because the scene that replaces it is sent next.
         let (plane_tx, plane_rx) = crossbeam_channel::bounded(8);
         let (tx, rx) = crossbeam_channel::bounded(8);
-        let pump = Feed::new(tx).pump(plane_rx);
+        let pump = Feed::new(tx)
+            .pump(plane_rx)
+            .expect("the feed thread starts");
         plane_tx.send(scope("ns-live")).expect("queued");
         drop(plane_tx);
         pump.join().expect("the pump ends by itself");
@@ -426,7 +439,9 @@ mod tests {
     fn a_pump_whose_world_has_gone_stops_rather_than_spinning() {
         let (plane_tx, plane_rx) = crossbeam_channel::bounded(8);
         let (tx, rx) = crossbeam_channel::bounded(8);
-        let pump = Feed::new(tx).pump(plane_rx);
+        let pump = Feed::new(tx)
+            .pump(plane_rx)
+            .expect("the feed thread starts");
         drop(rx);
         plane_tx.send(scope("ns-live")).expect("queued");
         pump.join()

@@ -6,10 +6,15 @@
 //!
 //! Nothing here blocks the UI thread. Reads, writes, and even the conflict
 //! stamp run on the background executor, and every non-`Ok` outcome becomes a
-//! labelled note rather than a silent absence. Writes go through
-//! [`crate::saves::SaveQueue`] -- one in flight, only the newest text queued
-//! behind it -- because a write per keypress leaves the order to the executor,
-//! and an older write can land last on a buffer already marked clean.
+//! labelled note rather than a silent absence. A schema fetch that fails gives
+//! its once-only flag back and an answer is dropped unless the store still
+//! belongs to the connection it was asked of, so one expired token cannot leave
+//! the window validating blind and the previous cluster cannot fill the store
+//! that replaced it. A load that never landed leaves nothing to lose, and says
+//! so, rather than warning about unsaved changes in an empty buffer. Writes go
+//! through [`crate::saves::SaveQueue`] -- one in flight, only the newest text
+//! queued behind it -- because a write per keypress leaves the order to the
+//! executor, and an older write can land last on a buffer already marked clean.
 
 use std::path::PathBuf;
 
@@ -104,8 +109,12 @@ impl EditorView {
                         }
                         ManifestOutcome::Denied(what) => {
                             this.status = Some(format!("{what}: access denied for this account"));
+                            this.clean_if_never_loaded(cx);
                         }
-                        ManifestOutcome::Failed(why) => this.status = Some(why),
+                        ManifestOutcome::Failed(why) => {
+                            this.status = Some(why);
+                            this.clean_if_never_loaded(cx);
+                        }
                     }
                     cx.notify();
                 });
@@ -161,10 +170,16 @@ impl EditorView {
                                 this.ensure_schema(cx);
                                 this.schedule_validation(cx);
                             }
-                            None => this.status = Some(format!("open failed: {error}")),
+                            None => {
+                                this.status = Some(format!("open failed: {error}"));
+                                this.clean_if_never_loaded(cx);
+                            }
                         }
                     }
-                    Err(error) => this.status = Some(format!("open failed: {error}")),
+                    Err(error) => {
+                        this.status = Some(format!("open failed: {error}"));
+                        this.clean_if_never_loaded(cx);
+                    }
                 }
                 cx.notify();
             });
@@ -322,9 +337,13 @@ impl EditorView {
         if self.schema_root.is_some() {
             return;
         }
-        let fetch_catalog = {
+        let (epoch, fetch_catalog, fetch_crds) = {
             let mut store = self.schema.borrow_mut();
-            !std::mem::replace(&mut store.requested_catalog, true)
+            (
+                store.epoch(),
+                !std::mem::replace(&mut store.requested_catalog, true),
+                !std::mem::replace(&mut store.requested_crds, true),
+            )
         };
         if fetch_catalog {
             let (tx, rx) = futures::channel::oneshot::channel();
@@ -336,7 +355,7 @@ impl EditorView {
                 if let Ok(outcome) = rx.await {
                     let _ = this.update(cx, |this, cx| {
                         {
-                            absorb_catalog(&mut this.schema.borrow_mut(), outcome);
+                            absorb_catalog(&mut this.schema.borrow_mut(), outcome, epoch);
                         }
                         this.ensure_documents(cx);
                         this.schedule_validation(cx);
@@ -346,10 +365,6 @@ impl EditorView {
             })
             .detach();
         }
-        let fetch_crds = {
-            let mut store = self.schema.borrow_mut();
-            !std::mem::replace(&mut store.requested_crds, true)
-        };
         if fetch_crds {
             let (tx, rx) = futures::channel::oneshot::channel();
             let reply: Reply<SchemaTextOutcome> = Box::new(move |outcome| {
@@ -363,7 +378,8 @@ impl EditorView {
                             absorb_schema_text(
                                 &mut this.schema.borrow_mut(),
                                 outcome,
-                                SchemaDoc::CrdList,
+                                &SchemaDoc::CrdList,
+                                epoch,
                             );
                         }
                         this.schedule_validation(cx);
@@ -380,8 +396,13 @@ impl EditorView {
         let Some(api_version) = self.meta.api_version.clone() else {
             return;
         };
-        let Some(url) = next_document_url(&mut self.schema.borrow_mut(), &api_version) else {
-            return;
+        let (epoch, url) = {
+            let mut store = self.schema.borrow_mut();
+            let epoch = store.epoch();
+            let Some(url) = next_document_url(&mut store, &api_version) else {
+                return;
+            };
+            (epoch, url)
         };
         let (tx, rx) = futures::channel::oneshot::channel();
         let reply: Reply<SchemaTextOutcome> = Box::new(move |outcome| {
@@ -395,7 +416,8 @@ impl EditorView {
                         absorb_schema_text(
                             &mut this.schema.borrow_mut(),
                             outcome,
-                            SchemaDoc::OpenApi,
+                            &SchemaDoc::OpenApi(api_version),
+                            epoch,
                         );
                     }
                     this.schedule_validation(cx);
@@ -405,13 +427,31 @@ impl EditorView {
         })
         .detach();
     }
+
+    /// A buffer whose load never landed has nothing to lose, and a close that
+    /// warns about unsaved changes in an empty buffer teaches people to press
+    /// through the warning that matters. Only ever called where the load
+    /// failed: a buffer that has loaded once keeps its own clean point.
+    fn clean_if_never_loaded(&mut self, cx: &mut Context<Self>) {
+        if self.dirty.never_loaded() {
+            self.dirty.mark_clean(self.buffer.version(), None);
+            self.publish_state(cx);
+        }
+    }
 }
 
 // How a catalog answer lands in the store: every source's group version is
 // registered with the index BEFORE the catalog is stored, so a document the
 // index cannot name is never offered for fetching; and a denial is worded for
 // the person reading the notes, not for the transport.
-pub(crate) fn absorb_catalog(store: &mut SchemaStore, outcome: SchemaCatalogOutcome) {
+//
+// An answer from the cluster the window has left is dropped on its epoch, and a
+// fetch that did not arrive gives its flag back: a token that expired once must
+// not leave this workspace validating blind until it is restarted.
+pub(crate) fn absorb_catalog(store: &mut SchemaStore, outcome: SchemaCatalogOutcome, epoch: u64) {
+    if store.epoch() != epoch {
+        return;
+    }
     match outcome {
         SchemaCatalogOutcome::Catalog(sources) => {
             for source in &sources {
@@ -420,42 +460,67 @@ pub(crate) fn absorb_catalog(store: &mut SchemaStore, outcome: SchemaCatalogOutc
             store.catalog = sources;
         }
         SchemaCatalogOutcome::Denied(what) => {
+            store.requested_catalog = false;
             store.note(format!("{what}: access denied for this account"))
         }
-        SchemaCatalogOutcome::Failed(why) => store.note(why),
+        SchemaCatalogOutcome::Failed(why) => {
+            store.requested_catalog = false;
+            store.note(why)
+        }
     }
 }
 
 // Which schema text an answer carries; the Denied and Failed arms are shared
-// and only the destination of the Text arm differs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// and only the destination of the Text arm differs. The OpenAPI document names
+// the group version it was asked for, because that is the flag a failure has to
+// give back.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SchemaDoc {
-    OpenApi,
+    OpenApi(String),
     CrdList,
 }
 
 pub(crate) fn absorb_schema_text(
     store: &mut SchemaStore,
     outcome: SchemaTextOutcome,
-    kind: SchemaDoc,
+    kind: &SchemaDoc,
+    epoch: u64,
 ) {
+    if store.epoch() != epoch {
+        return;
+    }
     match outcome {
         SchemaTextOutcome::Text(json) => {
             let landed = match kind {
-                SchemaDoc::OpenApi => store.index.add_openapi_document(&json),
+                SchemaDoc::OpenApi(_) => store.index.add_openapi_document(&json),
                 SchemaDoc::CrdList => store.index.add_crd_list(&json),
             };
             if let Err(why) = landed {
                 store.note(match kind {
-                    SchemaDoc::OpenApi => format!("schema document: {why}"),
+                    SchemaDoc::OpenApi(_) => format!("schema document: {why}"),
                     SchemaDoc::CrdList => format!("CRD schemas: {why}"),
                 });
             }
         }
         SchemaTextOutcome::Denied(what) => {
+            forget_request(store, kind);
             store.note(format!("{what}: access denied for this account"))
         }
-        SchemaTextOutcome::Failed(why) => store.note(why),
+        SchemaTextOutcome::Failed(why) => {
+            forget_request(store, kind);
+            store.note(why)
+        }
+    }
+}
+
+/// A fetch that failed was never answered, so the flag that says it was asked
+/// for is a lie the next editor would believe.
+fn forget_request(store: &mut SchemaStore, kind: &SchemaDoc) {
+    match kind {
+        SchemaDoc::OpenApi(group_version) => {
+            store.requested_documents.remove(group_version);
+        }
+        SchemaDoc::CrdList => store.requested_crds = false,
     }
 }
 

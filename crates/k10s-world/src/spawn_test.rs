@@ -101,7 +101,9 @@ fn a_scene_chosen_after_spawn_replaces_an_empty_world_and_then_replaces_itself()
         while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
     };
     settle(&wake_rx);
-    let empty_rev = scene.load().rev;
+    let empty = scene.load_full();
+    let empty_rev = empty.rev;
+    let empty_identity_rev = empty.identity_rev;
     assert_eq!(
         scene.load().totals,
         Default::default(),
@@ -122,6 +124,11 @@ fn a_scene_chosen_after_spawn_replaces_an_empty_world_and_then_replaces_itself()
         "a replacement stays in the process-wide revision domain"
     );
     let filled_rev = filled.rev;
+    let filled_identity_rev = filled.identity_rev;
+    assert_ne!(
+        filled_identity_rev, empty_identity_rev,
+        "an index built for the empty world cannot survive its replacement"
+    );
     assert_eq!(filled.totals.cells, 2);
     assert_eq!(region_named(&filled, "prod").1.label.as_ref(), "prod");
     assert!(
@@ -145,6 +152,8 @@ fn a_scene_chosen_after_spawn_replaces_an_empty_world_and_then_replaces_itself()
     settle(&wake_rx);
     let second = scene.load_full();
     assert!(second.rev > filled_rev);
+    assert_ne!(second.identity_rev, filled_identity_rev);
+    let second_identity_rev = second.identity_rev;
     assert_eq!(second.totals.regions, 1);
     assert_eq!(second.totals.cells, 1);
     assert_eq!(region_named(&second, "edge").1.label.as_ref(), "edge");
@@ -165,14 +174,15 @@ fn a_scene_chosen_after_spawn_replaces_an_empty_world_and_then_replaces_itself()
         ))
         .expect("queued");
     settle(&wake_rx);
+    let changed = scene.load_full();
     assert_eq!(
-        pod_named(&scene.load_full(), "pod-cdn")
-            .1
-            .ext
-            .state
-            .severity,
+        pod_named(&changed, "pod-cdn").1.ext.state.severity,
         Severity::Err,
         "a rebuilt world still reads its live deltas"
+    );
+    assert_eq!(
+        changed.identity_rev, second_identity_rev,
+        "a health publish does not invalidate a UID and name index"
     );
 
     ctrl_tx.send(WorldCtrl::Shutdown).expect("sent");

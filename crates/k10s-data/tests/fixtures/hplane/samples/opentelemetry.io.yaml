@@ -1,0 +1,13 @@
+# Lab fixture only. No OpenTelemetry operator, so no collector Pod.
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: k10s-hplane-otel
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  mode: deployment
+  config: {}

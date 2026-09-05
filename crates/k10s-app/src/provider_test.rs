@@ -33,7 +33,7 @@ fn a_describe_maps_its_document_and_keeps_denial_and_failure_labels() {
 }
 
 #[test]
-fn a_release_inventory_renders_on_this_side_of_the_seam() {
+fn a_release_inventory_crosses_as_a_table() {
     let releases = k10s_data::helm::Releases {
         releases: vec![k10s_data::helm::Release {
             name: "ingress".to_string(),
@@ -51,11 +51,77 @@ fn a_release_inventory_renders_on_this_side_of_the_seam() {
         truncated: false,
         unreadable: 0,
     };
-    let expected = k10s_data::helm::render(&releases);
     match releases_outcome(Fetched::Ok(releases)) {
-        k10s_shell::DocOutcome::Doc { title, lines } => {
-            assert_eq!(title, "helm releases");
-            assert_eq!(lines, expected);
+        k10s_shell::TableOutcome::Table(page) => {
+            assert_eq!(
+                page.rows[0].cells,
+                ["ingress", "infra", "3", "deployed", "ingress-nginx-4.11.0"]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        releases_outcome(Fetched::Denied {
+            what: "helm releases"
+        }),
+        k10s_shell::TableOutcome::Denied("helm releases")
+    ));
+}
+
+#[test]
+fn gitops_absence_is_invisible_and_a_denial_stays_labelled() {
+    assert!(matches!(
+        argo_outcome(Fetched::Ok(k10s_data::argo::Inventory::default())),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        flux_outcome(Fetched::Ok(k10s_data::flux::Inventory::default())),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        argo_outcome(Fetched::Denied {
+            what: "argo applications"
+        }),
+        k10s_shell::TableOutcome::Denied("argo applications")
+    ));
+    let denied_flux = k10s_data::flux::Inventory {
+        git_repositories: k10s_data::flux::KindSet::Denied,
+        ..k10s_data::flux::Inventory::default()
+    };
+    match flux_outcome(Fetched::Ok(denied_flux)) {
+        k10s_shell::TableOutcome::Table(page) => {
+            let text = page
+                .rows
+                .iter()
+                .flat_map(|row| row.cells.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                text.contains("access denied for this account"),
+                "Denied is labelled, not Absent: {text}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_day2_needs_confirm_crosses_the_summary_and_not_a_write() {
+    match day2_outcome(k10s_data::day2::Day2Outcome::NeedsConfirm {
+        blast: k10s_data::day2::Blast::Replicas { from: 3, to: 0 },
+        summary: "scale api from 3 to 0 replicas".to_string(),
+    }) {
+        k10s_shell::Day2Outcome::NeedsConfirm { summary } => {
+            assert_eq!(summary, "scale api from 3 to 0 replicas");
+        }
+        other => panic!("{other:?}"),
+    }
+    match day2_outcome(k10s_data::day2::Day2Outcome::Denied {
+        what: "scale",
+        why: "this account cannot patch".to_string(),
+    }) {
+        k10s_shell::Day2Outcome::Denied { what, why } => {
+            assert_eq!((what, why.as_str()), ("scale", "this account cannot patch"));
         }
         other => panic!("{other:?}"),
     }
@@ -158,25 +224,96 @@ fn every_apply_arm_keeps_what_the_review_reads() {
         other => panic!("{other:?}"),
     }
 
+    // The sentences the review shows, asserted as sentences: a swapped or
+    // renamed message is the failure mode a shape-only check cannot see.
+    match apply_outcome(Plane::Stale {
+        message: "newer".to_string(),
+    }) {
+        k10s_shell::ApplyOutcome::Stale { message } => assert_eq!(message, "newer"),
+        other => panic!("{other:?}"),
+    }
+    match apply_outcome(Plane::Denied {
+        what: "apply",
+        why: "forbidden".to_string(),
+    }) {
+        k10s_shell::ApplyOutcome::Denied { what, why } => {
+            assert_eq!((what, why.as_str()), ("apply", "forbidden"));
+        }
+        other => panic!("{other:?}"),
+    }
+    match apply_outcome(Plane::Failed {
+        why: "io".to_string(),
+    }) {
+        k10s_shell::ApplyOutcome::Failed(why) => assert_eq!(why, "io"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_arms_that_only_carry_a_label_still_carry_it() {
+    // Every remaining translator arm that decides UI copy or a row's state.
+    // These are the ones a seam loses silently: nothing fails to compile when
+    // a reason stops crossing, it just stops being on screen.
+    match adapt_chunk(k10s_data::logs::LogChunk::Lines(vec!["one".to_string()])) {
+        k10s_shell::LogChunk::Lines(lines) => assert_eq!(lines, vec!["one".to_string()]),
+        other => panic!("{other:?}"),
+    }
+    match adapt_chunk(k10s_data::logs::LogChunk::Failed {
+        what: "logs",
+        why: "connection reset".to_string(),
+    }) {
+        k10s_shell::LogChunk::Failed(why) => assert_eq!(why, "connection reset"),
+        other => panic!("{other:?}"),
+    }
+
+    let opening = k10s_data::forward::ForwardRow {
+        id: 1,
+        spec: k10s_data::forward::ForwardSpec {
+            namespace: "prod".to_string(),
+            pod: "api-1".to_string(),
+            local_port: 8080,
+            remote_port: 80,
+        },
+        state: k10s_data::forward::ForwardState::Opening,
+    };
+    let active = k10s_data::forward::ForwardRow {
+        state: k10s_data::forward::ForwardState::Active,
+        ..opening.clone()
+    };
     assert!(matches!(
-        apply_outcome(Plane::Stale {
-            message: "newer".to_string()
-        }),
-        k10s_shell::ApplyOutcome::Stale { .. }
+        adapt_forward(opening).state,
+        k10s_shell::ForwardState::Opening
     ));
     assert!(matches!(
-        apply_outcome(Plane::Denied {
-            what: "apply",
-            why: "forbidden".to_string()
-        }),
-        k10s_shell::ApplyOutcome::Denied { what: "apply", .. }
+        adapt_forward(active).state,
+        k10s_shell::ForwardState::Active
     ));
+
+    match table_outcome(Fetched::<k10s_data::browse::TablePage>::Failed {
+        what: "table",
+        why: "the list timed out".to_string(),
+    }) {
+        k10s_shell::TableOutcome::Failed(why) => assert_eq!(why, "the list timed out"),
+        other => panic!("{other:?}"),
+    }
     assert!(matches!(
-        apply_outcome(Plane::Failed {
-            why: "io".to_string()
-        }),
-        k10s_shell::ApplyOutcome::Failed(_)
+        table_outcome(Fetched::<k10s_data::browse::TablePage>::Denied { what: "pods" }),
+        k10s_shell::TableOutcome::Denied("pods")
     ));
+    match schema_text_outcome(Fetched::Failed {
+        what: "schema",
+        why: "not served".to_string(),
+    }) {
+        k10s_shell::SchemaTextOutcome::Failed(why) => assert_eq!(why, "not served"),
+        other => panic!("{other:?}"),
+    }
+    match containers_outcome(Fetched::Failed {
+        what: "containers",
+        why: "gone".to_string(),
+    }) {
+        k10s_shell::ContainersOutcome::Failed(why) => assert_eq!(why, "gone"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -284,6 +421,161 @@ fn a_dead_forward_keeps_the_reason_it_died() {
 }
 
 #[test]
+fn a_usage_sample_crosses_typed_and_every_label_survives() {
+    use k10s_data::metrics as plane;
+
+    let sample = plane::UsageSample {
+        cpu: Some(plane::Millicores(250)),
+        memory: Some(plane::Bytes(32 * 1024 * 1024)),
+        cpu_request: Some(plane::Millicores(500)),
+        cpu_limit: None,
+        memory_request: Some(plane::Bytes(64 * 1024 * 1024)),
+        memory_limit: Some(plane::Bytes(128 * 1024 * 1024)),
+        source: plane::UsageSource::Kubelet,
+        pods_measured: 2,
+        pods_total: 3,
+        truncated: true,
+    };
+    match usage_outcome(plane::UsageOutcome::Usage(sample)) {
+        k10s_shell::UsageOutcome::Usage(sample) => {
+            assert_eq!(sample.cpu, Some(k10s_shell::Millicores(250)));
+            assert_eq!(sample.memory, Some(k10s_shell::Bytes(32 * 1024 * 1024)));
+            assert_eq!(sample.cpu_request, Some(k10s_shell::Millicores(500)));
+            // "No limit" must survive the seam as an absence, never as zero.
+            assert_eq!(sample.cpu_limit, None);
+            assert_eq!(
+                sample.memory_request,
+                Some(k10s_shell::Bytes(64 * 1024 * 1024))
+            );
+            assert_eq!(
+                sample.memory_limit,
+                Some(k10s_shell::Bytes(128 * 1024 * 1024))
+            );
+            assert_eq!(sample.source, k10s_shell::UsageSource::Kubelet);
+            assert_eq!(
+                (sample.pods_measured, sample.pods_total),
+                (2, 3),
+                "a partial sum keeps saying how partial it is"
+            );
+            assert!(sample.truncated);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    assert!(matches!(
+        usage_outcome(plane::UsageOutcome::Denied {
+            what: "pod metrics"
+        }),
+        k10s_shell::UsageOutcome::Denied("pod metrics")
+    ));
+    match usage_outcome(plane::UsageOutcome::Failed {
+        what: "node metrics",
+        why: "did not parse".to_string(),
+    }) {
+        k10s_shell::UsageOutcome::Failed(why) => assert_eq!(why, "did not parse"),
+        other => panic!("{other:?}"),
+    }
+    match usage_outcome(plane::UsageOutcome::Absent {
+        why: "metrics-server is not installed".to_string(),
+    }) {
+        k10s_shell::UsageOutcome::Absent(why) => {
+            assert_eq!(why, "metrics-server is not installed");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn policy_harbor_and_mesh_absence_hide_the_pane() {
+    assert!(matches!(
+        policy_outcome(Fetched::Ok(k10s_data::policy::Inventory::default())),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        harbor_outcome(Fetched::Ok(k10s_data::harbor::Inventory::default())),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        mesh_outcome(k10s_data::mesh::MeshInventory::default()),
+        k10s_shell::TableOutcome::Absent
+    ));
+    assert!(matches!(
+        grafana_outcome(Fetched::Ok(k10s_data::read::GrafanaCatalog {
+            dashboards: Vec::new(),
+            extra_hits: Vec::new(),
+            truncated: false,
+            browser_base: None,
+            served: false,
+        })),
+        k10s_shell::GrafanaOutcome::Absent
+    ));
+    assert!(matches!(
+        prom_outcome(Fetched::Ok(None)),
+        k10s_shell::PromOutcome::Absent
+    ));
+    assert!(matches!(
+        loki_outcome(Fetched::Ok(None)),
+        k10s_shell::LokiOutcome::Absent
+    ));
+    assert!(matches!(
+        trace_outcome(Fetched::Ok(None)),
+        k10s_shell::TraceOutcome::Absent
+    ));
+}
+
+#[test]
+fn a_helm_rollback_report_keeps_the_not_helm_rollback_note() {
+    let report = k10s_data::helm_reveal::RollbackReport {
+        note: k10s_data::helm_reveal::NOT_HELM_ROLLBACK,
+        documents: Vec::new(),
+    };
+    match helm_rollback_outcome(Fetched::Ok(report)) {
+        k10s_shell::HelmRollbackOutcome::Report { note, lines } => {
+            assert_eq!(note, k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
+            assert_eq!(lines[0], k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
+    let catalog = k10s_data::read::GrafanaCatalog {
+        dashboards: vec![k10s_data::grafana::Dashboard {
+            uid: "node".to_string(),
+            title: "Node".to_string(),
+            panels: vec![k10s_data::grafana::Panel {
+                id: 2,
+                title: "CPU".to_string(),
+                kind: k10s_data::grafana::PanelKind::Timeseries,
+                queries: vec![k10s_data::grafana::PanelQuery {
+                    ref_id: "A".to_string(),
+                    expr: "rate(cpu[1m])".to_string(),
+                    dialect: k10s_data::grafana::QueryDialect::PromQL,
+                    datasource: None,
+                }],
+                transformed: false,
+            }],
+            truncated: false,
+        }],
+        extra_hits: Vec::new(),
+        truncated: false,
+        browser_base: Some("http://grafana.mon.svc:3000".to_string()),
+        served: true,
+    };
+    match grafana_outcome(Fetched::Ok(catalog)) {
+        k10s_shell::GrafanaOutcome::Catalog { panels, .. } => {
+            assert_eq!(panels[0].expr, "rate(cpu[1m])");
+            assert_eq!(
+                panels[0].browser_url.as_deref(),
+                Some("http://grafana.mon.svc:3000/d/node?viewPanel=2")
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn inspect_details_become_event_rows_with_their_counts() {
     let detail = adapt(k10s_data::inspect::InspectDetail::Events(vec![
         k10s_data::inspect::EventLine {
@@ -301,6 +593,189 @@ fn inspect_details_become_event_rows_with_their_counts() {
             assert_eq!(rows[0].reason, "BackOff");
             assert_eq!(rows[0].count, 12);
         }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn policy_findings_sharing_a_resource_get_distinct_row_uids() {
+    let finding = |policy: &str, uid: &str| k10s_data::policy::Finding {
+        policy: policy.to_string(),
+        result: "fail".to_string(),
+        severity: k10s_core::Severity::Warn,
+        resource_name: "api".to_string(),
+        resource_kind: "Deployment".to_string(),
+        resource_uid: uid.to_string(),
+    };
+    let inventory = k10s_data::policy::Inventory {
+        served: true,
+        reports: vec![k10s_data::policy::Report {
+            namespace: "prod".to_string(),
+            name: "polr-api".to_string(),
+            results: vec![
+                finding("require-limits", "uid-1"),
+                finding("disallow-latest", "uid-1"),
+                finding("require-probes", ""),
+                finding("require-labels", ""),
+            ],
+        }],
+        truncated: false,
+        partly_denied: false,
+    };
+    match policy_outcome(Fetched::Ok(inventory)) {
+        k10s_shell::TableOutcome::Table(page) => {
+            let mut uids: Vec<&str> = page.rows.iter().map(|row| row.uid.as_str()).collect();
+            uids.sort_unstable();
+            let before = uids.len();
+            uids.dedup();
+            assert_eq!(uids.len(), before, "every finding keeps its own row uid");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_harbor_project_without_fetched_repos_counts_them_under_repository_not_artifacts() {
+    let inventory = k10s_data::harbor::Inventory {
+        served: true,
+        projects: vec![k10s_data::harbor::Project {
+            name: "library".to_string(),
+            public: true,
+            repo_count: 7,
+            repositories: Vec::new(),
+        }],
+        truncated: false,
+        unreadable: 0,
+    };
+    match harbor_outcome(Fetched::Ok(inventory)) {
+        k10s_shell::TableOutcome::Table(page) => {
+            // Columns are Project, Visibility, Repository, Artifacts, Scan.
+            assert_eq!(page.rows[0].cells[2], "(7 repositories)");
+            assert_eq!(page.rows[0].cells[3], "");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_harbor_repo_scan_cell_reports_the_worst_artifact_not_the_first() {
+    let scan = |severity: &str, mapped: k10s_core::Severity, critical: u32, total: u32| {
+        k10s_data::harbor::ArtifactScan {
+            digest: format!("sha256:{severity}"),
+            tags: Vec::new(),
+            scan: Some(k10s_data::harbor::ScanOverview {
+                status: "Success".to_string(),
+                severity: severity.to_string(),
+                mapped,
+                total,
+                fixable: 0,
+                critical,
+                high: 0,
+                medium: 0,
+                low: 0,
+            }),
+        }
+    };
+    let inventory = k10s_data::harbor::Inventory {
+        served: true,
+        projects: vec![k10s_data::harbor::Project {
+            name: "library".to_string(),
+            public: false,
+            repo_count: 1,
+            repositories: vec![k10s_data::harbor::Repository {
+                name: "api".to_string(),
+                artifact_count: 2,
+                pull_count: 0,
+                artifacts: vec![
+                    scan("Low", k10s_core::Severity::Warn, 0, 3),
+                    scan("Critical", k10s_core::Severity::Err, 2, 9),
+                ],
+            }],
+        }],
+        truncated: false,
+        unreadable: 0,
+    };
+    match harbor_outcome(Fetched::Ok(inventory)) {
+        k10s_shell::TableOutcome::Table(page) => {
+            assert_eq!(page.rows[0].cells[4], "Critical (9)");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn unreadable_harbor_rows_mark_the_listing_as_partial() {
+    let inventory = k10s_data::harbor::Inventory {
+        served: true,
+        projects: vec![k10s_data::harbor::Project {
+            name: "library".to_string(),
+            public: true,
+            repo_count: 1,
+            repositories: Vec::new(),
+        }],
+        truncated: false,
+        unreadable: 2,
+    };
+    match harbor_outcome(Fetched::Ok(inventory)) {
+        k10s_shell::TableOutcome::Table(page) => assert!(page.truncated),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_denied_mesh_group_stays_visible_next_to_the_one_that_answered() {
+    use k10s_data::mesh::{GroupState, MeshInventory, MeshKind, MeshObject};
+
+    let object = MeshObject {
+        kind: MeshKind::VirtualService,
+        namespace: "prod".to_string(),
+        name: "api".to_string(),
+        hosts: vec!["api.prod".to_string()],
+        destinations: Vec::new(),
+        gateways: Vec::new(),
+    };
+
+    // Istio answered with rows; the linkerd denial makes the page partial.
+    match mesh_outcome(MeshInventory {
+        istio: GroupState::Served,
+        linkerd: GroupState::Denied,
+        objects: vec![object],
+        truncated: false,
+    }) {
+        k10s_shell::TableOutcome::Table(page) => assert!(page.truncated),
+        other => panic!("{other:?}"),
+    }
+
+    // With nothing to show, the sibling's denial is the whole answer.
+    assert!(matches!(
+        mesh_outcome(MeshInventory {
+            istio: GroupState::Served,
+            linkerd: GroupState::Denied,
+            objects: Vec::new(),
+            truncated: false,
+        }),
+        k10s_shell::TableOutcome::Denied("mesh")
+    ));
+    match mesh_outcome(MeshInventory {
+        istio: GroupState::Served,
+        linkerd: GroupState::Failed {
+            why: "timed out".to_string(),
+        },
+        objects: Vec::new(),
+        truncated: false,
+    }) {
+        k10s_shell::TableOutcome::Failed(why) => assert_eq!(why, "timed out"),
+        other => panic!("{other:?}"),
+    }
+
+    // Both groups served and simply empty stays an ordinary empty table.
+    match mesh_outcome(MeshInventory {
+        istio: GroupState::Served,
+        linkerd: GroupState::Served,
+        objects: Vec::new(),
+        truncated: false,
+    }) {
+        k10s_shell::TableOutcome::Table(page) => assert!(!page.truncated),
         other => panic!("{other:?}"),
     }
 }

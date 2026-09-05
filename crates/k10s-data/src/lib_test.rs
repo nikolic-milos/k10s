@@ -118,6 +118,85 @@ fn resource_event(event: Option<IngestEvent>) -> ResourceEvent {
     }
 }
 
+fn settle(settled: &mut Settled, kind: KindId, listed: bool) {
+    let mut store = Store::new(Vec::new());
+    let mut desyncs = Vec::new();
+    apply(
+        Message::Settled { kind, listed },
+        &mut store,
+        settled,
+        &mut desyncs,
+        &IngestMetrics::default(),
+    );
+}
+
+#[test]
+fn a_kind_is_caught_up_only_when_every_one_of_its_streams_listed() {
+    let mut settled: Settled = HashMap::new();
+    settle(&mut settled, KindId::POD, true);
+    assert!(
+        !kind_synced(&settled, KindId::POD, 2),
+        "one namespace of two has not answered yet"
+    );
+
+    settle(&mut settled, KindId::POD, false);
+    assert!(
+        !kind_synced(&settled, KindId::POD, 2),
+        "a stream that settled without listing cannot be spoken for by the one that did"
+    );
+
+    let mut both: Settled = HashMap::new();
+    settle(&mut both, KindId::POD, true);
+    settle(&mut both, KindId::POD, true);
+    assert!(kind_synced(&both, KindId::POD, 2));
+    assert!(
+        !kind_synced(&both, KindId::NAMESPACE, 1),
+        "a kind no stream ever settled is not caught up"
+    );
+}
+
+#[test]
+fn deleting_what_the_store_never_held_is_not_a_change() {
+    let mut store = Store::new(Vec::new());
+    store.apply(object(KindId::NAMESPACE, Role::Scope, "ns-1", "prod"));
+    let mut settled: Settled = HashMap::new();
+    let mut desyncs = Vec::new();
+    let metrics = IngestMetrics::default();
+
+    let phantom = apply(
+        Message::Delete {
+            kind: KindId::POD,
+            uid: "never-here".into(),
+        },
+        &mut store,
+        &mut settled,
+        &mut desyncs,
+        &metrics,
+    );
+    assert!(
+        phantom.is_none(),
+        "a delete the store did not hold changes nothing and must not force a reconcile"
+    );
+
+    let real = apply(
+        Message::Delete {
+            kind: KindId::NAMESPACE,
+            uid: "ns-1".into(),
+        },
+        &mut store,
+        &mut settled,
+        &mut desyncs,
+        &metrics,
+    );
+    assert!(matches!(
+        real,
+        Some(Change {
+            op: Op::Deleted,
+            ..
+        })
+    ));
+}
+
 #[test]
 fn a_live_replicaset_is_emitted_only_where_the_sync_gave_it_a_card() {
     let (mut store, mut catalog, assembled) = after_sync(vec![

@@ -7,8 +7,9 @@
 //! speak: everything above the seam -- grid state, input encoding, resize --
 //! is tested against a fake transport in `k10s-shell`, while the kube
 //! implementation below stays thin plumbing, proven only against a live
-//! cluster. Input is bounded by a fixed queue; a session that ends, is
-//! denied, or fails says so through its event callback, never by going
+//! cluster (its cancel contract excepted, which a hanging transport proves
+//! here). Input is bounded by a fixed queue; a session that ends, is denied,
+//! fails, or is dropped says so through its event callback, never by going
 //! silent.
 
 use futures::SinkExt;
@@ -20,10 +21,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::read::{Fetched, classify};
 
 // Keystrokes and resizes waiting for the WebSocket; a full queue drops the
-// oldest-pending writes rather than growing, and a human cannot type past it.
+// write being offered rather than growing or reordering what is already
+// queued, and a human cannot type past it.
 const INPUT_QUEUE: usize = 256;
 // One read's worth of remote output handed to the callback at a time.
 const OUTPUT_CHUNK: usize = 8 * 1024;
+const STOPPED: &str = "stopped";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecRequest {
@@ -112,7 +115,10 @@ impl ExecTransport for KubeExecTransport {
             let mut params = AttachParams::interactive_tty();
             params.container = request.container.clone();
             let attached = tokio::select! {
-                _ = &mut cancel => return,
+                _ = &mut cancel => {
+                    on_event(ExecEvent::Ended { why: STOPPED.to_string() });
+                    return;
+                }
                 attached = api.exec(&request.pod, request.command.clone(), &params) => attached,
             };
             let mut attached = match attached {
@@ -140,7 +146,10 @@ impl ExecTransport for KubeExecTransport {
             let mut buffer = vec![0u8; OUTPUT_CHUNK];
             loop {
                 tokio::select! {
-                    _ = &mut cancel => return,
+                    _ = &mut cancel => {
+                        on_event(ExecEvent::Ended { why: STOPPED.to_string() });
+                        return;
+                    }
                     message = input.recv() => match message {
                         Some(SessionMsg::Bytes(bytes)) => {
                             if stdin.write_all(&bytes).await.is_err() {
@@ -156,8 +165,12 @@ impl ExecTransport for KubeExecTransport {
                                 .await;
                         }
                         // The session handle is gone; its Drop also fired
-                        // cancel, so this arm is belt and braces.
-                        None => return,
+                        // cancel, so this arm is belt and braces and answers
+                        // with the same terminal state that arm would.
+                        None => {
+                            on_event(ExecEvent::Ended { why: STOPPED.to_string() });
+                            return;
+                        }
                     },
                     read = stdout.read(&mut buffer) => match read {
                         Ok(0) => {
@@ -182,5 +195,57 @@ impl ExecTransport for KubeExecTransport {
             input: input_tx,
             cancel: Some(cancel_tx),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transport that accepts the upgrade request and then never answers,
+    /// which is what a real API server holding an exec open looks like from
+    /// here: the only thing that can end it is the caller.
+    fn hanging_client() -> Client {
+        Client::new(
+            tower::service_fn(|_: http::Request<kube::client::Body>| {
+                std::future::pending::<Result<http::Response<kube::client::Body>, tower::BoxError>>(
+                )
+            }),
+            "prod",
+        )
+    }
+
+    fn request() -> ExecRequest {
+        ExecRequest {
+            namespace: "prod".to_string(),
+            pod: "api-1".to_string(),
+            container: None,
+            command: vec!["sh".to_string()],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_session_while_it_is_still_attaching_ends_it_out_loud() {
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let transport = KubeExecTransport::new(hanging_client(), tokio::runtime::Handle::current());
+        let session = transport.start(
+            &request(),
+            Box::new(move |event| {
+                let _ = events.send(event);
+            }),
+        );
+
+        drop(session);
+
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), seen.recv())
+            .await
+            .expect("a cancelled session answers rather than going silent");
+        assert_eq!(
+            ended,
+            Some(ExecEvent::Ended {
+                why: STOPPED.to_string()
+            }),
+            "the terminal state is labelled the same way a stopped log follow is"
+        );
     }
 }

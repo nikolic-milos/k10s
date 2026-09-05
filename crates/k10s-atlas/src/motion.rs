@@ -11,7 +11,7 @@
 //! while [`Step::Moving`] says so, and arriving is a state rather than a
 //! threshold somebody has to test for.
 
-use crate::camera::{Camera, MAX_ZOOM, MIN_ZOOM};
+use crate::camera::Camera;
 
 /// Whether this window may animate at all.
 ///
@@ -97,10 +97,16 @@ impl FlyTo {
     /// Under [`Motion::Reduced`] the duration is zero, so the first step arrives.
     /// Zero rather than absent, because the caller's loop must not have to know
     /// which it is holding.
+    ///
+    /// Both ends are brought inside the zoom range, not just the destination.
+    /// The source is whatever camera the caller was holding, and the zoom lerp
+    /// is logarithmic: a zero or negative source zoom makes `ln` infinite and
+    /// every sample between here and arrival NaN, which is a flight that paints
+    /// nothing and only recovers on the frame it lands.
     pub fn new(from: Camera, to: Camera, motion: Motion) -> FlyTo {
         FlyTo {
-            from,
-            to: clamped(to),
+            from: from.clamped(),
+            to: to.clamped(),
             elapsed: 0.0,
             duration: match motion {
                 Motion::Animate => FLY_SECONDS,
@@ -145,29 +151,29 @@ impl FlyTo {
 
     /// Where the flight is at a normalised time, eased.
     fn at(&self, t: f32) -> Camera {
-        let e = ease_in_out(t);
-        Camera {
-            cx: lerp(self.from.cx, self.to.cx, e),
-            cy: lerp(self.from.cy, self.to.cy, e),
-            // Zoom is a scale factor, so it travels geometrically. Interpolated
-            // linearly, a flight from 0.05 to 24 spends its first half crossing
-            // a hundredth of the zoom range and its second half crossing the
-            // rest, which reads as a lurch at the end rather than as approach.
-            // Halfway through a flight should be halfway through the zoom in the
-            // sense zoom is actually used, which is multiplicative.
-            zoom: (self.from.zoom.ln() + (self.to.zoom.ln() - self.from.zoom.ln()) * e).exp(),
-        }
+        lerp_camera(self.from, self.to, ease_in_out(t))
     }
 }
 
-fn clamped(camera: Camera) -> Camera {
+/// A camera part way from `a` to `b`.
+///
+/// Zoom is a scale factor, so it travels geometrically. Interpolated linearly,
+/// a flight from 0.05 to 24 spends its first half crossing a hundredth of the
+/// zoom range and its second half crossing the rest, which reads as a lurch at
+/// the end rather than as approach. Halfway through a flight should be halfway
+/// through the zoom in the sense zoom is actually used, which is multiplicative.
+///
+/// Both the interactive fly-to and the scripted flight sample cameras this way,
+/// and they share this function rather than each keeping the rule, because a
+/// recording that moved differently from the product would be measuring
+/// something nobody ever sees. Endpoints must already be inside the zoom range
+/// -- see [`Camera::clamped`], which is what makes the logarithm defined.
+#[inline]
+pub(crate) fn lerp_camera(a: Camera, b: Camera, t: f32) -> Camera {
     Camera {
-        zoom: if camera.zoom.is_finite() {
-            camera.zoom.clamp(MIN_ZOOM, MAX_ZOOM)
-        } else {
-            MIN_ZOOM
-        },
-        ..camera
+        cx: lerp(a.cx, b.cx, t),
+        cy: lerp(a.cy, b.cy, t),
+        zoom: (a.zoom.ln() + (b.zoom.ln() - a.zoom.ln()) * t).exp(),
     }
 }
 
@@ -196,6 +202,7 @@ fn ease_in_out(t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera::{MAX_ZOOM, MIN_ZOOM};
 
     fn camera(cx: f32, cy: f32, zoom: f32) -> Camera {
         Camera { cx, cy, zoom }
@@ -339,6 +346,31 @@ mod tests {
             Motion::Animate,
         );
         assert_eq!(under.step(FLY_SECONDS).camera().zoom, MIN_ZOOM);
+    }
+
+    #[test]
+    fn a_flight_that_starts_from_an_impossible_zoom_still_flies() {
+        let to = camera(100.0, 100.0, 4.0);
+        for bad in [0.0, -2.0, f32::NAN, f32::INFINITY, 1e12] {
+            let mut fly = FlyTo::new(camera(0.0, 0.0, bad), to, Motion::Animate);
+            for frame in 0..200 {
+                let step = fly.step(0.016);
+                let at = step.camera();
+                assert!(
+                    at.cx.is_finite() && at.cy.is_finite() && at.zoom.is_finite(),
+                    "a flight from a zoom of {bad} reached {at:?} on frame {frame}"
+                );
+                assert!(
+                    (MIN_ZOOM..=MAX_ZOOM).contains(&at.zoom),
+                    "a flight from a zoom of {bad} left the range at {}",
+                    at.zoom
+                );
+                if !step.owes_a_frame() {
+                    break;
+                }
+            }
+            assert_eq!(fly.step(FLY_SECONDS), Step::Arrived(to));
+        }
     }
 
     #[test]

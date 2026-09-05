@@ -1,0 +1,53 @@
+# Lab fixture only. No controller will evaluate these.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: k10s-hplane-clusterpolicy
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+  - name: k10s-hplane-noop
+    match:
+      any:
+      - resources:
+          kinds: [ConfigMap]
+    validate:
+      message: lab fixture only
+      deny:
+        conditions:
+          any:
+          - key: "{{ request.object.metadata.name }}"
+            operator: Equals
+            value: k10s-hplane-never
+---
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: k10s-hplane-policy
+  namespace: k10s-hplane
+  labels:
+    k10s.dev/hplane-fixture: "true"
+  annotations:
+    k10s.lab/canary: PLANTED-live-canary
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+  - name: k10s-hplane-noop
+    match:
+      any:
+      - resources:
+          kinds: [ConfigMap]
+    validate:
+      message: lab fixture only
+      deny:
+        conditions:
+          any:
+          - key: "{{ request.object.metadata.name }}"
+            operator: Equals
+            value: k10s-hplane-never

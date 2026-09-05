@@ -148,37 +148,46 @@ registry! {
     AIRFLOW        => tool("airflow", "Airflow"),
     ARGO_CD        => tool("argocd", "Argo CD"),
     CASSANDRA      => tool("cassandra", "Cassandra"),
+    CILIUM         => tool("cilium", "Cilium"),
     CLICK_HOUSE    => tool("clickhouse", "ClickHouse"),
     CONSUL         => tool("consul", "Consul"),
     ELASTICSEARCH  => tool("elasticsearch", "Elasticsearch"),
     ENVOY          => tool("envoy", "Envoy"),
     ETCD           => tool("etcd", "etcd"),
+    FALCO          => tool("falco", "Falco"),
     FLUENT_BIT     => tool("fluentbit", "Fluent Bit"),
     FLUENTD        => tool("fluentd", "Fluentd"),
     FLUX           => tool("flux", "Flux"),
     GRAFANA        => tool("grafana", "Grafana"),
     HARBOR         => tool("harbor", "Harbor"),
+    HEADLAMP       => tool("headlamp", "Headlamp"),
     ISTIO          => tool("istio", "Istio"),
     JAEGER         => tool("jaeger", "Jaeger"),
     JENKINS        => tool("jenkins", "Jenkins"),
     KAFKA          => tool("kafka", "Kafka"),
+    KARGO          => tool("kargo", "Kargo"),
     KEYCLOAK       => tool("keycloak", "Keycloak"),
     KIBANA         => tool("kibana", "Kibana"),
     KUBERNETES     => tool("kubernetes", "Kubernetes"),
+    KYVERNO        => tool("kyverno", "Kyverno"),
+    LOKI           => tool("loki", "Loki"),
     MARIA_DB       => tool("mariadb", "MariaDB"),
     MINIO          => tool("minio", "MinIO"),
     MONGO_DB       => tool("mongodb", "MongoDB"),
     MY_SQL         => tool("mysql", "MySQL"),
     NATS           => tool("nats", "NATS"),
     NGINX          => tool("nginx", "nginx"),
+    OPEN_BAO       => tool("openbao", "OpenBao"),
     OPEN_TELEMETRY => tool("opentelemetry", "OpenTelemetry"),
     POSTGRES       => tool("postgres", "PostgreSQL"),
     PROMETHEUS     => tool("prometheus", "Prometheus"),
     RABBIT_MQ      => tool("rabbitmq", "RabbitMQ"),
     REDIS          => tool("redis", "Redis"),
     TEMPORAL       => tool("temporal", "Temporal"),
+    TETRAGON       => tool("tetragon", "Tetragon"),
     TRAEFIK        => tool("traefik", "Traefik"),
     VAULT          => tool("vault", "Vault"),
+    VELERO         => tool("velero", "Velero"),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,7 +432,9 @@ mod tests {
             BUILTIN_TOOLS[ToolId::PROMETHEUS.0 as usize].slug,
             "prometheus"
         );
+        assert_eq!(BUILTIN_TOOLS[ToolId::CILIUM.0 as usize].slug, "cilium");
         assert_eq!(BUILTIN_TOOLS[ToolId::VAULT.0 as usize].slug, "vault");
+        assert_eq!(BUILTIN_TOOLS[ToolId::VELERO.0 as usize].slug, "velero");
         assert_eq!(
             BUILTIN_REASONS[ReasonId::UNKNOWN.0 as usize].slug,
             "unknown"

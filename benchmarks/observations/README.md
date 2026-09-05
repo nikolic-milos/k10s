@@ -1,7 +1,7 @@
 # Recorded observations
 
 Contributed in-app flight runs (`k10s --bench`) from machines the project does not control. These are
-not baselines and nothing here gates anything. The comparator consumes the seven headless suite JSON
+not baselines and nothing here gates anything. The comparator consumes the nine headless suite JSON
 files described in [the baseline README](../README.md); none of those are in this directory.
 
 The flight harness pins a letterboxed logical viewport of 1600×1000 (`FLIGHT_VIEWPORT`) for planning
@@ -76,6 +76,6 @@ they predate schema v4 provenance and were not collected under `--churn 0`.
 - `proc_cpu_ms` returned `0.0` on every non-Linux target; it is now `Option` / `n/a` when unmeasurable
   (`crates/k10s-atlas/src/flight.rs`).
 - `--machine` accepted a placeholder, and neither the machine nor the churn setting was stamped into
-  the output; `--bench` now requires a usable `--machine`, schema v4 stamps both, and the idle line
-  names the churn it ran under.
+  the output; `--bench` now requires a usable `--machine`, the report stamps both (from schema v4
+  onward), and the idle line names the churn it ran under.
 - The idle line reported paints without naming the churn value it ran under.

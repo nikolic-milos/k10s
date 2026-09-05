@@ -14,6 +14,12 @@ name = "k10s"
 path = "src/main.rs"
 
 [dependencies]
+# The global allocator. Construction, not paint, is the dominant large-scene
+# cost, and construction is many small allocations across threads, the case
+# glibc's allocator serves worst. Measured with the startup bench on the
+# labelled host: the million-object scene's content phase 184.9 to 121.9 ms
+# and its first useful frame 295.4 to 225.2 ms. Two packages, budgeted.
+mimalloc = "0.1"
 k10s-core.workspace = true
 k10s-clustergen.workspace = true
 k10s-data.workspace = true

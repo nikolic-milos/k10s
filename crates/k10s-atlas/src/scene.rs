@@ -160,6 +160,14 @@ pub struct EdgeSegment {
 }
 
 impl EdgeSegment {
+    /// The segment's box, never thinner than one world unit on either axis.
+    ///
+    /// A horizontal or vertical edge has a degenerate box, and a degenerate box
+    /// intersects nothing -- the line would vanish from the very index built to
+    /// find it. `cull::edge_visible` fattens the same way when it tests an edge
+    /// against the viewport, and the two must keep agreeing: an index whose
+    /// boxes are thinner than the visibility test's would hand the walk edges it
+    /// then drops, and a fatter one would hide edges that are on screen.
     pub fn bounds(self) -> Rect {
         Rect::new(
             self.a.0.min(self.b.0),

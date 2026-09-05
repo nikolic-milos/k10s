@@ -36,6 +36,7 @@ pub(crate) fn viewport() -> Bounds<Pixels> {
 
 fn scene(cell_label: &str) -> SceneSnapshot {
     SceneSnapshot {
+        identity_rev: 1,
         ids: Default::default(),
         scene: SceneData {
             rev: 1,
@@ -112,7 +113,9 @@ impl FrameSink for Collect {
 
 pub(crate) fn icon_bounds(job: &IconJob) -> Bounds<Pixels> {
     match job {
-        IconJob::Wl(_, bounds) | IconJob::ToolId(_, bounds) | IconJob::Sat(_, bounds) => *bounds,
+        IconJob::Wl(_, primitive) | IconJob::ToolId(_, primitive) | IconJob::Sat(_, primitive) => {
+            primitive.bounds
+        }
     }
 }
 

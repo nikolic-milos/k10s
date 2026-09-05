@@ -3,6 +3,13 @@ use k10s_core::Rect;
 use k10s_core::layout::*;
 use rustc_hash::FxHashMap as HashMap;
 
+/// Spread: island scatter with satellite rings. Dense: shelf pack, no sats.
+///
+/// Node and Zone packing are not variants. `Payload::Instance` and
+/// `PreparedPod` carry only `state`; `mapping::stage_pod` keeps labels and
+/// volume refs, not `spec.nodeName`. Adding a layout that packed by node
+/// would either invent positions or churn every exhaustive match that the
+/// committed fingerprints pin. Filter a published snapshot instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
     Spread,

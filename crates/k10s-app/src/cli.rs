@@ -27,6 +27,7 @@ shared options:
   --startup-bench                         exit after the first useful presented frame
                                           (needs --machine)
   --json                                  benchmark report as JSON on stdout
+  --attribution                           print CC BY icon notices and exit
   -h, --help                              print this message
 
 unrecognized arguments are reported on stderr and ignored";
@@ -71,6 +72,7 @@ pub struct Args {
     pub startup_bench: bool,
     pub json: bool,
     pub help: bool,
+    pub attribution: bool,
     pub cluster: bool,
     pub churn_explicit: bool,
     pub objects_explicit: bool,
@@ -97,6 +99,7 @@ impl Default for Args {
             startup_bench: false,
             json: false,
             help: false,
+            attribution: false,
             cluster: false,
             churn_explicit: false,
             objects_explicit: false,
@@ -293,10 +296,10 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
             }
             "--machine" => args.machine = Some(value("--machine", inline, &mut rest)?),
             "--cluster" => args.cluster = true,
-            "--context" => args.context = Some(value("--context", inline, &mut rest)?),
+            "--context" => args.context = Some(named("--context", inline, &mut rest)?),
             "--namespace" => args
                 .namespaces
-                .push(value("--namespace", inline, &mut rest)?),
+                .push(named("--namespace", inline, &mut rest)?),
             "--sync-timeout" => {
                 args.sync_timeout_secs = bounded(
                     "--sync-timeout",
@@ -311,12 +314,13 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
             "--bench" => args.bench = true,
             "--startup-bench" => args.startup_bench = true,
             "--json" => args.json = true,
+            "--attribution" => args.attribution = true,
             "--help" | "-h" => args.help = true,
             other => args.ignored.push(other.to_string()),
         }
     }
 
-    if args.help {
+    if args.help || args.attribution {
         return Ok(args);
     }
     if args.bench && args.startup_bench {
@@ -366,6 +370,26 @@ fn value(
         Some(inline) => Ok(inline.to_string()),
         None => rest.next().ok_or(ArgError::MissingValue { flag }),
     }
+}
+
+// A name of something in a cluster. An empty one is what an unset shell
+// variable expands to, and passing it on would probe a namespace that cannot
+// exist or ask for a context nobody named -- an answer that looks like a
+// cluster's rather than the command line's.
+fn named(
+    flag: &'static str,
+    inline: Option<&str>,
+    rest: &mut impl Iterator<Item = String>,
+) -> Result<String, ArgError> {
+    let got = value(flag, inline, rest)?;
+    if got.trim().is_empty() {
+        return Err(ArgError::BadValue {
+            flag,
+            expected: "a name".to_string(),
+            got: format!("{got:?}"),
+        });
+    }
+    Ok(got)
 }
 
 fn number<T: std::str::FromStr>(

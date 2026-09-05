@@ -3,10 +3,18 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hyper_timeout::TimeoutConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use kube::client::AuthError;
 use kube::client::oidc_errors::{Error as OidcError, IdTokenError, RefreshError};
+use kube::client::retry::RetryPolicy;
+use kube::client::{Body, ClientBuilder, ConfigExt, DynBody};
 use kube::config::{KubeConfigOptions, Kubeconfig, KubeconfigError};
 use kube::{Client, Config};
+use tower::{BoxError, ServiceBuilder, ServiceExt as _};
+use tower_http::ServiceExt as _;
+use tower_http::decompression::DecompressionLayer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -268,18 +276,83 @@ pub fn resolve_context(cfg: &Kubeconfig, requested: Option<&str>) -> Result<Stri
 
 const CREDENTIAL_SKEW_SECS: i64 = 30;
 
-pub fn credential_is_fresh(expires_at: Option<i64>, now_secs: i64) -> bool {
-    match expires_at {
-        None => true,
-        Some(deadline) => now_secs + CREDENTIAL_SKEW_SECS < deadline,
+/// The kube client, assembled here rather than by `Client::try_from`.
+///
+/// kube 4.2 builds its hyper client behind a private function, and the
+/// connector it builds speaks HTTP/1.1 with TCP_NODELAY left off, hyper-util's
+/// default. Measured on the labelled host against a local k3s on 2026-09-04:
+/// the RBAC probe's 24 concurrent POSTs cost a flat 44 ms because Nagle held
+/// each request body until the previous segment was acknowledged and Linux
+/// delayed that acknowledgement by 40 ms; with the option on, 7 to 11 ms, and
+/// three of eight cold starts finished the whole data plane in 19 ms. So the
+/// same public layers kube itself stacks are stacked here in the same order,
+/// with the one connector line kube does not offer. Two configs keep kube's
+/// own path. A proxied one, because its tunnelling is not worth reproducing
+/// for a rare case and a proxy hop makes the loopback stall this fixes
+/// irrelevant anyway. And one that runs an exec plugin, because the expiry of
+/// the identity that plugin hands back is computed behind a method kube does
+/// not export, and `Connector` reconnects on exactly that expiry; a client
+/// that never reported one would sit on a dead certificate.
+fn client_from(config: Config) -> Result<Client, kube::Error> {
+    if config.proxy_url.is_some() || config.auth_info.exec.is_some() {
+        return Client::try_from(config);
+    }
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
+    let https = config.rustls_https_connector_with_connector(http)?;
+    let mut connector = TimeoutConnector::new(https);
+    connector.set_connect_timeout(config.connect_timeout);
+    connector.set_read_timeout(config.read_timeout);
+    connector.set_write_timeout(config.write_timeout);
+    let transport: hyper_util::client::legacy::Client<_, Body> =
+        hyper_util::client::legacy::Builder::new(TokioExecutor::new()).build(connector);
+
+    let stack = ServiceBuilder::new()
+        .layer(config.base_uri_layer())
+        .layer(
+            DecompressionLayer::new()
+                .no_br()
+                .no_deflate()
+                .no_zstd()
+                .gzip(!config.disable_compression),
+        )
+        .into_inner();
+    let service = ServiceBuilder::new()
+        .layer(stack)
+        .option_layer(
+            config
+                .default_retry
+                .then_some(tower::retry::RetryLayer::new(RetryPolicy::server_retry())),
+        )
+        .option_layer(config.auth_layer()?)
+        .layer(config.extra_headers_layer()?)
+        .map_err(BoxError::from)
+        .service(transport);
+    Ok(ClientBuilder::new(
+        service
+            .map_response_body(|body| {
+                Box::new(http_body_util::BodyExt::map_err(body, BoxError::from)) as Box<DynBody>
+            })
+            .boxed(),
+        config.default_namespace,
+    )
+    .build())
+}
+
+pub fn credential_is_fresh(expires_at: Option<i64>, now_secs: Option<i64>) -> bool {
+    match (expires_at, now_secs) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(deadline), Some(now)) => now + CREDENTIAL_SKEW_SECS < deadline,
     }
 }
 
-fn now_secs() -> i64 {
+fn now_secs() -> Option<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
+        .ok()
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[derive(Clone)]
@@ -405,7 +478,7 @@ impl Connector {
         let config = self.config_for(resolved.as_deref()).await?;
         let cluster_url = config.cluster_url.to_string();
         let default_namespace = config.default_namespace.clone();
-        let client = Client::try_from(config)
+        let client = client_from(config)
             .map_err(|e| ConnectError::Client(describe(&e as &dyn std::error::Error)))?;
         let expires_at = client.valid_until().as_ref().map(|t| t.as_second());
         let connection = Connection {

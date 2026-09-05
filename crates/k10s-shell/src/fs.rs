@@ -21,8 +21,10 @@
 //! truncate-then-write. Only what a rename genuinely cannot carry falls back to
 //! writing in place: a hard-linked file, or attributes that could not be read.
 //! A destination that is not a regular file is refused rather than truncated or
-//! blocked on. Both paths flush the file, and the rename path flushes the
-//! directory entry, before reporting success. The replacement is created with
+//! blocked on. Both paths flush the file before reporting success, and the
+//! rename path then asks for the directory entry too -- best effort, because
+//! the file is already in place by then and a directory that will not open or
+//! will not sync is not a save that failed. The replacement is created with
 //! the destination's permissions rather than chmodded afterwards, because a
 //! 0600 kubeconfig whose temp file is briefly 0644 has already leaked. Temp
 //! names carry a process-unique ticket and do not embed the target's name,
@@ -373,7 +375,10 @@ fn rename_into_place(
         return Err(error);
     }
     // The rename is only durable once the directory entry is, and a manifest
-    // that survives the process but not the machine is not saved.
+    // that survives the process but not the machine is not saved. Asked for
+    // rather than required: the file is in place by now, so a directory this
+    // process cannot open or a filesystem that will not sync one is not a
+    // reason to tell the editor its save failed.
     let directory = parent_of(target).unwrap_or(Path::new("."));
     if let Ok(handle) = std::fs::File::open(directory) {
         let _ = handle.sync_all();
@@ -424,13 +429,23 @@ fn write_temp(
     file.sync_all()
 }
 
-// The process umask, read without changing it: `umask` has no getter, so the
-// value is sampled once and remembered.
+// The process umask, sampled once and remembered. `umask` has no getter, and
+// the way around that -- set it to zero and set it back -- is a process-wide
+// window in which every other thread's `open` and `creat` inherits mask 0, so
+// the kernel is asked instead wherever it will answer. Only a system with no
+// such answer pays the poke.
 #[cfg(unix)]
 fn current_umask() -> u32 {
     use std::sync::OnceLock;
     static UMASK: OnceLock<u32> = OnceLock::new();
     *UMASK.get_or_init(|| {
+        if let Some(mask) = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .as_deref()
+            .and_then(umask_in_status)
+        {
+            return mask;
+        }
         let mode = rustix::process::umask(rustix::fs::Mode::empty());
         rustix::process::umask(mode);
         // `RawMode` is u32 on Linux and u16 on Apple and the BSDs; widen it
@@ -438,6 +453,17 @@ fn current_umask() -> u32 {
         #[allow(clippy::useless_conversion)]
         u32::from(mode.bits())
     })
+}
+
+// The `Umask:` line of a Linux process status, which is octal. Anything else
+// is a kernel that does not publish it, and answers nothing rather than a mask
+// that would silently open up every file this process creates.
+#[cfg(unix)]
+fn umask_in_status(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Umask:"))
+        .and_then(|mask| u32::from_str_radix(mask.trim(), 8).ok())
 }
 
 #[cfg(any(test, feature = "test-support"))]

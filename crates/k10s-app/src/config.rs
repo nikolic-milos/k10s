@@ -6,6 +6,10 @@
 //! and publish what they say -- settings, theme resolved against the window's
 //! current appearance, and key bindings with their derived suppressors -- as
 //! the app globals every view reads.
+//!
+//! A file that is not there is an answer: it means defaults. A file that is
+//! there and will not read is not, so a poll that hits one keeps whatever is
+//! already applied rather than publishing an empty document over it.
 
 #[derive(Clone)]
 pub(crate) struct ConfigFiles {
@@ -22,6 +26,10 @@ pub(crate) struct ConfigText {
     // from, and sorted so two files that both define a name resolve the same
     // way on every start.
     themes: Vec<(String, String)>,
+    // The files that exist and would not read. A missing file is an answer --
+    // it means defaults -- but a permission error is not, and applying it as an
+    // empty document would silently reset a running session's theme and keymap.
+    unreadable: Vec<String>,
 }
 
 impl ConfigFiles {
@@ -63,24 +71,32 @@ impl ConfigFiles {
     }
 
     pub(crate) fn read(&self) -> ConfigText {
-        let read = |path: &Option<std::path::PathBuf>| {
-            path.as_ref()
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .unwrap_or_default()
+        let mut unreadable = Vec::new();
+        let mut read = |path: &Option<std::path::PathBuf>| match path {
+            Some(path) => read_text(path, &mut unreadable).unwrap_or_default(),
+            None => String::new(),
         };
+        let settings = read(&self.settings);
+        let keymap = read(&self.keymap);
+        let themes = self.read_themes(&mut unreadable);
         ConfigText {
-            settings: read(&self.settings),
-            keymap: read(&self.keymap),
-            themes: self.read_themes(),
+            settings,
+            keymap,
+            themes,
+            unreadable,
         }
     }
 
-    fn read_themes(&self) -> Vec<(String, String)> {
+    fn read_themes(&self, unreadable: &mut Vec<String>) -> Vec<(String, String)> {
         let Some(dir) = &self.themes else {
             return Vec::new();
         };
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                note_unreadable(dir, &error, unreadable);
+                return Vec::new();
+            }
         };
         let mut files: Vec<(String, String)> = entries
             .flatten()
@@ -90,9 +106,7 @@ impl ConfigFiles {
             })
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                std::fs::read_to_string(entry.path())
-                    .ok()
-                    .map(|text| (name, text))
+                read_text(&entry.path(), unreadable).map(|text| (name, text))
             })
             .collect();
         files.sort();
@@ -101,6 +115,25 @@ impl ConfigFiles {
 
     fn watchable(&self) -> bool {
         self.settings.is_some() || self.keymap.is_some() || self.themes.is_some()
+    }
+}
+
+// A file that is not there means defaults; anything else that stops a read is
+// reported, so the poller can keep what it already applied.
+fn read_text(path: &std::path::Path, unreadable: &mut Vec<String>) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            note_unreadable(path, &error, unreadable);
+            None
+        }
+    }
+}
+
+fn note_unreadable(path: &std::path::Path, error: &std::io::Error, unreadable: &mut Vec<String>) {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        unreadable.push(format!("{}: {error}", path.display()));
     }
 }
 
@@ -120,6 +153,9 @@ fn appearance(cx: &gpui::App) -> k10s_theme::Appearance {
 }
 
 pub(crate) fn apply_config(text: &ConfigText, cx: &mut gpui::App) {
+    for path in &text.unreadable {
+        eprintln!("k10s: cannot read {path}; its defaults are used instead");
+    }
     let mut registry = k10s_theme::ThemeRegistry::builtin();
     for (file, body) in &text.themes {
         let loaded = k10s_theme::parse_family(body);
@@ -215,6 +251,7 @@ pub(crate) fn watch_config(config: ConfigFiles, mut last: ConfigText, cx: &mut g
     }
     let background = cx.background_executor().clone();
     cx.spawn(async move |cx| {
+        let mut warned = false;
         loop {
             background.timer(std::time::Duration::from_secs(2)).await;
             // File I/O never belongs on GPUI's foreground executor. Reading
@@ -223,6 +260,23 @@ pub(crate) fn watch_config(config: ConfigFiles, mut last: ConfigText, cx: &mut g
             // visible frame hitch.
             let reader = config.clone();
             let now = background.spawn(async move { reader.read() }).await;
+            // A file that stopped being readable is not a file that was
+            // deleted. Reloading it as an empty document would reset the theme,
+            // the keymap and reduced motion under a session that changed
+            // nothing, so what is already applied stays applied and the reason
+            // is said once rather than every two seconds.
+            if !now.unreadable.is_empty() {
+                if !warned {
+                    for path in &now.unreadable {
+                        eprintln!(
+                            "k10s: cannot read {path}; keeping the configuration already loaded"
+                        );
+                    }
+                    warned = true;
+                }
+                continue;
+            }
+            warned = false;
             if now != last {
                 cx.update(|cx| {
                     apply_config(&now, cx);

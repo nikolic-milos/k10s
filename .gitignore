@@ -1,7 +1,12 @@
 /target
 /.tmp
-# The designer handoff: the rules PDF, the 2000px logo originals and the upstream
-# font packages. What the product actually ships is vendored, downscaled and
-# licence-carrying under crates/k10s-assets/assets/, so nothing here is needed to
-# build -- and none of it belongs in a clone.
 /ui
+kubeconfig
+kubeconfig-*
+*.kubeconfig
+.env
+.env.*
+*.pem
+*.key
+/AGENTS.md
+*.pristine

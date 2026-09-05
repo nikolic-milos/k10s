@@ -307,11 +307,7 @@ impl TextState {
 // "2026-08-02T05:00:01Z ready" -> "ready", but only when the head actually
 // looks like the timestamp the kubelet prepends.
 pub fn strip_timestamp(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    if bytes.len() > 11
-        && bytes[..4].iter().all(u8::is_ascii_digit)
-        && bytes[4] == b'-'
-        && bytes[10] == b'T'
+    if kubelet_stamped(line.as_bytes())
         && let Some(space) = line.find(' ')
     {
         return &line[space + 1..];
@@ -319,12 +315,26 @@ pub fn strip_timestamp(line: &str) -> &str {
     line
 }
 
+/// The whole `YYYY-MM-DDThh:mm:ss` head, not its first three characters: what
+/// gets thrown away here is the start of a log line, and a line that merely
+/// begins with four digits and a dash is not a stamped one.
+fn kubelet_stamped(bytes: &[u8]) -> bool {
+    bytes.len() > 19
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[10] == b'T'
+        && bytes[11..13].iter().all(u8::is_ascii_digit)
+        && bytes[13] == b':'
+        && bytes[14..16].iter().all(u8::is_ascii_digit)
+        && bytes[16] == b':'
+        && bytes[17..19].iter().all(u8::is_ascii_digit)
+}
+
 enum Source {
     Doc(DescribeRequest),
-    // Helm's stored releases. A document rather than a list view because that is
-    // what it is: an inventory with a history under each entry, read-only, with
-    // the same scrolling and regex search every other document here has.
-    Releases,
     Logs(LogSource),
 }
 
@@ -370,24 +380,6 @@ impl TextView {
             title: format!("describe {}", request.name).into(),
             state: TextState::new(usize::MAX),
             source: Source::Doc(request),
-            status: Some("loading...".to_string()),
-            searching: false,
-            input: String::new(),
-            show_timestamps: true,
-            generation: 0,
-            viewport: Viewport::default(),
-        };
-        view.reload(cx);
-        view
-    }
-
-    pub fn releases(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> TextView {
-        let mut view = TextView {
-            focus: cx.focus_handle(),
-            provider,
-            title: "helm releases".into(),
-            state: TextState::new(usize::MAX),
-            source: Source::Releases,
             status: Some("loading...".to_string()),
             searching: false,
             input: String::new(),
@@ -470,9 +462,8 @@ impl TextView {
         self.focus.clone()
     }
 
-    // Both documents this view can hold arrive the same way and are shown the
-    // same way; only the question differs, which is why the two live in one
-    // branch rather than in two copies of the spawn below.
+    // Documents this view holds arrive the same way and are shown the
+    // same way; only the question differs.
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
@@ -482,7 +473,6 @@ impl TextView {
         });
         match &self.source {
             Source::Doc(request) => self.provider.fetch_describe(request, reply),
-            Source::Releases => self.provider.fetch_releases(reply),
             Source::Logs(_) => {
                 self.start_follow(cx);
                 return;

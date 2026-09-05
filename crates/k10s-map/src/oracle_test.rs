@@ -86,7 +86,9 @@ impl FrameSink for Tally {
     fn icon(&mut self, icon: IconJob) {
         self.icons += 1;
         let b = match icon {
-            IconJob::Wl(_, b) | IconJob::ToolId(_, b) | IconJob::Sat(_, b) => b,
+            IconJob::Wl(_, primitive)
+            | IconJob::ToolId(_, primitive)
+            | IconJob::Sat(_, primitive) => primitive.bounds,
         };
         self.place(f32::from(b.origin.x), f32::from(b.origin.y));
     }
@@ -157,6 +159,7 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
     ];
 
     SceneSnapshot {
+        identity_rev: 1,
         ids: Default::default(),
         scene: SceneData {
             card_header: 26.0,

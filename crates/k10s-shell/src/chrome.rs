@@ -9,36 +9,34 @@
 //! window; this module only knows how to draw each one.
 
 use gpui::{
-    App, ClickEvent, Context, Decorations, DragMoveEvent, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Render, Role, SharedString, Styled, Window, div,
-    img, prelude::*, px, rgb, svg,
+    App, AppContext as _, ClickEvent, Context, Decorations, DragMoveEvent, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, Role,
+    SharedString, Styled, Window, div, img, prelude::*, px, rgb, svg,
 };
 
 use k10s_core::Level;
 use k10s_theme::{Theme, Typography};
 
-use crate::dock::Dock;
+use crate::dock::{self, Dock};
 use crate::hosting::Tab;
-use crate::provider::Detail;
+use crate::provider::{
+    Bytes, Detail, Millicores, PostureOutcome, UsageOutcome, UsageSample, UsageSource,
+};
 use crate::selection::Selection;
 use crate::settings;
 use crate::ui::{
-    self, DockSizes, MAX_DOCK_SIZE, MIN_DOCK_SIZE, MODAL_TOP, RESIZE_HANDLE_SIZE,
-    STATUS_BAR_HEIGHT, TAB_HEIGHT, TITLE_MARK_SIZE, brand_mark, icon_button, panel_header,
-    title_bar_height,
+    self, ACTIVITY_BAR_WIDTH, DockSizes, MODAL_TOP, RESIZE_HANDLE_SIZE, TAB_HEIGHT,
+    TITLE_MARK_SIZE, brand_mark, icon_button, panel_header, rail_button, title_bar_height,
 };
 use crate::workspace::Workspace;
 use crate::{
-    ChooseCluster, OpenBrowser, OpenForwards, OpenNodes, OpenPalette, OpenReleases, Quit,
-    ToggleBottomDock, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    ChooseCluster, FindCluster, LoadSavedView, OpenArgo, OpenBrowser, OpenDay2, OpenEcosystem,
+    OpenFlux, OpenForwards, OpenHarbor, OpenMesh, OpenNodes, OpenObserve, OpenPalette, OpenPolicy,
+    OpenReleases, OpenSettings, OpenTraces, Quit, ToggleBottomDock, ToggleInspector,
+    ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
 
-#[derive(Clone, Copy)]
-pub(crate) enum DockEdge {
-    Left,
-    Right,
-    Bottom,
-}
+pub(crate) use crate::dock::DockEdge;
 
 #[derive(Clone)]
 pub(crate) struct DraggedDockResize(pub(crate) DockEdge);
@@ -119,6 +117,12 @@ impl Workspace {
                 if !selection.uid.is_empty() {
                     body = body.child(Self::row(theme, &fonts, "UID", selection.uid.to_string()));
                 }
+                if selection.usage_target().is_some() {
+                    body = body.child(Self::usage_section(theme, &fonts, self.usage.as_ref()));
+                }
+                if selection.level == Level::Cell {
+                    body = body.child(Self::posture_section(theme, &fonts, self.posture.as_ref()));
+                }
                 body = body.child(Self::detail_section(
                     theme,
                     &fonts,
@@ -131,7 +135,7 @@ impl Workspace {
                         rows.iter()
                             .map(|row| {
                                 format!(
-                                    "{} x{} {} — {}",
+                                    "{} x{} {} · {}",
                                     row.kind, row.count, row.reason, row.message
                                 )
                             })
@@ -145,10 +149,12 @@ impl Workspace {
                         "Log tail",
                         self.log.as_ref(),
                         |detail| {
-                            let Detail::Log(lines) = detail else {
+                            let Detail::Log(lines, note) = detail else {
                                 return Vec::new();
                             };
-                            lines.iter().rev().take(12).rev().cloned().collect()
+                            let mut rows: Vec<String> = note.iter().cloned().collect();
+                            rows.extend(lines.iter().rev().take(12).rev().cloned());
+                            rows
                         },
                     ));
                 }
@@ -240,6 +246,105 @@ impl Workspace {
         section
     }
 
+    // The usage panel's labelled states, in `detail_section`'s manner but
+    // over its own outcome: absence renders muted like loading -- it is a
+    // fact about the cluster, not an alarm -- while a denial or a failure
+    // keeps the text colour a person reads first.
+    pub(crate) fn usage_section(
+        theme: &Theme,
+        fonts: &Typography,
+        usage: Option<&UsageOutcome>,
+    ) -> impl IntoElement {
+        let section = div().flex().flex_col().gap(px(4.0)).child(
+            div()
+                .text_size(px(fonts.small()))
+                .text_color(rgb(theme.shell.text_muted))
+                .child("Usage"),
+        );
+        let muted = |section: gpui::Div, text: String| {
+            section.child(
+                div()
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text_muted))
+                    .child(text),
+            )
+        };
+        let plain = |section: gpui::Div, text: String| {
+            section.child(
+                div()
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text))
+                    .child(text),
+            )
+        };
+        match usage {
+            None => muted(section, "Loading…".to_string()),
+            Some(UsageOutcome::Denied(what)) => {
+                plain(section, format!("{what}: access denied for this account"))
+            }
+            Some(UsageOutcome::Failed(why)) => plain(section, why.clone()),
+            Some(UsageOutcome::Absent(why)) => muted(section, why.clone()),
+            Some(UsageOutcome::Usage(sample)) => {
+                section.children(usage_lines(sample).into_iter().map(|line| {
+                    div()
+                        .text_size(px(fonts.small()))
+                        .line_height(px(18.0))
+                        .text_color(rgb(theme.shell.text))
+                        .child(line)
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn posture_section(
+        theme: &Theme,
+        fonts: &Typography,
+        posture: Option<&PostureOutcome>,
+    ) -> impl IntoElement {
+        let section = div().flex().flex_col().gap(px(4.0)).child(
+            div()
+                .text_size(px(fonts.small()))
+                .text_color(rgb(theme.shell.text_muted))
+                .child("Network policy"),
+        );
+        let muted = |section: gpui::Div, text: String| {
+            section.child(
+                div()
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text_muted))
+                    .child(text),
+            )
+        };
+        let plain = |section: gpui::Div, text: String| {
+            section.child(
+                div()
+                    .text_size(px(fonts.small()))
+                    .text_color(rgb(theme.shell.text))
+                    .child(text),
+            )
+        };
+        match posture {
+            None => muted(section, "Loading…".to_string()),
+            Some(PostureOutcome::Denied(what)) => {
+                plain(section, format!("{what}: access denied for this account"))
+            }
+            Some(PostureOutcome::Failed(why)) => plain(section, why.clone()),
+            Some(PostureOutcome::Missing) => muted(
+                section,
+                "this pod was not in the policy inventory".to_string(),
+            ),
+            Some(PostureOutcome::Ready(view)) => {
+                section.children(posture_lines(view).into_iter().map(|line| {
+                    div()
+                        .text_size(px(fonts.small()))
+                        .line_height(px(18.0))
+                        .text_color(rgb(theme.shell.text))
+                        .child(line)
+                }))
+            }
+        }
+    }
+
     pub(crate) fn status_line(&self) -> String {
         status_line(Status {
             connected: self.connected,
@@ -285,26 +390,95 @@ impl Workspace {
             )
     }
 
-    // Zed's dock toggle button: the panel's own icon, lit while its dock is
-    // showing it, tooltip carrying the action's live keybinding, and the
-    // click dispatching the same action the key would.
-    pub(crate) fn panel_button<A: gpui::Action + Clone>(
-        id: &'static str,
-        icon: &'static str,
-        label: &'static str,
+    pub(crate) fn activity_rail(&self, theme: &Theme) -> impl IntoElement {
+        use crate::activity::{ACTIVITIES, ActivityGroup, lit};
+        let state = self.rail_state();
+        let mut primary = Vec::new();
+        let mut trailing = Vec::new();
+        for slot in ACTIVITIES {
+            let button = Self::activity_button(*slot, lit(slot.id, state), theme);
+            match slot.group {
+                ActivityGroup::Primary => primary.push(button),
+                ActivityGroup::Trailing => trailing.push(button),
+            }
+        }
+        div()
+            .id("activity-rail")
+            .w(px(ACTIVITY_BAR_WIDTH))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_center()
+            .py(px(6.0))
+            .gap(px(4.0))
+            .bg(rgb(theme.shell.surface_background))
+            .border_r_1()
+            .border_color(rgb(theme.shell.border))
+            .role(Role::Toolbar)
+            .aria_label("Activity bar")
+            .children(primary)
+            .child(div().flex_1())
+            .children(trailing)
+    }
+
+    fn activity_button(
+        slot: crate::activity::Activity,
         active: bool,
-        action: A,
         theme: &Theme,
-    ) -> impl IntoElement {
-        let tooltip_action = action.clone();
-        icon_button(id, icon, label, active, theme)
-            .on_click(move |_, window, cx| {
-                window.dispatch_action(Box::new(action.clone()), cx);
+    ) -> gpui::AnyElement {
+        use crate::ShowStarmap;
+        use crate::activity::ActivityId;
+        let id = slot.id;
+        let label = slot.label;
+        rail_button(slot.element_id, slot.icon, label, active, theme)
+            .on_click(move |_, window, cx| match id {
+                ActivityId::Starmap => window.dispatch_action(Box::new(ShowStarmap), cx),
+                ActivityId::Resources => window.dispatch_action(Box::new(OpenBrowser), cx),
+                ActivityId::Nodes => window.dispatch_action(Box::new(OpenNodes), cx),
+                ActivityId::Find => window.dispatch_action(Box::new(FindCluster), cx),
+                ActivityId::Releases => window.dispatch_action(Box::new(OpenReleases), cx),
+                ActivityId::Argo => window.dispatch_action(Box::new(OpenArgo), cx),
+                ActivityId::Flux => window.dispatch_action(Box::new(OpenFlux), cx),
+                ActivityId::Day2 => window.dispatch_action(Box::new(OpenDay2), cx),
+                ActivityId::Observe => window.dispatch_action(Box::new(OpenObserve), cx),
+                ActivityId::Policy => window.dispatch_action(Box::new(OpenPolicy), cx),
+                ActivityId::Ecosystem => window.dispatch_action(Box::new(OpenEcosystem), cx),
+                ActivityId::Forwards => window.dispatch_action(Box::new(OpenForwards), cx),
+                ActivityId::Terminal => window.dispatch_action(Box::new(ToggleTerminal), cx),
+                ActivityId::Inspector => window.dispatch_action(Box::new(ToggleInspector), cx),
+                ActivityId::Settings => window.dispatch_action(Box::new(OpenSettings), cx),
             })
             .tooltip(move |window, cx| {
-                let tooltip = ui::Tooltip::with_binding(label, &tooltip_action, window);
+                let tooltip = match id {
+                    ActivityId::Starmap => ui::Tooltip {
+                        label: label.into(),
+                        key: None,
+                    },
+                    ActivityId::Resources => ui::Tooltip::with_binding(label, &OpenBrowser, window),
+                    ActivityId::Nodes => ui::Tooltip::with_binding(label, &OpenNodes, window),
+                    ActivityId::Find => ui::Tooltip::with_binding(label, &FindCluster, window),
+                    ActivityId::Releases => ui::Tooltip::with_binding(label, &OpenReleases, window),
+                    ActivityId::Argo => ui::Tooltip::with_binding(label, &OpenArgo, window),
+                    ActivityId::Flux => ui::Tooltip::with_binding(label, &OpenFlux, window),
+                    ActivityId::Day2 => ui::Tooltip::with_binding(label, &OpenDay2, window),
+                    ActivityId::Observe => ui::Tooltip::with_binding(label, &OpenObserve, window),
+                    ActivityId::Policy => ui::Tooltip::with_binding(label, &OpenPolicy, window),
+                    ActivityId::Ecosystem => {
+                        ui::Tooltip::with_binding(label, &OpenEcosystem, window)
+                    }
+                    ActivityId::Forwards => ui::Tooltip::with_binding(label, &OpenForwards, window),
+                    ActivityId::Terminal => {
+                        ui::Tooltip::with_binding(label, &ToggleTerminal, window)
+                    }
+                    ActivityId::Inspector => {
+                        ui::Tooltip::with_binding(label, &ToggleInspector, window)
+                    }
+                    ActivityId::Settings => ui::Tooltip::with_binding(label, &OpenSettings, window),
+                };
                 cx.new(move |_| tooltip).into()
             })
+            .into_any_element()
     }
 
     /// The sentence the title bar's state dot is about.
@@ -330,14 +504,12 @@ impl Workspace {
     }
 
     pub(crate) fn requested_dock_sizes(&self, cx: &App) -> DockSizes {
-        self.dock_size_override.unwrap_or_else(|| {
-            let settings = settings::active(cx);
-            DockSizes {
-                left: settings.left_dock_width,
-                right: settings.right_dock_width,
-                bottom: settings.bottom_dock_height,
-            }
-        })
+        let settings = settings::active(cx);
+        DockSizes {
+            left: settings.left_dock_width,
+            right: settings.right_dock_width,
+            bottom: settings.bottom_dock_height,
+        }
     }
 
     pub(crate) fn resize_dock(
@@ -345,15 +517,18 @@ impl Workspace {
         event: &DragMoveEvent<DraggedDockResize>,
         cx: &mut Context<Self>,
     ) {
-        let sizes = dragged_dock_sizes(
+        let edge = event.drag(cx).0;
+        let sizes = dock::dragged_dock_sizes(
             self.requested_dock_sizes(cx),
-            event.drag(cx).0,
+            edge,
             f32::from(event.event.position.x),
             f32::from(event.event.position.y),
             self.viewport,
         );
-        if self.dock_size_override != Some(sizes) {
-            self.dock_size_override = Some(sizes);
+        let mut next = settings::active(cx).clone();
+        dock::apply_dock_size(&mut next, sizes, edge);
+        if settings::active(cx) != &next {
+            cx.set_global(settings::ActiveSettings(next));
             cx.notify();
         }
     }
@@ -704,18 +879,28 @@ impl Workspace {
                     .aria_label("Application menu")
                     .child(entry(0, "Command Palette…", Box::new(OpenPalette)))
                     .child(entry(1, "Choose Cluster…", Box::new(ChooseCluster)))
+                    .child(entry(2, "Load Saved View…", Box::new(LoadSavedView)))
                     .child(separator())
-                    .child(entry(2, "Browse Resources", Box::new(OpenBrowser)))
-                    .child(entry(3, "Node Capacity", Box::new(OpenNodes)))
-                    .child(entry(4, "Port Forwards", Box::new(OpenForwards)))
-                    .child(entry(5, "Helm Releases", Box::new(OpenReleases)))
-                    .child(entry(6, "Terminal", Box::new(ToggleTerminal)))
+                    .child(entry(3, "Browse Resources", Box::new(OpenBrowser)))
+                    .child(entry(4, "Node Capacity", Box::new(OpenNodes)))
+                    .child(entry(5, "Port Forwards", Box::new(OpenForwards)))
+                    .child(entry(6, "Helm Releases", Box::new(OpenReleases)))
+                    .child(entry(7, "Argo CD", Box::new(OpenArgo)))
+                    .child(entry(8, "Flux", Box::new(OpenFlux)))
+                    .child(entry(9, "Day-2", Box::new(OpenDay2)))
+                    .child(entry(10, "Grafana queries", Box::new(OpenObserve)))
+                    .child(entry(11, "Policy", Box::new(OpenPolicy)))
+                    .child(entry(12, "Ecosystem", Box::new(OpenEcosystem)))
+                    .child(entry(13, "Harbor", Box::new(OpenHarbor)))
+                    .child(entry(14, "Mesh", Box::new(OpenMesh)))
+                    .child(entry(15, "Traces", Box::new(OpenTraces)))
+                    .child(entry(16, "Terminal", Box::new(ToggleTerminal)))
                     .child(separator())
-                    .child(entry(7, "Toggle Left Dock", Box::new(ToggleLeftDock)))
-                    .child(entry(8, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
-                    .child(entry(9, "Toggle Inspector", Box::new(ToggleRightDock)))
+                    .child(entry(17, "Toggle Left Dock", Box::new(ToggleLeftDock)))
+                    .child(entry(18, "Toggle Bottom Dock", Box::new(ToggleBottomDock)))
+                    .child(entry(19, "Toggle Inspector", Box::new(ToggleRightDock)))
                     .child(separator())
-                    .child(entry(10, "Quit", Box::new(Quit))),
+                    .child(entry(20, "Quit", Box::new(Quit))),
             )
     }
 
@@ -887,30 +1072,144 @@ pub(crate) fn status_line(status: Status<'_>) -> String {
     parts.join("  ·  ")
 }
 
-/// Where a dock edge lands when it is dragged to a point. Pure, because the
-/// clamps are the whole of it: a drag past either bound has to stop rather than
-/// let a dock eat the window or collapse to a line nobody can grab again.
-pub(crate) fn dragged_dock_sizes(
-    mut sizes: DockSizes,
-    edge: DockEdge,
-    position_x: f32,
-    position_y: f32,
-    viewport: ui::Viewport,
-) -> DockSizes {
-    match edge {
-        DockEdge::Left => sizes.left = position_x.clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE),
-        DockEdge::Right => {
-            sizes.right = (viewport.width - position_x).clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
+/// The usage sample as the lines the inspector shows, pure so the sentences
+/// can be checked without a window. Percentages are computed here, at display
+/// time, from the two typed values -- nothing upstream stores one -- and every
+/// absence keeps its meaning: an unmeasured value says "sampling", a missing
+/// request says nothing, and a missing limit says "no limit" rather than a
+/// number that was never set.
+pub(crate) fn usage_lines(sample: &UsageSample) -> Vec<String> {
+    let cpu = |value: Millicores| (value.0, value.to_string());
+    let memory = |value: Bytes| (value.0, value.to_string());
+    let mut lines = vec![
+        gauge(
+            "CPU",
+            sample.cpu.map(cpu),
+            sample.cpu_request.map(cpu),
+            sample.cpu_limit.map(cpu),
+        ),
+        gauge(
+            "Memory",
+            sample.memory.map(memory),
+            sample.memory_request.map(memory),
+            sample.memory_limit.map(memory),
+        ),
+    ];
+    // A single fully-measured pod needs no coverage sentence; everything else
+    // must say how much of the target the numbers describe.
+    if sample.pods_total != 1 || sample.pods_measured != sample.pods_total {
+        let mut coverage = format!(
+            "{} of {} pods measured",
+            sample.pods_measured, sample.pods_total
+        );
+        if sample.truncated {
+            coverage.push_str("; more match than are polled");
         }
-        DockEdge::Bottom => {
-            // The bottom dock is measured from the top of the status bar, not
-            // from the bottom of the window: the bar is below it and does not
-            // move.
-            let body_bottom = viewport.height - STATUS_BAR_HEIGHT;
-            sizes.bottom = (body_bottom - position_y).clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
-        }
+        lines.push(coverage);
     }
-    sizes
+    if sample.source == UsageSource::Kubelet {
+        lines.push("via the kubelet; metrics-server is not installed".to_string());
+    }
+    lines
+}
+
+pub(crate) fn posture_lines(view: &crate::provider::PodPostureView) -> Vec<String> {
+    let mut lines = vec![
+        direction_line(
+            "Ingress",
+            view.ingress_isolated,
+            view.ingress_policies,
+            &view.ingress_names,
+            view.ingress_truncated,
+        ),
+        direction_line(
+            "Egress",
+            view.egress_isolated,
+            view.egress_policies,
+            &view.egress_names,
+            view.egress_truncated,
+        ),
+    ];
+    if !view.ports.is_empty() {
+        lines.push(format!("Ports: {}", view.ports.join(", ")));
+    }
+    if !view.completeness.is_empty() {
+        lines.push(view.completeness.clone());
+    }
+    lines.push("an allow or deny needs a source, protocol, and destination port".to_string());
+    lines
+}
+
+fn direction_line(
+    name: &str,
+    isolated: bool,
+    policies: usize,
+    names: &[String],
+    truncated: bool,
+) -> String {
+    if !isolated {
+        return format!("{name}: default allow (no selecting policy)");
+    }
+    let mut line = format!("{name}: isolated by {policies}");
+    if policies == 1 {
+        line.push_str(" policy");
+    } else {
+        line.push_str(" policies");
+    }
+    if !names.is_empty() {
+        line.push_str(" (");
+        line.push_str(&names.join(", "));
+        if truncated {
+            line.push_str(", …");
+        }
+        line.push(')');
+    } else if truncated {
+        line.push_str(" (names truncated)");
+    }
+    line
+}
+
+// One resource's sentence: what is used, against what was asked for and what
+// is allowed. Values arrive as (raw, rendered) pairs so the percentage and
+// the text always describe the same number.
+fn gauge(
+    label: &str,
+    used: Option<(u64, String)>,
+    request: Option<(u64, String)>,
+    limit: Option<(u64, String)>,
+) -> String {
+    let mut parts = vec![match &used {
+        Some((_, text)) => format!("{label} {text}"),
+        None => format!("{label} sampling…"),
+    }];
+    if let Some((base, text)) = &request {
+        parts.push(format!(
+            "request {text}{}",
+            percent(used.as_ref().map(|(value, _)| *value), *base)
+        ));
+    }
+    match &limit {
+        Some((base, text)) => parts.push(format!(
+            "limit {text}{}",
+            percent(used.as_ref().map(|(value, _)| *value), *base)
+        )),
+        None => parts.push("no limit".to_string()),
+    }
+    parts.join(" · ")
+}
+
+// Rendered with the trailing space built in so an unmeasured or zero base
+// simply contributes nothing to the sentence.
+fn percent(used: Option<u64>, base: u64) -> String {
+    match used {
+        Some(value) if base > 0 => {
+            format!(
+                " ({}%)",
+                (value as u128 * 100 + base as u128 / 2) / base as u128
+            )
+        }
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]

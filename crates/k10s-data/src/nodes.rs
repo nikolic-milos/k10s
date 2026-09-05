@@ -10,8 +10,8 @@
 //! allowed -- and follows the same rule: if the budgets are unreadable,
 //! absent, or too many to list completely, the column disappears rather
 //! than under-count. Every fetch is bounded (`limit` plus a `truncated`
-//! flag) and a node whose pods cannot be listed shows `?` cells rather
-//! than a guess.
+//! flag) and a node whose pods cannot be listed -- refused, or too many to
+//! fit one page -- shows `?` cells rather than a guess.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::read::{Fetched, classify};
+use crate::talos;
 
 const NODE_LIMIT: u32 = 500;
 const PODS_PER_NODE_LIMIT: u32 = 1_500;
@@ -45,7 +46,7 @@ pub(crate) async fn fetch_node_table(client: &Client) -> Fetched<TablePage> {
     let usage = fetch_usage(client).await;
     let budgets = fetch_blocked_budgets(client).await;
 
-    let scanned: Vec<(Node, Result<Load, kube::Error>)> =
+    let scanned: Vec<(Node, Option<Load>)> =
         futures::stream::iter(nodes.items.into_iter().map(|node| {
             let client = client.clone();
             let budgets = budgets.as_deref();
@@ -64,6 +65,8 @@ pub(crate) async fn fetch_node_table(client: &Client) -> Fetched<TablePage> {
         column("Status"),
         column("Roles"),
         column("Version"),
+        column("OS"),
+        column("Address"),
         column("Pods"),
         column("CPU req"),
         column("Memory req"),
@@ -105,18 +108,22 @@ struct Load {
     pdb_blocked: usize,
 }
 
-async fn load_on(
-    client: &Client,
-    node: &str,
-    budgets: Option<&[BlockedBudget]>,
-) -> Result<Load, kube::Error> {
+async fn load_on(client: &Client, node: &str, budgets: Option<&[BlockedBudget]>) -> Option<Load> {
     let api: Api<Pod> = Api::all(client.clone());
     let params = ListParams::default()
         .fields(&format!(
             "spec.nodeName={node},status.phase!=Succeeded,status.phase!=Failed"
         ))
         .limit(PODS_PER_NODE_LIMIT);
-    let pods = api.list(&params).await?;
+    let pods = api.list(&params).await.ok()?;
+    if pods
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
+    {
+        return None;
+    }
     let mut load = Load {
         pods: pods.items.len(),
         cpu_millis: 0,
@@ -140,10 +147,12 @@ async fn load_on(
             }
         }
     }
-    Ok(load)
+    Some(load)
 }
 
-// A budget that currently blocks eviction: `status.disruptionsAllowed == 0`.
+// A budget that currently blocks eviction: `status.disruptionsAllowed == 0`,
+// or a status the controller has not computed yet -- the eviction API reads
+// an unset disruptionsAllowed as the Go zero value and blocks on it.
 // Only these are held; a budget with headroom cannot block anything.
 struct BlockedBudget {
     namespace: String,
@@ -176,17 +185,21 @@ async fn fetch_blocked_budgets(client: &Client) -> Option<Vec<BlockedBudget>> {
     Some(
         list.items
             .into_iter()
-            .filter(|pdb| {
-                pdb.status
-                    .as_ref()
-                    .is_some_and(|status| status.disruptions_allowed == 0)
-            })
+            .filter(blocks_eviction)
             .map(|pdb| BlockedBudget {
                 namespace: pdb.metadata.namespace.unwrap_or_default(),
                 selector: pdb.spec.and_then(|spec| spec.selector),
             })
             .collect(),
     )
+}
+
+// Missing status or missing disruptionsAllowed counts as 0: only a budget the
+// controller has computed headroom for is exempt.
+fn blocks_eviction(pdb: &PodDisruptionBudget) -> bool {
+    pdb.status
+        .as_ref()
+        .is_none_or(|status| status.disruptions_allowed.unwrap_or(0) == 0)
 }
 
 // policy/v1 semantics: a nil selector selects no pods, an empty one selects
@@ -218,12 +231,7 @@ fn selector_matches(selector: Option<&LabelSelector>, labels: &BTreeMap<String, 
     true
 }
 
-fn row(
-    node: Node,
-    load: Result<Load, kube::Error>,
-    usage: Option<&Usage>,
-    show_pdb: bool,
-) -> TableRow {
+fn row(node: Node, load: Option<Load>, usage: Option<&Usage>, show_pdb: bool) -> TableRow {
     let name = node.metadata.name.clone().unwrap_or_default();
     let uid = node.metadata.uid.clone().unwrap_or_default();
     let status = node.status.as_ref();
@@ -245,14 +253,22 @@ fn row(
             .and_then(|s| s.node_info.as_ref())
             .map(|info| info.kubelet_version.clone())
             .unwrap_or_default(),
+        status
+            .and_then(|status| status.node_info.as_ref())
+            .map(|info| info.os_image.clone())
+            .unwrap_or_default(),
+        talos::detect(&node)
+            .and_then(|talos| talos.address)
+            .or_else(|| node_address(&node))
+            .unwrap_or_default(),
     ];
     match &load {
-        Ok(load) => {
+        Some(load) => {
             cells.push(counted(load.pods as i64, pods_alloc, |n| n.to_string()));
             cells.push(counted(load.cpu_millis, cpu_alloc, fmt_cpu));
             cells.push(counted(load.mem_bytes, mem_alloc, fmt_bytes));
         }
-        Err(_) => {
+        None => {
             cells.push("?".to_string());
             cells.push("?".to_string());
             cells.push("?".to_string());
@@ -273,8 +289,8 @@ fn row(
     }
     if show_pdb {
         cells.push(match &load {
-            Ok(load) => load.pdb_blocked.to_string(),
-            Err(_) => "?".to_string(),
+            Some(load) => load.pdb_blocked.to_string(),
+            None => "?".to_string(),
         });
     }
     cells.push(
@@ -291,6 +307,20 @@ fn row(
         namespace: None,
         uid,
     }
+}
+
+fn node_address(node: &Node) -> Option<String> {
+    let addresses = node.status.as_ref()?.addresses.as_deref()?;
+    addresses
+        .iter()
+        .find(|address| address.type_ == "InternalIP")
+        .or_else(|| {
+            addresses
+                .iter()
+                .find(|address| address.type_ == "ExternalIP")
+        })
+        .map(|address| address.address.clone())
+        .filter(|address| !address.is_empty())
 }
 
 fn counted(value: i64, allocatable: Option<i64>, fmt: impl Fn(i64) -> String) -> String {
@@ -372,7 +402,7 @@ fn roles_text(node: &Node) -> String {
 // The scheduler's effective request: init containers run in sequence (the
 // largest one is the floor), restartable init containers -- sidecars -- keep
 // running and accumulate on top of the app containers.
-fn effective_request(spec: &PodSpec, key: &str, parse: fn(&str) -> Option<i64>) -> i64 {
+pub(crate) fn effective_request(spec: &PodSpec, key: &str, parse: fn(&str) -> Option<i64>) -> i64 {
     let request = |container: &Container| {
         container
             .resources

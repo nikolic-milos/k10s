@@ -121,3 +121,91 @@ fn the_inspector_reads_events_and_logs_and_labels_a_denial() {
 
     drop(runtime);
 }
+
+/// A crash-looping pod's running container is a fresh process with nothing to
+/// say; the explanation is in the instance that exited. The tail follows the
+/// evidence and labels itself, so nobody reads an empty pane as a quiet app.
+#[test]
+fn a_crash_looping_pod_tails_the_instance_that_died_and_says_so() {
+    use k10s_data::inspect::InspectDetail;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/pods/api-1",
+        200,
+        r#"{"kind":"Pod","apiVersion":"v1",
+            "metadata":{"name":"api-1","namespace":"prod","uid":"uid-api-1"},
+            "status":{"phase":"Running","containerStatuses":[
+              {"name":"api","restartCount":7,"ready":false,
+               "state":{"waiting":{"reason":"CrashLoopBackOff"}},
+               "lastState":{"terminated":{"exitCode":137,"reason":"OOMKilled"}}}
+            ]}}"#,
+    );
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/pods/api-1/log?",
+        200,
+        "2026-08-02T04:59:59Z out of memory\n",
+    );
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let sync = runtime
+        .block_on(async {
+            sync_from(
+                script.client(),
+                "prod",
+                &options(),
+                tx,
+                Arc::new(IngestMetrics::default()),
+            )
+            .await
+        })
+        .expect("the scripted cluster syncs");
+
+    let recv = |rx: futures::channel::oneshot::Receiver<InspectDetail>| {
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), rx).await })
+            .expect("a reply within the budget")
+            .expect("the fetch task replies")
+    };
+
+    let (reply, rx) = futures::channel::oneshot::channel();
+    sync.inspector
+        .fetch_log_tail("prod", &Arc::from("api-1"), move |detail| {
+            let _ = reply.send(detail);
+        });
+    let InspectDetail::Log(tail) = recv(rx) else {
+        panic!("logs must resolve");
+    };
+
+    let note = tail.note.expect("a crash tail names itself");
+    assert!(note.contains("previous instance of api"), "{note}");
+    assert!(note.contains("OOMKilled"), "{note}");
+    assert!(note.contains("exit 137"), "{note}");
+    assert!(note.contains("CrashLoopBackOff"), "{note}");
+    assert!(note.contains("7 restarts"), "{note}");
+
+    let request = &script.requests_for("/pods/api-1/log")[0];
+    assert!(
+        request.path.contains("previous=true"),
+        "the tail must ask for the container that exited: {}",
+        request.path
+    );
+    assert!(
+        request.path.contains("container=api"),
+        "and name which container it means: {}",
+        request.path
+    );
+
+    drop(runtime);
+}

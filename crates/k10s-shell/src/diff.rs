@@ -475,6 +475,10 @@ pub(crate) fn mark_of(side: Side, origin: Origin) -> char {
 pub struct DiffView {
     focus: FocusHandle,
     provider: Rc<dyn ReadProvider>,
+    // The kubeconfig context this view's apply would write to, captured when the
+    // review opened. It is in the armed sentence because "the cluster" reads the
+    // same in every window somebody has open.
+    context: Option<String>,
     // The buffer this diff is of. A diff outlives nothing: if the editor closed,
     // there is nothing to re-read and nothing to apply, and saying so beats
     // applying a document nobody can see any more.
@@ -518,9 +522,11 @@ impl DiffView {
         editor: WeakEntity<EditorView>,
         sources: DiffSources,
         dry_run: bool,
+        context: Option<String>,
         cx: &mut Context<Self>,
     ) -> DiffView {
         let mut view = DiffView {
+            context,
             focus: cx.focus_handle(),
             provider,
             editor,
@@ -789,7 +795,7 @@ impl DiffView {
                 // for as long as it stands, rather than printing it once into a
                 // message the next action overwrites.
                 self.answered = uid;
-                let live = self.state.live.clone();
+                let live = std::mem::take(&mut self.state.live);
                 self.state.set(Mode::DryRun, live, None, yaml);
                 self.status = Some(match reviewed(self.state.diff().verdict()) {
                     Ok(note) => {
@@ -888,6 +894,7 @@ impl DiffView {
             conflict_truncated: self.conflict_truncated,
             identity: identity(self.uid.as_deref(), self.answered.as_deref()),
             status: self.status.as_deref(),
+            context: self.context.as_deref(),
         })
     }
 }
@@ -904,6 +911,18 @@ pub(crate) struct Line<'a> {
     pub(crate) conflict_truncated: bool,
     pub(crate) identity: Identity,
     pub(crate) status: Option<&'a str>,
+    /// The kubeconfig context this write would land in. `None` is an
+    /// in-cluster account, which has no context name to print.
+    pub(crate) context: Option<&'a str>,
+}
+
+/// How a write names where it lands. An unnamed context is the in-cluster
+/// account, which is a real answer rather than a missing one.
+fn target(context: Option<&str>) -> String {
+    match context {
+        Some(context) if !context.is_empty() => format!("context {context}"),
+        _ => "this cluster's in-cluster account".to_string(),
+    }
 }
 
 pub(crate) fn status_line(at: Line<'_>) -> String {
@@ -927,10 +946,15 @@ pub(crate) fn status_line(at: Line<'_>) -> String {
     // have.
     if let Some(armed) = at.armed {
         pieces.push(match armed {
-            Armed::Apply => "ctrl-s again to apply this to the cluster".to_string(),
+            // Which cluster, by name, in the sentence that fires the write.
+            // A confirm that says "the cluster" is the same sentence in every
+            // context a person has open, and that is how the wrong one gets
+            // written to.
+            Armed::Apply => format!("ctrl-s again to apply this to {}", target(at.context)),
             Armed::Force => format!(
-                "ctrl-shift-s again to take {} from their managers",
-                taken(at.conflict.len(), at.conflict_truncated)
+                "ctrl-shift-s again to take {} from their managers in {}",
+                taken(at.conflict.len(), at.conflict_truncated),
+                target(at.context)
             ),
         });
     }

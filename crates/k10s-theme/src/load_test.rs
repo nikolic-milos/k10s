@@ -146,6 +146,43 @@ fn colours_come_in_the_four_shapes_people_write() {
 }
 
 #[test]
+fn an_alpha_on_a_key_that_is_painted_opaque_is_applied_and_said() {
+    // Eight-digit colours are what a person copies out of a Zed theme. The hue
+    // is kept, because refusing it would be worse, but a file that asks for
+    // translucency on a key that has none must not look like it got it.
+    let loaded = parse_family(
+        r##"{ "name": "Alpha", "themes": [ { "name": "Alpha", "style": {
+             "text": "#ff000080",
+             "background": "#101010ff",
+             "map": { "heat_fill": ["#11223344", "#556677", "#8899aa"] }
+           } } ] }"##,
+    );
+    let family = loaded.family.expect("a family");
+    let theme = &family.themes[0];
+    assert_eq!(theme.shell.text, 0xff0000, "the colour still lands");
+    assert_eq!(theme.shell.background, 0x101010);
+    assert_eq!(
+        theme.map.heat_fill,
+        [0x112233, 0x556677, 0x8899aa],
+        "a ramp with an alpha in it still lands whole"
+    );
+
+    let notes: Vec<&String> = loaded
+        .notes
+        .iter()
+        .filter(|note| note.contains("opaque"))
+        .collect();
+    assert_eq!(notes.len(), 2, "{:?}", loaded.notes);
+    assert!(notes[0].contains("text"), "{:?}", notes[0]);
+    assert!(notes[1].contains("heat_fill"), "{:?}", notes[1]);
+    assert!(
+        !loaded.notes.iter().any(|note| note.contains("background")),
+        "a fully opaque eight-digit colour is exactly what it says: {:?}",
+        loaded.notes
+    );
+}
+
+#[test]
 fn overrides_complain_once_and_then_replay_silently() {
     let (overrides, notes) = parse_overrides(&serde_json::json!({
         "editor_background": "#101014",
@@ -181,5 +218,31 @@ fn comments_and_trailing_commas_are_what_a_person_writes() {
     assert_eq!(
         loaded.family.expect("a family").themes[0].shell.text,
         0xffffff
+    );
+
+    // Block comments, a comment sitting between a trailing comma and the brace
+    // that closes the thing it trails, and a `//` inside a string that is not a
+    // comment at all.
+    let dense = parse_family(
+        r##"/* the whole file
+               is explained up here */
+            {
+              "name": "Dense",
+              "themes": [
+                {
+                  "name": "https://example.invalid",
+                  "style": { "text": "#00ff00" /* the only colour */ },
+                  /* trailing */
+                },
+                // and nothing after this one
+              ],
+            }"##,
+    );
+    assert!(dense.notes.is_empty(), "{:?}", dense.notes);
+    let family = dense.family.expect("a family");
+    assert_eq!(family.themes[0].shell.text, 0x00ff00);
+    assert_eq!(
+        family.themes[0].name, "https://example.invalid",
+        "a slash pair inside a string is text, not a comment"
     );
 }
