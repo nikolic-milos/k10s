@@ -2124,7 +2124,6 @@ dependencies = [
 name = "k10s-map"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "crossbeam-channel",
  "futures",
  "gpui",
