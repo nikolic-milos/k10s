@@ -9,6 +9,14 @@
 //! a letterboxed `FLIGHT_VIEWPORT` so a recording is comparable across
 //! machines, and stamps the real window and any mid-flight resizes as
 //! provenance instead of trusting the environment.
+//!
+//! `camera`, `cull`, `lod`, `curves`, `motion`, `pacing` and `scene` run inside
+//! a frame and are held to the frame's budget: no allocation, no dynamic
+//! dispatch, nothing added per entity. `flight`, `stats` and `testing` are the
+//! harness -- they own strings and boxed closures, and they are entered once a
+//! frame or at a segment boundary, never per node. The line matters because the
+//! thing that measures the engine, and anything of it that leaks onto the paint
+//! path is measured as the engine.
 
 pub mod camera;
 pub mod cull;
@@ -25,12 +33,12 @@ pub mod stats;
 pub mod testing;
 
 pub use camera::{Camera, MAX_ZOOM, MIN_ZOOM};
-pub use cull::{CullStats, cull, walk_edges};
+pub use cull::{CullStats, MAX_Z0_REGIONS, cull, walk_edges};
 pub use flight::{
     CpuPercentiles, FLIGHT_VIEWPORT, Flight, FlightAnchors, FlightFrame, FlightResult, IdleResult,
     Percentiles, Segment, SegmentResult,
 };
-pub use lod::{LodPolicy, StageBlend, StageMachine};
+pub use lod::{LodPolicy, StageBlend, StageMachine, WorkloadPresentation};
 pub use motion::{FLY_SECONDS, FlyTo, Motion, Step};
 pub use pacing::FramePacer;
 pub use scene::{

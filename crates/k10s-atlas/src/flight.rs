@@ -265,19 +265,25 @@ impl Flight {
         };
 
         self.segments = (self.planner)(&anchors, vw, vh);
-        assert!(
-            !self.segments.is_empty(),
-            "planner returned an empty flight"
-        );
+        if self.segments.is_empty() {
+            eprintln!("bench: the planner returned no segments; aborting flight");
+            return false;
+        }
+        for segment in &mut self.segments {
+            segment.from = segment.from.clamped();
+            segment.to = segment.to.clamped();
+        }
         self.seg_start = now;
         true
     }
 
     fn step(&mut self, now: Instant, stats: &mut FrameStats) -> FlightFrame {
-        let seg = &self.segments[self.current];
+        let Some(seg) = self.segments.get(self.current) else {
+            return FlightFrame::Aborted;
+        };
         let elapsed = (now - self.seg_start).as_secs_f32();
         let t = (elapsed / seg.dur).min(1.0);
-        let cam = lerp_cam(seg.from, seg.to, smoothstep(t));
+        let cam = crate::motion::lerp_camera(seg.from, seg.to, smoothstep(t));
 
         if seg.idle && t < 1.0 {
             let arm_timer = if self.idle_entry.is_none() {
@@ -390,14 +396,6 @@ fn proc_stat_cpu_ms(stat: &str, ticks_per_second: u64) -> Option<f64> {
 
 fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
-}
-
-fn lerp_cam(a: Camera, b: Camera, t: f32) -> Camera {
-    Camera {
-        cx: a.cx + (b.cx - a.cx) * t,
-        cy: a.cy + (b.cy - a.cy) * t,
-        zoom: (a.zoom.ln() + (b.zoom.ln() - a.zoom.ln()) * t).exp(),
-    }
 }
 
 #[cfg(test)]

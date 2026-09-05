@@ -22,7 +22,6 @@ k10s-edit.workspace = true
 k10s-map.workspace = true
 k10s-theme.workspace = true
 gpui.workspace = true
-crossbeam-channel.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 regex.workspace = true

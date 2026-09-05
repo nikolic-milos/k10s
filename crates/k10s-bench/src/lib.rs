@@ -167,4 +167,56 @@ mod tests {
         assert!(samples.percentile(0.5).is_finite());
         assert_eq!(samples.tail_label(), "max");
     }
+
+    fn samples(per_call_ns: Vec<f64>) -> Samples {
+        Samples {
+            per_call_ns,
+            batch_size: 1,
+        }
+    }
+
+    #[test]
+    fn percentiles_are_the_ordinals_a_baseline_was_recorded_with() {
+        // Nearest-rank on the sorted samples: the gate compares these numbers
+        // against numbers a previous build produced, so the ordinal a
+        // percentile names cannot drift without invalidating every baseline.
+        let ten = samples((1..=10).map(f64::from).collect());
+        assert_eq!(ten.percentile(0.0), 1.0);
+        assert_eq!(ten.percentile(0.5), 6.0);
+        assert_eq!(ten.percentile(0.99), 10.0);
+        assert_eq!(ten.percentile(1.0), 10.0);
+        assert_eq!(samples(vec![7.0]).percentile(0.5), 7.0);
+    }
+
+    #[test]
+    fn the_relative_mad_is_the_median_deviation_over_the_median() {
+        // Deviations from the median 6 are 5,4,3,2,1,0,1,2,3,4; sorted, the
+        // lower-middle one is 2, so the answer is 2/6.
+        let ten = samples((1..=10).map(f64::from).collect());
+        assert!((ten.p50_relative_mad() - 2.0 / 6.0).abs() < 1e-12);
+        assert_eq!(
+            samples(vec![4.0; 8]).p50_relative_mad(),
+            0.0,
+            "a run with no spread has no relative deviation"
+        );
+        assert_eq!(
+            samples(vec![0.0, 0.0, 0.0]).p50_relative_mad(),
+            0.0,
+            "and a median of zero is a division that must not happen"
+        );
+    }
+
+    #[test]
+    fn the_tail_is_labelled_by_whether_a_p99_means_anything() {
+        // Below the floor a "p99" is the maximum wearing a name it has not
+        // earned, which is how a noisy one-off becomes a permanent baseline.
+        let scarce = samples((0..P99_MIN_SAMPLES - 1).map(|i| i as f64).collect());
+        assert_eq!(scarce.tail_label(), "max");
+        assert_eq!(scarce.tail(), (P99_MIN_SAMPLES - 2) as f64);
+
+        let enough = samples((0..P99_MIN_SAMPLES).map(|i| i as f64).collect());
+        assert_eq!(enough.tail_label(), "p99");
+        assert_eq!(enough.tail(), enough.percentile(0.99));
+        assert!(enough.tail() < (P99_MIN_SAMPLES - 1) as f64);
+    }
 }

@@ -515,6 +515,10 @@ mod tests {
             "k10s-light",
             "an explicit mode wins over the desktop"
         );
+        assert_eq!(
+            DEFAULT_LIGHT_THEME, "k10s-light",
+            "ThemeMode::Light resolves to the K10S_LIGHT brand theme"
+        );
 
         let sparse = parse(r#"{ "theme": {} }"#);
         assert_eq!(

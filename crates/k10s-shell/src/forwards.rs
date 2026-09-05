@@ -6,7 +6,8 @@
 //! refreshes after every action and on `r`; it never polls, because an idle
 //! shell must not paint. Starting arrives either from a pod or service row in
 //! the browser or from a selection, as a [`ForwardRequest`] the provider
-//! resolves; every outcome lands in the status line, labelled.
+//! resolves; every outcome lands in the status line, labelled, and the line is
+//! about the newest start rather than whichever open happened to answer last.
 
 use std::rc::Rc;
 
@@ -32,6 +33,10 @@ pub struct ForwardsView {
     table: TableState,
     status: Option<String>,
     viewport: Viewport,
+    // Which start request the status line is about. Two opens can be in flight
+    // at once and can answer out of order, and the sentence on screen has to be
+    // about the one the user asked for last, not whichever finished last.
+    generation: u64,
 }
 
 impl ForwardsView {
@@ -46,6 +51,7 @@ impl ForwardsView {
             table: TableState::new(),
             status: None,
             viewport: Viewport::default(),
+            generation: 0,
         };
         view.refresh();
         if let Some(request) = start {
@@ -68,6 +74,8 @@ impl ForwardsView {
     }
 
     pub fn start(&mut self, request: ForwardRequest, cx: &mut Context<Self>) {
+        self.generation += 1;
+        let generation = self.generation;
         self.status = Some(format!(
             "opening a forward to {}/{}...",
             request.namespace, request.name
@@ -82,16 +90,18 @@ impl ForwardsView {
         cx.spawn(async move |this, cx| {
             if let Ok(outcome) = rx.await {
                 let _ = this.update(cx, |this, cx| {
-                    this.status = Some(match outcome {
-                        ForwardOutcome::Opened(row) => format!(
-                            "forwarding 127.0.0.1:{} -> {}:{}",
-                            row.local_port, row.pod, row.remote_port
-                        ),
-                        ForwardOutcome::Denied(what) => {
-                            format!("{what}: access denied for this account")
-                        }
-                        ForwardOutcome::Failed(why) => why,
-                    });
+                    if this.generation == generation {
+                        this.status = Some(match outcome {
+                            ForwardOutcome::Opened(row) => format!(
+                                "forwarding 127.0.0.1:{} -> {}:{}",
+                                row.local_port, row.pod, row.remote_port
+                            ),
+                            ForwardOutcome::Denied(what) => {
+                                format!("{what}: access denied for this account")
+                            }
+                            ForwardOutcome::Failed(why) => why,
+                        });
+                    }
                     this.refresh();
                     cx.notify();
                 });
@@ -187,7 +197,7 @@ impl Render for ForwardsView {
 
         div()
             .id("forwards-view")
-            .key_context("Browse")
+            .key_context("Browse Forwards")
             .track_focus(&self.focus)
             .size_full()
             .relative()

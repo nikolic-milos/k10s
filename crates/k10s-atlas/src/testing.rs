@@ -97,6 +97,12 @@ fn tag(n: usize, width: usize) -> String {
         .collect()
 }
 
+/// The policy every bench and oracle test culls with.
+///
+/// Every threshold and budget here is the shipping one from `k10s-map`'s `lod`.
+/// A bench that measured a policy the product does not use would be measuring
+/// nothing, so when a shipping threshold moves this moves with it -- and if one
+/// is ever deliberately different, this is where that has to be said.
 pub fn lod_policy() -> LodPolicy {
     LodPolicy {
         stage_block: 0.09,
@@ -347,6 +353,16 @@ mod tests {
                 let cells = &s.cells[block.children.start as usize..block.children.end as usize];
                 for cell in cells {
                     assert!(block.inner.contains(&cell.rect));
+                }
+                let sats = &s.sats[block.sats.start as usize..block.sats.end as usize];
+                for sat in sats {
+                    assert!(
+                        block.rect.contains(&sat.rect),
+                        "satellite {:?} escapes the halo {:?} that the cull takes as its \
+                         bound when the block is wholly on screen",
+                        sat.rect,
+                        block.rect
+                    );
                 }
             }
         }

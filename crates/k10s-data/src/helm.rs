@@ -53,6 +53,7 @@ use kube::Client;
 use kube::api::{ListParams, Request};
 use serde::Deserialize;
 
+use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::describe::is_secret;
 use crate::discover::KindTarget;
 use crate::read::{Fetched, classify, collection_path};
@@ -62,6 +63,10 @@ use crate::read::{Fetched, classify, collection_path};
 const RELEASE_TYPE: &str = "helm.sh/release.v1";
 const OWNER_SELECTOR: &str = "owner=helm";
 const PAYLOAD_KEY: &str = "release";
+// Helm's own word for the revision that is serving. Every other status --
+// superseded, failed, pending-upgrade, pending-install, pending-rollback,
+// uninstalling -- describes a revision that is not.
+const DEPLOYED: &str = "deployed";
 
 const PAGE_LIMIT: u32 = 200;
 // Helm keeps ten revisions per release by default and a cluster can hold many
@@ -112,11 +117,21 @@ pub struct Release {
 }
 
 impl Release {
-    /// The revision a cluster is actually running, which is the highest one
-    /// stored. Absent only for a release with no revisions, which this module
-    /// never builds.
-    pub fn current(&self) -> Option<&Revision> {
+    /// The newest stored revision, whatever Helm marked it. This is the top of
+    /// the stack, which is a different question from what is running.
+    pub fn latest(&self) -> Option<&Revision> {
         self.revisions.first()
+    }
+
+    /// The revision the cluster is actually running: the newest one Helm marked
+    /// `deployed`. An interrupted `helm upgrade` leaves a `pending-upgrade`
+    /// revision on top of the one still serving traffic, so the highest stored
+    /// revision answers the wrong question. `None` means this release has never
+    /// deployed -- a state to show, never a reason to drop the row.
+    pub fn current(&self) -> Option<&Revision> {
+        self.revisions
+            .iter()
+            .find(|revision| revision.status == DEPLOYED)
     }
 }
 
@@ -237,6 +252,13 @@ pub(crate) fn decode(encoded: &str) -> Result<Stored, &'static str> {
             app_version: clipped(wire.chart.metadata.app_version),
         },
     })
+}
+
+/// The same gzip/base64 layers [`decode`] reads, returned as a scratch buffer
+/// rather than reduced to an inventory. [`Revision`] still has nowhere to put
+/// the values; this is the reveal path's entrance, and the only other one.
+pub(crate) fn decode_scratch(encoded: &str) -> Result<crate::reach::Scratch, &'static str> {
+    Ok(crate::reach::Scratch::from_bytes(payload(encoded)?))
 }
 
 // One field, at a length a line can hold. Truncated with the ellipsis
@@ -411,9 +433,73 @@ pub(crate) async fn fetch_releases(
     })
 }
 
+/// One row per release, using the running revision. History stays on
+/// [`Release::revisions`]; a table is not a document, so it does not pad every
+/// stored revision onto the screen. Cells are the inventory fields only:
+/// [`Revision`] still has nowhere for values or manifests.
+pub fn table_page(releases: &Releases) -> TablePage {
+    let columns = ["Name", "Namespace", "Revision", "Status", "Chart"]
+        .iter()
+        .map(|name| TableColumn {
+            name: name.to_string(),
+            wide: false,
+        })
+        .collect();
+    let rows = releases
+        .releases
+        .iter()
+        .filter_map(|release| {
+            let latest = release.latest()?;
+            let revision = release.current().unwrap_or(latest);
+            Some(TableRow {
+                cells: vec![
+                    release.name.clone(),
+                    release.namespace.clone(),
+                    revision.revision.to_string(),
+                    status_label(revision, latest),
+                    chart_label(revision),
+                ],
+                name: release.name.clone(),
+                namespace: Some(release.namespace.clone()),
+                uid: format!("{}/{}", release.namespace, release.name),
+            })
+        })
+        .collect();
+    TablePage {
+        columns,
+        rows,
+        truncated: releases.truncated,
+        continue_token: None,
+    }
+}
+
+/// What the row says about the release's state. When the newest stored revision
+/// is the one running, that is the whole answer. When it is not, both facts are
+/// named: an interrupted upgrade leaves a revision Helm will not roll forward
+/// past, and a row that printed only one of the two would be reporting either a
+/// revision that is not serving or a release that looks unremarkable.
+fn status_label(running: &Revision, latest: &Revision) -> String {
+    if running.revision == latest.revision {
+        return running.status.clone();
+    }
+    format!(
+        "{} (revision {} {})",
+        running.status, latest.revision, latest.status
+    )
+}
+
+fn chart_label(revision: &Revision) -> String {
+    match (revision.chart.as_str(), revision.chart_version.as_str()) {
+        ("", "") => "chart unnamed".to_string(),
+        (name, "") => name.to_string(),
+        (name, version) => format!("{name}-{version}"),
+    }
+}
+
 /// The inventory as a document, rendered here for the same reason a describe is:
-/// the shell's text item shows lines, and one deterministic rendering is what
-/// makes it gateable by a test rather than by a screenshot.
+/// one deterministic rendering is what makes it gateable by a test rather than
+/// by a screenshot. The shell lists releases as a table; this stays for the
+/// history a table does not show.
 pub fn render(releases: &Releases) -> Vec<String> {
     let mut lines = Vec::new();
     if releases.releases.is_empty() && releases.unreadable == 0 {
@@ -473,15 +559,11 @@ pub fn render(releases: &Releases) -> Vec<String> {
         let width = release
             .revisions
             .iter()
-            .map(|revision| revision.status.len())
+            .map(|revision| revision.status.chars().count())
             .max()
             .unwrap_or(0);
         for revision in &release.revisions {
-            let chart = match (revision.chart.as_str(), revision.chart_version.as_str()) {
-                ("", "") => "chart unnamed".to_string(),
-                (name, "") => name.to_string(),
-                (name, version) => format!("{name}-{version}"),
-            };
+            let chart = chart_label(revision);
             let mut line = format!(
                 "  rev {:<4} {:<width$}  {chart}",
                 revision.revision, revision.status,

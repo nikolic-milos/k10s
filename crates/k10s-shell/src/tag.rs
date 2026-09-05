@@ -30,8 +30,23 @@ pub enum ItemTag {
     Forwards,
     Files,
     Releases,
+    Argo,
+    Flux,
+    Day2,
+    Observe,
+    Policy,
+    Harbor,
+    Mesh,
+    Traces,
+    Ecosystem,
+    HelmReport(String),
     Doc(String),
     Edit(String),
+    /// An editor over text the app revealed out of the cluster (Helm values,
+    /// rendered manifests). Editable, but nothing in it is the user's until
+    /// they save it somewhere — so unlike [`ItemTag::Edit`] it retires with
+    /// its cluster instead of carrying revealed secrets across a switch.
+    Reveal(String),
     Diff(String),
     Logs(String),
     Term(String),
@@ -57,7 +72,18 @@ impl ItemTag {
             | ItemTag::Nodes
             | ItemTag::Forwards
             | ItemTag::Releases
+            | ItemTag::Argo
+            | ItemTag::Flux
+            | ItemTag::Day2
+            | ItemTag::Observe
+            | ItemTag::Policy
+            | ItemTag::Harbor
+            | ItemTag::Mesh
+            | ItemTag::Traces
+            | ItemTag::Ecosystem
+            | ItemTag::HelmReport(_)
             | ItemTag::Doc(_)
+            | ItemTag::Reveal(_)
             | ItemTag::Diff(_)
             | ItemTag::Logs(_)
             | ItemTag::Term(_) => OnAdopt::Retire,
@@ -91,7 +117,24 @@ mod tests {
             (ItemTag::Nodes, OnAdopt::Retire),
             (ItemTag::Forwards, OnAdopt::Retire),
             (ItemTag::Releases, OnAdopt::Retire),
+            (ItemTag::Argo, OnAdopt::Retire),
+            (ItemTag::Flux, OnAdopt::Retire),
+            (ItemTag::Day2, OnAdopt::Retire),
+            (ItemTag::Observe, OnAdopt::Retire),
+            (ItemTag::Policy, OnAdopt::Retire),
+            (ItemTag::Harbor, OnAdopt::Retire),
+            (ItemTag::Mesh, OnAdopt::Retire),
+            (ItemTag::Traces, OnAdopt::Retire),
+            (ItemTag::Ecosystem, OnAdopt::Retire),
+            (ItemTag::HelmReport("ingress/3".into()), OnAdopt::Retire),
             (ItemTag::Doc("uid/name".into()), OnAdopt::Retire),
+            // Revealed Helm values are the old cluster's secrets, not the
+            // user's typing: keeping them across a switch is the leak the
+            // Edit exemption must never grow to cover.
+            (
+                ItemTag::Reveal("scratch:web-r3-values.yaml".into()),
+                OnAdopt::Retire,
+            ),
             (ItemTag::Diff("uid/name".into()), OnAdopt::Retire),
             (ItemTag::Logs("prod/pod-1".into()), OnAdopt::Retire),
             (ItemTag::Term("prod/pod-1".into()), OnAdopt::Retire),

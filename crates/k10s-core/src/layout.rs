@@ -1,3 +1,14 @@
+//! The spacing vocabulary of the hierarchical scene, in world units.
+//!
+//! Policy lives here so one number cannot drift between the crate that places
+//! nodes and the crates that draw or measure them; the algorithms that consume
+//! it live in `k10s-world`. Nothing here is per-run random: `SAT_JITTER_MAX`
+//! bounds a displacement derived from a hash of the object's identity, so the
+//! same scene lays out the same way on every run.
+//!
+//! Changing a constant is a visual change to every consumer at once, even
+//! though no type changes with it.
+
 pub const POD_SIZE: f32 = 10.0;
 pub const POD_GAP: f32 = 4.0;
 pub const POD_PITCH: f32 = POD_SIZE + POD_GAP;

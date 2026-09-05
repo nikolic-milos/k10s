@@ -8,11 +8,13 @@
 //! document keeps the text the fetch returned beside the buffer it became, so
 //! `diff_sources` can hand a diff three documents rather than two; ctrl-s on
 //! one asks the server what it would store instead of writing anything.
-//! Schemas arrive lazily through a per-workspace [`SchemaStore`] -- catalog
+//! Schemas arrive lazily through a per-connection [`SchemaStore`] -- catalog
 //! once, CRDs once, one document per group-version on demand -- and every
 //! fetch outcome that is not `Ok` becomes a labelled note, never a silent
-//! absence. Typing reaches the buffer through `key_char` exactly like the
-//! terminal; named keys and chords arrive as `Editor`-context actions.
+//! absence. The store is retired when the workspace adopts another cluster,
+//! because a schema describes the server it came from and nothing else.
+//! Typing reaches the buffer through `key_char` exactly like the terminal;
+//! named keys and chords arrive as `Editor`-context actions.
 //! [`DirtyState`] owns the three moments that can throw work away -- closing,
 //! reloading, and overwriting a file this buffer did not read -- and each
 //! costs a second press that any edit in between disarms. Each arms under its
@@ -48,8 +50,8 @@ use k10s_edit::complete::{
 };
 use k10s_edit::schema::SchemaNode;
 use k10s_edit::{
-    Buffer, CursorPosition, Diagnostic, DocMeta, EditGroup, LanguageKind, Motion, SchemaIndex,
-    SearchState, Selection, SelectionIntent, Syntax, completion_edit,
+    Buffer, CursorPosition, Diagnostic, DocMeta, EditGroup, LanguageKind, Motion, Rope,
+    SchemaIndex, SearchState, Selection, SelectionIntent, Syntax, completion_edit,
 };
 
 use k10s_theme::Typography;
@@ -66,10 +68,11 @@ pub(crate) const MAX_VISIBLE_COMPLETIONS: usize = 8;
 pub(crate) const COMPLETION_WIDTH: f32 = 460.0;
 pub(crate) const MAX_DOC_CHARS: usize = 280;
 
-// One schema index per workspace: catalog and CRDs fetched once, one OpenAPI
+// One schema index per connection: catalog and CRDs fetched once, one OpenAPI
 // document per group-version fetched the first time an editor needs it, and
 // every non-Ok outcome a labelled note. Shared by `Rc<RefCell>` because the
-// provider handle itself never leaves the UI thread.
+// provider handle itself never leaves the UI thread, and retired when the
+// window adopts another cluster, because none of it describes that one.
 pub struct SchemaStore {
     pub index: SchemaIndex,
     pub(crate) catalog: Vec<SchemaSource>,
@@ -77,6 +80,7 @@ pub struct SchemaStore {
     pub(crate) requested_crds: bool,
     pub(crate) requested_documents: HashSet<String>,
     pub(crate) notes: Vec<String>,
+    epoch: u64,
 }
 
 impl Default for SchemaStore {
@@ -94,7 +98,29 @@ impl SchemaStore {
             requested_crds: false,
             requested_documents: HashSet::new(),
             notes: Vec::new(),
+            epoch: 0,
         }
+    }
+
+    /// Give up everything one API server said, because the window has left it.
+    ///
+    /// A catalog, a CRD list and an OpenAPI document describe the shape of one
+    /// cluster's objects, and the flags beside them say those were asked for
+    /// already. Carried across a connection switch they answer for a cluster
+    /// nothing on screen belongs to any more: completions and diagnostics that
+    /// look exactly like right ones. The epoch is what the answers still in
+    /// flight are checked against, so the previous cluster cannot fill the store
+    /// that replaced it.
+    pub(crate) fn retire(&mut self) {
+        let epoch = self.epoch + 1;
+        *self = SchemaStore::new();
+        self.epoch = epoch;
+    }
+
+    /// Which connection this store is filled from. Taken when a fetch is asked
+    /// for and compared when it answers.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub(crate) fn note(&mut self, note: String) {
@@ -297,6 +323,11 @@ pub struct EditorView {
     // the UI thread.
     pub(crate) template: Option<&'static str>,
     pub(crate) generation: u64,
+    /// The settle timer a large buffer validates behind, held rather than
+    /// detached: a keystroke replaces it, and replacing a task is what cancels
+    /// the one before it. Detaching each one left a task per keypress waiting
+    /// to do a whole-document walk the version gate would then throw away.
+    pub(crate) validation: Option<gpui::Task<()>>,
     pub(crate) viewport: Viewport,
     pub(crate) rows: usize,
     pub(crate) origin: (f32, f32),
@@ -342,6 +373,7 @@ impl EditorView {
             saves: SaveQueue::default(),
             template: None,
             generation: 0,
+            validation: None,
             viewport: Viewport::default(),
             rows: 4,
             origin: (0.0, 0.0),
@@ -590,11 +622,12 @@ impl EditorView {
         const SYNCHRONOUS_LIMIT: usize = 64 << 10;
         const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
         if self.buffer.rope().len() <= SYNCHRONOUS_LIMIT {
+            self.validation = None;
             self.revalidate();
             return;
         }
         let version = self.buffer.version();
-        cx.spawn(async move |this, cx| {
+        self.validation = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SETTLE).await;
             let _ = this.update(cx, |this, cx| {
                 // The typing stopped, so this is where the walk happens. Arming
@@ -606,8 +639,7 @@ impl EditorView {
                     cx.notify();
                 }
             });
-        })
-        .detach();
+        }));
     }
 
     // Every mutation ends here, whatever made it. An edit that skipped this
@@ -756,7 +788,7 @@ impl EditorView {
                     return;
                 }
                 Motion::Down => {
-                    menu.selected = (menu.selected + 1).min(menu.items.len() - 1);
+                    menu.selected = (menu.selected + 1).min(menu.items.len().saturating_sub(1));
                     cx.notify();
                     return;
                 }
@@ -896,26 +928,7 @@ impl EditorView {
 
     pub(crate) fn toggle_comment(&mut self, cx: &mut Context<Self>) {
         let rows = self.buffer.cursor_rows();
-        let rope = self.buffer.rope();
-        let all_commented = rows.iter().all(|row| {
-            let line = rope.line(*row);
-            line.trim().is_empty() || line.trim_start().starts_with('#')
-        });
-        let mut edits = Vec::new();
-        for row in rows {
-            let line = rope.line(row);
-            let start = rope.line_start(row);
-            let indent = line.len() - line.trim_start().len();
-            if all_commented {
-                let body = line.trim_start();
-                if let Some(rest) = body.strip_prefix('#') {
-                    let strip = 1 + if rest.starts_with(' ') { 1 } else { 0 };
-                    edits.push((start + indent..start + indent + strip, String::new()));
-                }
-            } else if !line.trim().is_empty() {
-                edits.push((start + indent..start + indent, "# ".to_string()));
-            }
-        }
+        let edits = comment_edits(self.buffer.rope(), &rows, self.syntax.language());
         if !edits.is_empty() {
             let splices = self
                 .buffer
@@ -1008,6 +1021,47 @@ pub(crate) fn shape_plain(text: &str, fonts: &Typography, window: &mut Window) -
         .shape_line(text.to_string().into(), px(fonts.buffer_size), &[run], None)
 }
 
+/// What a line comment starts with in this language. A JSON buffer -- the
+/// settings and the keymap are both one -- has no `#` comment: writing one is
+/// not a toggle, it is a parse error the next reader inherits.
+pub(crate) fn comment_marker(language: LanguageKind) -> &'static str {
+    match language {
+        LanguageKind::Json => "//",
+        LanguageKind::Yaml | LanguageKind::Plain => "#",
+    }
+}
+
+/// The edits a comment toggle makes: uncomment when every touched line is
+/// already commented, comment otherwise, blank lines untouched either way.
+/// Pure, so the marker a language uses is checked without a window.
+pub(crate) fn comment_edits(
+    rope: &Rope,
+    rows: &[usize],
+    language: LanguageKind,
+) -> Vec<(Range<usize>, String)> {
+    let marker = comment_marker(language);
+    let all_commented = rows.iter().all(|row| {
+        let line = rope.line(*row);
+        line.trim().is_empty() || line.trim_start().starts_with(marker)
+    });
+    let mut edits = Vec::new();
+    for row in rows {
+        let line = rope.line(*row);
+        let start = rope.line_start(*row);
+        let indent = line.len() - line.trim_start().len();
+        if all_commented {
+            let body = line.trim_start();
+            if let Some(rest) = body.strip_prefix(marker) {
+                let strip = marker.len() + usize::from(rest.starts_with(' '));
+                edits.push((start + indent..start + indent + strip, String::new()));
+            }
+        } else if !line.trim().is_empty() {
+            edits.push((start + indent..start + indent, format!("{marker} ")));
+        }
+    }
+    edits
+}
+
 pub(crate) fn file_title(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1082,6 +1136,41 @@ mod tests {
         store.note("schema catalog: access denied for this account".to_string());
         assert_eq!(store.notes.len(), 1);
         assert!(store.first_note().expect("noted").contains("denied"));
+    }
+
+    #[test]
+    fn a_comment_toggle_uses_the_marker_the_language_actually_has() {
+        let json = Buffer::new("{\n  \"a\": 1\n}\n");
+        let edits = comment_edits(json.rope(), &[1], LanguageKind::Json);
+        assert_eq!(
+            edits,
+            vec![(4..4, "// ".to_string())],
+            "a hash in a JSON buffer is not a comment, it is a parse error"
+        );
+
+        let yaml = Buffer::new("a: 1\n");
+        assert_eq!(
+            comment_edits(yaml.rope(), &[0], LanguageKind::Yaml),
+            vec![(0..0, "# ".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_comment_toggle_uncomments_only_what_it_would_have_written() {
+        let json = Buffer::new("  // \"a\": 1\n  //\"b\": 2\n");
+        let edits = comment_edits(json.rope(), &[0, 1], LanguageKind::Json);
+        assert_eq!(
+            edits,
+            vec![(2..5, String::new()), (14..16, String::new())],
+            "the marker and the one space after it, and nothing else"
+        );
+
+        let mixed = Buffer::new("// \"a\": 1\n\"b\": 2\n");
+        assert_eq!(
+            comment_edits(mixed.rope(), &[0, 1], LanguageKind::Json),
+            vec![(0..0, "// ".to_string()), (10..10, "// ".to_string())],
+            "one uncommented line among commented ones comments the block"
+        );
     }
 
     // "Which field is being typed into" used to be decided in three places in

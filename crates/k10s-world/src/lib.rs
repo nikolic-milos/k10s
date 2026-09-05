@@ -18,6 +18,8 @@ mod topology;
 // costs nothing at runtime. Splitting the *implementation* the same way did
 // cost something -- see benchmarks/README.md -- which is why it is still here.
 #[cfg(test)]
+mod filter_test;
+#[cfg(test)]
 mod publish_test;
 #[cfg(test)]
 mod spawn_test;
@@ -28,6 +30,7 @@ mod test_support;
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -35,14 +38,268 @@ use crate::input::ClusterInput;
 use bevy_ecs::prelude::*;
 use crossbeam_channel::Receiver;
 use k10s_core::{
-    EdgeInst, IngestEvent, Intake, KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, Rect, SatExt,
-    SatNode, SceneIds, SceneSnapshot, Severity, SharedScene, State, ToolId, Totals, WlExt,
-    WorkloadNode, WorldCtrl,
+    BUILTIN_KINDS, EdgeInst, IngestEvent, Intake, KindId, NsExt, NsNode, PodExt, PodNode, ReasonId,
+    Rect, SatExt, SatNode, SceneIds, SceneSnapshot, Severity, SharedScene, State, ToolId, Totals,
+    WlExt, WorkloadNode, WorldCtrl,
 };
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 
 pub use layout::LayoutMode;
+
+/// The same axes a saved Starmap view carries (`k10s-shell::saved_views::MapFilter`).
+///
+/// `labels` is accepted so a view can round-trip, but a `SceneSnapshot` has no
+/// Kubernetes label map, only display names, so a non-empty selector is not
+/// evaluated. Namespace, kind, and health read what the snapshot actually holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SceneFilter {
+    pub namespaces: Vec<String>,
+    pub kinds: Vec<String>,
+    pub labels: Vec<(String, String)>,
+    pub health: Option<HealthFilter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthFilter {
+    Unhealthy,
+    Healthy,
+}
+
+/// Visibility of snapshot slots. Bits are parallel to `regions` / `blocks` /
+/// `cells` / `sats`; the scene itself is not cloned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneVisibility {
+    pub regions: IndexMask,
+    pub blocks: IndexMask,
+    pub cells: IndexMask,
+    pub sats: IndexMask,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexMask {
+    bits: Vec<u64>,
+    len: usize,
+}
+
+impl IndexMask {
+    fn zeros(len: usize) -> Self {
+        IndexMask {
+            bits: vec![0; len.div_ceil(64)],
+            len,
+        }
+    }
+
+    fn fill(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        self.bits.fill(u64::MAX);
+        let rem = self.len % 64;
+        if rem != 0 {
+            let last = self.bits.len() - 1;
+            self.bits[last] = (1u64 << rem) - 1;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn contains(&self, index: usize) -> bool {
+        if index >= self.len {
+            return false;
+        }
+        self.bits[index / 64] & (1u64 << (index % 64)) != 0
+    }
+
+    fn insert(&mut self, index: usize) {
+        if index < self.len {
+            self.bits[index / 64] |= 1u64 << (index % 64);
+        }
+    }
+}
+
+impl SceneFilter {
+    fn unconstrained(&self) -> bool {
+        self.namespaces.is_empty() && self.kinds.is_empty() && self.health.is_none()
+    }
+}
+
+/// Mark which region, block, and cell slots pass `filter`. Allocates only the
+/// bitsets; the snapshot is borrowed.
+pub fn filter_scene(snap: &SceneSnapshot, filter: &SceneFilter) -> SceneVisibility {
+    let mut vis = SceneVisibility {
+        regions: IndexMask::zeros(snap.regions.len()),
+        blocks: IndexMask::zeros(snap.blocks.len()),
+        cells: IndexMask::zeros(snap.cells.len()),
+        sats: IndexMask::zeros(snap.sats.len()),
+    };
+    if filter.unconstrained() {
+        vis.regions.fill();
+        vis.blocks.fill();
+        vis.cells.fill();
+        vis.sats.fill();
+        return vis;
+    }
+
+    let mut kind_bits = vec![false; BUILTIN_KINDS.len()];
+    let kinds_open = filter.kinds.is_empty();
+    if !kinds_open {
+        for wanted in &filter.kinds {
+            for (i, info) in BUILTIN_KINDS.iter().enumerate() {
+                if eq_ci(wanted, info.slug) || eq_ci(wanted, info.short) || eq_ci(wanted, info.kind)
+                {
+                    kind_bits[i] = true;
+                }
+            }
+        }
+    }
+    let kind_ok = |id: KindId| kinds_open || (id.is_builtin() && kind_bits[id.0 as usize]);
+    let ns_ok =
+        |name: &str| filter.namespaces.is_empty() || filter.namespaces.iter().any(|n| n == name);
+    let health_ok = |severity: Severity| match filter.health {
+        None => true,
+        Some(HealthFilter::Unhealthy) => severity.is_unhealthy(),
+        Some(HealthFilter::Healthy) => !severity.is_unhealthy(),
+    };
+
+    let mut self_regions = IndexMask::zeros(snap.regions.len());
+    let mut self_blocks = IndexMask::zeros(snap.blocks.len());
+
+    for (i, region) in snap.regions.iter().enumerate() {
+        if region.label.as_ref().is_empty() {
+            continue;
+        }
+        if ns_ok(region.label.as_ref())
+            && kind_ok(KindId::NAMESPACE)
+            && health_ok(region.ext.rollup)
+        {
+            self_regions.insert(i);
+            vis.regions.insert(i);
+        }
+    }
+    for (i, block) in snap.blocks.iter().enumerate() {
+        if block.label.as_ref().is_empty() {
+            continue;
+        }
+        let ns = snap
+            .regions
+            .get(block.ext.ns as usize)
+            .map(|r| r.label.as_ref())
+            .unwrap_or("");
+        if ns_ok(ns) && kind_ok(block.ext.kind) && health_ok(block.ext.rollup) {
+            self_blocks.insert(i);
+            vis.blocks.insert(i);
+        }
+    }
+    for (bi, block) in snap.blocks.iter().enumerate() {
+        let ns = snap
+            .regions
+            .get(block.ext.ns as usize)
+            .map(|r| r.label.as_ref())
+            .unwrap_or("");
+        let ns_pass = ns_ok(ns);
+        for cell in snap.block_cell_indices(bi) {
+            let Some(node) = snap.cells.get(cell) else {
+                continue;
+            };
+            if node.label.as_ref().is_empty() {
+                continue;
+            }
+            if ns_pass && kind_ok(KindId::POD) && health_ok(node.ext.state.severity) {
+                vis.cells.insert(cell);
+            }
+        }
+        for sat in snap.block_sat_indices(bi) {
+            let Some(node) = snap.sats.get(sat) else {
+                continue;
+            };
+            if node.label.as_ref().is_empty() {
+                continue;
+            }
+            if ns_pass && kind_ok(node.ext.kind) && health_ok(block.ext.rollup) {
+                vis.sats.insert(sat);
+            }
+        }
+    }
+
+    for region in 0..snap.regions.len() {
+        if !self_regions.contains(region) {
+            continue;
+        }
+        snap.for_each_region_block(region, |bi, block| {
+            if kind_ok(block.ext.kind) && health_ok(block.ext.rollup) {
+                vis.blocks.insert(bi);
+            }
+            for cell in snap.block_cell_indices(bi) {
+                if let Some(node) = snap.cells.get(cell)
+                    && !node.label.as_ref().is_empty()
+                    && kind_ok(KindId::POD)
+                    && health_ok(node.ext.state.severity)
+                {
+                    vis.cells.insert(cell);
+                }
+            }
+            for sat in snap.block_sat_indices(bi) {
+                if let Some(node) = snap.sats.get(sat)
+                    && !node.label.as_ref().is_empty()
+                    && kind_ok(node.ext.kind)
+                {
+                    vis.sats.insert(sat);
+                }
+            }
+        });
+    }
+
+    for bi in 0..snap.blocks.len() {
+        if !self_blocks.contains(bi) {
+            continue;
+        }
+        let block = &snap.blocks[bi];
+        for cell in snap.block_cell_indices(bi) {
+            if let Some(node) = snap.cells.get(cell)
+                && !node.label.as_ref().is_empty()
+                && health_ok(node.ext.state.severity)
+            {
+                vis.cells.insert(cell);
+            }
+        }
+        for sat in snap.block_sat_indices(bi) {
+            if let Some(node) = snap.sats.get(sat)
+                && !node.label.as_ref().is_empty()
+            {
+                vis.sats.insert(sat);
+            }
+        }
+        vis.regions.insert(block.ext.ns as usize);
+    }
+
+    for (bi, block) in snap.blocks.iter().enumerate() {
+        let ns = block.ext.ns as usize;
+        for cell in snap.block_cell_indices(bi) {
+            if vis.cells.contains(cell) {
+                vis.blocks.insert(bi);
+                vis.regions.insert(ns);
+            }
+        }
+        for sat in snap.block_sat_indices(bi) {
+            if vis.sats.contains(sat) {
+                vis.blocks.insert(bi);
+                vis.regions.insert(ns);
+            }
+        }
+        if vis.blocks.contains(bi) {
+            vis.regions.insert(ns);
+        }
+    }
+
+    vis
+}
+
+fn eq_ci(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
 
 const TICK_HZ: f32 = 20.0;
 
@@ -148,6 +405,20 @@ struct Aggregates {
     ns_unhealthy_count: Vec<u32>,
 }
 
+/// Take one pod out of a derived count.
+///
+/// Every decrement of a severity bucket or an unhealthy tally is paired with an
+/// increment that already happened, so reaching zero here means a structural
+/// path and a state path disagreed about which bucket a pod was in. A bare
+/// `-= 1` wraps to `u32::MAX` in release and poisons every rollup that reads
+/// the bucket afterwards; this fails the suites loudly and keeps a shipped
+/// world merely wrong by one pod instead of by four billion.
+#[inline(always)]
+fn release_one(count: &mut u32) {
+    debug_assert!(*count > 0, "a derived count lost a pod it never held");
+    *count = count.saturating_sub(1);
+}
+
 fn rollup_of(counts: &[u32; 4]) -> Severity {
     if counts[3] > 0 {
         Severity::Err
@@ -227,6 +498,24 @@ impl Pending {
 
 pub const SNAPSHOT_POOL_DEPTH: usize = 3;
 
+static NEXT_IDENTITY_REV: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Resource)]
+struct IdentityClock {
+    topology_revision: u64,
+    published: u64,
+}
+
+impl IdentityClock {
+    fn observe(&mut self, topology_revision: u64) -> u64 {
+        if self.topology_revision != topology_revision {
+            self.topology_revision = topology_revision;
+            self.published = NEXT_IDENTITY_REV.fetch_add(1, Ordering::Relaxed);
+        }
+        self.published
+    }
+}
+
 #[derive(Resource)]
 struct SnapshotPool {
     bufs: [Arc<SceneSnapshot>; SNAPSHOT_POOL_DEPTH],
@@ -297,16 +586,16 @@ fn rollup(
         let wl = topo.pod_wl[i];
         let ns = topo.wl_ns[wl as usize] as usize;
         let sev = &mut agg.wl_sev_counts[wl as usize];
-        sev[old.severity.rank() as usize] -= 1;
+        release_one(&mut sev[old.severity.rank() as usize]);
         sev[new.severity.rank() as usize] += 1;
         let nsev = &mut agg.ns_sev_counts[ns];
-        nsev[old.severity.rank() as usize] -= 1;
+        release_one(&mut nsev[old.severity.rank() as usize]);
         nsev[new.severity.rank() as usize] += 1;
         if old.severity.is_unhealthy() != new.severity.is_unhealthy() {
             if new.severity.is_unhealthy() {
                 agg.ns_unhealthy_count[ns] += 1;
             } else {
-                agg.ns_unhealthy_count[ns] -= 1;
+                release_one(&mut agg.ns_unhealthy_count[ns]);
             }
         }
         if !std::mem::replace(&mut scratch.wl_stamp[wl as usize], true) {
@@ -492,10 +781,12 @@ fn materialize_into(
     topo: &Topology,
     agg: &Aggregates,
     rev: u64,
+    identity_rev: u64,
     rebuild_spatial_index: bool,
     rebuild_ids: bool,
 ) {
     snap.rev = rev;
+    snap.identity_rev = identity_rev;
     snap.bounds = topo.bounds;
     snap.card_header = topo.card_header;
     snap.totals = Totals {
@@ -553,9 +844,29 @@ fn card_header_of(mode: LayoutMode) -> f32 {
     }
 }
 
+#[cfg(test)]
 fn materialize_snapshot(topo: &Topology, agg: &Aggregates, rev: u64) -> SceneSnapshot {
     let mut snap = SceneSnapshot::default();
-    materialize_into(&mut snap, topo, agg, rev, true, true);
+    materialize_into(
+        &mut snap,
+        topo,
+        agg,
+        rev,
+        topo.identity_revision,
+        true,
+        true,
+    );
+    snap
+}
+
+fn materialize_published_snapshot(
+    topo: &Topology,
+    agg: &Aggregates,
+    rev: u64,
+    identity_rev: u64,
+) -> SceneSnapshot {
+    let mut snap = SceneSnapshot::default();
+    materialize_into(&mut snap, topo, agg, rev, identity_rev, true, true);
     snap
 }
 
@@ -638,7 +949,7 @@ fn patch_structural_into(
             .unwrap_or_else(|| tombstone.clone())
     };
     // Deref hides the field split from the borrow checker; name both halves.
-    let SceneSnapshot { scene, ids } = snap;
+    let SceneSnapshot { scene, ids, .. } = snap;
     let ids = Arc::make_mut(ids);
     for i in scene.regions.len()..topo.ns_rects.len() {
         scene.regions.push(ns_node(topo, agg, i));
@@ -718,6 +1029,7 @@ fn extract(
     agg: Res<Aggregates>,
     mut dirty: ResMut<Dirty>,
     mut rev: ResMut<Rev>,
+    mut identity_clock: ResMut<IdentityClock>,
     mut pool: ResMut<SnapshotPool>,
     mut stats: ResMut<PublishStats>,
     out: Res<SceneOut>,
@@ -728,6 +1040,7 @@ fn extract(
     dirty.0 = false;
     rev.0 += 1;
     stats.publishes += 1;
+    let identity_rev = identity_clock.observe(topo.identity_revision);
 
     let SnapshotPool {
         bufs,
@@ -747,10 +1060,23 @@ fn extract(
         let rebuild_spatial_index = *spatial_revision != topo.spatial_revision;
         let rebuild_ids = *identity_revision != topo.identity_revision;
         match Arc::get_mut(buf) {
-            Some(snap) => {
-                materialize_into(snap, &topo, &agg, rev.0, rebuild_spatial_index, rebuild_ids)
+            Some(snap) => materialize_into(
+                snap,
+                &topo,
+                &agg,
+                rev.0,
+                identity_rev,
+                rebuild_spatial_index,
+                rebuild_ids,
+            ),
+            None => {
+                *buf = Arc::new(materialize_published_snapshot(
+                    &topo,
+                    &agg,
+                    rev.0,
+                    identity_rev,
+                ))
             }
-            None => *buf = Arc::new(materialize_snapshot(&topo, &agg, rev.0)),
         }
         *spatial_revision = topo.spatial_revision;
         *identity_revision = topo.identity_revision;
@@ -777,6 +1103,7 @@ fn extract(
             ext.rollup = agg.ns_rollup[i as usize];
         }
         snap.rev = rev.0;
+        snap.identity_rev = identity_rev;
     }
     pending.clear();
     out.0.store(buf.clone());
@@ -943,9 +1270,6 @@ fn build_world_with_layout(
     let mut sat_details = Vec::with_capacity(sats);
     let mut sat_kinds = Vec::with_capacity(sats);
     let mut sat_wl = Vec::with_capacity(sats);
-    let mut edges = Vec::with_capacity(edge_capacity);
-    let mut ns_edge_range = Vec::with_capacity(namespaces);
-    let mut cross_pending: Vec<(u32, u32)> = Vec::with_capacity(edge_capacity);
 
     for (ni, ns) in spec.namespaces.into_iter().enumerate() {
         let (ns_slot, inserted) = ns_slots.insert(ns.uid);
@@ -1001,33 +1325,6 @@ fn build_world_with_layout(
     }
     debug_assert_eq!(sat_labels.len(), lay.sat_rects.len());
 
-    // Resolve only after the permanent slot map is complete. Building a second
-    // workload UID map before flattening cloned and hashed every workload just
-    // to discard that index here. Namespace/workload order is already stable,
-    // so local edge order remains byte-for-byte identical and cross edges still
-    // occupy the tail.
-    for (namespace, workloads) in ns_wl_range.iter().enumerate() {
-        let edge_start = edges.len() as u32;
-        for source in workloads.clone() {
-            for target in &wl_depends_on[source as usize] {
-                let Some(to) = wl_slots.get(target) else {
-                    continue;
-                };
-                if wl_ns[to as usize] as usize == namespace {
-                    edges.push(EdgeInst::blocks(source, to));
-                } else {
-                    cross_pending.push((source, to));
-                }
-            }
-        }
-        ns_edge_range.push(edge_start..edges.len() as u32);
-    }
-    let cross_start = edges.len() as u32;
-    for (a, b) in cross_pending {
-        edges.push(EdgeInst::blocks(a, b));
-    }
-    let cross_edge_range = cross_start..edges.len() as u32;
-
     let ns_unhealthy: Vec<f32> = ns_pod_range
         .iter()
         .zip(&ns_unhealthy_count)
@@ -1042,8 +1339,7 @@ fn build_world_with_layout(
     pod_slots.seal_ids();
     sat_slots.seal_ids();
 
-    let mut world = World::new();
-    world.insert_resource(Topology {
+    let mut topology = Topology {
         spatial_revision: 1,
         identity_revision: 1,
         ns_slots,
@@ -1077,12 +1373,18 @@ fn build_world_with_layout(
         sat_kinds,
         sat_rects: lay.sat_rects,
         sat_wl,
-        edges,
-        ns_edge_range,
-        cross_edge_range,
+        edges: Vec::with_capacity(edge_capacity),
+        ns_edge_range: Vec::new(),
+        cross_edge_range: 0..0,
         bounds: lay.bounds,
         card_header: card_header_of(mode),
-    });
+    };
+    // One edge builder for the initial scene and every live rebuild, so extra
+    // sat→cell edges cannot drift from `verify_derived_state`.
+    topology::rebuild_edges(&mut topology);
+
+    let mut world = World::new();
+    world.insert_resource(topology);
     world.insert_resource(Aggregates {
         pod_state,
         wl_rollup,
@@ -1095,6 +1397,10 @@ fn build_world_with_layout(
     world.insert_resource(SceneOut(scene));
     world.insert_resource(Dirty(false));
     world.insert_resource(Rev(0));
+    world.insert_resource(IdentityClock {
+        topology_revision: 0,
+        published: 0,
+    });
     world.insert_resource(SnapshotPool::new());
     world.insert_resource(PublishStats::default());
     world.insert_resource(RollupScratch::default());

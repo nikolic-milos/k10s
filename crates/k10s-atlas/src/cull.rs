@@ -1,8 +1,13 @@
 use crate::camera::Camera;
-use crate::lod::{LodPolicy, StageBlend};
+use crate::lod::{LodPolicy, StageBlend, WorkloadPresentation};
 use crate::scene::{BlockNode, Rect, Scene};
 
-const DIRECT_REGION_SCAN_LIMIT: usize = 2_048;
+/// Regions a Z0 painter will scan without aggregation. The fit-camera corpus
+/// tops out at 1600, which still fits. Two of those on one Starmap would not,
+/// so a window still shows one cluster: launch replaces the connection, it
+/// does not merge contexts into one scene.
+pub const MAX_Z0_REGIONS: usize = 2_048;
+const DIRECT_REGION_SCAN_LIMIT: usize = MAX_Z0_REGIONS;
 const DIRECT_SINGLE_REGION_FRACTION: f32 = 0.125;
 const DIRECT_STAGE_ONE_CHILD_LIMIT: usize = 64;
 const DIRECT_MULTI_REGION_CHILD_LIMIT: usize = 4_096;
@@ -167,6 +172,46 @@ fn cull_stage_zero<R, B, C, S>(
     }
 }
 
+#[inline]
+fn count_workload_mark(
+    st: &mut CullStats,
+    policy: &LodPolicy,
+    inner_w: f32,
+    zoom: f32,
+    stage: u8,
+    skip_blocks: bool,
+) -> WorkloadPresentation {
+    let presentation = if skip_blocks {
+        WorkloadPresentation::Hidden
+    } else {
+        policy.workload_presentation(inner_w, zoom, stage)
+    };
+    if presentation == WorkloadPresentation::Hidden {
+        return presentation;
+    }
+
+    st.drawn_blocks += 1;
+    if presentation.card_shown() {
+        st.quads += 1;
+        if presentation == WorkloadPresentation::Detailed
+            && policy.block_chrome_shown(inner_w, zoom)
+        {
+            st.quads += 2;
+        }
+    }
+    if matches!(
+        presentation,
+        WorkloadPresentation::Medallion | WorkloadPresentation::Detailed
+    ) && policy.block_icon_shown(inner_w, zoom)
+    {
+        push_icon(st, policy);
+    }
+    if presentation.card_shown() && policy.block_label_shown(inner_w, zoom) {
+        push_label(st, policy);
+    }
+    presentation
+}
+
 fn cull_stage_one_indexed<R, B, C, S>(
     scene: &Scene<R, B, C, S>,
     zoom: f32,
@@ -194,19 +239,7 @@ fn cull_stage_one_indexed<R, B, C, S>(
             if !(region_inside || block.rect.intersects(visible)) {
                 return;
             }
-            if policy.block_painted(block.inner.w, zoom) && !skip_blocks {
-                st.drawn_blocks += 1;
-                st.quads += 1;
-                if policy.block_chrome_shown(block.inner.w, zoom) {
-                    st.quads += 2;
-                }
-                if policy.block_icon_shown(block.inner.w, zoom) {
-                    push_icon(&mut st, policy);
-                }
-                if policy.block_label_shown(block.inner.w, zoom) {
-                    push_label(&mut st, policy);
-                }
-            }
+            count_workload_mark(&mut st, policy, block.inner.w, zoom, 1, skip_blocks);
         });
     });
     st
@@ -239,19 +272,7 @@ fn cull_stage_one_contiguous<R, B, C, S>(
             if !(region_inside || block.rect.intersects(visible)) {
                 continue;
             }
-            if policy.block_painted(block.inner.w, zoom) && !skip_blocks {
-                st.drawn_blocks += 1;
-                st.quads += 1;
-                if policy.block_chrome_shown(block.inner.w, zoom) {
-                    st.quads += 2;
-                }
-                if policy.block_icon_shown(block.inner.w, zoom) {
-                    push_icon(&mut st, policy);
-                }
-                if policy.block_label_shown(block.inner.w, zoom) {
-                    push_label(&mut st, policy);
-                }
-            }
+            count_workload_mark(&mut st, policy, block.inner.w, zoom, 1, skip_blocks);
         }
     }
     st
@@ -292,26 +313,14 @@ fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
                 return;
             }
 
-            let painted = policy.block_painted(block.inner.w, zoom) && !skip_blocks;
-            if painted {
-                st.drawn_blocks += 1;
-                st.quads += 1;
-                if policy.block_chrome_shown(block.inner.w, zoom) {
-                    st.quads += 2;
-                }
-                if policy.block_icon_shown(block.inner.w, zoom) {
-                    push_icon(&mut st, policy);
-                }
-                if policy.block_label_shown(block.inner.w, zoom) {
-                    push_label(&mut st, policy);
-                }
-            }
+            let presentation =
+                count_workload_mark(&mut st, policy, block.inner.w, zoom, stage, skip_blocks);
             if stage < 2 {
                 return;
             }
 
             let block_inside = region_inside || visible.contains(&block.rect);
-            if painted || policy.stress_curves {
+            if presentation != WorkloadPresentation::Hidden || policy.stress_curves {
                 for satellite in &scene.sats[block.sats.start as usize..block.sats.end as usize] {
                     if !(block_inside || satellite.rect.intersects(visible))
                         || !policy.sat_painted(satellite.rect.w, zoom)
@@ -335,7 +344,7 @@ fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
                     }
                 }
             }
-            if !painted {
+            if !presentation.cells_shown() {
                 return;
             }
 
@@ -476,28 +485,14 @@ fn cull_block<const INDEXED: bool, R, B, C, S>(
         return;
     }
 
-    let painted = policy.block_painted(block.inner.w, zoom) && !skip_blocks;
-    if painted {
-        st.drawn_blocks += 1;
-        st.quads += 1;
-
-        if policy.block_chrome_shown(block.inner.w, zoom) {
-            st.quads += 2;
-        }
-        if policy.block_icon_shown(block.inner.w, zoom) {
-            push_icon(st, policy);
-        }
-        if policy.block_label_shown(block.inner.w, zoom) {
-            push_label(st, policy);
-        }
-    }
+    let presentation = count_workload_mark(st, policy, block.inner.w, zoom, stage, skip_blocks);
 
     if stage < 2 {
         return;
     }
     let block_inside = region_inside || visible.contains(&block.rect);
 
-    if painted || policy.stress_curves {
+    if presentation != WorkloadPresentation::Hidden || policy.stress_curves {
         scene.for_each_block_sat(block_index, |_, sat| {
             if !(block_inside || sat.rect.intersects(visible))
                 || !policy.sat_painted(sat.rect.w, zoom)
@@ -522,7 +517,7 @@ fn cull_block<const INDEXED: bool, R, B, C, S>(
         });
     }
 
-    if !painted {
+    if !presentation.cells_shown() {
         return;
     }
     let cells = block.children.len();

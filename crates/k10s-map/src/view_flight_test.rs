@@ -55,6 +55,41 @@ fn a_flight_stops_asking_the_frame_it_arrives_on() {
 }
 
 #[test]
+fn a_retargeted_flight_keeps_flying_from_here_to_the_new_target() {
+    let start = camera(0.0, 0.0, 0.1);
+    let mut at = start;
+    let mut fly = Some(FlyTo::new(
+        start,
+        camera(400.0, 300.0, 2.0),
+        Motion::Animate,
+    ));
+
+    for _ in 0..8 {
+        assert!(advance_flight(&mut fly, &mut at, FLY_SECONDS * 0.05));
+    }
+    let midway = at;
+    assert_ne!(midway, start, "the first flight never left");
+
+    let second = camera(-400.0, -300.0, 0.5);
+    fly.as_mut()
+        .expect("still flying")
+        .retarget(second, Motion::Animate);
+    assert!(
+        advance_flight(&mut fly, &mut at, 0.0),
+        "a retargeted flight stopped asking to be painted"
+    );
+    assert_eq!(at, midway, "retargeting snapped the camera instead of it");
+
+    let mut frames = 0;
+    while advance_flight(&mut fly, &mut at, 0.016) {
+        frames += 1;
+        assert!(frames < 1_000, "a {FLY_SECONDS}s flight never arrived");
+    }
+    assert_eq!(at, second);
+    assert!(fly.is_none());
+}
+
+#[test]
 fn reduced_motion_costs_one_frame_and_not_a_flight() {
     let target = camera(400.0, 300.0, 2.0);
     let mut at = camera(0.0, 0.0, 0.1);

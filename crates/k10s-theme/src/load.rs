@@ -236,7 +236,10 @@ fn apply_style(theme: &mut Theme, style: &serde_json::Map<String, Value>, notes:
 macro_rules! solid {
     ($into:expr, $key:expr, $value:expr, $notes:expr) => {
         match color(($key), ($value), ($notes)) {
-            Some((rgb, _)) => $into = rgb,
+            Some((rgb, alpha)) => {
+                $into = rgb;
+                opaque_note(($key), alpha, ($notes));
+            }
             None => {}
         }
     };
@@ -453,13 +456,18 @@ fn colors_into<const N: usize>(
     // theme inherited, so the whole array is staged and only then committed.
     let mut staged = *into;
     let before = notes.len();
+    let mut alpha = 1.0f32;
     for (slot, item) in staged.iter_mut().zip(items) {
-        if let Some((rgb, _)) = color(key, item, notes) {
+        if let Some((rgb, item_alpha)) = color(key, item, notes) {
             *slot = rgb;
+            alpha = alpha.min(item_alpha);
         }
     }
+    // Counted before the note below, because the commit is decided by whether
+    // anything failed to parse and an ignored alpha is not a failure.
     if notes.len() == before {
         *into = staged;
+        opaque_note(key, alpha, notes);
     }
 }
 
@@ -491,6 +499,19 @@ fn blends_into<const N: usize>(
     }
     if notes.len() == before {
         *into = staged;
+    }
+}
+
+// An eight-digit colour on a key that is painted opaque is accepted, because
+// refusing it would throw away the hue somebody meant. It is still not what
+// they wrote, so it is a note like everything else that did not land the way
+// the file says.
+fn opaque_note(key: &str, alpha: f32, notes: &mut Vec<String>) {
+    if alpha < 1.0 {
+        notes.push(format!(
+            "{key:?} is painted opaque, so its alpha is ignored; use a colour without one to \
+             say so"
+        ));
     }
 }
 

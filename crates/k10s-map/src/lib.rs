@@ -16,7 +16,9 @@ mod hex;
 mod lod;
 #[cfg(test)]
 mod oracle_test;
+mod overlay;
 mod pick;
+mod primitive;
 mod text;
 
 use std::cell::{Cell, RefCell};
@@ -58,6 +60,7 @@ gpui::actions!(
         ToggleEdges,
         ToggleHud,
         ToggleLegend,
+        CycleOverlay,
         FitView,
         ZoomIn,
         ZoomOut,
@@ -73,6 +76,7 @@ pub fn keybindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("e", ToggleEdges, map),
         gpui::KeyBinding::new("g", ToggleLegend, map),
         gpui::KeyBinding::new("h", ToggleHud, map),
+        gpui::KeyBinding::new("o", CycleOverlay, map),
         gpui::KeyBinding::new("f", FitView, map),
         gpui::KeyBinding::new("=", ZoomIn, map),
         gpui::KeyBinding::new("-", ZoomOut, map),
@@ -81,7 +85,9 @@ pub fn keybindings() -> Vec<gpui::KeyBinding> {
 pub use frame::FrameOpts;
 pub use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 pub use lod::{cull, stage_for_zoom};
+pub use overlay::{OverlayFrame, OverlayKind, OverlayMark};
 pub use pick::{PickPath, path_rect, pick};
+pub use primitive::{MarkPrimitive, mark_primitive};
 
 type PresentCallback = Box<dyn FnOnce(Instant, &mut App)>;
 type SceneReady = Box<dyn Fn(&SceneSnapshot) -> bool>;
@@ -242,6 +248,7 @@ struct HoverBasis {
     rev: u64,
     camera: Camera,
     viewport: (f32, f32),
+    stage: u8,
 }
 
 type Glyph = (&'static str, &'static [u8]);
@@ -292,37 +299,46 @@ static TOOL_GLYPHS: &[Glyph] = &[
     tool_glyph!("apacheairflow.svg"),
     tool_glyph!("argo.svg"),
     tool_glyph!("apachecassandra.svg"),
+    tool_glyph!("cilium.svg"),
     tool_glyph!("clickhouse.svg"),
     tool_glyph!("consul.svg"),
     tool_glyph!("elasticsearch.svg"),
     tool_glyph!("envoyproxy.svg"),
     tool_glyph!("etcd.svg"),
+    tool_glyph!("falco.svg"),
     tool_glyph!("fluentbit.svg"),
     tool_glyph!("fluentd.svg"),
     tool_glyph!("flux.svg"),
     tool_glyph!("grafana.svg"),
     tool_glyph!("harbor.svg"),
+    tool_glyph!("headlamp.svg"),
     tool_glyph!("istio.svg"),
     tool_glyph!("jaeger.svg"),
     tool_glyph!("jenkins.svg"),
     tool_glyph!("apachekafka.svg"),
+    tool_glyph!("kargo.svg"),
     tool_glyph!("keycloak.svg"),
     tool_glyph!("kibana.svg"),
     tool_glyph!("kubernetes.svg"),
+    tool_glyph!("kyverno.svg"),
+    tool_glyph!("loki.svg"),
     tool_glyph!("mariadb.svg"),
     tool_glyph!("minio.svg"),
     tool_glyph!("mongodb.svg"),
     tool_glyph!("mysql.svg"),
     tool_glyph!("natsdotio.svg"),
     tool_glyph!("nginx.svg"),
+    tool_glyph!("openbao.svg"),
     tool_glyph!("opentelemetry.svg"),
     tool_glyph!("postgresql.svg"),
     tool_glyph!("prometheus.svg"),
     tool_glyph!("rabbitmq.svg"),
     tool_glyph!("redis.svg"),
     tool_glyph!("temporal.svg"),
+    tool_glyph!("tetragon.svg"),
     tool_glyph!("traefikproxy.svg"),
     tool_glyph!("vault.svg"),
+    tool_glyph!("velero.svg"),
 ];
 
 const _: () = assert!(
@@ -333,6 +349,18 @@ const _: () = assert!(
 fn glyph_of(table: &'static [Glyph], idx: usize) -> (SharedString, &'static [u8]) {
     let (key, data) = table.get(idx).copied().unwrap_or(UNKNOWN_GLYPH);
     (SharedString::new_static(key), data)
+}
+
+/// The bytes behind a map glyph asset key, for chrome outside the map's
+/// paint path: the app's AssetSource consults this so an `svg()` element
+/// can name a brand mask by the same `icons/tools/...` key the map uses.
+pub fn embedded_icon(path: &str) -> Option<&'static [u8]> {
+    KIND_GLYPHS
+        .iter()
+        .chain(TOOL_GLYPHS)
+        .chain(std::iter::once(&UNKNOWN_GLYPH))
+        .find(|(key, _)| *key == path)
+        .map(|(_, data)| *data)
 }
 
 fn kind_icon(kind: KindId) -> (SharedString, &'static [u8]) {
@@ -378,10 +406,15 @@ pub struct MapView {
     summary: chrome::SummaryCache,
     chrome: gpui::Entity<chrome::Chrome>,
     chrome_state: Option<chrome::State>,
+    // Behind an Rc so the canvas paint closure shares the frame instead of
+    // deep-cloning up to 512 marks' strings and series every painted frame.
+    overlay: Rc<OverlayFrame>,
+    overlay_cache: Rc<RefCell<overlay::StampCache>>,
     present_probe: PresentProbe,
 
     pacer: FramePacer,
     stage: StageMachine,
+    displayed_stage: u8,
     last_stage_tick: Option<std::time::Instant>,
     bench: Option<Bench>,
     // The flight in progress, if any. `None` is the whole idle case: no flight
@@ -473,11 +506,14 @@ impl MapView {
             summary: chrome::SummaryCache::default(),
             chrome: map_chrome,
             chrome_state: None,
+            overlay: Rc::new(OverlayFrame::default()),
+            overlay_cache: Rc::new(RefCell::new(overlay::StampCache::default())),
             present_probe: PresentProbe::default(),
             pacer: FramePacer::default(),
             fly: None,
             bench_failed,
             stage: StageMachine::new(lod::STAGE_FADE_SECS),
+            displayed_stage: lod().stage_for_zoom(Camera::default().zoom),
             last_stage_tick: None,
             bench: bench.map(Bench::new),
         }
@@ -485,6 +521,12 @@ impl MapView {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// The published scene the map is drawing. Search builds an index from
+    /// this, never from a paint walk.
+    pub fn snapshot(&self) -> std::sync::Arc<SceneSnapshot> {
+        self.scene.load_full()
     }
 
     pub fn with_present_probe(mut self, probe: PresentProbe) -> Self {
@@ -497,6 +539,26 @@ impl MapView {
     /// map, while a semantic-band or hover change rebuilds this view alone.
     pub fn chrome_view(&self) -> gpui::AnyView {
         self.chrome.clone().into()
+    }
+
+    /// Stamp overlay marks onto the map. Empty is the first-paint case: no
+    /// overlay, not a hole. Replacing the frame notifies; identical frames do
+    /// not.
+    pub fn set_overlay(&mut self, overlay: OverlayFrame, cx: &mut Context<Self>) {
+        if *self.overlay == overlay {
+            return;
+        }
+        self.overlay = Rc::new(overlay);
+        // New marks may resolve to different slots; the paint path trusts the
+        // stamp cache until told otherwise.
+        self.overlay_cache.borrow_mut().invalidate();
+        cx.notify();
+    }
+
+    /// The stamps the finder can index. Search reads this table, not the
+    /// paint walk, so an overlay query does not wait on a frame.
+    pub fn overlay(&self) -> &OverlayFrame {
+        &self.overlay
     }
 
     // The map's commands, invoked by the workspace's action handlers: the
@@ -662,6 +724,7 @@ impl MapView {
             rev: scene.rev,
             camera: self.camera,
             viewport: (rect.w, rect.h),
+            stage: self.displayed_stage,
         }
     }
 
@@ -682,7 +745,7 @@ impl MapView {
             return None;
         }
         let policy = lod();
-        let blend = StageBlend::settled(policy.stage_for_zoom(self.camera.zoom));
+        let blend = StageBlend::settled(self.displayed_stage);
         let path = pick(
             scene,
             &self.camera,
@@ -723,10 +786,11 @@ impl MapView {
 
     #[cfg(feature = "testing")]
     pub fn testing_set_camera(&mut self, camera: Camera) {
-        self.camera = camera;
+        self.camera = camera.clamped();
         self.fitted = true;
         self.interacted = true;
         self.stage = StageMachine::new(0.0);
+        self.displayed_stage = lod().stage_for_zoom(self.camera.zoom);
         self.last_stage_tick = None;
     }
 
@@ -766,11 +830,8 @@ impl MapView {
         if snapshot.rev == 0 {
             return None;
         }
-        // A click resolves at the stage the zoom is settling toward; a fade
-        // lasts 180 ms and picking mid-fade should answer for where the user
-        // is going, not where the crossfade happens to be.
         let policy = lod();
-        let blend = StageBlend::settled(policy.stage_for_zoom(self.camera.zoom));
+        let blend = StageBlend::settled(self.displayed_stage);
         let Some(path) = pick(
             &snapshot,
             &self.camera,
@@ -885,7 +946,17 @@ impl Render for MapView {
         if advance_flight(&mut self.fly, &mut self.camera, dt) {
             self.pacer.request_frame();
         }
-        let blend = self.stage.update(lod(), self.camera.zoom, dt);
+        // Once per frame, not inside `w2s`: that call is per entity on the
+        // walk the budgets measure, and a public zoom of zero or NaN has to
+        // be repaired before LOD and paint divide by it, not a million times
+        // during them.
+        self.camera = self.camera.clamped();
+        let blend = if cx.reduce_motion() {
+            self.stage.settle(lod(), self.camera.zoom)
+        } else {
+            self.stage.update(lod(), self.camera.zoom, dt)
+        };
+        self.displayed_stage = blend.walk_stage();
         if self.stage.animating() {
             self.pacer.request_frame();
         }
@@ -919,6 +990,7 @@ impl Render for MapView {
                 edges_on,
                 legend_on: self.legend_on,
                 viewport: (map_width, map_height),
+                map_overlay: &self.overlay,
             });
             if self.chrome_state.as_ref() != Some(&state) {
                 self.chrome_state = Some(state.clone());
@@ -938,6 +1010,8 @@ impl Render for MapView {
             gpui::CursorStyle::Arrow
         };
         let paint_scene = scene.clone();
+        let overlay = Rc::clone(&self.overlay);
+        let overlay_cache = self.overlay_cache.clone();
 
         div()
             .id("starmap-view")
@@ -1032,9 +1106,15 @@ impl Render for MapView {
                             f32::from(bounds.size.width),
                             f32::from(bounds.size.height),
                         );
-                        if map_bounds.replace(next_bounds) != next_bounds {
-                            // The next render now has the element-relative
-                            // viewport for fit, reveal, picking and chrome.
+                        // Store the precise rect for picking and fit; ask for
+                        // another frame only when the device-pixel grid moved.
+                        // Hyprland fractional scale can rescale logical bounds
+                        // by a fraction every configure, and comparing f32s
+                        // would re-arm RAF forever while nothing visible
+                        // changed -- which is how the idle claim dies.
+                        let scale = window.scale_factor();
+                        let prev = map_bounds.replace(next_bounds);
+                        if device_px(prev, scale) != device_px(next_bounds, scale) {
                             window.request_animation_frame();
                         }
                         paint_map(
@@ -1049,6 +1129,8 @@ impl Render for MapView {
                             &icon_buf,
                             &text_cache,
                             marks,
+                            &overlay,
+                            &overlay_cache,
                             edges_on,
                             churn_on,
                             hud_on,
@@ -1071,6 +1153,57 @@ impl Render for MapView {
 fn skip_workloads() -> bool {
     static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SKIP.get_or_init(|| std::env::var_os("K10S_SKIP_WL").is_some_and(|v| v != "0"))
+}
+
+/// The device-pixel grid a logical rect occupies at `scale`.
+///
+/// Used to decide whether a bounds change is worth another frame: comparing
+/// the f32s themselves treats a 0.01 px Hyprland rescale as damage.
+fn device_px(rect: k10s_core::Rect, scale: f32) -> [i32; 4] {
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    [
+        (rect.x * s).round() as i32,
+        (rect.y * s).round() as i32,
+        (rect.w * s).round() as i32,
+        (rect.h * s).round() as i32,
+    ]
+}
+
+/// Round a paint rect onto the device pixel grid before `paint_svg`.
+///
+/// gpui keys its SVG atlas on the size of `snap_bounds`, which rounds each
+/// edge independently. Two icons of the same ladder size at different
+/// subpixel origins then become two tiles, and a fractional scale (1.25 /
+/// 1.5) makes that the common case. Rounding origin and size here keeps the
+/// atlas key equal to the ladder size the walk already chose. The walk is
+/// untouched: only the paint quad moves.
+fn snap_to_device(bounds: Bounds<Pixels>, scale: f32) -> Bounds<Pixels> {
+    if !(scale.is_finite() && scale > 0.0) {
+        return bounds;
+    }
+    let snap = |v: f32| px((v * scale).round() / scale);
+    Bounds {
+        origin: point(
+            snap(f32::from(bounds.origin.x)),
+            snap(f32::from(bounds.origin.y)),
+        ),
+        size: size(
+            snap(f32::from(bounds.size.width)),
+            snap(f32::from(bounds.size.height)),
+        ),
+    }
+}
+
+fn say_once(message: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        eprintln!("k10s: {message}");
+    }
 }
 
 fn letterbox_bounds(canvas: Bounds<Pixels>) -> Bounds<Pixels> {
@@ -1120,8 +1253,6 @@ impl Marks {
 // reads as a box drawn over a blob.
 const MARK_INSET: f32 = 3.0;
 const MARK_WIDTH: f32 = 2.0;
-const MARK_RADIUS_OF_SHORT: f32 = 0.2;
-const MARK_RADIUS_MAX: f32 = 20.0;
 const MARK_HALO_ALPHA: f32 = 0.16;
 
 // Draw whatever the pointer is on and whatever is selected, from the path and
@@ -1136,6 +1267,7 @@ fn paint_marks(
     bounds: Bounds<Pixels>,
     scene: &SceneSnapshot,
     camera: Camera,
+    stage: u8,
     marks: Marks,
     theme: &k10s_theme::MapTheme,
     window: &mut Window,
@@ -1151,23 +1283,15 @@ fn paint_marks(
         (marks.hovered, theme.hover_ring),
     ] {
         let Some(path) = path else { continue };
-        let Some(rect) = path_rect(scene, &path) else {
+        let Some(target) = mark_primitive(scene, path, camera, lod(), stage, (vw, vh), origin)
+        else {
             continue;
         };
-        let (x, y) = camera.w2s(rect.x, rect.y, vw, vh);
-        let ring = Bounds {
-            origin: point(px(origin.0 + x - MARK_INSET), px(origin.1 + y - MARK_INSET)),
-            size: size(
-                px(rect.w * camera.zoom + MARK_INSET * 2.0),
-                px(rect.h * camera.zoom + MARK_INSET * 2.0),
-            ),
-        };
-        let short = f32::from(ring.size.width).min(f32::from(ring.size.height));
-        let radius = px((short * MARK_RADIUS_OF_SHORT).min(MARK_RADIUS_MAX));
+        let ring = target.outset(MARK_INSET);
         let stroke = rgb(color);
         window.paint_quad(quad(
-            ring,
-            radius,
+            ring.bounds,
+            ring.corners,
             scale_alpha(stroke, MARK_HALO_ALPHA),
             px(MARK_WIDTH),
             stroke,
@@ -1202,6 +1326,8 @@ fn paint_map(
     icon_buf: &Rc<RefCell<Vec<IconJob>>>,
     text_cache: &Rc<RefCell<TextCache>>,
     marks: Marks,
+    overlay: &OverlayFrame,
+    overlay_cache: &Rc<RefCell<overlay::StampCache>>,
     edges_on: bool,
     churn_on: bool,
     hud_on: bool,
@@ -1311,48 +1437,91 @@ fn paint_map(
 
     let fg_quads_start = std::time::Instant::now();
     window.paint_quads(&fg);
+    // Overlay stamps sit outside `frame::walk`, the same way hover rings do:
+    // a post-pass over the bounded mark table, keyed by uid, only for objects
+    // the camera already has on screen. CullStats does not grow a field.
+    if !overlay.marks.is_empty() {
+        let vw = f32::from(bounds.size.width);
+        let vh = f32::from(bounds.size.height);
+        let stamps = overlay.visible_stamps_cached(
+            &mut overlay_cache.borrow_mut(),
+            scene,
+            camera,
+            lod(),
+            blend,
+            vw,
+            vh,
+        );
+        overlay::paint_stamps(
+            &stamps,
+            (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),
+            &theme.map,
+            window,
+        );
+    }
     if !marks.is_empty() {
-        paint_marks(bounds, scene, camera, marks, &theme.map, window);
+        paint_marks(
+            bounds,
+            scene,
+            camera,
+            blend.walk_stage(),
+            marks,
+            &theme.map,
+            window,
+        );
     }
 
     let icons_start = std::time::Instant::now();
     if !icons.is_empty() {
         let wl_icon_color: gpui::Hsla =
             scale_alpha(rgb(theme.map.wl_icon), 0.95 * block_alpha).into();
+        let scale = window.scale_factor();
         window.paint_layer(bounds, |window| {
             for job in icons.iter() {
                 let (key, data, icon_bounds, color) = match job {
-                    IconJob::Wl(kind, b) => {
+                    IconJob::Wl(kind, primitive) => {
                         let (key, data) = kind_icon(*kind);
-                        (key, data, *b, wl_icon_color)
+                        (
+                            key,
+                            data,
+                            snap_to_device(primitive.bounds, scale),
+                            wl_icon_color,
+                        )
                     }
-                    IconJob::ToolId(tool, b) => {
+                    IconJob::ToolId(tool, primitive) => {
                         let (key, data) = tool_icon(*tool);
                         (
                             key,
                             data,
-                            *b,
+                            snap_to_device(primitive.bounds, scale),
                             scale_alpha(theme.map.tool_color(*tool), 0.95 * block_alpha).into(),
                         )
                     }
-                    IconJob::Sat(kind, b) => {
+                    IconJob::Sat(kind, primitive) => {
                         let (key, data) = kind_icon(*kind);
                         (
                             key,
                             data,
-                            *b,
+                            snap_to_device(primitive.bounds, scale),
                             scale_alpha(theme.map.kind_color(*kind), cell_alpha).into(),
                         )
                     }
                 };
-                let _ = window.paint_svg(
-                    icon_bounds,
-                    key,
-                    Some(data),
-                    TransformationMatrix::unit(),
-                    color,
-                    cx,
-                );
+                if window
+                    .paint_svg(
+                        icon_bounds,
+                        key,
+                        Some(data),
+                        TransformationMatrix::unit(),
+                        color,
+                        cx,
+                    )
+                    .is_err()
+                {
+                    say_once(
+                        "a map icon failed to paint; further failures this process are silent",
+                    );
+                }
             }
         });
     }

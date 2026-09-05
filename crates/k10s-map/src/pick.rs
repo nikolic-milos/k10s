@@ -1,5 +1,9 @@
-use k10s_atlas::{Camera, Level, LodPolicy, Rect, Scene, StageBlend};
+use gpui::{point, px};
+use k10s_atlas::{Camera, Level, LodPolicy, Rect, Scene, StageBlend, WorkloadPresentation};
 
+use crate::primitive::Projection;
+
+#[cfg(test)]
 fn inside(rect: &Rect, x: f32, y: f32) -> bool {
     rect.x <= x && x < rect.max_x() && rect.y <= y && y < rect.max_y()
 }
@@ -81,6 +85,8 @@ pub fn pick<R, B, C, S>(
     let stage = blend.walk_stage();
     let zoom = camera.zoom;
     let visible = camera.visible_world(vw, vh);
+    let projection = Projection::new(*camera, (vw, vh), (0.0, 0.0));
+    let screen_point = point(px(sx), px(sy));
 
     // Layout guarantees regions do not overlap, so the first containing
     // region is the only one. The probe rect exists because the spatial
@@ -89,7 +95,7 @@ pub fn pick<R, B, C, S>(
     let mut region_hit: Option<u32> = None;
     if scene.region_index_is_selective(&probe) {
         scene.for_each_region_candidate(&probe, |index, region| {
-            if region_hit.is_none() && inside(&region.rect, wx, wy) {
+            if region_hit.is_none() && projection.region(region.rect).contains(screen_point) {
                 region_hit = Some(index as u32);
             }
         });
@@ -97,7 +103,7 @@ pub fn pick<R, B, C, S>(
         region_hit = scene
             .regions
             .iter()
-            .position(|region| inside(&region.rect, wx, wy))
+            .position(|region| projection.region(region.rect).contains(screen_point))
             .map(|index| index as u32);
     }
     let region = region_hit?;
@@ -111,29 +117,36 @@ pub fn pick<R, B, C, S>(
         return Some(path);
     }
 
-    // The card (`inner`) is what the painter draws; the halo is spacing and
-    // must not capture clicks. Satellites orbit outside every card, so each
-    // painted block's ring is probed whether or not the point is on its card.
-    let mut sat_hit: Option<u32> = None;
+    // The halo is only a spatial-index envelope. Resolving the displayed
+    // primitive here keeps a mid-zoom medallion clickable without turning its
+    // unused card or orbit spacing into a target.
+    let mut sat_hit: Option<(u32, u32)> = None;
     // The halo rect indexed for a block encloses its card and satellites, so a
     // point probe can narrow both hit classes together. Large fan-out regions
     // stay O(log n + leaf) under pointer motion; small regions deliberately
     // retain the cheaper direct scan selected by the scene index.
     scene.for_each_region_block_candidate(region as usize, &probe, |block_index, block| {
-        let painted = policy.block_painted(block.inner.w, zoom);
-        if !painted {
+        let presentation = policy.workload_presentation(block.inner.w, zoom, stage);
+        if presentation == WorkloadPresentation::Hidden {
             return;
         }
-        if path.block.is_none() && inside(&block.inner, wx, wy) {
+        let block_primitive = match presentation {
+            WorkloadPresentation::Medallion => projection.medallion(block.rect, block.inner),
+            WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
+                projection.card(block.inner)
+            }
+            WorkloadPresentation::Hidden => unreachable!(),
+        };
+        if path.block.is_none() && block_primitive.contains(screen_point) {
             path.block = Some(block_index as u32);
 
-            if stage >= 2 {
+            if presentation.cells_shown() {
                 let cells = block.children.len();
                 let aggregated = cells > policy.max_cells_per_block
                     && policy.cells_aggregated(cells, block.inner.intersection_fraction(&visible));
                 if !aggregated {
                     scene.for_each_block_cell_candidate(block_index, &probe, |cell_index, cell| {
-                        if path.cell.is_none() && inside(&cell.rect, wx, wy) {
+                        if path.cell.is_none() && projection.pod(cell.rect).contains(screen_point) {
                             path.cell = Some(cell_index as u32);
                         }
                     });
@@ -144,16 +157,19 @@ pub fn pick<R, B, C, S>(
             scene.for_each_block_sat(block_index, |sat_index, satellite| {
                 if sat_hit.is_none()
                     && policy.sat_painted(satellite.rect.w, zoom)
-                    && inside(&satellite.rect, wx, wy)
+                    && projection.satellite(satellite.rect).contains(screen_point)
                 {
-                    sat_hit = Some(sat_index as u32);
+                    sat_hit = Some((block_index as u32, sat_index as u32));
                 }
             });
         }
     });
 
     if path.cell.is_none() {
-        path.sat = sat_hit;
+        if let Some((block, sat)) = sat_hit {
+            path.block = Some(block);
+            path.sat = Some(sat);
+        }
     }
     Some(path)
 }
@@ -189,40 +205,54 @@ mod tests {
         if sx < 0.0 || sy < 0.0 || sx >= vw || sy >= vh {
             return None;
         }
-        let (wx, wy) = camera.s2w(sx, sy, vw, vh);
         let stage = blend.walk_stage();
         let zoom = camera.zoom;
         let visible = camera.visible_world(vw, vh);
+        let projection = Projection::new(*camera, (vw, vh), (0.0, 0.0));
+        let screen_point = point(px(sx), px(sy));
 
         let region = scene
             .regions
             .iter()
-            .position(|region| inside(&region.rect, wx, wy))? as u32;
+            .position(|region| projection.region(region.rect).contains(screen_point))?
+            as u32;
         let mut path = PickPath {
             region,
             block: None,
             cell: None,
             sat: None,
         };
+        let mut sat_hit: Option<(u32, u32)> = None;
         if stage == 0 {
             return Some(path);
         }
 
         for block_index in scene.region_block_indices(region as usize) {
             let block = &scene.blocks[block_index];
-            if !policy.block_painted(block.inner.w, zoom) {
+            let presentation = policy.workload_presentation(block.inner.w, zoom, stage);
+            if presentation == WorkloadPresentation::Hidden {
                 continue;
             }
-            if path.block.is_none() && inside(&block.inner, wx, wy) {
+            let block_primitive = match presentation {
+                WorkloadPresentation::Medallion => projection.medallion(block.rect, block.inner),
+                WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
+                    projection.card(block.inner)
+                }
+                WorkloadPresentation::Hidden => unreachable!(),
+            };
+            if path.block.is_none() && block_primitive.contains(screen_point) {
                 path.block = Some(block_index as u32);
-                if stage >= 2 {
+                if presentation.cells_shown() {
                     let cells = block.children.len();
                     let aggregated = cells > policy.max_cells_per_block
                         && policy
                             .cells_aggregated(cells, block.inner.intersection_fraction(&visible));
                     if !aggregated {
                         for cell_index in scene.block_cell_indices(block_index) {
-                            if inside(&scene.cells[cell_index].rect, wx, wy) {
+                            if projection
+                                .pod(scene.cells[cell_index].rect)
+                                .contains(screen_point)
+                            {
                                 path.cell = Some(cell_index as u32);
                                 break;
                             }
@@ -230,19 +260,23 @@ mod tests {
                     }
                 }
             }
-            if stage >= 2 && path.sat.is_none() {
+            if stage >= 2 && sat_hit.is_none() {
                 for sat_index in scene.block_sat_indices(block_index) {
                     let satellite = &scene.sats[sat_index];
-                    if policy.sat_painted(satellite.rect.w, zoom) && inside(&satellite.rect, wx, wy)
+                    if policy.sat_painted(satellite.rect.w, zoom)
+                        && projection.satellite(satellite.rect).contains(screen_point)
                     {
-                        path.sat = Some(sat_index as u32);
+                        sat_hit = Some((block_index as u32, sat_index as u32));
                         break;
                     }
                 }
             }
         }
-        if path.cell.is_some() {
-            path.sat = None;
+        if path.cell.is_none()
+            && let Some((block, sat)) = sat_hit
+        {
+            path.block = Some(block);
+            path.sat = Some(sat);
         }
         Some(path)
     }
@@ -318,6 +352,126 @@ mod tests {
             (Level::Region, None),
             "the halo is spacing, not a click target"
         );
+    }
+
+    #[test]
+    fn a_mid_zoom_medallion_owns_pixels_outside_its_hidden_card() {
+        let (vw, vh) = (1251.5, 733.25);
+        let policy = lod_policy();
+        let s = scene(SceneSpec::uniform(4, 4));
+        let block = &s.blocks[0];
+        let camera = Camera {
+            cx: block.inner.center().0,
+            cy: block.inner.center().1,
+            zoom: 0.20,
+        };
+        let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
+        let medallion = projection.medallion(block.rect, block.inner);
+        let card = projection.card(block.inner);
+        assert!(
+            medallion.bounds.size.width > card.bounds.size.width,
+            "the probe must cover the pixels the old card hit box missed"
+        );
+
+        let probe = point(
+            medallion.bounds.origin.x + px(1.0),
+            medallion.bounds.center().y,
+        );
+        assert!(medallion.contains(probe));
+        assert!(!card.contains(probe));
+        let path = pick(
+            &s,
+            &camera,
+            &policy,
+            StageBlend::settled(1),
+            vw,
+            vh,
+            f32::from(probe.x),
+            f32::from(probe.y),
+        )
+        .expect("the displayed medallion lies inside its namespace");
+        assert_eq!(path.block, Some(0));
+    }
+
+    #[test]
+    fn transition_pick_switches_hierarchy_only_at_the_display_handoff() {
+        let (vw, vh) = (1251.5, 733.25);
+        let policy = lod_policy();
+        let s = scene(SceneSpec::uniform(1, 8));
+        let cell = &s.cells[0];
+        let camera = Camera {
+            cx: cell.rect.center().0,
+            cy: cell.rect.center().1,
+            zoom: 4.5,
+        };
+        let (sx, sy) = camera.w2s(cell.rect.center().0, cell.rect.center().1, vw, vh);
+
+        let before = pick(
+            &s,
+            &camera,
+            &policy,
+            StageBlend {
+                from: 1,
+                to: 2,
+                t: 0.49,
+            },
+            vw,
+            vh,
+            sx,
+            sy,
+        )
+        .expect("the workload remains displayed before the handoff");
+        let after = pick(
+            &s,
+            &camera,
+            &policy,
+            StageBlend {
+                from: 1,
+                to: 2,
+                t: 0.5,
+            },
+            vw,
+            vh,
+            sx,
+            sy,
+        )
+        .expect("the detailed card is displayed at the handoff");
+
+        assert_eq!(before.cell, None);
+        assert_eq!(after.cell, Some(0));
+    }
+
+    #[test]
+    fn a_satellite_pick_keeps_its_parent_ancestry() {
+        let (vw, vh) = (1251.5, 733.25);
+        let policy = lod_policy();
+        let s = scene(SceneSpec::uniform(1, 4));
+        let sat_index = 0usize;
+        let block_index = s
+            .blocks
+            .iter()
+            .position(|block| block.sats.contains(&(sat_index as u32)))
+            .expect("the fixture satellite has a workload parent");
+        let sat = &s.sats[sat_index];
+        let camera = Camera {
+            cx: sat.rect.center().0,
+            cy: sat.rect.center().1,
+            zoom: 4.5,
+        };
+        let path = pick(
+            &s,
+            &camera,
+            &policy,
+            StageBlend::settled(2),
+            vw,
+            vh,
+            vw * 0.5,
+            vh * 0.5,
+        )
+        .expect("the satellite glyph is displayed at the viewport center");
+
+        assert_eq!(path.sat, Some(sat_index as u32));
+        assert_eq!(path.block, Some(block_index as u32));
     }
 
     #[test]

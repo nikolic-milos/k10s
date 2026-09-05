@@ -25,7 +25,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use k10s_core::KindId;
+use k10s_core::{KindId, Severity};
+use k10s_map::OverlayKind;
 
 pub type Reply<T> = Box<dyn FnOnce(T) + Send>;
 
@@ -41,7 +42,53 @@ pub struct EventRow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Detail {
     Events(Vec<EventRow>),
-    Log(Vec<String>),
+    /// Tail lines, and why they are these lines: a crash tail names the
+    /// container that exited, so a quiet pane is never mistaken for a quiet
+    /// process.
+    Log(Vec<String>, Option<String>),
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayStamp {
+    pub uid: String,
+    pub namespace: String,
+    pub name: String,
+    pub tint: Option<Severity>,
+    pub samples: Vec<(i64, f64)>,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverlayOutcome {
+    Ready {
+        stamps: Vec<OverlayStamp>,
+        truncated: bool,
+        note: Option<String>,
+    },
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodPostureView {
+    pub ingress_isolated: bool,
+    pub ingress_policies: usize,
+    pub ingress_names: Vec<String>,
+    pub ingress_truncated: bool,
+    pub egress_isolated: bool,
+    pub egress_policies: usize,
+    pub egress_names: Vec<String>,
+    pub egress_truncated: bool,
+    pub ports: Vec<String>,
+    pub completeness: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostureOutcome {
+    Ready(PodPostureView),
+    Missing,
     Denied(&'static str),
     Failed(String),
 }
@@ -85,8 +132,199 @@ pub struct TablePage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableOutcome {
     Table(TablePage),
+    /// The adapter is not on this cluster. The view stays invisible rather
+    /// than opening an empty pane that looks broken.
+    Absent,
     Denied(&'static str),
     Failed(String),
+}
+
+/// One ecosystem family's answer. [`TableOutcome::Absent`] means the family
+/// is not on this cluster and its row stays hidden; the id is the stable
+/// key the ecosystem pane joins its presentation onto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcosystemEntry {
+    pub id: &'static str,
+    pub outcome: TableOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPresence {
+    Ready,
+    /// The adapter is not on this cluster. The pane stays down.
+    Missing,
+    /// The tool is visible but this process cannot speak to it.
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObserveReach {
+    pub prometheus: ToolPresence,
+    pub loki: ToolPresence,
+    pub traces: ToolPresence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryDialect {
+    PromQL,
+    LogQL,
+    TraceQL,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrafanaPanelKind {
+    Timeseries,
+    Stat,
+    Gauge,
+    Table,
+    Logs,
+    Heatmap,
+    Bar,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrafanaPanelRow {
+    pub dashboard_uid: String,
+    pub dashboard_title: String,
+    pub panel_id: i64,
+    pub title: String,
+    pub kind: GrafanaPanelKind,
+    pub expr: String,
+    pub dialect: QueryDialect,
+    pub transformed: bool,
+    pub browser_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrafanaOutcome {
+    Catalog {
+        panels: Vec<GrafanaPanelRow>,
+        truncated: bool,
+    },
+    Absent,
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromSeriesView {
+    pub labels: String,
+    pub points: Vec<(i64, f64)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PromOutcome {
+    Series {
+        series: Vec<PromSeriesView>,
+        truncated: bool,
+        dropped_series: usize,
+    },
+    Absent,
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LokiOutcome {
+    Logs { lines: Vec<String>, truncated: bool },
+    Absent,
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanView {
+    pub id: String,
+    pub parent: String,
+    pub name: String,
+    pub service: String,
+    pub start_us: u64,
+    pub duration_us: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceOutcome {
+    Trace {
+        trace_id: String,
+        spans: Vec<SpanView>,
+    },
+    Absent,
+    Denied(&'static str),
+    Failed(String),
+}
+
+/// Bytes that just left a reveal Scratch. Open them into an editor scratch
+/// and drop this value. Never a table cell, a saved view, or a log line —
+/// which is why `Debug` below is written by hand to redact the payloads.
+#[derive(PartialEq, Eq)]
+pub struct HelmReveal {
+    pub name: String,
+    pub namespace: String,
+    pub revision: u32,
+    pub config: String,
+    pub chart_values: String,
+    pub manifest: String,
+}
+
+impl std::fmt::Debug for HelmReveal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HelmReveal")
+            .field("name", &self.name)
+            .field("namespace", &self.namespace)
+            .field("revision", &self.revision)
+            .field("config", &"[redacted]")
+            .field("chart_values", &"[redacted]")
+            .field("manifest", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HelmRevealOutcome {
+    Revealed(HelmReveal),
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelmRollbackOutcome {
+    Report { note: String, lines: Vec<String> },
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Day2Op {
+    Scale { current: i32, replicas: i32 },
+    Restart,
+    Pause,
+    Resume,
+    Delete,
+    Evict,
+    Cordon { unschedulable: bool },
+    Drain { force: bool },
+    Debug,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Day2Request {
+    pub kind: KindId,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub op: Day2Op,
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Day2Outcome {
+    Applied { summary: String, truncated: bool },
+    Denied { what: &'static str, why: String },
+    Rejected { message: String },
+    Failed { why: String },
+    NeedsConfirm { summary: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +498,97 @@ pub enum LogChunk {
     Failed(String),
 }
 
+/// CPU in millicores, mirrored across the seam so usage and its bounds never
+/// travel as unlabelled numbers. `Display` renders for a person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Millicores(pub u64);
+
+impl std::fmt::Display for Millicores {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 < 1000 {
+            return write!(f, "{}m", self.0);
+        }
+        let cores = format!("{:.2}", self.0 as f64 / 1000.0);
+        let cores = cores.trim_end_matches('0').trim_end_matches('.');
+        if cores == "1" {
+            write!(f, "1 core")
+        } else {
+            write!(f, "{cores} cores")
+        }
+    }
+}
+
+/// Memory in bytes, mirrored for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Bytes(pub u64);
+
+impl std::fmt::Display for Bytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const KI: f64 = 1024.0;
+        let b = self.0 as f64;
+        if b >= KI * KI * KI {
+            write!(f, "{:.1}Gi", b / (KI * KI * KI))
+        } else if b >= KI * KI {
+            write!(f, "{:.0}Mi", b / (KI * KI))
+        } else if b >= KI {
+            write!(f, "{:.0}Ki", b / KI)
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+
+// A usage poll names a pod or a workload; the provider owns how the numbers
+// are obtained and at what cadence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRequest {
+    pub namespace: String,
+    pub target: UsageTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageTarget {
+    Pod { name: String },
+    Workload { kind: KindId, name: String },
+}
+
+// Which endpoint produced the numbers: the display says so when the answer
+// came the degraded way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    MetricsServer,
+    Kubelet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageSample {
+    // None is "not measured yet", never zero: a kubelet's first sample has no
+    // CPU rate and a pod no source has scraped has neither number.
+    pub cpu: Option<Millicores>,
+    pub memory: Option<Bytes>,
+    // From the pod specs. A limit is only a number when every running
+    // container carries one; a request only when something declares one.
+    pub cpu_request: Option<Millicores>,
+    pub cpu_limit: Option<Millicores>,
+    pub memory_request: Option<Bytes>,
+    pub memory_limit: Option<Bytes>,
+    pub source: UsageSource,
+    // What the numbers cover, so a partial sum can never pass as the whole.
+    pub pods_measured: usize,
+    pub pods_total: usize,
+    pub truncated: bool,
+}
+
+// Usage is a state, not a number: a cluster without a metrics source is
+// Absent with the reason, a 403 is Denied, and neither may render as zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageOutcome {
+    Usage(UsageSample),
+    Denied(&'static str),
+    Failed(String),
+    Absent(String),
+}
+
 // A forward start request: a pod row forwards its first declared port, a
 // service row resolves through its selector and targetPort. Port choice and
 // bounds live with the provider.
@@ -302,6 +631,10 @@ pub struct ExecRequest {
     pub pod: String,
     pub container: Option<String>,
     pub command: Vec<String>,
+    /// Attach to the running process (stdin, no TTY command) rather than
+    /// exec a shell. The transport still takes this request; a backend that
+    /// does not yet distinguish the two ignores the flag and execs.
+    pub attach: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,14 +734,23 @@ read_provider! {
     fn fetch_table(&self, kind: KindId, continue_token: Option<String>, reply: Reply<TableOutcome>);
     fn fetch_node_table(&self, reply: Reply<TableOutcome>);
     fn fetch_describe(&self, request: &DescribeRequest, reply: Reply<DocOutcome>);
-    /// Helm's stored releases, as a document. Rendered on the far side of the
-    /// seam like a describe is, for the same reason: one deterministic rendering
-    /// a test can gate, and a shell that holds no release payload of its own.
-    fn fetch_releases(&self, reply: Reply<DocOutcome>);
+    /// Helm's stored releases as a table. Values and manifests never cross:
+    /// the far side reduces a release to inventory columns before it answers.
+    fn fetch_releases(&self, reply: Reply<TableOutcome>);
+    /// Argo Applications. [`TableOutcome::Absent`] means the group is not
+    /// served, so the view stays invisible rather than opening an empty pane.
+    fn fetch_argo(&self, reply: Reply<TableOutcome>);
+    /// Flux CRs. Absent is the same rule as Argo.
+    fn fetch_flux(&self, reply: Reply<TableOutcome>);
+    /// Scale, rollout, delete, evict, cordon, drain, debug. Caps are applied
+    /// on the far side of the seam so a caller cannot skip the gate. The first
+    /// call with confirm=false never touches the wire.
+    fn run_day2(&self, request: &Day2Request, reply: Reply<Day2Outcome>);
     fn fetch_manifest(&self, request: &DescribeRequest, reply: Reply<ManifestOutcome>);
-    /// The one mutating method on the seam. Dry run and apply differ by one
-    /// field of the request, so a caller cannot reach the second without being
-    /// able to reach the first.
+    /// Server-side apply. Dry run and apply differ by one field of the
+    /// request, so a caller cannot reach the second without being able to
+    /// reach the first. Day-2 clicks are [`ReadProvider::run_day2`]; they
+    /// are not documents.
     fn apply(&self, request: &ApplyRequest, reply: Reply<ApplyOutcome>);
     fn fetch_schema_catalog(&self, reply: Reply<SchemaCatalogOutcome>);
     fn fetch_schema_document(&self, url: &str, reply: Reply<SchemaTextOutcome>);
@@ -424,6 +766,14 @@ read_provider! {
         request: &WorkloadLogRequest,
         on_chunk: Box<dyn Fn(LogChunk) + Send + Sync>,
     ) -> LogStop;
+    /// Live usage for a pod or workload, re-delivered on the provider's own
+    /// cadence until the guard drops; a tick that repeats the last answer is
+    /// not re-delivered, and Denied or Absent ends the poll by itself.
+    fn poll_usage(
+        &self,
+        request: &UsageRequest,
+        on_update: Box<dyn Fn(UsageOutcome) + Send + Sync>,
+    ) -> LogStop;
     fn open_forward(&self, request: &ForwardRequest, reply: Reply<ForwardOutcome>);
     /// Local registry state: synchronous, no cluster round trip.
     fn list_forwards(&self) -> Vec<ForwardRow>;
@@ -433,6 +783,53 @@ read_provider! {
         request: &ExecRequest,
         on_event: Box<dyn Fn(ExecEvent) + Send + Sync>,
     ) -> Box<dyn ExecSession>;
+    /// Overlay stamps assembled off the paint path. Empty Ready is a missing
+    /// adapter, not a hole in the cluster.
+    fn fetch_overlay(&self, kind: OverlayKind, reply: Reply<OverlayOutcome>);
+    /// Isolation and named ports. Not an allow or deny: that needs a source,
+    /// protocol, and destination port.
+    fn fetch_pod_posture(&self, namespace: &str, name: &str, reply: Reply<PostureOutcome>);
+    /// Grafana dashboards reduced to queries. [`GrafanaOutcome::Absent`] hides
+    /// the Grafana pane.
+    fn fetch_grafana(&self, reply: Reply<GrafanaOutcome>);
+    fn probe_observe(&self, reply: Reply<ObserveReach>);
+    fn query_promql(&self, expr: String, reply: Reply<PromOutcome>);
+    fn query_loki(&self, query: String, reply: Reply<LokiOutcome>);
+    fn lookup_trace(&self, trace_id: String, reply: Reply<TraceOutcome>);
+    /// PolicyReport findings. Absent hides the pane.
+    fn fetch_policy(&self, reply: Reply<TableOutcome>);
+    /// Harbor projects. Absent hides the pane.
+    fn fetch_harbor(&self, reply: Reply<TableOutcome>);
+    /// Declared mesh inventory. Observed stays the overlay.
+    fn fetch_mesh(&self, reply: Reply<TableOutcome>);
+    /// Every ecosystem family the data plane can list, each reduced to its
+    /// own table. Absent families stay hidden; one denied or failed family
+    /// never hides the others.
+    fn fetch_ecosystem(&self, reply: Reply<Vec<EcosystemEntry>>);
+    /// Explicit reveal of one Helm revision. The answer is for a scratch
+    /// editor, never a table page.
+    fn reveal_helm(
+        &self,
+        namespace: Option<String>,
+        name: String,
+        revision: u32,
+        reply: Reply<HelmRevealOutcome>,
+    );
+    fn diff_helm(
+        &self,
+        namespace: Option<String>,
+        name: String,
+        from: u32,
+        to: u32,
+        reply: Reply<DocOutcome>,
+    );
+    fn rollback_helm(
+        &self,
+        namespace: Option<String>,
+        name: String,
+        revision: u32,
+        reply: Reply<HelmRollbackOutcome>,
+    );
 }
 
 pub struct NullProvider;
@@ -464,8 +861,22 @@ impl ReadProvider for NullProvider {
         reply(DocOutcome::Failed(NO_CLUSTER.to_string()));
     }
 
-    fn fetch_releases(&self, reply: Reply<DocOutcome>) {
-        reply(DocOutcome::Failed(NO_CLUSTER.to_string()));
+    fn fetch_releases(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_argo(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_flux(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn run_day2(&self, _: &Day2Request, reply: Reply<Day2Outcome>) {
+        reply(Day2Outcome::Failed {
+            why: NO_CLUSTER.to_string(),
+        });
     }
 
     fn fetch_manifest(&self, _: &DescribeRequest, reply: Reply<ManifestOutcome>) {
@@ -506,6 +917,15 @@ impl ReadProvider for NullProvider {
         LogStop::noop()
     }
 
+    fn poll_usage(
+        &self,
+        _: &UsageRequest,
+        on_update: Box<dyn Fn(UsageOutcome) + Send + Sync>,
+    ) -> LogStop {
+        on_update(UsageOutcome::Failed(NO_CLUSTER.to_string()));
+        LogStop::noop()
+    }
+
     fn open_forward(&self, _: &ForwardRequest, reply: Reply<ForwardOutcome>) {
         reply(ForwardOutcome::Failed(NO_CLUSTER.to_string()));
     }
@@ -525,6 +945,72 @@ impl ReadProvider for NullProvider {
     ) -> Box<dyn ExecSession> {
         on_event(ExecEvent::Failed(NO_CLUSTER.to_string()));
         Box::new(NullExecSession)
+    }
+
+    fn fetch_overlay(&self, _: OverlayKind, reply: Reply<OverlayOutcome>) {
+        reply(OverlayOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_pod_posture(&self, _: &str, _: &str, reply: Reply<PostureOutcome>) {
+        reply(PostureOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_grafana(&self, reply: Reply<GrafanaOutcome>) {
+        reply(GrafanaOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn probe_observe(&self, reply: Reply<ObserveReach>) {
+        reply(ObserveReach {
+            prometheus: ToolPresence::Missing,
+            loki: ToolPresence::Missing,
+            traces: ToolPresence::Missing,
+        });
+    }
+
+    fn query_promql(&self, _: String, reply: Reply<PromOutcome>) {
+        reply(PromOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn query_loki(&self, _: String, reply: Reply<LokiOutcome>) {
+        reply(LokiOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn lookup_trace(&self, _: String, reply: Reply<TraceOutcome>) {
+        reply(TraceOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_policy(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_harbor(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_mesh(&self, reply: Reply<TableOutcome>) {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn fetch_ecosystem(&self, reply: Reply<Vec<EcosystemEntry>>) {
+        reply(Vec::new());
+    }
+
+    fn reveal_helm(&self, _: Option<String>, _: String, _: u32, reply: Reply<HelmRevealOutcome>) {
+        reply(HelmRevealOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn diff_helm(&self, _: Option<String>, _: String, _: u32, _: u32, reply: Reply<DocOutcome>) {
+        reply(DocOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn rollback_helm(
+        &self,
+        _: Option<String>,
+        _: String,
+        _: u32,
+        reply: Reply<HelmRollbackOutcome>,
+    ) {
+        reply(HelmRollbackOutcome::Failed(NO_CLUSTER.to_string()));
     }
 }
 
@@ -691,5 +1177,67 @@ impl LaunchProvider for NullLaunchProvider {
 
     fn generate(&self, reply: Reply<DemoOutcome>) {
         reply(DemoOutcome::Failed(NO_LAUNCH.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn take<T: Send + 'static>(call: impl FnOnce(Reply<T>)) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        call(Box::new(move |value| {
+            let _ = tx.send(value);
+        }));
+        rx.recv().expect("NullProvider answers on this thread")
+    }
+
+    #[test]
+    fn null_provider_labels_the_new_surfaces_and_hides_observe_tools() {
+        let provider = NullProvider;
+        assert!(matches!(
+            take(|reply| provider.fetch_grafana(reply)),
+            GrafanaOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.fetch_policy(reply)),
+            TableOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.fetch_harbor(reply)),
+            TableOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.fetch_mesh(reply)),
+            TableOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.query_promql("up".into(), reply)),
+            PromOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.query_loki("{app=\"a\"}".into(), reply)),
+            LokiOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.lookup_trace("abc".into(), reply)),
+            TraceOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.reveal_helm(None, "ingress".into(), 1, reply)),
+            HelmRevealOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.diff_helm(None, "ingress".into(), 1, 2, reply)),
+            DocOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            take(|reply| provider.rollback_helm(None, "ingress".into(), 1, reply)),
+            HelmRollbackOutcome::Failed(_)
+        ));
+        let reach = take(|reply| provider.probe_observe(reply));
+        assert_eq!(reach.prometheus, ToolPresence::Missing);
+        assert_eq!(reach.loki, ToolPresence::Missing);
+        assert_eq!(reach.traces, ToolPresence::Missing);
     }
 }

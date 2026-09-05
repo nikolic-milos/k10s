@@ -1,0 +1,5 @@
+# Methods that look convenient and are the wrong tool. `disallowed_methods`
+# is denied in the workspace manifest; this is the list it reads.
+disallowed-methods = [
+    { path = "serde_json::from_reader", reason = "parsing from a buffer is much slower than first reading into a Vec/String; use serde_json::from_slice or from_str" },
+]

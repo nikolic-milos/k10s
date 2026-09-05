@@ -530,6 +530,39 @@ fn an_owner_reference_cycle_is_bounded_rather_than_hanging() {
 }
 
 #[test]
+fn an_owner_chain_longer_than_the_hop_bound_stops_walking() {
+    let hops = 10;
+    let mut objects = vec![scope("ns-1", "prod")];
+    for hop in 0..hops {
+        let next = if hop + 1 == hops {
+            None
+        } else {
+            Some(ctrl(
+                &format!("rs-{}", hop + 1),
+                "ReplicaSet",
+                "r",
+                "apps/v1",
+            ))
+        };
+        objects.push(replicaset(&format!("rs-{hop}"), "prod", "r", next));
+    }
+    objects.push(instance(
+        "pod-1",
+        "prod",
+        "p",
+        Some(ctrl("rs-0", "ReplicaSet", "r", "apps/v1")),
+    ));
+
+    let a = assemble(&store(objects), &mut Catalog::new());
+    assert_eq!(
+        a.stats.owner_cycles, 1,
+        "a chain that outruns the hop bound is refused the same way a loop is"
+    );
+    assert_eq!(a.stats.instances, 0);
+    assert_conforming(&a);
+}
+
+#[test]
 fn the_reason_string_becomes_the_state_the_scene_carries() {
     let mut crash = instance("pod-1", "prod", "api-1", None);
     crash.detail = Detail::Instance {

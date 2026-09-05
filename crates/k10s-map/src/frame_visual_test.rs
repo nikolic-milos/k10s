@@ -16,6 +16,7 @@ use crate::lod::{Knobs, policy};
 
 fn one_of_each(pod_state: State) -> SceneSnapshot {
     SceneSnapshot {
+        identity_rev: 1,
         ids: Default::default(),
         scene: SceneData {
             rev: 1,
@@ -136,9 +137,10 @@ fn a_workload_glyph_grows_to_fill_the_space_the_workload_owns() {
     for camera in cameras() {
         let sink = walk_at(&scene, camera);
         for job in sink.icons.iter() {
-            let IconJob::Wl(_, bounds) = job else {
+            let IconJob::Wl(_, primitive) = job else {
                 continue;
             };
+            let bounds = primitive.bounds;
             let side = f32::from(bounds.size.width);
             biggest = biggest.max(side);
             assert!(
@@ -177,7 +179,7 @@ fn a_workload_glyph_grows_to_fill_the_space_the_workload_owns() {
         .icons
         .iter()
         .find_map(|job| match job {
-            IconJob::Wl(_, bounds) => Some(*bounds),
+            IconJob::Wl(_, primitive) => Some(primitive.bounds),
             _ => None,
         })
         .expect("the workload glyph was drawn without chrome");
@@ -198,6 +200,67 @@ fn a_workload_glyph_grows_to_fill_the_space_the_workload_owns() {
             && (f32::from(bounds.center().y) - y).abs() <= 1.0,
         "the glyph is not centred on the card it stands for"
     );
+}
+
+#[test]
+fn workload_lod_never_stacks_medallion_card_and_pods() {
+    let scene = one_of_each(State::OK);
+    let block = &scene.blocks[0];
+    let center = block.inner.center();
+    let mid = Camera {
+        cx: center.0,
+        cy: center.1,
+        zoom: 0.20,
+    };
+    let mid_frame = walk_at(&scene, mid);
+    assert_eq!(mid_frame.fg.len(), 0, "the medallion retained a card");
+    assert_eq!(
+        mid_frame
+            .icons
+            .iter()
+            .filter(|job| matches!(job, IconJob::Wl(..) | IconJob::ToolId(..)))
+            .count(),
+        1
+    );
+
+    let near = Camera {
+        cx: center.0,
+        cy: center.1,
+        zoom: 0.90,
+    };
+    let near_frame = walk_at(&scene, near);
+    assert!(
+        near_frame.fg.len() >= 4,
+        "the detailed representation lost its card, chrome, or pod"
+    );
+
+    let pol = policy(Knobs {
+        no_icons: true,
+        ..Knobs::default()
+    });
+    let opts = FrameOpts {
+        theme: &k10s_theme::K10S_DARK.map,
+        policy: &pol,
+        type_: k10s_theme::Typography::default().map(),
+        edges_on: false,
+        skip_blocks: false,
+        hex: false,
+    };
+    let mut fallback = Collect::default();
+    walk(
+        viewport(),
+        &scene,
+        mid,
+        StageBlend::settled(1),
+        opts,
+        &mut fallback,
+    );
+    assert_eq!(
+        fallback.fg.len(),
+        1,
+        "icon disable erased the card fallback"
+    );
+    assert!(fallback.icons.is_empty());
 }
 
 // A name is centred in a box and clipped to it, and the box belongs to the

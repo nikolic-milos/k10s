@@ -3,6 +3,15 @@ use crate::scene::Rect;
 pub const MIN_ZOOM: f32 = 0.004;
 pub const MAX_ZOOM: f32 = 40.0;
 
+/// How far past the window edge the cull rect reaches, in screen pixels.
+///
+/// A thing whose centre is off screen can still have a stroke, a halo or a
+/// label that is on it, so the rect the cull walks is the window plus a margin
+/// rather than the window. Screen pixels rather than world units, because what
+/// bleeds across the edge is drawn in screen space and does not grow when the
+/// camera pulls back.
+const VISIBLE_PAD_PX: f32 = 8.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
     pub cx: f32,
@@ -37,17 +46,26 @@ impl Camera {
 
     pub fn visible_world(&self, vw: f32, vh: f32) -> Rect {
         let (x0, y0) = self.s2w(0.0, 0.0, vw, vh);
-        Rect::new(x0, y0, vw / self.zoom, vh / self.zoom).inflate(8.0 / self.zoom)
+        Rect::new(x0, y0, vw / self.zoom, vh / self.zoom).inflate(VISIBLE_PAD_PX / self.zoom)
     }
 
     pub fn pan_px(&mut self, dx: f32, dy: f32) {
+        // Divide by a zoom that is known to be in range, not by the field: the
+        // field is public, and a zero or a NaN here would send the centre to
+        // infinity and every later `visible_world` to an empty rect.
+        *self = self.clamped();
         self.cx -= dx / self.zoom;
         self.cy -= dy / self.zoom;
     }
 
     pub fn zoom_around(&mut self, factor: f32, sx: f32, sy: f32, vw: f32, vh: f32) {
+        *self = self.clamped();
+        let next = self.zoom * factor;
+        if !next.is_finite() {
+            return;
+        }
         let (wx, wy) = self.s2w(sx, sy, vw, vh);
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom = next.clamp(MIN_ZOOM, MAX_ZOOM);
         self.cx = wx - (sx - vw * 0.5) / self.zoom;
         self.cy = wy - (sy - vh * 0.5) / self.zoom;
     }
@@ -93,15 +111,58 @@ impl Camera {
         }
     }
 
+    /// Frame the whole of `bounds`, or leave the camera where it is.
+    ///
+    /// Refused for the same reasons [`Camera::reveal`] refuses: a scene with no
+    /// extent, a viewport nobody has laid out yet, or a coordinate that came
+    /// back non-finite. Clamping a NaN yields a NaN, so a fit that accepted one
+    /// would not leave a bad camera behind -- it would leave every later
+    /// `visible_world` an empty rect and the screen blank with nothing to show
+    /// which frame it went wrong on.
     pub fn fit(&mut self, bounds: Rect, vw: f32, vh: f32) {
-        if bounds.w <= 0.0 || bounds.h <= 0.0 || vw <= 0.0 || vh <= 0.0 {
+        let (cx, cy) = bounds.center();
+        if fit_refused(bounds, vw, vh, cx, cy) {
             return;
         }
         self.zoom = ((vw / bounds.w).min(vh / bounds.h) * 0.94).clamp(MIN_ZOOM, MAX_ZOOM);
-        let (cx, cy) = bounds.center();
         self.cx = cx;
         self.cy = cy;
     }
+
+    /// The same camera with a zoom that can be divided by.
+    ///
+    /// Every mutator here already keeps zoom inside the range, but the field is
+    /// public and a camera can also arrive from outside this crate -- a flight
+    /// segment, a saved view, a planner. Anything that interpolates or divides
+    /// by a zoom takes it through here first, because a zero or a NaN does not
+    /// stop at the frame that produced it: it travels into `visible_world` and
+    /// silently culls the whole scene.
+    #[inline]
+    pub fn clamped(self) -> Camera {
+        Camera {
+            zoom: if self.zoom.is_finite() {
+                self.zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+            } else {
+                MIN_ZOOM
+            },
+            ..self
+        }
+    }
+}
+
+/// The refusal half of [`Camera::fit`], kept out of line so the guard's eight
+/// comparisons do not sit in the crate's hot text between the walks the frame
+/// budget measures; `fit` runs at most once per publish or flight, never per
+/// frame, and a call is nothing there.
+#[cold]
+#[inline(never)]
+fn fit_refused(bounds: Rect, vw: f32, vh: f32, cx: f32, cy: f32) -> bool {
+    !(bounds.w.is_finite() && bounds.w > 0.0)
+        || !(bounds.h.is_finite() && bounds.h > 0.0)
+        || !(vw.is_finite() && vw > 0.0)
+        || !(vh.is_finite() && vh > 0.0)
+        || !cx.is_finite()
+        || !cy.is_finite()
 }
 
 #[cfg(test)]
@@ -121,6 +182,57 @@ mod tests {
         let after = cam.s2w(sx, sy, 1600.0, 1000.0);
         assert!((before.0 - after.0).abs() < 1e-3);
         assert!((before.1 - after.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_pan_or_zoom_from_an_impossible_zoom_stays_divisible() {
+        for zoom in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let mut panned = Camera {
+                cx: 10.0,
+                cy: 20.0,
+                zoom,
+            };
+            panned.pan_px(8.0, -4.0);
+            assert!(
+                (MIN_ZOOM..=MAX_ZOOM).contains(&panned.zoom),
+                "a pan from {zoom} left zoom {}",
+                panned.zoom
+            );
+            assert!(
+                panned.cx.is_finite() && panned.cy.is_finite(),
+                "a pan from {zoom} sent the centre to {panned:?}"
+            );
+
+            let mut zoomed = Camera {
+                cx: 10.0,
+                cy: 20.0,
+                zoom,
+            };
+            zoomed.zoom_around(1.5, 100.0, 100.0, 1600.0, 1000.0);
+            assert!(
+                (MIN_ZOOM..=MAX_ZOOM).contains(&zoomed.zoom),
+                "a zoom from {zoom} left zoom {}",
+                zoomed.zoom
+            );
+            assert!(
+                zoomed.cx.is_finite() && zoomed.cy.is_finite(),
+                "a zoom from {zoom} sent the centre to {zoomed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_finite_zoom_factor_leaves_a_usable_camera() {
+        let before = Camera {
+            cx: 10.0,
+            cy: 20.0,
+            zoom: 2.0,
+        };
+        let mut cam = before;
+        cam.zoom_around(f32::NAN, 100.0, 100.0, 1600.0, 1000.0);
+        assert_eq!(cam, before, "a NaN wheel step moved a good camera");
+        cam.zoom_around(f32::INFINITY, 100.0, 100.0, 1600.0, 1000.0);
+        assert_eq!(cam, before, "an infinite wheel step moved a good camera");
     }
 
     #[test]
@@ -227,5 +339,50 @@ mod reveal_tests {
             once,
             "a reveal drifted on repeat"
         );
+    }
+
+    #[test]
+    fn a_fit_of_nonsense_bounds_leaves_the_camera_where_it_was() {
+        let before = Camera {
+            cx: 12.0,
+            cy: -34.0,
+            zoom: 0.5,
+        };
+        for (bounds, vw, vh) in [
+            (Rect::new(0.0, 0.0, f32::NAN, 100.0), 1600.0, 1000.0),
+            (Rect::new(0.0, 0.0, 100.0, f32::NAN), 1600.0, 1000.0),
+            (Rect::new(f32::NAN, 0.0, 100.0, 100.0), 1600.0, 1000.0),
+            (Rect::new(0.0, f32::INFINITY, 100.0, 100.0), 1600.0, 1000.0),
+            (Rect::new(0.0, 0.0, f32::INFINITY, 100.0), 1600.0, 1000.0),
+            (Rect::new(0.0, 0.0, 100.0, 100.0), f32::NAN, 1000.0),
+            (Rect::new(0.0, 0.0, 100.0, 100.0), 1600.0, f32::INFINITY),
+        ] {
+            let mut cam = before;
+            cam.fit(bounds, vw, vh);
+            assert_eq!(cam, before, "{bounds:?} at {vw}x{vh} moved the camera");
+        }
+    }
+
+    #[test]
+    fn a_clamped_camera_can_always_be_divided_by() {
+        for zoom in [0.0, -1.0, f32::NAN, f32::INFINITY, 1e9, MIN_ZOOM * 0.5] {
+            let clamped = Camera {
+                cx: 1.0,
+                cy: 2.0,
+                zoom,
+            }
+            .clamped();
+            assert!(
+                (MIN_ZOOM..=MAX_ZOOM).contains(&clamped.zoom),
+                "a zoom of {zoom} stayed outside the range"
+            );
+            assert_eq!((clamped.cx, clamped.cy), (1.0, 2.0));
+        }
+        let sane = Camera {
+            cx: 0.0,
+            cy: 0.0,
+            zoom: 1.5,
+        };
+        assert_eq!(sane.clamped(), sane, "a usable camera was changed");
     }
 }

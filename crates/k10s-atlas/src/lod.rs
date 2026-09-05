@@ -108,6 +108,30 @@ impl LodPolicy {
         inner_w * zoom >= self.block_chrome_min_px && !self.stress && !self.stress_curves
     }
 
+    /// Keeps cards, glyph medallions, and pod grids from occupying the same
+    /// pixels while an LOD boundary is crossed.
+    #[inline]
+    pub fn workload_presentation(
+        &self,
+        inner_w: f32,
+        zoom: f32,
+        stage: u8,
+    ) -> WorkloadPresentation {
+        if stage == 0 || !self.block_painted(inner_w, zoom) {
+            return WorkloadPresentation::Hidden;
+        }
+        if stage >= 2
+            && (self.block_chrome_shown(inner_w, zoom) || self.stress || self.stress_curves)
+        {
+            return WorkloadPresentation::Detailed;
+        }
+        if self.block_icon_shown(inner_w, zoom) {
+            WorkloadPresentation::Medallion
+        } else {
+            WorkloadPresentation::Card
+        }
+    }
+
     #[inline]
     pub fn sat_painted(&self, sat_w: f32, zoom: f32) -> bool {
         sat_w * zoom >= self.sat_min_px || self.stress_curves
@@ -141,6 +165,26 @@ impl LodPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadPresentation {
+    Hidden,
+    Medallion,
+    Card,
+    Detailed,
+}
+
+impl WorkloadPresentation {
+    #[inline]
+    pub const fn card_shown(self) -> bool {
+        matches!(self, Self::Card | Self::Detailed)
+    }
+
+    #[inline]
+    pub const fn cells_shown(self) -> bool {
+        matches!(self, Self::Detailed)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StageBlend {
     pub from: u8,
@@ -162,7 +206,7 @@ impl StageBlend {
     }
 
     pub fn walk_stage(&self) -> u8 {
-        self.from.max(self.to)
+        if self.t < 0.5 { self.from } else { self.to }
     }
 
     pub fn fade_alpha(&self) -> f32 {
@@ -232,6 +276,17 @@ impl StageMachine {
         }
         self.blend = Some(b);
         b
+    }
+
+    /// Reduced motion keeps hysteresis but cannot leave a half-faded hierarchy
+    /// waiting for animation frames the application will not request.
+    pub fn settle(&mut self, policy: &LodPolicy, zoom: f32) -> StageBlend {
+        let current = self
+            .blend
+            .map_or_else(|| policy.stage_for_zoom(zoom), |blend| blend.to);
+        let blend = StageBlend::settled(policy.stage_target(current, zoom));
+        self.blend = Some(blend);
+        blend
     }
 
     pub fn animating(&self) -> bool {
@@ -307,6 +362,34 @@ mod tests {
     }
 
     #[test]
+    fn workload_representation_is_exclusive_across_detail_and_icon_gates() {
+        let mut pol = policy();
+        let width = 100.0;
+
+        assert_eq!(
+            pol.workload_presentation(width, 0.40, 1),
+            WorkloadPresentation::Medallion,
+            "stage one stays a glyph even when the card could fit chrome"
+        );
+        assert_eq!(
+            pol.workload_presentation(width, 0.20, 2),
+            WorkloadPresentation::Medallion,
+            "pods do not appear before their detailed card fits"
+        );
+        assert_eq!(
+            pol.workload_presentation(width, 0.55, 2),
+            WorkloadPresentation::Detailed
+        );
+
+        pol.block_icon_min_px = f32::INFINITY;
+        assert_eq!(
+            pol.workload_presentation(width, 0.20, 1),
+            WorkloadPresentation::Card,
+            "disabling icons must not erase the workload"
+        );
+    }
+
+    #[test]
     fn blend_alphas() {
         let settled = StageBlend::settled(2);
         assert!(settled.is_settled());
@@ -326,10 +409,10 @@ mod tests {
             StageBlend {
                 from: 1,
                 to: 2,
-                t: 0.0
+                t: 0.49
             }
-            .stage_alpha(2),
-            0.0
+            .walk_stage(),
+            1
         );
 
         let fade_out = StageBlend {
@@ -343,10 +426,10 @@ mod tests {
             StageBlend {
                 from: 2,
                 to: 1,
-                t: 1.0
+                t: 0.5
             }
-            .stage_alpha(2),
-            0.0
+            .walk_stage(),
+            1
         );
 
         let jump = StageBlend {
@@ -354,7 +437,7 @@ mod tests {
             to: 1,
             t: 0.5,
         };
-        assert_eq!(jump.walk_stage(), 3);
+        assert_eq!(jump.walk_stage(), 1);
         assert_eq!(jump.stage_alpha(1), 1.0);
         assert_eq!(jump.stage_alpha(2), 0.5);
         assert_eq!(jump.stage_alpha(3), 0.5);
@@ -397,5 +480,19 @@ mod tests {
         assert!((b.stage_alpha(3) - alpha_before).abs() < 1e-3);
         let b = m.update(&pol, 2.4, 1.0);
         assert_eq!(b, StageBlend::settled(2));
+    }
+
+    #[test]
+    fn settling_for_reduced_motion_preserves_the_exit_band() {
+        let pol = policy();
+        let mut machine = StageMachine::new(0.2);
+        assert_eq!(machine.settle(&pol, 1.0), StageBlend::settled(2));
+        assert_eq!(
+            machine.settle(&pol, 0.50),
+            StageBlend::settled(2),
+            "settling must not bypass hysteresis"
+        );
+        assert_eq!(machine.settle(&pol, 0.46), StageBlend::settled(1));
+        assert!(!machine.animating());
     }
 }

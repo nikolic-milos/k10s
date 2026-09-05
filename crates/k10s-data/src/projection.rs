@@ -35,18 +35,15 @@ impl Projection {
             return self.reconcile(store, catalog);
         }
 
-        let Some(event) = live_event(store, &self.index, catalog, change) else {
+        let Some(resource) = live_event(store, &self.index, catalog, change) else {
             return Vec::new();
-        };
-        let IngestEvent::Resource(resource) = &event else {
-            unreachable!("a projected object change is always a resource event")
         };
         self.resources
             .insert(resource.uid.clone(), canonical(resource.clone()));
-        vec![event]
+        vec![IngestEvent::Resource(resource)]
     }
 
-    fn reconcile(&mut self, store: &Store, catalog: &mut Catalog) -> Vec<IngestEvent> {
+    pub(crate) fn reconcile(&mut self, store: &Store, catalog: &mut Catalog) -> Vec<IngestEvent> {
         let assembled = assemble::assemble(store, catalog);
         let next = resources(&assembled.events);
         let mut replaced = HashSet::new();
@@ -179,7 +176,7 @@ fn live_event(
     index: &Index,
     catalog: &mut Catalog,
     change: &Change,
-) -> Option<IngestEvent> {
+) -> Option<ResourceEvent> {
     let staged = store.get(&change.uid)?;
     let uid = &*change.uid;
     let (parent, payload) = match &staged.detail {
@@ -218,7 +215,7 @@ fn live_event(
             },
         ),
     };
-    Some(IngestEvent::Resource(ResourceEvent {
+    Some(ResourceEvent {
         kind: staged.kind,
         uid: staged.uid.clone(),
         namespace: staged.namespace.clone(),
@@ -227,7 +224,7 @@ fn live_event(
         parent,
         op: change.op,
         payload,
-    }))
+    })
 }
 
 fn live_depends_on(index: &Index, staged: &Staged) -> Vec<Arc<str>> {

@@ -10,6 +10,7 @@
 //! counters (entries, rows, matches, spans) are deterministic and gated exactly.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use k10s_bench::{Config, Samples, measure};
@@ -21,7 +22,7 @@ use k10s_shell::files::{FilesState, read_tree};
 use k10s_shell::finder::{PickerMode, PickerState, rank, scan_root};
 use k10s_shell::fs::Fs;
 use k10s_shell::fs::fake::FakeFs;
-use k10s_shell::reveal::MapIndex;
+use k10s_shell::reveal::{ClusterFinder, MapIndex};
 
 // One 60 Hz frame: what a keystroke's share of the work has to fit inside. The
 // cases a person waits on are gated against it absolutely, not only against the
@@ -59,7 +60,13 @@ impl Row {
     fn budget(&self) -> Option<f64> {
         matches!(
             self.op,
-            "keystroke" | "layers" | "query-and-compose" | "diff-paint" | "diff-fold"
+            "keystroke"
+                | "broad"
+                | "structured"
+                | "layers"
+                | "query-and-compose"
+                | "diff-paint"
+                | "diff-fold"
         )
         .then_some(FRAME_NS)
     }
@@ -208,9 +215,9 @@ fn picker(rows: &mut Vec<Row>) {
 
 fn map_scene() -> k10s_core::SceneSnapshot {
     use k10s_core::{NsExt, NsNode, PodExt, PodNode, Rect, Severity, State, WlExt, WorkloadNode};
-    use std::sync::Arc;
-
     let mut snap = k10s_core::SceneSnapshot::default();
+    snap.identity_rev = 1;
+    snap.rev = 1;
     let ids = Arc::make_mut(&mut snap.ids);
     for namespace in 0..MAP_NAMESPACES {
         let first_block = snap.scene.blocks.len() as u32;
@@ -257,7 +264,7 @@ fn map_scene() -> k10s_core::SceneSnapshot {
 }
 
 fn map_search(rows: &mut Vec<Row>) {
-    let scene = map_scene();
+    let scene = Arc::new(map_scene());
     let mut built = 0usize;
     let samples = measure(HUNDRED, || {
         built = MapIndex::build(&scene).candidates().len();
@@ -270,18 +277,80 @@ fn map_search(rows: &mut Vec<Row>) {
         samples,
     });
 
-    let index = MapIndex::build(&scene);
+    let mut opened = 0usize;
+    let samples = measure(HUNDRED, || {
+        let finder = ClusterFinder::open(scene.clone());
+        opened = finder.index().candidates().len();
+    });
+    rows.push(Row {
+        scenario: "map-50k",
+        op: "open",
+        entries: built,
+        result: opened,
+        samples,
+    });
+
+    let mut finder = ClusterFinder::open(scene.clone());
     // A query that matches deep into the label rather than at its start: the
     // cheap answer is a prefix test, and benching one would measure the case
     // that never happens while a person is still typing.
-    let mut matched = 0usize;
+    finder.set_query("team7checkout3".to_string());
+    let mut matched = finder.hits().len();
+    let mut suffix = false;
     let samples = measure(FAST, || {
-        matched = index.rank("team7checkout3", 32).len();
+        if suffix {
+            finder.pop_char();
+        } else {
+            finder.push_char("-");
+        }
+        suffix = !suffix;
+        matched = matched.max(finder.hits().len());
     });
     rows.push(Row {
         scenario: "map-50k",
         op: "keystroke",
-        entries: index.candidates().len(),
+        entries: finder.index().candidates().len(),
+        result: matched,
+        samples,
+    });
+
+    let mut finder = ClusterFinder::open(scene.clone());
+    let mut matched = finder.hits().len();
+    let mut narrowed = false;
+    let samples = measure(FAST, || {
+        if narrowed {
+            finder.pop_char();
+        } else {
+            finder.push_char("c");
+        }
+        narrowed = !narrowed;
+        matched = matched.max(finder.hits().len());
+    });
+    rows.push(Row {
+        scenario: "map-50k",
+        op: "broad",
+        entries: finder.index().candidates().len(),
+        result: matched,
+        samples,
+    });
+
+    let mut finder = ClusterFinder::open(scene);
+    finder.set_query("kind:Pod ns:team-7 status:healthy checkout-3".to_string());
+    let mut matched = finder.hits().len();
+    let mut narrowed = false;
+    let samples = measure(FAST, || {
+        if narrowed {
+            finder.pop_char();
+        } else {
+            finder.push_char("-");
+        }
+        narrowed = !narrowed;
+        matched = matched.max(finder.hits().len());
+    });
+    rows.push(Row {
+        scenario: "map-50k",
+        op: "structured",
+        entries: finder.index().candidates().len(),
         result: matched,
         samples,
     });
@@ -492,12 +561,16 @@ fn print_table(rows: &[Row]) {
 }
 
 fn print_json(rows: &[Row]) {
+    // `open`, `broad`, and `structured` are measured and gated against a
+    // frame in-process. Emitting them would make the comparator treat new
+    // cases as regressions against a baseline recorded before they existed.
+    let cases: Vec<&Row> = rows.iter().filter(|row| emit_json_case(row)).collect();
     println!("{{");
     println!("  \"schema_version\": 1,");
     println!("  \"mode\": \"shell\",");
     println!("  \"cases\": [");
-    for (index, row) in rows.iter().enumerate() {
-        let comma = if index + 1 == rows.len() { "" } else { "," };
+    for (index, row) in cases.iter().enumerate() {
+        let comma = if index + 1 == cases.len() { "" } else { "," };
         println!("    {{");
         println!("      \"scenario\": \"{}\",", row.scenario);
         println!("      \"op\": \"{}\",", row.op);
@@ -513,4 +586,11 @@ fn print_json(rows: &[Row]) {
     }
     println!("  ]");
     println!("}}");
+}
+
+fn emit_json_case(row: &Row) -> bool {
+    !matches!(
+        (row.scenario, row.op),
+        ("map-50k", "open" | "broad" | "structured")
+    )
 }

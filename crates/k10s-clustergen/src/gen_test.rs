@@ -14,24 +14,31 @@ fn cfg(seed: u64, target_objects: u32) -> GenConfig {
 fn deterministic() {
     let a = generate(&cfg(42, 5000));
     let b = generate(&cfg(42, 5000));
-    assert_eq!(a.namespaces.len(), b.namespaces.len());
-    assert_eq!(a.total_pods, b.total_pods);
-    assert_eq!(a.total_sats, b.total_sats);
-    assert_eq!(
-        a.namespaces[0].workloads[0].name,
-        b.namespaces[0].workloads[0].name
+    assert!(
+        a == b,
+        "the same seed produced two different clusters: {} vs {} namespaces, \
+         {} vs {} pods, {} vs {} sats, {} vs {} edges",
+        a.namespaces.len(),
+        b.namespaces.len(),
+        a.total_pods,
+        b.total_pods,
+        a.total_sats,
+        b.total_sats,
+        a.total_edges,
+        b.total_edges,
     );
-    let sat_a = a
-        .namespaces
-        .iter()
-        .flat_map(|n| &n.workloads)
-        .find_map(|w| w.sats.first());
-    let sat_b = b
-        .namespaces
-        .iter()
-        .flat_map(|n| &n.workloads)
-        .find_map(|w| w.sats.first());
-    assert_eq!(sat_a.map(|s| &s.name), sat_b.map(|s| &s.name));
+    assert!(
+        a.namespaces
+            .iter()
+            .flat_map(|n| &n.workloads)
+            .any(|w| !w.sats.is_empty() && !w.pods.is_empty() && !w.deps.is_empty()),
+        "the fixture has to carry pods, sats and deps or full equality proves little"
+    );
+    assert_ne!(
+        a,
+        generate(&cfg(43, 5000)),
+        "a different seed, same cluster"
+    );
 }
 
 #[test]

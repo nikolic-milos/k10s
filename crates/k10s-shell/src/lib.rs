@@ -20,7 +20,8 @@
 //! `Typing`), with text-typing keystrokes -- plain and shifted -- suppressed
 //! while an input mode is capturing. Panels and items render on notify only:
 //! zero paints at idle is a gated invariant and the shell must never be the
-//! reason it fails.
+//! reason it fails. The left edge is a thin activity rail of chrome icons;
+//! clicking one opens the matching dock or item. Brand glyphs stay on the map.
 //!
 //! [`Workspace`] is one type described by five modules, split by what each is
 //! about rather than by what it is made of: `workspace` holds the state and the
@@ -31,13 +32,16 @@
 //! the docks -- are their own modules precisely so they can be tested without a
 //! window.
 
+pub mod attribution;
 pub mod browse;
 pub mod config_schema;
+pub mod day2;
 pub mod diff;
 pub mod diff_gate;
 #[cfg(test)]
 mod diff_test;
 pub mod dock;
+pub mod ecosystem;
 pub mod editor;
 pub mod files;
 pub mod finder;
@@ -45,24 +49,30 @@ pub mod finder;
 mod finder_test;
 pub mod forwards;
 pub mod fs;
+pub mod helm_values;
 pub mod item;
 pub mod keymap;
 pub mod launch;
+pub mod lists;
+pub mod observe;
 pub mod palette;
 pub mod provider;
 #[cfg(unix)]
 pub mod pty;
 pub mod reveal;
+pub mod saved_views;
 pub mod settings;
 pub mod table;
 pub mod term;
 pub mod text;
+pub mod traces;
 pub mod ui;
 
 // The shell's own parts. Private, because the crate's surface is the views it
 // hosts and the seams it reads through -- everything a consumer needs from here
 // is re-exported below under the name it has always had.
 mod actions;
+mod activity;
 mod bindings;
 mod chrome;
 mod cluster;
@@ -73,6 +83,7 @@ mod editor_io;
 mod editor_io_test;
 mod hosting;
 mod modal;
+mod overlay;
 mod pane;
 mod render;
 mod saves;
@@ -85,13 +96,18 @@ pub use actions::*;
 pub use bindings::{input_suppressors, keybindings};
 pub use item::{Item, ItemHandle};
 pub use provider::{
-    ApplyOutcome, ApplyRequest, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest,
-    Connection, ContainersOutcome, ContextRow, DemoOutcome, DescribeRequest, Detail, DocOutcome,
-    EventRow, ExecEvent, ExecRequest, ExecSession, ForwardOutcome, ForwardRequest, ForwardRow,
-    ForwardState, KindRow, LaunchProvider, LogChunk, LogRequest, LogStop, ManifestOutcome,
-    NullExecSession, NullLaunchProvider, NullProvider, ProviderFactory, ProviderSlot, ReadProvider,
-    Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome, SchemaSource, SchemaTextOutcome,
-    TableColumn, TableOutcome, TablePage, TableRow, WorkloadLogRequest,
+    ApplyOutcome, ApplyRequest, Bytes, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest,
+    Connection, ContainersOutcome, ContextRow, Day2Op, Day2Outcome, Day2Request, DemoOutcome,
+    DescribeRequest, Detail, DocOutcome, EcosystemEntry, EventRow, ExecEvent, ExecRequest,
+    ExecSession, ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, GrafanaOutcome,
+    GrafanaPanelKind, GrafanaPanelRow, HelmReveal, HelmRevealOutcome, HelmRollbackOutcome, KindRow,
+    LaunchProvider, LogChunk, LogRequest, LogStop, LokiOutcome, ManifestOutcome, Millicores,
+    NullExecSession, NullLaunchProvider, NullProvider, ObserveReach, OverlayOutcome, OverlayStamp,
+    PodPostureView, PostureOutcome, PromOutcome, PromSeriesView, ProviderFactory, ProviderSlot,
+    QueryDialect, ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome,
+    SchemaSource, SchemaTextOutcome, SpanView, TableColumn, TableOutcome, TablePage, TableRow,
+    ToolPresence, TraceOutcome, UsageOutcome, UsageRequest, UsageSample, UsageSource, UsageTarget,
+    WorkloadLogRequest,
 };
 pub use selection::{LogTarget, Selection};
 pub use workspace::{ConfigPaths, Workspace};

@@ -96,6 +96,7 @@ pub trait Forwarder: Send + Sync {
 pub enum OpenError {
     PortInUse { local_port: u16, held_by: String },
     Full { max: usize },
+    Closed,
 }
 
 impl std::fmt::Display for OpenError {
@@ -111,6 +112,7 @@ impl std::fmt::Display for OpenError {
             OpenError::Full { max } => {
                 write!(f, "{max} forwards are already open; close one first")
             }
+            OpenError::Closed => write!(f, "this forward was closed while it was opening"),
         }
     }
 }
@@ -205,6 +207,15 @@ pub(crate) async fn resolve(client: &Client, request: &ForwardRequest) -> Fetche
             why: format!("service {} selects no pods right now", request.name),
         };
     };
+    let Some(pod_name) = pod.metadata.name.clone().filter(|name| !name.is_empty()) else {
+        return Fetched::Failed {
+            what: "port-forward",
+            why: format!(
+                "the pod service {} selects carries no name, so there is nothing to forward to",
+                request.name
+            ),
+        };
+    };
     let local_port = match as_port(port.port, "the service port") {
         Ok(local_port) => local_port,
         Err(failed) => return failed,
@@ -230,7 +241,7 @@ pub(crate) async fn resolve(client: &Client, request: &ForwardRequest) -> Fetche
     };
     Fetched::Ok(ForwardSpec {
         namespace: request.namespace.clone(),
-        pod: pod.metadata.name.clone().unwrap_or_default(),
+        pod: pod_name,
         local_port,
         remote_port,
     })
@@ -344,7 +355,7 @@ impl ForwardRegistry {
             }
             // Closed in the window between the two locks: cancel what was
             // just started by dropping its guard.
-            None => Err(OpenError::Full { max: MAX_FORWARDS }),
+            None => Err(OpenError::Closed),
         }
     }
 
@@ -407,6 +418,7 @@ impl Forwarder for KubeForwarder {
             let api: Api<Pod> = Api::namespaced(client, &spec.namespace);
             let (dead_tx, mut dead) = tokio::sync::mpsc::channel::<String>(1);
             let live_connections = Arc::new(AtomicUsize::new(0));
+            let mut connections: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
                 let accepted = tokio::select! {
                     _ = &mut cancel => return,
@@ -416,6 +428,7 @@ impl Forwarder for KubeForwarder {
                         ));
                         return;
                     }
+                    Some(_) = connections.join_next(), if !connections.is_empty() => continue,
                     accepted = listener.accept() => accepted,
                 };
                 let (mut local, _) = match accepted {
@@ -434,7 +447,7 @@ impl Forwarder for KubeForwarder {
                 let spec = spec.clone();
                 let dead_tx = dead_tx.clone();
                 let live_connections = live_connections.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     match api.portforward(&spec.pod, &[spec.remote_port]).await {
                         Ok(mut forwarded) => {
                             if let Some(mut upstream) = forwarded.take_stream(spec.remote_port) {
@@ -507,6 +520,28 @@ mod tests {
                 shared.lock().unwrap().cancelled.push(spec);
             })
         }
+    }
+
+    /// A cluster that accepts the port-forward upgrade and then never answers,
+    /// so a connection task stays parked exactly where a real one waits for
+    /// the kubelet; every request it receives is reported first.
+    fn hanging_client(reached: tokio::sync::mpsc::UnboundedSender<()>) -> Client {
+        Client::new(
+            tower::service_fn(move |_: http::Request<kube::client::Body>| {
+                let _ = reached.send(());
+                std::future::pending::<Result<http::Response<kube::client::Body>, tower::BoxError>>(
+                )
+            }),
+            "prod",
+        )
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("a free local port")
+            .local_addr()
+            .expect("a bound address")
+            .port()
     }
 
     fn spec(pod: &str, local: u16, remote: u16) -> ForwardSpec {
@@ -618,6 +653,89 @@ mod tests {
             matches!(registry.list()[0].state, ForwardState::Dead { .. }),
             "the synchronous death reached the row"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_a_forward_ends_the_connections_it_was_still_carrying() {
+        use tokio::io::AsyncReadExt;
+
+        let port = free_port();
+        let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel();
+        let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let forwarder = KubeForwarder::new(
+            hanging_client(reached_tx),
+            tokio::runtime::Handle::current(),
+        );
+        let guard = forwarder.start(
+            &spec("api-1", port, 80),
+            Box::new(move |event| {
+                let _ = events_tx.send(event);
+            }),
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("the listener binds"),
+            Some(ForwardEvent::Ready)
+        );
+
+        let mut connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the forward is listening");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached.recv())
+            .await
+            .expect("the connection reaches the cluster and parks there");
+
+        drop(guard);
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connection.read(&mut byte),
+        )
+        .await
+        .expect("closing a forward ends its connections rather than orphaning them");
+        assert_eq!(
+            read.ok(),
+            Some(0),
+            "the socket the copy task held is closed, not left open behind a cancelled guard"
+        );
+    }
+
+    #[test]
+    fn a_row_closed_while_it_opens_is_told_apart_from_a_full_registry() {
+        #[derive(Default)]
+        struct ClosingForwarder {
+            registry: Mutex<Option<ForwardRegistry>>,
+        }
+        impl Forwarder for ClosingForwarder {
+            fn start(
+                &self,
+                _: &ForwardSpec,
+                _: Box<dyn Fn(ForwardEvent) + Send + Sync>,
+            ) -> ForwardGuard {
+                let registry =
+                    self.registry.lock().expect("test lock").clone().expect(
+                        "the registry releases its lock around start, so a close lands here",
+                    );
+                for row in registry.list() {
+                    assert!(registry.close(row.id));
+                }
+                ForwardGuard::noop()
+            }
+        }
+
+        let forwarder = Arc::new(ClosingForwarder::default());
+        let registry = ForwardRegistry::new(forwarder.clone());
+        *forwarder.registry.lock().expect("test lock") = Some(registry.clone());
+
+        assert_eq!(
+            registry.open(spec("api-1", 8080, 80)),
+            Err(OpenError::Closed),
+            "a registry with one row in it is not full, and saying so would \
+             stop a caller retrying for the wrong reason"
+        );
+        assert!(registry.list().is_empty());
     }
 
     #[test]

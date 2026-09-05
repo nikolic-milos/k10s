@@ -7,9 +7,13 @@ use gpui::{
 use k10s_core::Severity;
 use k10s_theme::{Theme, Typography};
 
+use crate::overlay::{OverlayKind, place_sparkline, sparkline_quads};
 use crate::{FitView, ToggleEdges, ToggleLegend, ZoomIn, ZoomOut};
 
-use super::{Chrome, Density, DetailBand, HOVER_HEIGHT, HOVER_WIDTH, HoverAnchor, HoverInfo};
+use super::{
+    Chrome, Density, DetailBand, HOVER_SPARK, HOVER_WIDTH, HoverAnchor, HoverInfo,
+    hover_card_height,
+};
 
 const EDGE_ICON: &str = "icons/link.svg";
 const LEGEND_ICON: &str = "icons/info.svg";
@@ -33,6 +37,7 @@ impl Render for Chrome {
                 summary_panel(
                     state.summary,
                     state.band,
+                    state.overlay_kind,
                     state.density == Density::Full,
                     &theme,
                     &fonts,
@@ -40,7 +45,8 @@ impl Render for Chrome {
             }))
             .child(controls(state.edges_on, state.legend_on, &theme, &fonts))
             .children(
-                (state.legend_on && state.density == Density::Full).then(|| legend(&theme, &fonts)),
+                (state.legend_on && state.density == Density::Full)
+                    .then(|| legend(state.overlay_kind, &theme, &fonts)),
             )
             .children(
                 state
@@ -70,6 +76,7 @@ fn panel(theme: &Theme) -> Div {
 fn summary_panel(
     summary: SharedString,
     active: DetailBand,
+    overlay_kind: Option<OverlayKind>,
     expanded: bool,
     theme: &Theme,
     fonts: &Typography,
@@ -109,6 +116,18 @@ fn summary_panel(
                         .text_color(rgb(theme.shell.text_accent))
                         .child(active.label()),
                 )
+                .when_some(overlay_kind, |row, kind| {
+                    row.child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded_full()
+                            .bg(rgb(theme.shell.element_selected))
+                            .text_size(px(fonts.xsmall()))
+                            .text_color(rgb(theme.shell.text_accent))
+                            .child(kind.badge()),
+                    )
+                })
                 .when(expanded, |row| {
                     row.child(
                         div()
@@ -116,6 +135,14 @@ fn summary_panel(
                             .text_color(rgb(theme.shell.text_muted))
                             .child(active.description()),
                     )
+                    .when_some(overlay_kind, |row, kind| {
+                        row.child(
+                            div()
+                                .text_size(px(fonts.xsmall()))
+                                .text_color(rgb(theme.shell.text_muted))
+                                .child(kind.blurb()),
+                        )
+                    })
                 }),
         )
         .when(expanded, |card| {
@@ -283,7 +310,27 @@ fn action_button<A: Action + Clone>(
         })
 }
 
-fn legend(theme: &Theme, fonts: &Typography) -> impl IntoElement {
+fn swatch_label(severity: Severity, overlay: bool) -> &'static str {
+    match (overlay, severity) {
+        (false, Severity::Ok) => "Healthy",
+        (false, Severity::Warn) => "Warning",
+        (false, Severity::Err) => "Critical",
+        (false, Severity::Unknown) => "Unknown",
+        (true, Severity::Ok) => "Ok",
+        (true, Severity::Warn) => "Warn",
+        (true, Severity::Err) => "Err",
+        (true, Severity::Unknown) => "Unknown",
+    }
+}
+
+fn legend(
+    overlay_kind: Option<OverlayKind>,
+    theme: &Theme,
+    fonts: &Typography,
+) -> impl IntoElement {
+    let title = overlay_kind.map_or("HEALTH", OverlayKind::legend_title);
+    let aria = overlay_kind.map_or("Health legend", OverlayKind::legend_aria);
+    let overlay = overlay_kind.is_some();
     panel(theme)
         .id("map-health-legend")
         .absolute()
@@ -295,19 +342,23 @@ fn legend(theme: &Theme, fonts: &Typography) -> impl IntoElement {
         .items_center()
         .gap(px(10.0))
         .role(Role::Legend)
-        .aria_label("Health legend")
+        .aria_label(aria)
         .child(
             div()
                 .text_size(px(fonts.xsmall()))
                 .text_color(rgb(theme.shell.text_muted))
-                .child("HEALTH"),
+                .child(title),
         )
         .children(
             [
-                (Severity::Ok, "✓", "Healthy"),
-                (Severity::Warn, "!", "Warning"),
-                (Severity::Err, "×", "Critical"),
-                (Severity::Unknown, "?", "Unknown"),
+                (Severity::Ok, "✓", swatch_label(Severity::Ok, overlay)),
+                (Severity::Warn, "!", swatch_label(Severity::Warn, overlay)),
+                (Severity::Err, "×", swatch_label(Severity::Err, overlay)),
+                (
+                    Severity::Unknown,
+                    "?",
+                    swatch_label(Severity::Unknown, overlay),
+                ),
             ]
             .into_iter()
             .map(|(severity, mark, label)| {
@@ -344,12 +395,17 @@ fn hover_card(
     fonts: &Typography,
 ) -> impl IntoElement {
     let color = info.color(theme);
+    let card_h = hover_card_height(&info);
+    let overlay_kind = info.overlay_kind;
+    let overlay_label = info.overlay_label.clone();
+    let overlay_spark = info.overlay_spark.clone();
+    let overlay_tint = info.overlay_tint;
     panel(theme)
         .absolute()
         .left(px(anchor.left))
         .top(px(anchor.top))
         .w(px(HOVER_WIDTH))
-        .min_h(px(HOVER_HEIGHT))
+        .min_h(px(card_h))
         .px(px(10.0))
         .py(px(8.0))
         .flex()
@@ -424,8 +480,57 @@ fn hover_card(
                                 .child("/")
                                 .child(owner)
                         })),
-                ),
+                )
+                .when(overlay_kind.is_some() || overlay_label.is_some(), |col| {
+                    col.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_size(px(fonts.xsmall()))
+                            .text_color(rgb(theme.shell.text_accent))
+                            .children(overlay_kind.map(OverlayKind::badge))
+                            .children(overlay_label.map(|label| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child("·")
+                                    .child(label)
+                            })),
+                    )
+                })
+                .when(overlay_spark.len() >= 2, |col| {
+                    col.child(spark_strip(&overlay_spark, overlay_tint, theme))
+                }),
         )
+}
+
+fn spark_strip(
+    unit: &[k10s_theme::Point],
+    tint: Option<Severity>,
+    theme: &Theme,
+) -> impl IntoElement {
+    let color = tint.map_or_else(
+        || rgb(theme.shell.text_accent),
+        |severity| theme.map.pod_color(severity),
+    );
+    let w = HOVER_WIDTH - 20.0;
+    let dest = k10s_core::Rect::new(0.0, 0.0, w, HOVER_SPARK);
+    let placed = place_sparkline(unit, dest);
+    div().relative().w(px(w)).h(px(HOVER_SPARK)).children(
+        sparkline_quads(&placed, 1.5).into_iter().map(move |rect| {
+            div()
+                .absolute()
+                .left(px(rect.x))
+                .top(px(rect.y))
+                .w(px(rect.w.max(1.5)))
+                .h(px(rect.h.max(1.5)))
+                .bg(color)
+        }),
+    )
 }
 
 fn empty_state(

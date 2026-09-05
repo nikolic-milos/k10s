@@ -71,6 +71,14 @@ impl DirtyState {
         self.clean_version != Some(version)
     }
 
+    /// Whether this buffer has ever had a clean point at all. A buffer whose
+    /// load never landed has none, and is dirty by definition -- there is
+    /// nothing in it to lose, and a close that warns about it is warning about
+    /// an empty document.
+    pub(crate) fn never_loaded(&self) -> bool {
+        self.clean_version.is_none()
+    }
+
     pub(crate) fn mark_clean(&mut self, version: u64, stamp: Option<Stamp>) {
         self.clean_version = Some(version);
         if stamp.is_some() {
@@ -158,6 +166,25 @@ mod tests {
         assert!(
             !dirty.is_dirty(7),
             "only the clean version itself reads clean"
+        );
+    }
+
+    #[test]
+    fn a_buffer_that_never_loaded_says_so_and_stops_saying_it_once_it_has() {
+        let mut dirty = DirtyState::default();
+        assert!(
+            dirty.never_loaded(),
+            "an editor whose read was denied has no clean point and nothing to lose"
+        );
+        dirty.mark_clean(0, None);
+        assert!(
+            !dirty.never_loaded(),
+            "a buffer with a clean point owns its own answer about unsaved work"
+        );
+        dirty.edited();
+        assert!(
+            !dirty.never_loaded(),
+            "editing after a load is exactly the work a close must warn about"
         );
     }
 

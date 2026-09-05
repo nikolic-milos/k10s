@@ -1161,6 +1161,21 @@ fn the_fit_camera_costs_one_quad_a_region_and_nothing_deeper() {
 }
 
 #[test]
+fn two_corpus_clusters_would_exceed_the_published_z0_region_cap() {
+    // The fit-camera corpus tops out at 1600 regions, one cluster. Two of
+    // those on one Starmap would leave Z0 without the aggregation §I still
+    // owes, so composing them is refused until that work exists.
+    assert!(
+        1600 <= MAX_Z0_REGIONS,
+        "the published cap must still admit the largest one-cluster fit case"
+    );
+    assert!(
+        1600 * 2 > MAX_Z0_REGIONS,
+        "two 1600-region clusters must not share a Z0 painter before aggregation"
+    );
+}
+
+#[test]
 fn cull_z2_draws_cells() {
     let snap = tiny_scene();
     let cam = Camera {
@@ -1325,7 +1340,7 @@ fn stress_curves_probes_every_visible_sat() {
 }
 
 #[test]
-fn fade_counts_union_of_stages() {
+fn fade_counts_exactly_one_displayed_stage() {
     let snap = hub_scene();
     let cam = Camera {
         cx: 200.0,
@@ -1358,24 +1373,33 @@ fn fade_counts_union_of_stages() {
     );
     assert_eq!(at_2.drawn_sats, 3);
 
-    for blend in [
-        StageBlend {
-            from: 1,
-            to: 2,
-            t: 0.0,
-        },
-        StageBlend {
-            from: 1,
-            to: 2,
-            t: 0.5,
-        },
-        StageBlend {
-            from: 2,
-            to: 1,
-            t: 0.5,
-        },
+    for (blend, expected) in [
+        (
+            StageBlend {
+                from: 1,
+                to: 2,
+                t: 0.49,
+            },
+            at_1,
+        ),
+        (
+            StageBlend {
+                from: 1,
+                to: 2,
+                t: 0.5,
+            },
+            at_2,
+        ),
+        (
+            StageBlend {
+                from: 2,
+                to: 1,
+                t: 0.5,
+            },
+            at_1,
+        ),
     ] {
         let fading = cull(&snap, &cam, &pol, blend, 1600.0, 1000.0, true, false);
-        assert_eq!(fading, at_2, "fade {blend:?} must count the union");
+        assert_eq!(fading, expected, "fade {blend:?} counted both stages");
     }
 }

@@ -8,6 +8,7 @@ targets = [
 all-features = true
 
 [advisories]
+yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is build-time-only through image/exr/pulp; upstream has no safe upgrade" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser is pinned by GPUI/fontdb/usvg; track until GPUI moves to skrifa" },
@@ -75,6 +76,9 @@ unused-allowed-source = "allow"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/nikolic-milos/zed",
+    # proptest is a git dep of the excluded tools/k10s-paint-bench graph, which
+    # security.yml checks with --config deny.toml; it is absent from the
+    # workspace lock on purpose.
     "https://github.com/proptest-rs/proptest",
     "https://github.com/rust-x-bindings/rust-xcb",
     "https://github.com/zed-industries/font-kit",

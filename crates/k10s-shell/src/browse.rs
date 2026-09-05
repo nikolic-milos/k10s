@@ -57,11 +57,34 @@ pub enum BrowseEvent {
         kind: k10s_core::KindId,
         name: String,
     },
+    OpenLocalCommand(LocalCommand),
     StartForward(ForwardRequest),
     OpenExec {
         namespace: String,
         pod: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalCommand {
+    pub title: String,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TalosRead {
+    Dmesg,
+    Services,
+}
+
+impl TalosRead {
+    fn command(self) -> &'static str {
+        match self {
+            TalosRead::Dmesg => "dmesg",
+            TalosRead::Services => "service",
+        }
+    }
 }
 
 // The built-in kinds whose spec.selector selects pods, so a merged log
@@ -71,6 +94,25 @@ fn selects_pods(kind: &str) -> bool {
         kind,
         "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" | "Job"
     )
+}
+
+/// Which row actions a kind offers, stated once so the key that fires and the
+/// hint that advertises it cannot disagree. A shell needs a tty, so a pod;
+/// logs need pods to read, so a pod or a kind whose selector finds them; a
+/// forward needs a port, so a pod directly or a service through its selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowActions {
+    pub(crate) logs: bool,
+    pub(crate) shell: bool,
+    pub(crate) forward: bool,
+}
+
+pub(crate) fn row_actions(kind: &str) -> RowActions {
+    RowActions {
+        logs: kind == "Pod" || selects_pods(kind),
+        shell: kind == "Pod",
+        forward: kind == "Pod" || kind == "Service",
+    }
 }
 
 pub struct BrowseView {
@@ -174,6 +216,10 @@ impl BrowseView {
                         *loading = false;
                         match outcome {
                             TableOutcome::Table(page) => this.table.set_page(page),
+                            TableOutcome::Absent => {
+                                this.table.set_page(TablePage::default());
+                                *status = Some("not served by this cluster".to_string());
+                            }
                             TableOutcome::Denied(what) => {
                                 this.table.set_page(TablePage::default());
                                 *status = Some(format!("{what}: access denied for this account"));
@@ -230,6 +276,9 @@ impl BrowseView {
                         *loading = false;
                         match outcome {
                             TableOutcome::Table(page) => this.table.append_page(page),
+                            TableOutcome::Absent => {
+                                *status = Some("not served by this cluster".to_string());
+                            }
                             TableOutcome::Denied(what) => {
                                 *status = Some(format!("{what}: access denied for this account"));
                             }
@@ -315,12 +364,15 @@ impl BrowseView {
         let Some(namespace) = row.namespace.clone() else {
             return;
         };
+        if !row_actions(&kind.kind).logs {
+            return;
+        }
         if kind.kind == "Pod" {
             cx.emit(BrowseEvent::OpenLogs {
                 namespace,
                 pod: row.name.clone(),
             });
-        } else if selects_pods(&kind.kind) {
+        } else {
             cx.emit(BrowseEvent::OpenWorkloadLogs {
                 namespace,
                 kind: kind.id,
@@ -338,7 +390,7 @@ impl BrowseView {
         else {
             return;
         };
-        if kind.kind != "Pod" {
+        if !row_actions(&kind.kind).shell {
             return;
         }
         let Some(row) = self.table.selected_row() else {
@@ -363,7 +415,7 @@ impl BrowseView {
         else {
             return;
         };
-        if kind.kind != "Pod" && kind.kind != "Service" {
+        if !row_actions(&kind.kind).forward {
             return;
         }
         let Some(row) = self.table.selected_row() else {
@@ -377,6 +429,41 @@ impl BrowseView {
             name: row.name.clone(),
             service: kind.kind == "Service",
         }));
+    }
+
+    fn talos_selected(&mut self, read: TalosRead, cx: &mut Context<Self>) {
+        let Phase::Table {
+            source: TableSource::Nodes,
+            status,
+            ..
+        } = &mut self.phase
+        else {
+            return;
+        };
+        let Some(row) = self.table.selected_row() else {
+            return;
+        };
+        let os = self.table.selected_cell("OS").unwrap_or_default();
+        if !contains_ascii_folded(os, "talos") {
+            return;
+        }
+        let address = self.table.selected_cell("Address").unwrap_or_default();
+        if address.is_empty() {
+            *status = Some("this Talos node reports no reachable node address".to_string());
+            cx.notify();
+            return;
+        }
+        if !talosctl_available() {
+            *status =
+                Some("talosctl is not on PATH; install it to open machine diagnostics".to_string());
+            cx.notify();
+            return;
+        }
+        cx.emit(BrowseEvent::OpenLocalCommand(talos_command(
+            row.name.as_str(),
+            address,
+            read,
+        )));
     }
 
     fn back(&mut self, cx: &mut Context<Self>) {
@@ -593,6 +680,12 @@ impl Render for BrowseView {
             .on_action(cx.listener(|this, _: &ExecRow, _, cx| {
                 this.exec_selected(cx);
             }))
+            .on_action(cx.listener(|this, _: &crate::TalosDmesg, _, cx| {
+                this.talos_selected(TalosRead::Dmesg, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TalosServices, _, cx| {
+                this.talos_selected(TalosRead::Services, cx);
+            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 this.fetch(cx);
                 cx.notify();
@@ -740,19 +833,131 @@ impl Render for BrowseView {
                                 hints.push_str(" · m more");
                             }
                             if let TableSource::Kind(kind) = source {
-                                if kind.kind == "Pod" || selects_pods(&kind.kind) {
+                                hints.push_str(" · y edit");
+                                let actions = row_actions(&kind.kind);
+                                if actions.logs {
                                     hints.push_str(" · l logs");
                                 }
-                                if kind.kind == "Pod" {
+                                if actions.shell {
                                     hints.push_str(" · s shell");
                                 }
-                                if kind.kind == "Pod" || kind.kind == "Service" {
+                                if actions.forward {
                                     hints.push_str(" · F forward");
                                 }
+                            } else if self
+                                .table
+                                .selected_cell("OS")
+                                .is_some_and(|os| contains_ascii_folded(os, "talos"))
+                            {
+                                hints.push_str(" · D dmesg · S services");
                             }
                             hints
                         }
                     }),
             )
+    }
+}
+
+fn talos_command(node: &str, address: &str, read: TalosRead) -> LocalCommand {
+    LocalCommand {
+        title: format!("talos {} {node}", read.command()),
+        program: "talosctl".to_string(),
+        args: vec![
+            "--nodes".to_string(),
+            address.to_string(),
+            read.command().to_string(),
+        ],
+    }
+}
+
+fn contains_ascii_folded(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[cfg(unix)]
+fn talosctl_available() -> bool {
+    crate::pty::command_on_path("talosctl")
+}
+
+#[cfg(not(unix))]
+fn talosctl_available() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn talos_commands_keep_the_node_target_as_one_argv_value() {
+        let command = talos_command(
+            "control-plane-1",
+            "10.0.0.7;printf should-not-run",
+            TalosRead::Dmesg,
+        );
+
+        assert_eq!(command.program, "talosctl");
+        assert_eq!(
+            command.args,
+            ["--nodes", "10.0.0.7;printf should-not-run", "dmesg"]
+        );
+        assert!(!command.args.iter().any(|arg| arg == "-c"));
+    }
+
+    #[test]
+    fn service_inventory_uses_the_read_only_singular_cli_command() {
+        let command = talos_command("worker-1", "10.0.0.8", TalosRead::Services);
+        assert_eq!(command.args, ["--nodes", "10.0.0.8", "service"]);
+    }
+
+    // The policy the keys and the hints both read. A change here is a change
+    // to what a person can do from a row, and it must not happen twice.
+    #[test]
+    fn row_actions_follow_what_a_kind_can_answer() {
+        let all = RowActions {
+            logs: true,
+            shell: true,
+            forward: true,
+        };
+        let none = RowActions {
+            logs: false,
+            shell: false,
+            forward: false,
+        };
+        assert_eq!(row_actions("Pod"), all);
+        for workload in [
+            "Deployment",
+            "StatefulSet",
+            "DaemonSet",
+            "ReplicaSet",
+            "Job",
+        ] {
+            assert_eq!(
+                row_actions(workload),
+                RowActions { logs: true, ..none },
+                "{workload} selects pods, so its logs merge; nothing else applies"
+            );
+        }
+        assert_eq!(
+            row_actions("Service"),
+            RowActions {
+                forward: true,
+                ..none
+            },
+            "a service forwards through its selector and offers nothing else"
+        );
+        for other in [
+            "CronJob",
+            "ConfigMap",
+            "Secret",
+            "Namespace",
+            "Node",
+            "Ingress",
+        ] {
+            assert_eq!(row_actions(other), none, "{other}");
+        }
     }
 }

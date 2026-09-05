@@ -170,6 +170,9 @@ pub fn register_fonts(cx: &gpui::App) -> Result<(), String> {
         .add_fonts(bytes)
         .map_err(|error| format!("cannot register the embedded fonts: {error}"))?;
 
+    // gpui has no `has_family` query, so the confirmation walks the system
+    // list. First photon pays it once; a silent platform fallback would cost
+    // every frame after that, and look almost right.
     let available = cx.text_system().all_font_names();
     let missing: Vec<&str> = [
         k10s_theme::DEFAULT_UI_FAMILY,
@@ -254,6 +257,15 @@ mod tests {
             "icons/file_tree.svg",
             "icons/terminal_alt.svg",
             "icons/info.svg",
+            "icons/star.svg",
+            "icons/server.svg",
+            "icons/magnifying_glass.svg",
+            "icons/box.svg",
+            "icons/git_branch.svg",
+            "icons/pull_request.svg",
+            "icons/tool_hammer.svg",
+            "icons/forward_arrow.svg",
+            "icons/settings.svg",
         ] {
             assert!(
                 Assets.load(icon).expect("loads").is_some(),

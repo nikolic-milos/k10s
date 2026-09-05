@@ -6,6 +6,19 @@ use k10s_core::{
     PreparedScene, PreparedWorkload, ResourceEvent,
 };
 
+const WATCHED_KINDS: [KindId; 10] = [
+    KindId::NAMESPACE,
+    KindId::DEPLOYMENT,
+    KindId::STATEFUL_SET,
+    KindId::DAEMON_SET,
+    KindId::JOB,
+    KindId::POD,
+    KindId::VOLUME,
+    KindId::SERVICE,
+    KindId::CONFIG_MAP,
+    KindId::SECRET,
+];
+
 fn indexed_uid(prefix: &str, mut index: usize) -> Arc<str> {
     // Four prefix bytes plus twenty decimal digits cover every 64-bit usize.
     // Formatting into this stack buffer avoids allocating a temporary String
@@ -174,6 +187,18 @@ pub fn prepared(spec: ClusterSpec, with_attachments: bool) -> PreparedScene {
 }
 
 pub fn emit_snapshot(spec: &ClusterSpec, with_attachments: bool, out: &mut Vec<IngestEvent>) {
+    out.reserve(
+        spec.namespaces.len()
+            + spec.total_workloads as usize
+            + spec.total_pods as usize
+            + if with_attachments {
+                spec.total_sats as usize
+            } else {
+                0
+            }
+            + 2 * WATCHED_KINDS.len(),
+    );
+
     let mut wl_i = 0usize;
     let mut pod_i = 0usize;
     let mut sat_i = 0usize;
@@ -249,18 +274,7 @@ pub fn emit_snapshot(spec: &ClusterSpec, with_attachments: bool, out: &mut Vec<I
         }
     }
 
-    for kind in [
-        KindId::NAMESPACE,
-        KindId::DEPLOYMENT,
-        KindId::STATEFUL_SET,
-        KindId::DAEMON_SET,
-        KindId::JOB,
-        KindId::POD,
-        KindId::VOLUME,
-        KindId::SERVICE,
-        KindId::CONFIG_MAP,
-        KindId::SECRET,
-    ] {
+    for kind in WATCHED_KINDS {
         out.push(IngestEvent::Capability {
             kind,
             verdict: Capability::Watchable,
@@ -327,6 +341,91 @@ mod tests {
         let spread = resources(&snapshot(&spec, true)).len();
         assert_eq!(spread - dense, spec.total_sats as usize);
         assert!(spec.total_sats > 0, "the fixture must exercise attachments");
+    }
+
+    type Object = (Arc<str>, Arc<str>, Option<Arc<str>>, Payload);
+
+    fn flatten(batch: &PreparedScene) -> Vec<Object> {
+        let mut out = Vec::new();
+        for ns in &batch.namespaces {
+            out.push((ns.uid.clone(), ns.name.clone(), None, Payload::Scope));
+            for wl in &ns.workloads {
+                out.push((
+                    wl.uid.clone(),
+                    wl.name.clone(),
+                    Some(ns.uid.clone()),
+                    Payload::Owner {
+                        kind: wl.kind,
+                        tool: wl.tool,
+                        depends_on: wl.depends_on.clone(),
+                    },
+                ));
+                for pod in &wl.pods {
+                    out.push((
+                        pod.uid.clone(),
+                        pod.name.clone(),
+                        Some(wl.uid.clone()),
+                        Payload::Instance { state: pod.state },
+                    ));
+                }
+                for sat in &wl.sats {
+                    out.push((
+                        sat.uid.clone(),
+                        sat.name.clone(),
+                        Some(wl.uid.clone()),
+                        Payload::Attached {
+                            kind: sat.kind,
+                            detail: sat.detail.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_prepared_batch_is_the_event_stream_with_its_hierarchy_kept() {
+        let spec = spec(55, 8_000);
+        let streamed: Vec<Object> = resources(&snapshot(&spec, true))
+            .iter()
+            .map(|r| {
+                (
+                    r.uid.clone(),
+                    r.name.clone(),
+                    r.parent.clone(),
+                    r.payload.clone(),
+                )
+            })
+            .collect();
+        let batch = prepared(spec, true);
+        let hierarchy = flatten(&batch);
+
+        assert_eq!(hierarchy.len(), streamed.len(), "object count");
+        for (index, (from_batch, from_stream)) in hierarchy.iter().zip(&streamed).enumerate() {
+            assert_eq!(from_batch, from_stream, "object {index}");
+        }
+    }
+
+    #[test]
+    fn the_prepared_totals_are_the_hierarchy_they_claim_to_size() {
+        for with_attachments in [true, false] {
+            let batch = prepared(spec(55, 8_000), with_attachments);
+            let workloads = batch.namespaces.iter().flat_map(|ns| &ns.workloads);
+            let (mut pods, mut sats, mut edges, mut count) = (0u32, 0u32, 0u32, 0u32);
+            for wl in workloads {
+                count += 1;
+                pods += wl.pods.len() as u32;
+                sats += wl.sats.len() as u32;
+                edges += wl.depends_on.len() as u32;
+            }
+            assert_eq!(batch.total_workloads, count);
+            assert_eq!(batch.total_pods, pods);
+            assert_eq!(batch.total_sats, sats, "attachments {with_attachments}");
+            assert_eq!(batch.total_edges, edges);
+            assert!(pods > 0 && edges > 0);
+            assert_eq!(sats > 0, with_attachments);
+        }
     }
 
     #[test]

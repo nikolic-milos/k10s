@@ -4,7 +4,8 @@ use std::sync::Arc;
 use bevy_ecs::prelude::*;
 use k10s_clustergen::{GenConfig, Scenario, generate};
 use k10s_core::{
-    IngestEvent, KindId, Level, Op, ReasonId, SceneSnapshot, Severity, State, ToolId, replay,
+    Endpoint, IngestEvent, KindId, Level, Op, ReasonId, SceneSnapshot, Severity, State, ToolId,
+    replay,
 };
 
 use crate::PublishBench;
@@ -242,6 +243,23 @@ fn publish_under_a_lapped_reader_stays_correct() {
             "pinned snapshot cell {i} changed"
         );
     }
+}
+
+#[test]
+fn a_derived_count_that_still_holds_pods_gives_one_back() {
+    let mut count = 2;
+    crate::release_one(&mut count);
+    assert_eq!(count, 1);
+    crate::release_one(&mut count);
+    assert_eq!(count, 0);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a derived count lost a pod it never held")]
+fn a_derived_count_that_would_go_negative_fails_loudly_instead_of_wrapping() {
+    let mut count = 0;
+    crate::release_one(&mut count);
 }
 
 #[test]
@@ -836,4 +854,160 @@ fn canonical_pod_state_keeps_the_incremental_publish_fast_path() {
         after_stats.full_materializes, before_stats.full_materializes,
         "state-only changes must retain patch-in-place publication"
     );
+}
+
+fn extra_spec(pods: u32, sats: Vec<(KindId, &str)>) -> crate::input::ClusterInput {
+    use crate::input::{ClusterInput, NsInput, PodInput, SatInput, WlInput};
+    let pod_nodes: Vec<PodInput> = (0..pods)
+        .map(|i| PodInput {
+            uid: format!("pod-{i}").into(),
+            name: format!("pod-{i}").into(),
+            state: State::OK,
+        })
+        .collect();
+    let sat_nodes: Vec<SatInput> = sats
+        .into_iter()
+        .enumerate()
+        .map(|(i, (kind, name))| SatInput {
+            uid: format!("sat-{i}").into(),
+            name: name.into(),
+            kind,
+            detail: Arc::from(""),
+        })
+        .collect();
+    let total_pods = pod_nodes.len() as u32;
+    let total_sats = sat_nodes.len() as u32;
+    ClusterInput {
+        namespaces: vec![NsInput {
+            uid: "ns-prod".into(),
+            name: "prod".into(),
+            workloads: vec![WlInput {
+                uid: "wl-api".into(),
+                name: "api".into(),
+                kind: KindId::DEPLOYMENT,
+                tool: ToolId::NONE,
+                pods: pod_nodes,
+                sats: sat_nodes,
+                depends_on: Vec::new(),
+            }],
+        }],
+        total_workloads: 1,
+        total_pods,
+        total_sats,
+        total_edges: 0,
+    }
+}
+
+fn extra_edges(snap: &SceneSnapshot) -> Vec<(Endpoint, Endpoint)> {
+    snap.edges
+        .iter()
+        .filter(|edge| !edge.is_block_pair())
+        .map(|edge| (edge.a, edge.b))
+        .collect()
+}
+
+#[test]
+fn a_service_satellite_links_to_the_pods_of_its_workload() {
+    let spec = extra_spec(3, vec![(KindId::SERVICE, "api")]);
+    let scene = k10s_core::new_shared_scene();
+    let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
+    schedule.run(&mut world);
+    topology::verify_derived_state(&mut world);
+    let snap = scene.load_full();
+    let extra = extra_edges(&snap);
+    assert_eq!(extra.len(), 3, "one edge per pod: {extra:?}");
+    for (_, b) in &extra {
+        assert_eq!(b.level(), Level::Cell);
+    }
+    assert!(extra.iter().all(|(a, _)| a.level() == Level::Sat));
+    assert_published_matches_full(&world, &snap);
+}
+
+#[test]
+fn extra_edges_are_capped_per_namespace() {
+    let spec = extra_spec(80, vec![(KindId::SERVICE, "api"), (KindId::VOLUME, "data")]);
+    let scene = k10s_core::new_shared_scene();
+    let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
+    schedule.run(&mut world);
+    topology::verify_derived_state(&mut world);
+    let snap = scene.load_full();
+    let extra = extra_edges(&snap);
+    assert_eq!(
+        extra.len(),
+        topology::EXTRA_EDGES_PER_NS,
+        "80 pods × 2 sats would be 160 without the cap"
+    );
+}
+
+#[test]
+fn an_ingress_satellite_links_to_a_sibling_service() {
+    let spec = extra_spec(
+        1,
+        vec![(KindId::SERVICE, "api"), (KindId::INGRESS, "api-ing")],
+    );
+    let scene = k10s_core::new_shared_scene();
+    let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
+    schedule.run(&mut world);
+    topology::verify_derived_state(&mut world);
+    let snap = scene.load_full();
+    let extra = extra_edges(&snap);
+    assert!(
+        extra.iter().any(|(a, b)| {
+            a.level() == Level::Sat
+                && b.level() == Level::Sat
+                && snap.sats[a.index() as usize].ext.kind == KindId::INGRESS
+                && snap.sats[b.index() as usize].ext.kind == KindId::SERVICE
+        }),
+        "expected Ingress→Service among extra edges: {extra:?}"
+    );
+    assert!(
+        extra
+            .iter()
+            .any(|(a, b)| a.level() == Level::Sat && b.level() == Level::Cell),
+        "the service still links to the pod"
+    );
+}
+
+#[test]
+fn dense_layout_emits_no_satellite_edges() {
+    let spec = extra_spec(4, vec![(KindId::SERVICE, "api")]);
+    let scene = k10s_core::new_shared_scene();
+    let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Dense);
+    schedule.run(&mut world);
+    topology::verify_derived_state(&mut world);
+    let snap = scene.load_full();
+    assert!(snap.sats.is_empty());
+    assert!(extra_edges(&snap).is_empty());
+}
+
+#[test]
+fn adding_a_service_live_rebuilds_the_same_edges_as_a_full_materialize() {
+    let spec = extra_spec(2, Vec::new());
+    let scene = k10s_core::new_shared_scene();
+    let (mut world, mut schedule) = build_world(&spec, scene.clone(), LayoutMode::Spread);
+    schedule.run(&mut world);
+    assert!(extra_edges(&scene.load_full()).is_empty());
+
+    topology::apply_events(
+        &mut world,
+        &[IngestEvent::Resource(k10s_core::ResourceEvent {
+            kind: KindId::SERVICE,
+            uid: "svc-api".into(),
+            namespace: "prod".into(),
+            name: "api".into(),
+            resource_version: 1,
+            parent: Some("wl-api".into()),
+            op: Op::Added,
+            payload: k10s_core::Payload::Attached {
+                kind: KindId::SERVICE,
+                detail: Arc::from("ClusterIP"),
+            },
+        })],
+        LayoutMode::Spread,
+    );
+    schedule.run(&mut world);
+    topology::verify_derived_state(&mut world);
+    let snap = scene.load_full();
+    assert_eq!(extra_edges(&snap).len(), 2);
+    assert_published_matches_full(&world, &snap);
 }
