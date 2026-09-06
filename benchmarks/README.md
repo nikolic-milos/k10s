@@ -63,21 +63,23 @@ moving to different hardware or a materially different operating-system/toolchai
 
 ## Current recording
 
-`linux-x86_64-i5-12600k`, recorded 2026-09-04 from a clean build of d1b2371: nine suites,
-two collections on an idle machine pinned to CPU 4, gated against each other at 5,029 checks
-with one flag on a case this host has always wobbled on. The recording reflects two changes
-since the previous one. Bounded Service and PVC edges are drawn from the published parent,
-which multiplies the edges in every generated scene by 4.1 to 5.0. LOD bands are exclusive
-under a named Z0 region cap, which collapses a dense Z0 region from 2,002 quads to 2. On this
-recording a one-object structural publish patch costs 488 us at 50k, because a structural
+`linux-x86_64-i5-12600k` on kernel 7.2.3-arch1-2, recorded 2026-09-06 from a clean build of
+37509b9: nine suites, two collections on an idle machine pinned to CPU 4, the installed run
+gating clean against the witness and the witness carrying three tail-class flags in 5,029
+checks against the installed run. The kernel moved essentially nothing: against the previous
+recording on 7.1.8-arch1-3, the new collection flagged 2 of 5,029 checks, one p99 tail and the
+Z0 fit walk case this host has always wobbled on. The recording still reflects the two changes
+the previous one recorded: bounded Service and PVC edges from the published parent, which
+multiply the edges in every generated scene by 4.1 to 5.0, and exclusive LOD bands under a
+named Z0 region cap, which collapse a dense Z0 region from 2,002 quads to 2. A one-object
+structural publish patch costs about 490 us at 50k on this recording because a structural
 batch rebuilds those edges; incremental adjacency maintenance is the open item that brings it
 down. Every refresh is explained in the commit that made it.
 
-Startup, recorded 2026-09-04 from a clean build of 2ebd33c with `check-flight-gate.sh --run`:
-ten samples per launch shape on the six P-cores, idle. The chooser presents its first and
-useful frame at 63.7 ms median and 73.0 max, the 25,000-object scene at 64.7 and 70.4, and the
-million-object scene its first frame at 69.9 and its useful frame at 229.9 ms with a 231.5 max;
-the window is built at 50 to 56 ms in all three. Relative deviation is under 0.02 on every
+Startup, recorded the same day from the same commit with `check-flight-gate.sh --run`: ten
+samples per launch shape on the six P-cores, idle. The chooser presents its first and useful
+frame at 61.4 ms median and 69.4 max, the 25,000-object scene at 60.8 and 62.5, and the
+million-object scene its first frame at 66.3 and its useful frame at 214.6 ms with a 219.1 max;
+the window is built at 48 to 53 ms in all three. Relative deviation is under 0.015 on every
 case. `app-manifest.json` gates these at 1.15x plus 5 ms, and the aggregator holds the first
 two shapes at 100 ms absolutely.
-

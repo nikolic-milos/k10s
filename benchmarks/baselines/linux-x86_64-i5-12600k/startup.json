@@ -12,37 +12,37 @@
       "source": "generator",
       "objects": 25000,
       "samples": 10,
-      "first_presented_p50_ms": 64.71754999999999,
-      "first_presented_max_ms": 70.432329,
-      "first_presented_rmad": 0.012511312619219804,
-      "useful_presented_p50_ms": 64.71754999999999,
-      "useful_presented_max_ms": 70.432329,
-      "useful_presented_rmad": 0.012511312619219804,
-      "window_built_p50_ms": 52.3236345
+      "first_presented_p50_ms": 60.769219,
+      "first_presented_max_ms": 62.490652,
+      "first_presented_rmad": 0.00889372957055777,
+      "useful_presented_p50_ms": 60.769219,
+      "useful_presented_max_ms": 62.490652,
+      "useful_presented_rmad": 0.00889372957055777,
+      "window_built_p50_ms": 49.343245499999995
     },
     {
       "source": "generator",
       "objects": 1000000,
       "samples": 10,
-      "first_presented_p50_ms": 69.85904300000001,
-      "first_presented_max_ms": 72.115121,
-      "first_presented_rmad": 0.010727165271931929,
-      "useful_presented_p50_ms": 229.8526745,
-      "useful_presented_max_ms": 231.4643,
-      "useful_presented_rmad": 0.006985343996943553,
-      "window_built_p50_ms": 55.957322500000004
+      "first_presented_p50_ms": 66.3456385,
+      "first_presented_max_ms": 68.295956,
+      "first_presented_rmad": 0.013507564630642644,
+      "useful_presented_p50_ms": 214.60155200000003,
+      "useful_presented_max_ms": 219.144435,
+      "useful_presented_rmad": 0.009470537286701455,
+      "window_built_p50_ms": 52.8744235
     },
     {
       "source": "launch",
       "objects": 0,
       "samples": 10,
-      "first_presented_p50_ms": 63.69774199999999,
-      "first_presented_max_ms": 72.993272,
-      "first_presented_rmad": 0.015235218227986718,
-      "useful_presented_p50_ms": 63.69774199999999,
-      "useful_presented_max_ms": 72.993272,
-      "useful_presented_rmad": 0.015235218227986718,
-      "window_built_p50_ms": 49.902004500000004
+      "first_presented_p50_ms": 61.368985499999994,
+      "first_presented_max_ms": 69.42526000000001,
+      "first_presented_rmad": 0.006164856676667717,
+      "useful_presented_p50_ms": 61.368985499999994,
+      "useful_presented_max_ms": 69.42526000000001,
+      "useful_presented_rmad": 0.006164856676667717,
+      "window_built_p50_ms": 48.222154
     }
   ]
 }
