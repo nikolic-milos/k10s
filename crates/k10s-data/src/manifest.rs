@@ -115,12 +115,8 @@ pub(crate) fn document(
     let declared = strip_bookkeeping(value);
     let mut yaml = String::new();
     if is_secret(target) {
-        // The read path never fetches a Secret's values -- it asks for
-        // `PartialObjectMetadata` -- so this note used to be true by where the
-        // object came from. An apply's response does not come from there: the
-        // server echoes the whole merged object, values included. Withholding
-        // them here makes the note true by construction for every caller
-        // instead of true by the accident of one caller's request shape.
+        // Network responses negotiate metadata. The emitter also accepts
+        // values supplied by other callers, so its note must hold for them too.
         withhold_values(value);
         yaml.push_str(SECRET_NOTE);
         yaml.push('\n');

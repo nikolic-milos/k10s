@@ -23,6 +23,8 @@
 //! holds the uid the document was *read* at can compare the two. This layer
 //! reports the identity and draws no conclusion from it; the conclusion needs
 //! the read's uid, which lives with the review rather than with the request.
+//! Secret responses are negotiated as metadata, including on a dry run: the
+//! merged data fields must not enter the process to be discarded later.
 //!
 //! `fieldManager=k10s` names us in `managedFields`, which is what makes a
 //! conflict possible in the first place -- and a conflict is a labelled state
@@ -184,14 +186,15 @@ pub(crate) async fn apply(
         field_manager: Some(FIELD_MANAGER.to_string()),
         field_validation: Some(ValidationDirective::Strict),
     };
-    let built = Request::new(collection_path(target, request.namespace.as_deref())).patch(
-        &request.name,
-        &params,
-        // The value is a placeholder the body replaces; what this variant is
-        // here for is the `application/apply-patch+yaml` content type and the
-        // query parameters, both of which are kube's own to spell.
-        &Patch::Apply(serde_json::Value::Null),
-    );
+    let api_request = Request::new(collection_path(target, request.namespace.as_deref()));
+    // The value is a placeholder the body replaces; the variant supplies
+    // kube's apply content type and query parameters.
+    let patch = Patch::Apply(serde_json::Value::Null);
+    let built = if crate::describe::is_secret(target) {
+        api_request.patch_metadata(&request.name, &params, &patch)
+    } else {
+        api_request.patch(&request.name, &params, &patch)
+    };
     let mut built = match built {
         Ok(built) => built,
         Err(error) => {

@@ -90,6 +90,7 @@
 
 use std::time::Duration;
 
+use k8s_openapi::api::core::v1::Secret;
 use k10s_core::KindId;
 use k10s_data::apply::{ApplyOutcome, ApplyRequest};
 use k10s_data::describe::DescribeRequest;
@@ -98,6 +99,95 @@ use k10s_data::metrics::{
 };
 use k10s_data::read::{Fetched, KindRow, Reader};
 use k10s_data::{DEFAULT_EVENT_SINK_CAPACITY, Options, Sync};
+
+const SECRET_PROBE_VALUE: &str = "k10s-live-secret-fixture";
+
+struct SecretProbe {
+    name: String,
+    api: kube::Api<Secret>,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl SecretProbe {
+    fn new(finalizer: bool) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a fixture runtime");
+        let (api, name) = runtime.block_on(async {
+            let client = kube::Client::try_default()
+                .await
+                .expect("the fixture client");
+            let api: kube::Api<Secret> = kube::Api::namespaced(client, &namespace());
+            let declared = serde_json::json!({"stringData": {"token": SECRET_PROBE_VALUE}});
+            let fixture = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "generateName": "k10s-secret-boundary-",
+                    "finalizers": if finalizer { vec!["test.k10s.io/hold"] } else { vec![] },
+                    "annotations": {
+                        "kubectl.kubernetes.io/last-applied-configuration": declared.to_string(),
+                    },
+                },
+                "stringData": {"token": SECRET_PROBE_VALUE},
+            });
+            let fixture: Secret = serde_json::from_value(fixture).expect("a fixture Secret");
+            let created = api
+                .create(&kube::api::PostParams::default(), &fixture)
+                .await
+                .expect("the generated fixture is created");
+            (
+                api,
+                created.metadata.name.expect("the server assigns a name"),
+            )
+        });
+        Self { name, api, runtime }
+    }
+
+    // A full GET is confined to the generated fixture, whose canary this test
+    // supplied. It proves metadata edits leave the stored value untouched.
+    fn read(&self) -> Option<Secret> {
+        self.runtime
+            .block_on(self.api.get_opt(&self.name))
+            .expect("the fixture can be read back")
+    }
+}
+
+impl Drop for SecretProbe {
+    fn drop(&mut self) {
+        let result = self.runtime.block_on(async {
+            let patch = kube::api::Patch::Merge(serde_json::json!({
+                "metadata": {"finalizers": []},
+            }));
+            match self
+                .api
+                .patch_metadata(&self.name, &kube::api::PatchParams::default(), &patch)
+                .await
+            {
+                Ok(_) => {}
+                Err(kube::Error::Api(status)) if status.code == 404 => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            match self
+                .api
+                .delete(&self.name, &kube::api::DeleteParams::default())
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+                Err(error) => Err(error),
+            }
+        });
+        if let Err(error) = result {
+            eprintln!(
+                "fixture cleanup failed for {}/{}: {error}",
+                namespace(),
+                self.name
+            );
+        }
+    }
+}
 
 fn namespace() -> String {
     std::env::var("K10S_LIVE_NAMESPACE").unwrap_or_else(|_| "g2".to_string())
@@ -575,8 +665,7 @@ fn a_secrets_values_never_reach_a_document_by_any_of_the_three_routes() {
         "while the base is still a document worth diffing:\n{base}"
     );
 
-    // Route three: the object the server echoes back from an apply, which is a
-    // full object and not a metadata projection.
+    // Route three: the metadata returned by apply still carries annotations.
     if secrets.patchable {
         let built = payload(&declared.yaml, declared.status_subresource);
         let outcome = apply(
@@ -602,6 +691,167 @@ fn a_secrets_values_never_reach_a_document_by_any_of_the_three_routes() {
             "the note that says so leads it:\n{}",
             applied.yaml
         );
+    }
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn secret_workload_reads_refuse_and_describe_omits_the_declared_canary() {
+    use k10s_data::logs::{LogChunk, WorkloadLogRequest};
+
+    let probe = SecretProbe::new(false);
+    let (_plane, sync) = connect(None);
+    let secrets = kind(&sync.reader, "secrets");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _logs = sync.reader.follow_workload_logs(
+        WorkloadLogRequest {
+            namespace: namespace(),
+            kind: secrets.id,
+            name: probe.name.clone(),
+        },
+        Box::new(move |chunk| {
+            let _ = tx.send(chunk);
+        }),
+    );
+    assert_eq!(
+        wait(&rx),
+        LogChunk::Failed {
+            what: "workload logs",
+            why: "a Secret has no workload logs; its values are withheld".to_string(),
+        }
+    );
+    let (_usage, rx) = poll_usage(
+        &sync.reader,
+        UsageTarget::Workload {
+            kind: secrets.id,
+            name: probe.name.clone(),
+        },
+    );
+    assert_eq!(
+        wait(&rx),
+        UsageOutcome::Absent {
+            why: "a Secret has no pod usage; its values are withheld".to_string(),
+        }
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_describe(
+        DescribeRequest {
+            kind: secrets.id,
+            namespace: Some(namespace()),
+            name: probe.name.clone(),
+            uid: String::new(),
+        },
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    );
+    let Fetched::Ok(doc) = wait(&rx) else {
+        panic!("the generated Secret's metadata can be described");
+    };
+    let text = doc.lines.join("\n");
+    assert!(text.contains("values withheld"), "{text}");
+    assert!(text.contains(&probe.name), "{text}");
+    assert!(!text.contains(SECRET_PROBE_VALUE), "{text}");
+    assert!(!text.contains("last-applied-configuration"), "{text}");
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn secret_apply_reviews_metadata_and_preserves_the_stored_value() {
+    let probe = SecretProbe::new(false);
+    let original = probe.read().expect("the fixture exists");
+    let (_plane, sync) = connect(None);
+    let secrets = kind(&sync.reader, "secrets");
+    let yaml = format!(
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: {}\n  labels:\n    test.k10s.io/reviewed: verified\n",
+        probe.name,
+    );
+    for dry_run in [true, false] {
+        let outcome = apply(
+            &sync.reader,
+            request(secrets.id, &probe.name, yaml.clone(), dry_run, false),
+        );
+        let ApplyOutcome::Applied(applied) = outcome else {
+            panic!("the metadata apply succeeds: {outcome:?}");
+        };
+        assert_eq!(applied.dry_run, dry_run);
+        assert_eq!(applied.uid, original.metadata.uid);
+        assert!(applied.yaml.contains("values withheld"), "{}", applied.yaml);
+        assert!(applied.yaml.contains("kind: Secret"), "{}", applied.yaml);
+        assert!(
+            !applied.yaml.contains(SECRET_PROBE_VALUE),
+            "{}",
+            applied.yaml
+        );
+        let stored = probe.read().expect("the fixture still exists");
+        assert_eq!(
+            stored.data, original.data,
+            "a metadata edit cannot change the stored token"
+        );
+        let reviewed = stored
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("test.k10s.io/reviewed"));
+        assert_eq!(
+            reviewed.map(String::as_str),
+            if dry_run { None } else { Some("verified") }
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn secret_delete_works_with_and_without_a_finalizer() {
+    use k10s_data::day2::{Caps, Day2Call, Day2Outcome, DeleteRequest};
+
+    let (_plane, sync) = connect(None);
+    let secrets = kind(&sync.reader, "secrets");
+    for finalizer in [false, true] {
+        let probe = SecretProbe::new(finalizer);
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader.day2(
+            secrets.id,
+            Day2Call::Delete(DeleteRequest {
+                namespace: Some(namespace()),
+                name: probe.name.clone(),
+                grace_period_seconds: None,
+                confirm: true,
+                caps: Caps::default(),
+            }),
+            move |outcome| {
+                let _ = tx.send(outcome);
+            },
+        );
+        let outcome = wait(&rx);
+        assert!(matches!(outcome, Day2Outcome::Applied(_)), "{outcome:?}");
+        let stored = probe.read();
+        if finalizer {
+            let stored = stored.expect("the finalizer holds deletion");
+            assert!(stored.metadata.deletion_timestamp.is_some());
+            let mut request =
+                kube::api::Request::new(format!("/api/v1/namespaces/{}/secrets", namespace()))
+                    .delete(&probe.name, &kube::api::DeleteParams::default())
+                    .expect("the metadata DELETE request");
+            request.headers_mut().insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static(
+                    "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+                ),
+            );
+            let response: serde_json::Value = probe
+                .runtime
+                .block_on(probe.api.clone().into_client().request(request))
+                .expect("the live server negotiates a finalizer-held DELETE response");
+            assert_eq!(response["kind"], "PartialObjectMetadata");
+            assert!(response.get("data").is_none());
+            assert!(response.get("stringData").is_none());
+        } else {
+            assert!(
+                stored.is_none(),
+                "the completed deletion removed the fixture"
+            );
+        }
     }
 }
 

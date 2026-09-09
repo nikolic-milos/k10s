@@ -16,6 +16,7 @@
 //! each line carrying the pod's name after the kubelet timestamp. One guard
 //! cancels every underlying follow; a pod's own ending becomes a marked line
 //! in the feed, and the merged feed ends only when the last pod's does.
+//! A Secret has no workload logs and is refused before any object fetch.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -199,6 +200,13 @@ pub(crate) fn follow_workload(
     request: WorkloadLogRequest,
     on_chunk: Box<dyn Fn(LogChunk) + Send + Sync>,
 ) -> LogStop {
+    if crate::describe::is_secret(&target) {
+        on_chunk(LogChunk::Failed {
+            what: "workload logs",
+            why: "a Secret has no workload logs; its values are withheld".to_string(),
+        });
+        return LogStop::noop();
+    }
     let (cancel_tx, mut cancel) = tokio::sync::oneshot::channel::<()>();
     handle.spawn(async move {
         let on_chunk: Arc<dyn Fn(LogChunk) + Send + Sync> = Arc::from(on_chunk);

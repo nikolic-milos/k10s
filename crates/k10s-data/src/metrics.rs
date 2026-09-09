@@ -11,7 +11,8 @@
 //! a kind the server does not serve is not retried. A response that will not
 //! parse or exceeds its byte cap is `Failed`, and a `Failed` tick keeps
 //! polling because the next one may recover. No variant ever carries a zero
-//! the cluster did not report.
+//! the cluster did not report. A Secret has no pod usage and is refused as
+//! `Absent` before fetching it to resolve a workload selector.
 //!
 //! The kubelet reports CPU as a cumulative counter stamped with its own
 //! timestamp, so a rate needs two samples: the first fallback tick carries
@@ -359,6 +360,11 @@ async fn resolve_pods(
                     why: "this kind is not served by the connected cluster".to_string(),
                 });
             };
+            if crate::describe::is_secret(target) {
+                return Err(UsageOutcome::Absent {
+                    why: "a Secret has no pod usage; its values are withheld".to_string(),
+                });
+            }
             let http_request = Request::new(collection_path(target, Some(&request.namespace)))
                 .get(name, &GetParams::default())
                 .map_err(|error| UsageOutcome::Failed {
