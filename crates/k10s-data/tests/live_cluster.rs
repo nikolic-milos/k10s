@@ -479,7 +479,7 @@ fn resource_version(yaml: &str) -> String {
 // and the message shape `manager_of` reads the manager out of.
 #[test]
 #[ignore = "needs a live cluster; see the module comment"]
-fn a_second_field_manager_produces_a_conflict_naming_it_and_force_takes_the_field() {
+fn a_field_manager_conflict_is_previewed_before_force_takes_the_field() {
     let (plane, sync) = connect(None);
     let configmaps = kind(&sync.reader, "configmaps");
 
@@ -517,7 +517,7 @@ fn a_second_field_manager_produces_a_conflict_naming_it_and_force_takes_the_fiel
             configmaps.id,
             "settings",
             sent(&built).to_string(),
-            false,
+            true,
             false,
         ),
     );
@@ -539,7 +539,44 @@ fn a_second_field_manager_produces_a_conflict_naming_it_and_force_takes_the_fiel
         "and the manager holding it, parsed out of the message: {causes:?}"
     );
 
-    // Forcing takes it, which is the only thing that gets past a conflict.
+    let preview = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            true,
+            true,
+        ),
+    );
+    let ApplyOutcome::Applied(preview) = preview else {
+        panic!("the forced dry run provides a review: {preview:?}");
+    };
+    assert!(preview.dry_run);
+    assert!(preview.yaml.contains("retries: \"5\""), "{}", preview.yaml);
+    let unchanged = manifest(&sync.reader, configmaps.id, "settings");
+    assert!(
+        unchanged.yaml.contains("retries: \"9\""),
+        "{}",
+        unchanged.yaml
+    );
+    let still_owned = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            true,
+            false,
+        ),
+    );
+    assert!(
+        matches!(still_owned, ApplyOutcome::Conflict { causes, .. }
+            if causes.iter().any(|cause| cause.manager == "rival" && cause.field.contains("retries"))),
+        "the preview transferred no ownership"
+    );
+
+    // Only the separate real apply takes the field and changes its value.
     let outcome = apply(
         &sync.reader,
         request(

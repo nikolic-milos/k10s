@@ -2,7 +2,7 @@
 //!
 //! The two things worth testing here are the classification -- an edit, drift
 //! the apply would revert, or a collision -- and the preconditions a *press*
-//! has to clear. The second is why [`crate::diff_gate::refuse`] is one pure
+//! has to clear. The second is why [`crate::diff_gate::prepare`] is one pure
 //! function: the two preconditions that ever failed were the two that lived
 //! somewhere else, guarding one way in while another way round stayed open.
 
@@ -10,8 +10,8 @@ use k10s_edit::diff::{self, Origin, Verdict};
 
 use crate::diff::*;
 use crate::diff_gate::{
-    ApplyGate, Armed, Flight, Identity, Keepable, Ready, Sent, Step, identity, kept_note,
-    landed_note, recreated_note, refuse, refuse_keep, reviewed, stale_object_note,
+    ApplyGate, Armed, Flight, Identity, Keepable, Preparation, Ready, Review, Sent, Step, identity,
+    kept_note, landed_note, prepare, recreated_note, refuse_keep, reviewed, stale_object_note,
 };
 use crate::editor::BufferStamp;
 use crate::provider::Conflicted;
@@ -357,7 +357,7 @@ fn ready<'a>(blocked: &'a [&'static str], verdict: Verdict) -> Ready<'a> {
         verdict,
         reviewed: stamp,
         editor: Some(stamp),
-        dry_run: Some(stamp),
+        dry_run: Some(Review { stamp, force: true }),
         conflicts: 1,
         in_flight: None,
     }
@@ -365,11 +365,17 @@ fn ready<'a>(blocked: &'a [&'static str], verdict: Verdict) -> Ready<'a> {
 
 #[test]
 fn a_press_that_clears_every_precondition_is_the_only_one_that_writes() {
-    assert_eq!(refuse(Armed::Apply, ready(&[], Verdict::Differs)), None);
-    assert_eq!(refuse(Armed::Force, ready(&[], Verdict::Differs)), None);
     assert_eq!(
-        refuse(Armed::Apply, ready(&[], Verdict::Agreed)),
-        None,
+        prepare(Armed::Apply, ready(&[], Verdict::Differs)),
+        Ok(Preparation::Confirm)
+    );
+    assert_eq!(
+        prepare(Armed::Force, ready(&[], Verdict::Differs)),
+        Ok(Preparation::Confirm)
+    );
+    assert_eq!(
+        prepare(Armed::Apply, ready(&[], Verdict::Agreed)),
+        Ok(Preparation::Confirm),
         "an apply that changes nothing is still an apply the user may make"
     );
 }
@@ -381,12 +387,12 @@ fn a_press_that_clears_every_precondition_is_the_only_one_that_writes() {
 fn a_comparison_the_diff_refused_to_make_is_not_a_comparison_that_agreed() {
     let refused = Verdict::Refused("one side of this comparison has more than 65,536 lines");
     assert_eq!(
-        refuse(Armed::Apply, ready(&[], refused)),
-        Some("nothing here has been reviewed, so there is nothing to apply".to_string()),
+        prepare(Armed::Apply, ready(&[], refused)),
+        Err("nothing here has been reviewed, so there is nothing to apply".to_string()),
     );
     assert_eq!(
-        refuse(Armed::Force, ready(&[], refused)),
-        Some("nothing here has been reviewed, so there is nothing to apply".to_string()),
+        prepare(Armed::Force, ready(&[], refused)),
+        Err("nothing here has been reviewed, so there is nothing to apply".to_string()),
     );
 }
 
@@ -397,16 +403,19 @@ fn a_payload_the_pruner_refused_never_becomes_a_request() {
     // The baseline press goes through, so the one thing that changed here
     // is the one thing that stopped it. The reasons themselves stand on
     // their own piece of the status line rather than being repeated.
-    assert_eq!(refuse(Armed::Apply, ready(&[], Verdict::Differs)), None);
     assert_eq!(
-        refuse(
+        prepare(Armed::Apply, ready(&[], Verdict::Differs)),
+        Ok(Preparation::Confirm)
+    );
+    assert_eq!(
+        prepare(
             Armed::Apply,
             ready(
                 &["a cluster apply needs exactly one YAML document"],
                 Verdict::Differs,
             ),
         ),
-        Some("this document cannot be applied, so nothing was sent".to_string()),
+        Err("this document cannot be applied, so nothing was sent".to_string()),
     );
 }
 
@@ -418,15 +427,18 @@ fn a_buffer_replaced_since_the_review_is_refused_even_at_the_same_version() {
     let mut at = ready(&[], Verdict::Differs);
     at.reviewed = BufferStamp::of(1, 3);
     at.editor = Some(BufferStamp::of(2, 3));
-    at.dry_run = Some(BufferStamp::of(1, 3));
-    let why = refuse(Armed::Apply, at).expect("refused");
+    at.dry_run = Some(Review {
+        stamp: BufferStamp::of(1, 3),
+        force: false,
+    });
+    let why = prepare(Armed::Apply, at).expect_err("refused");
     assert!(
         why.contains("the buffer changed after this comparison"),
         "{why}"
     );
 
     at.editor = None;
-    let why = refuse(Armed::Apply, at).expect("refused");
+    let why = prepare(Armed::Apply, at).expect_err("refused");
     assert!(
         why.contains("the editor this diff came from is gone"),
         "{why}"
@@ -440,12 +452,14 @@ fn a_buffer_replaced_since_the_review_is_refused_even_at_the_same_version() {
 fn an_apply_the_server_has_never_seen_is_refused_until_it_has() {
     let mut at = ready(&[], Verdict::Differs);
     at.dry_run = None;
-    let why = refuse(Armed::Apply, at).expect("refused");
+    let why = prepare(Armed::Apply, at).expect_err("refused");
     assert!(why.contains("ctrl-alt-r"), "{why}");
 
-    at.dry_run = Some(BufferStamp::of(1, 3));
-    let why = refuse(Armed::Force, at).expect("a force is an apply too");
-    assert!(why.contains("has not been asked"), "{why}");
+    at.dry_run = Some(Review {
+        stamp: BufferStamp::of(1, 3),
+        force: false,
+    });
+    assert_eq!(prepare(Armed::Force, at), Ok(Preparation::PreviewForce));
 }
 
 // This rule lived inside the ForceApply key handler, which is one of the
@@ -455,14 +469,95 @@ fn a_force_needs_a_conflict_that_named_the_fields() {
     let mut at = ready(&[], Verdict::Differs);
     at.conflicts = 0;
     assert_eq!(
-        refuse(Armed::Force, at),
-        Some("nothing is owned elsewhere, so there is nothing to force".to_string())
+        prepare(Armed::Force, at),
+        Err("nothing is owned elsewhere, so there is nothing to force".to_string())
     );
     assert_eq!(
-        refuse(Armed::Apply, at),
-        None,
+        prepare(Armed::Apply, at),
+        Ok(Preparation::Confirm),
         "which says nothing about a plain apply"
     );
+}
+
+#[test]
+fn the_first_conflict_needs_a_forced_preview_before_confirming_a_write() {
+    let mut at = ready(&[], Verdict::Differs);
+    for prior in [
+        None,
+        Some(Review {
+            stamp: at.reviewed,
+            force: false,
+        }),
+        Some(Review {
+            stamp: BufferStamp::of(1, 3),
+            force: true,
+        }),
+    ] {
+        at.dry_run = prior;
+        assert_eq!(prepare(Armed::Force, at), Ok(Preparation::PreviewForce));
+    }
+
+    at.dry_run = Some(Review {
+        stamp: at.reviewed,
+        force: true,
+    });
+    assert_eq!(prepare(Armed::Force, at), Ok(Preparation::Confirm));
+    let mut gate = ApplyGate::default();
+    assert_eq!(gate.step(Armed::Force), Step::Ask);
+    assert_eq!(gate.step(Armed::Force), Step::Go);
+}
+
+#[test]
+fn a_forced_preview_still_checks_the_buffer_payload_conflict_and_wire() {
+    let at = Ready {
+        dry_run: None,
+        ..ready(&[], Verdict::Differs)
+    };
+    for refused in [
+        Ready {
+            patchable: false,
+            ..at
+        },
+        Ready {
+            blocked: &["multiple documents"],
+            ..at
+        },
+        Ready {
+            verdict: Verdict::Refused("the comparison is too large"),
+            ..at
+        },
+        Ready { editor: None, ..at },
+        Ready {
+            editor: Some(BufferStamp::of(2, 4)),
+            ..at
+        },
+        Ready {
+            editor: Some(BufferStamp::of(1, 5)),
+            ..at
+        },
+        Ready { conflicts: 0, ..at },
+        Ready {
+            in_flight: Some("a dry run"),
+            ..at
+        },
+        Ready {
+            in_flight: Some("an apply"),
+            ..at
+        },
+    ] {
+        assert!(prepare(Armed::Force, refused).is_err(), "{refused:?}");
+    }
+}
+
+#[test]
+fn a_forced_preview_names_the_transfer_even_when_the_documents_agree() {
+    for verdict in [Verdict::Differs, Verdict::Agreed] {
+        assert_eq!(
+            reviewed(verdict, true),
+            Ok("forced dry run only; ctrl-shift-s asks to take the conflicting fields")
+        );
+    }
+    assert!(reviewed(Verdict::Refused("too many lines"), true).is_err());
 }
 
 #[test]
@@ -470,15 +565,15 @@ fn an_unpatchable_kind_and_a_held_wire_each_say_which_they_are() {
     let mut at = ready(&[], Verdict::Differs);
     at.patchable = false;
     assert_eq!(
-        refuse(Armed::Apply, at),
-        Some("the server serves this kind without a patch verb".to_string())
+        prepare(Armed::Apply, at),
+        Err("the server serves this kind without a patch verb".to_string())
     );
 
     let mut at = ready(&[], Verdict::Differs);
     at.in_flight = Some("a dry run");
     assert_eq!(
-        refuse(Armed::Apply, at),
-        Some("a dry run is already in flight".to_string()),
+        prepare(Armed::Apply, at),
+        Err("a dry run is already in flight".to_string()),
         "and it is named for what it is, not for what it is not"
     );
 }
@@ -488,28 +583,35 @@ fn an_unpatchable_kind_and_a_held_wire_each_say_which_they_are() {
 // discarding it left a webhook denial nowhere on screen.
 #[test]
 fn a_recompute_discards_a_dry_run_and_never_a_write() {
-    let sent = |dry_run| Sent {
+    let sent = |dry_run, force| Sent {
         generation: 7,
         stamp: BufferStamp::of(1, 4),
         dry_run,
+        force,
         note: String::new(),
         uid: Some("uid-1".to_string()),
     };
-    assert!(sent(true).still_speaks(7));
-    assert!(!sent(true).still_speaks(8), "the comparison moved on");
-    assert!(sent(false).still_speaks(8), "the write did not");
+    for force in [false, true] {
+        assert!(sent(true, force).still_speaks(7));
+        assert!(
+            !sent(true, force).still_speaks(8),
+            "the comparison moved on"
+        );
+        assert!(sent(false, force).still_speaks(8), "the write did not");
+    }
 }
 
 #[test]
 fn a_dry_run_the_diff_could_not_compare_authorises_nothing() {
-    assert_eq!(reviewed(Verdict::Differs), Ok("ctrl-s applies this"));
+    assert_eq!(reviewed(Verdict::Differs, false), Ok("ctrl-s applies this"));
     assert_eq!(
-        reviewed(Verdict::Agreed),
+        reviewed(Verdict::Agreed, false),
         Ok("the cluster already holds this; applying changes nothing")
     );
-    let note = reviewed(Verdict::Refused(
-        "one side of this comparison has more than 65,536 lines",
-    ))
+    let note = reviewed(
+        Verdict::Refused("one side of this comparison has more than 65,536 lines"),
+        false,
+    )
     .expect_err("a refusal is not a review");
     assert!(note.contains("65,536 lines"), "{note}");
     assert!(

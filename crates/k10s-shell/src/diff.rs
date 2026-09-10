@@ -10,14 +10,15 @@
 //! *would* store, defaulting and admission webhooks included, so the diff is
 //! against the real outcome rather than a client's guess at merge semantics.
 //!
-//! Applying is a second deliberate press, and forcing is a third: [`ApplyGate`]
-//! arms under the name of the thing being asked, so a press that answers a
-//! different question re-asks instead of firing -- the same rule the editor's
-//! destructive actions follow, and for the same reason. Any recompute disarms,
-//! because the thing that was being confirmed is no longer what is on screen.
+//! An apply needs a server dry run and two deliberate presses. After an
+//! ownership conflict, the first force press asks for a forced dry run. Its
+//! answer arms nothing; two more force presses confirm and take the fields
+//! the server named. [`ApplyGate`] arms under the name of the question, so a
+//! different press re-asks instead of firing. Any recompute disarms because
+//! the thing being confirmed is no longer what is on screen.
 //!
 //! Every precondition a *press* has to clear is in one pure function,
-//! [`refuse`], and none of them is anywhere else. That is not tidiness: the two
+//! [`prepare`], and none of them is anywhere else. That is not tidiness: the two
 //! that were not there were the two that failed. The force precondition lived
 //! inside a key handler, so it guarded one of the ways in; the diff's own
 //! refusal to compare was read by nobody, so an object too large to review
@@ -28,7 +29,7 @@
 //! `send`, because a dry run reaches that point without a press at all.
 //!
 //! Everything that decides is pure -- [`DiffState`], [`ApplyGate`], [`Flight`]
-//! and [`refuse`] -- so the destructive rules are tested without a window. The
+//! and [`prepare`] -- so the destructive rules are tested without a window. The
 //! rows are built once per comparison and only the visible ones are ever turned
 //! into text, so a diff of a megabyte costs a vector rather than a second copy
 //! of the document.
@@ -45,8 +46,8 @@ use k10s_edit::diff::{self, Origin, Side, Verdict};
 use k10s_theme::Theme;
 
 use crate::diff_gate::{
-    ApplyGate, Armed, Flight, Identity, Keepable, Ready, Sent, Step, identity, kept_note,
-    landed_note, refuse, refuse_keep, reviewed, stale_object_note,
+    ApplyGate, Armed, Flight, Identity, Keepable, Preparation, Ready, Review, Sent, Step, identity,
+    kept_note, landed_note, prepare, refuse_keep, reviewed, stale_object_note,
 };
 use crate::editor::{BufferStamp, DiffSources, EditorView};
 use crate::provider::{
@@ -495,7 +496,7 @@ pub struct DiffView {
     // The buffer the server has answered a dry run for. The dry run is the
     // right-hand side of the review, so an apply of anything else is an apply
     // of bytes the server has never seen. Cleared by every recompute.
-    reviewed: Option<BufferStamp>,
+    reviewed: Option<Review>,
     // Which object the live document was read from, and which object the server
     // last answered a dry run about. They differ when the object was deleted or
     // replaced since the read, which is the difference between an apply that
@@ -622,7 +623,7 @@ impl DiffView {
     }
 
     // The state every write precondition is decided from. Assembled here and
-    // judged in `refuse`, so that the rules are one pure function over data
+    // judged in `prepare`, so that the rules are one pure function over data
     // rather than a sequence of early returns nobody can test.
     fn ready(&self, editor: Option<BufferStamp>) -> Ready<'_> {
         Ready {
@@ -643,11 +644,19 @@ impl DiffView {
             .editor
             .upgrade()
             .map(|editor| editor.read(cx).buffer_stamp());
-        if let Some(why) = refuse(wanted, self.ready(editor)) {
-            self.gate.disarm();
-            self.status = Some(why);
-            cx.notify();
-            return;
+        match prepare(wanted, self.ready(editor)) {
+            Err(why) => {
+                self.gate.disarm();
+                self.status = Some(why);
+                cx.notify();
+                return;
+            }
+            Ok(Preparation::PreviewForce) => {
+                self.gate.disarm();
+                self.send(true, true, cx);
+                return;
+            }
+            Ok(Preparation::Confirm) => {}
         }
         if self.gate.step(wanted) == Step::Ask {
             // The prompt itself comes from the latch in `status_line`, so there
@@ -662,7 +671,7 @@ impl DiffView {
     // drift an apply would revert; until this existed the only way to keep it was
     // to retype it, and the ranges to do it with were already in the comparison.
     //
-    // Nothing goes on the wire, so `refuse` is not the gate here and there is no
+    // Nothing goes on the wire, so `prepare` is not the gate here and there is no
     // two-press latch: an edit to a buffer is undoable, and the editor's own undo
     // is what undoes it.
     fn keep_theirs(&mut self, cx: &mut Context<Self>) {
@@ -744,10 +753,17 @@ impl DiffView {
             generation: self.generation,
             stamp: self.stamp,
             dry_run,
-            note: prune_note(&self.payload),
+            force,
+            note: format!(
+                "{}{}",
+                prune_note(&self.payload),
+                if force { " (forced)" } else { "" }
+            ),
             uid: self.uid.clone(),
         };
-        self.status = Some(if dry_run {
+        self.status = Some(if dry_run && force {
+            "previewing a forced apply; nothing is being written...".to_string()
+        } else if dry_run {
             "asking the server what it would store...".to_string()
         } else {
             "applying...".to_string()
@@ -784,10 +800,14 @@ impl DiffView {
     }
 
     fn settle(&mut self, outcome: ApplyOutcome, sent: &Sent, cx: &mut Context<Self>) {
-        // Every outcome but Conflict clears the held causes; Conflict assigns
-        // both fields below. Hoisted so "Conflict is the one arm that keeps
-        // them" is structural rather than a nine-way invariant.
-        self.forget_conflicts();
+        // A forced preview takes no fields. Keep the named owners for the
+        // confirmation that follows it, including when the preview must retry.
+        if !sent.dry_run || !sent.force {
+            self.forget_conflicts();
+        }
+        if sent.dry_run {
+            self.reviewed = None;
+        }
         match outcome {
             ApplyOutcome::Applied { yaml, dry_run, uid } if dry_run => {
                 // Whose object the server answered about, before anything is said
@@ -797,13 +817,16 @@ impl DiffView {
                 self.answered = uid;
                 let live = std::mem::take(&mut self.state.live);
                 self.state.set(Mode::DryRun, live, None, yaml);
-                self.status = Some(match reviewed(self.state.diff().verdict()) {
+                self.status = Some(match reviewed(self.state.diff().verdict(), sent.force) {
                     Ok(note) => {
-                        self.reviewed = Some(sent.stamp);
+                        self.reviewed = Some(Review {
+                            stamp: sent.stamp,
+                            force: sent.force,
+                        });
                         note.to_string()
                     }
                     // No review was made, so none authorises a press: the stamp
-                    // stays unreviewed and `refuse` says why on the next one.
+                    // stays unreviewed and `prepare` says why on the next one.
                     Err(note) => note,
                 });
             }
@@ -841,7 +864,7 @@ impl DiffView {
                 self.conflict = causes;
                 self.conflict_truncated = truncated;
                 self.status = Some(format!(
-                    "{message}; ctrl-shift-s takes {} from {}",
+                    "{message}; ctrl-shift-s previews taking {} from {}",
                     self.taken(),
                     managers(&self.conflict)
                 ));
@@ -1206,7 +1229,7 @@ impl Render for DiffView {
                 this.apply(false, cx);
             }))
             // The rule that a force needs a conflict that named the fields is
-            // in `refuse` with every other precondition, not here: a guard
+            // in `prepare` with every other precondition, not here: a guard
             // inside a key handler guards one of the ways in.
             .on_action(cx.listener(|this, _: &crate::ForceApply, _, cx| {
                 this.apply(true, cx);
