@@ -701,9 +701,11 @@ impl Reader {
         });
     }
 
-    /// Grafana dashboards as extracted queries. Provisioned ConfigMaps do not
-    /// wait on a Grafana bind. [`GrafanaCatalog::served`] is false only when
-    /// Grafana is absent and nothing was provisioned.
+    /// Grafana dashboards as extracted queries. Provisioned ConfigMaps also
+    /// work without a Grafana bind. A bound API's failure is reported even
+    /// when provisioned dashboards exist, so a partial read cannot look complete.
+    /// [`GrafanaCatalog::served`] is false only when Grafana is absent and
+    /// nothing was provisioned.
     pub fn fetch_grafana_catalog(
         &self,
         reply: impl FnOnce(Fetched<GrafanaCatalog>) + Send + 'static,
@@ -1143,7 +1145,7 @@ async fn load_grafana_catalog(client: &Client) -> Fetched<GrafanaCatalog> {
                                 fetched += 1;
                             }
                             Fetched::Denied { what } => return Fetched::Denied { what },
-                            Fetched::Failed { .. } => extra_hits.push(hit),
+                            Fetched::Failed { what, why } => return Fetched::Failed { what, why },
                         }
                     } else {
                         extra_hits.push(hit);
@@ -1152,7 +1154,7 @@ async fn load_grafana_catalog(client: &Client) -> Fetched<GrafanaCatalog> {
                 }
             }
             Fetched::Denied { what } => return Fetched::Denied { what },
-            Fetched::Failed { .. } => {}
+            Fetched::Failed { what, why } => return Fetched::Failed { what, why },
         }
     } else if let ToolReach::Unbound(unbound) = reach {
         if dashboards.is_empty() {

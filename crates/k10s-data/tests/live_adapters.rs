@@ -20,6 +20,9 @@
 //! The decode-failure proof needs the lab's permissive CNPG fixture CRD. It
 //! creates one generated Cluster with an invalid instances field and removes
 //! it before checking the returned ecosystem table.
+//! The Grafana failure proof needs the observability lab's monitoring release
+//! and its monitoring-grafana PVC. A generated pod holds a SQLite lock without
+//! changing data. It is deleted even when a check panics; run this suite alone.
 
 use std::time::Duration;
 
@@ -362,6 +365,134 @@ fn an_unreadable_live_resource_survives_into_the_ecosystem_table() {
             "the readable row keeps its identity and cells: {row:?}"
         );
     }
+}
+
+#[test]
+#[ignore = "needs the observability lab's Grafana and PVC; see the module comment"]
+fn a_busy_live_grafana_catalog_reports_its_timeout_and_recovers() {
+    use futures::FutureExt;
+    use k8s_openapi::api::core::v1::Pod;
+    use k10s_data::reach::{self, ToolKind, ToolReach};
+    use kube::api::{AttachParams, DeleteParams, PostParams, Preconditions};
+    use kube::runtime::wait::{await_condition, conditions};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (_plane, sync) = connect(None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_grafana_catalog(move |answer| {
+        let _ = tx.send(answer);
+    });
+    let Fetched::Ok(before) = wait(&rx) else {
+        panic!("the lab's Grafana catalog must initially answer");
+    };
+    assert!(before.served && !before.dashboards.is_empty());
+
+    kube_runtime().block_on(async {
+        let client = kube::Client::try_default().await.expect("the fixture client");
+        let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), "observability");
+        let fixture: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"generateName": "k10s-grafana-lock-"},
+            "spec": {
+                "restartPolicy": "Never", "activeDeadlineSeconds": 120,
+                "securityContext": {
+                    "runAsUser": 472, "runAsGroup": 472, "fsGroup": 472, "runAsNonRoot": true,
+                },
+                "containers": [{
+                    "name": "lock",
+                    "image": "python:3.14.7-alpine3.24@sha256:c6ead215bfd31f1e433d968853b7a769989117115b728874824e6c0a27cb96fc",
+                    "command": ["python", "-c", "import time; time.sleep(120)"],
+                    "resources": {
+                        "requests": {"cpu": "10m", "memory": "32Mi"},
+                        "limits": {"memory": "96Mi"},
+                    },
+                    "securityContext": {
+                        "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]},
+                    },
+                    "volumeMounts": [{"name": "storage", "mountPath": "/var/lib/grafana"}],
+                }],
+                "volumes": [{
+                    "name": "storage", "persistentVolumeClaim": {"claimName": "monitoring-grafana"},
+                }],
+            },
+        })).expect("the lock fixture");
+        let created = pods.create(&PostParams::default(), &fixture).await.expect("the lock pod");
+        let name = created.metadata.name.expect("the generated name");
+        let uid = created.metadata.uid.expect("the generated UID");
+
+        let checked = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                await_condition(pods.clone(), &name, conditions::is_pod_running()),
+            ).await.expect("the lock pod starts within a minute").expect("the pod can be watched");
+            let code = r#"
+import sqlite3
+import sys
+
+database = sqlite3.connect("file:/var/lib/grafana/grafana.db?mode=rw", uri=True)
+database.execute("BEGIN EXCLUSIVE")
+print("locked", flush=True)
+sys.stdin.readline()
+database.rollback()
+print("released", flush=True)
+"#;
+            let mut lock = pods.exec(
+                &name,
+                ["python", "-u", "-c", code],
+                &AttachParams::default().stdin(true).stdout(true).stderr(true),
+            ).await.expect("the lock process attaches");
+            let status = lock.take_status().expect("the remote exit status");
+            let mut input = lock.stdin().expect("the release channel");
+            let mut output = BufReader::new(lock.stdout().expect("the lock markers")).lines();
+            let marker = tokio::time::timeout(Duration::from_secs(10), output.next_line())
+                .await.expect("the database can be locked").expect("the lock marker can be read");
+            assert_eq!(marker.as_deref(), Some("locked"));
+
+            let reached = reach::bind(&client, ToolKind::Grafana, &ReachSettings::default()).await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sync.reader.fetch_grafana_catalog(move |answer| {
+                let _ = tx.send(answer);
+            });
+            let answer = tokio::time::timeout(Duration::from_secs(15), rx).await;
+
+            input.write_all(b"release\n").await.expect("release the database lock");
+            let marker = tokio::time::timeout(Duration::from_secs(10), output.next_line())
+                .await.expect("the lock releases").expect("the release marker can be read");
+            assert_eq!(marker.as_deref(), Some("released"));
+            let status = tokio::time::timeout(Duration::from_secs(10), status)
+                .await.expect("the lock process exits").expect("the exit status arrives");
+            assert_eq!(status.status.as_deref(), Some("Success"), "{status:?}");
+            tokio::time::timeout(Duration::from_secs(10), lock.join())
+                .await.expect("the lock process ends").expect("the lock connection closes");
+            (reached, answer)
+        }).catch_unwind().await;
+
+        pods.delete(&name, &DeleteParams {
+            grace_period_seconds: Some(0),
+            preconditions: Some(Preconditions {uid: Some(uid.clone()), ..Default::default()}),
+            ..Default::default()
+        }).await.expect("remove only the generated lock pod");
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            await_condition(pods, &name, conditions::is_deleted(&uid)),
+        ).await.expect("the lock pod is removed").expect("the cleanup can be watched");
+
+        let (reached, answer) = checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        assert!(matches!(reached, ToolReach::Bound(_)), "health still answers while storage is locked: {reached:?}");
+        let answer = answer.expect("the catalog reports within the budget").expect("the callback arrives");
+        assert!(matches!(&answer, Fetched::Failed {what: "grafana", why}
+            if why == "Grafana did not answer within 4 seconds"), "{answer:?}");
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_grafana_catalog(move |answer| {
+        let _ = tx.send(answer);
+    });
+    assert_eq!(
+        wait(&rx),
+        Fetched::Ok(before),
+        "the catalog recovers after releasing the lock"
+    );
 }
 
 #[test]
