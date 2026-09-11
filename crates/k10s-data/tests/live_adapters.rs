@@ -17,6 +17,9 @@
 //! when the groups are not served, and as a table when they are -- never as
 //! an error. Day-2 mutates only `day2-probe` in `K10S_LIVE_NAMESPACE`. It
 //! does not scale `web`, and it does not cordon or drain the node.
+//! The decode-failure proof needs the lab's permissive CNPG fixture CRD. It
+//! creates one generated Cluster with an invalid instances field and removes
+//! it before checking the returned ecosystem table.
 
 use std::time::Duration;
 
@@ -265,6 +268,98 @@ fn helm_lists_stored_releases_and_never_a_secret_value() {
             row.cells[2].chars().all(|c| c.is_ascii_digit()),
             "Revision is the running number, not a payload: {:?}",
             row.cells[2]
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the live lab's permissive CNPG fixture CRD; see the module comment"]
+fn an_unreadable_live_resource_survives_into_the_ecosystem_table() {
+    use k10s_data::cnpg;
+    use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+
+    let (_plane, sync) = connect(None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_cnpg(move |answer| {
+        let _ = tx.send(answer);
+    });
+    let Fetched::Ok(before) = wait(&rx) else {
+        panic!("the lab's CNPG inventory can be read");
+    };
+    assert!(
+        matches!(before.clusters, cnpg::KindSet::Served { unreadable: 0, .. }),
+        "the initial CNPG fixtures must decode: {before:?}"
+    );
+    let before = cnpg::table_page(&before).expect("the CNPG fixture kind is served");
+    assert!(
+        !before.rows.is_empty(),
+        "the lab has a readable CNPG fixture"
+    );
+
+    let runtime = kube_runtime();
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("the fixture client");
+    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "postgresql.cnpg.io",
+        "v1",
+        "Cluster",
+    ));
+    let api: kube::Api<DynamicObject> = kube::Api::namespaced_with(client, &namespace(), &resource);
+    let fixture: DynamicObject = serde_json::from_value(serde_json::json!({
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "Cluster",
+        "metadata": {"generateName": "k10s-unreadable-"},
+        "spec": {"instances": "invalid-fixture-value"},
+    }))
+    .expect("the fixture object");
+    let created = runtime
+        .block_on(api.create(&kube::api::PostParams::default(), &fixture))
+        .expect("the permissive lab CRD accepts the malformed fixture");
+    let name = created
+        .metadata
+        .name
+        .expect("the server assigns the fixture's name");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_ecosystem(move |answer| {
+        let _ = tx.send(answer);
+    });
+    let answer = rx.recv_timeout(Duration::from_secs(30));
+    runtime
+        .block_on(api.delete(&name, &kube::api::DeleteParams::default()))
+        .expect("the generated fixture is removed before asserting the reply");
+    assert!(
+        runtime
+            .block_on(api.get_opt(&name))
+            .expect("the cleanup can be read back")
+            .is_none()
+    );
+
+    let family = answer
+        .expect("the ecosystem reply arrives within the budget")
+        .into_iter()
+        .find(|family| family.id == "cnpg")
+        .expect("the ecosystem includes CNPG");
+    let Fetched::Ok(Some(page)) = family.answer else {
+        panic!(
+            "the served family remains a labelled table: {:?}",
+            family.answer
+        );
+    };
+    assert_eq!(page.rows.len(), before.rows.len() + 1, "{page:?}");
+    let notice = page
+        .rows
+        .iter()
+        .find(|row| row.uid == "unreadable:Cluster")
+        .expect("the failed decode has a visible row");
+    assert_eq!(notice.cells[0], "Cluster");
+    assert_eq!(notice.cells[3], "1 object could not be decoded");
+    assert_eq!(notice.namespace, None);
+    for row in before.rows {
+        assert!(
+            page.rows.contains(&row),
+            "the readable row keeps its identity and cells: {row:?}"
         );
     }
 }

@@ -267,7 +267,7 @@ fn a_malformed_alert_is_counted_dropped_not_shown_as_a_blank_row() {
     let alerts = parse_alerts(json.as_bytes()).expect("the readable alert survives");
     assert_eq!(alerts.items.len(), 1);
     assert_eq!(alerts.items[0].fingerprint, "f1");
-    assert!(alerts.truncated);
+    assert!(!alerts.truncated);
     assert_eq!(alerts.dropped, 3);
 }
 

@@ -714,9 +714,15 @@ fn push_policy_rows(
         KindSet::Served {
             items,
             truncated: cap,
-            ..
+            unreadable,
         } => {
             *truncated |= *cap;
+            rows.extend(crate::browse::unreadable_row(
+                kind.as_str(),
+                *unreadable,
+                7,
+                4,
+            ));
             for item in items {
                 rows.push(TableRow {
                     cells: vec![
@@ -752,9 +758,15 @@ fn push_pod_rows(rows: &mut Vec<TableRow>, truncated: &mut bool, set: &KindSet<P
         KindSet::Served {
             items,
             truncated: cap,
-            ..
+            unreadable,
         } => {
             *truncated |= *cap;
+            rows.extend(crate::browse::unreadable_row(
+                Kind::PodInfo.as_str(),
+                *unreadable,
+                7,
+                4,
+            ));
             for item in items {
                 rows.push(TableRow {
                     cells: vec![

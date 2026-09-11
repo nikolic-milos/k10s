@@ -66,7 +66,9 @@ pub struct Alert {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Alerts {
     pub items: Vec<Alert>,
+    /// The response contained more alerts than the page keeps.
     pub truncated: bool,
+    /// Alerts omitted by either the page ceiling or a failed decode.
     pub dropped: usize,
 }
 
@@ -234,46 +236,62 @@ pub fn table_page(alerts: Option<&Alerts>) -> Option<TablePage> {
         wide: false,
     })
     .collect();
-    let rows = alerts
-        .items
-        .iter()
-        .map(|alert| {
-            let silenced = alert.silenced_by.join(",");
-            let muted = alert.muted_by.join(",");
-            TableRow {
-                cells: vec![
-                    alert.fingerprint.clone(),
-                    alert.state.clone(),
-                    alert.severity.clone(),
-                    alert.alertname.clone(),
-                    alert.namespace.clone(),
-                    alert.name.clone(),
-                    alert.pod.clone(),
-                    cluster_cell(alert),
-                    alert.runbook_url.clone(),
-                    alert.starts_at.clone(),
-                    if alert.inhibited {
-                        "true".to_string()
-                    } else {
-                        String::new()
-                    },
-                    silenced,
-                    muted,
-                ],
-                name: if alert.alertname.is_empty() {
-                    alert.fingerprint.clone()
-                } else {
-                    alert.alertname.clone()
-                },
-                namespace: if alert.namespace.is_empty() {
-                    None
-                } else {
-                    Some(alert.namespace.clone())
-                },
-                uid: alert.fingerprint.clone(),
+    let mut rows: Vec<TableRow> = Vec::new();
+    if alerts.dropped > 0 {
+        let mut cells = vec![String::new(); 13];
+        cells[0] = "Alerts".to_string();
+        cells[1] = format!(
+            "{} {} not shown (unreadable or beyond the limit)",
+            alerts.dropped,
+            if alerts.dropped == 1 {
+                "alert"
+            } else {
+                "alerts"
             }
-        })
-        .collect();
+        );
+        rows.push(TableRow {
+            cells,
+            name: "Alerts".to_string(),
+            namespace: None,
+            uid: "omitted:alerts".to_string(),
+        });
+    }
+    rows.extend(alerts.items.iter().map(|alert| {
+        let silenced = alert.silenced_by.join(",");
+        let muted = alert.muted_by.join(",");
+        TableRow {
+            cells: vec![
+                alert.fingerprint.clone(),
+                alert.state.clone(),
+                alert.severity.clone(),
+                alert.alertname.clone(),
+                alert.namespace.clone(),
+                alert.name.clone(),
+                alert.pod.clone(),
+                cluster_cell(alert),
+                alert.runbook_url.clone(),
+                alert.starts_at.clone(),
+                if alert.inhibited {
+                    "true".to_string()
+                } else {
+                    String::new()
+                },
+                silenced,
+                muted,
+            ],
+            name: if alert.alertname.is_empty() {
+                alert.fingerprint.clone()
+            } else {
+                alert.alertname.clone()
+            },
+            namespace: if alert.namespace.is_empty() {
+                None
+            } else {
+                Some(alert.namespace.clone())
+            },
+            uid: alert.fingerprint.clone(),
+        }
+    }));
     Some(TablePage {
         columns,
         rows,
@@ -376,7 +394,7 @@ pub fn parse_alerts(bytes: &[u8]) -> Result<Alerts, String> {
     }
     Ok(Alerts {
         items: out,
-        truncated: dropped > 0 || unreadable > 0,
+        truncated: dropped > 0,
         dropped: dropped + unreadable,
     })
 }
