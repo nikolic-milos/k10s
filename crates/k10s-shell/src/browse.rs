@@ -306,7 +306,7 @@ impl BrowseView {
                     loading: true,
                     status: None,
                 };
-                self.table = TableState::new();
+                self.table.reset();
                 self.fetch(cx);
                 cx.notify();
             }
@@ -471,7 +471,7 @@ impl BrowseView {
             Phase::Table { .. } => {
                 self.generation += 1;
                 self.phase = Phase::Kinds;
-                self.table = TableState::new();
+                self.table.reset();
                 self.table.set_page(kinds_page(&self.kinds));
                 cx.notify();
             }
