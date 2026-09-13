@@ -24,6 +24,8 @@
 //! telemetry tests read a trace id from the producer's real container log,
 //! then retrieve that span from Tempo and the same line from Loki through
 //! the production Reader. A backend with no ingested data cannot satisfy them.
+//! The alert proof creates its own PrometheusRule, reads the firing alert,
+//! silences its exact namespace and pod, and removes only what it created.
 
 use std::time::Duration;
 
@@ -781,4 +783,341 @@ fn loki_returns_the_producers_log_with_its_namespace_pod_and_trace_id() {
         );
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn live_alertmanager(reader: &Reader) -> k10s_data::reach::Bound {
+    let (tx, rx) = std::sync::mpsc::channel();
+    reader.bind_tool(
+        k10s_data::reach::ToolKind::Alertmanager,
+        ReachSettings::default(),
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
+    match wait(&rx) {
+        k10s_data::reach::ToolReach::Bound(bound) => {
+            assert!(
+                matches!(bound.transport, k10s_data::reach::Transport::Proxy { .. }),
+                "the live write uses the service proxy"
+            );
+            bound
+        }
+        answer => panic!("the observability fixture must serve Alertmanager: {answer:?}"),
+    }
+}
+
+fn await_live_alert(
+    reader: &Reader,
+    name: &str,
+    what: &str,
+    accept: impl Fn(&k10s_data::alertmanager::Alert) -> bool,
+) -> k10s_data::alertmanager::Alert {
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let (tx, rx) = std::sync::mpsc::channel();
+        reader.fetch_alertmanager_alerts(move |answer| {
+            let _ = tx.send(answer);
+        });
+        let answer = wait(&rx);
+        if let Fetched::Ok(Some(alerts)) = &answer
+            && let Some(alert) = alerts
+                .items
+                .iter()
+                .find(|alert| alert.alertname == name && accept(alert))
+        {
+            return alert.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "alert {name} never became {what}: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[test]
+#[ignore = "needs live_fixtures.sh --with observability; fires and silences a real Prometheus rule"]
+fn a_firing_live_alert_keeps_its_pod_join_and_is_silenced_by_exact_matchers() {
+    use k10s_data::alertmanager::{self, Matcher, SilenceOutcome, SilenceSpec};
+    use kube::api::{
+        ApiResource, DeleteParams, DynamicObject, GroupVersionKind, PostParams, Preconditions,
+    };
+    use kube::runtime::wait::{await_condition, conditions};
+
+    let (_plane, sync) = connect(None);
+    let (pod, _) = telemetry_probe_trace();
+    let bound = live_alertmanager(&sync.reader);
+    let runtime = kube_runtime();
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("a client");
+    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "monitoring.coreos.com",
+        "v1",
+        "PrometheusRule",
+    ));
+    let rules: kube::Api<DynamicObject> =
+        kube::Api::namespaced_with(client.clone(), "observability", &resource);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let alertname = format!("K10sLiveProbe{unique}");
+    let rule: DynamicObject = serde_json::from_value(serde_json::json!({
+        "apiVersion":"monitoring.coreos.com/v1", "kind":"PrometheusRule",
+        "metadata":{"generateName":"k10s-alert-probe-", "namespace":"observability", "labels":{"release":"monitoring"}},
+        "spec":{"groups":[{"name":"k10s.live", "rules":[{
+            "alert":alertname, "expr":"vector(1)", "for":"0s",
+            "labels":{"namespace":"observability", "pod":pod, "severity":"warning"},
+            "annotations":{"summary":"k10s live alert and silence proof"}
+        }]}]}
+    })).expect("a rule");
+    let created = runtime
+        .block_on(rules.create(&PostParams::default(), &rule))
+        .expect("create the live rule");
+    let name = created.metadata.name.as_deref().expect("the rule name");
+    let uid = created.metadata.uid.as_deref().expect("the rule UID");
+    let comment = format!("k10s live silence for rule {uid}");
+    let mut written_id = None;
+    let mut expired = false;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let alert = await_live_alert(&sync.reader, &alertname, "active", |alert| {
+            alert.state == "active"
+        });
+        assert_eq!(alert.namespace, "observability");
+        assert_eq!(alert.pod, pod);
+        assert!(alert.silenced_by.is_empty());
+        println!("live firing alert from PrometheusRule observability/{name}: {alert:?}");
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let start = std::time::UNIX_EPOCH + Duration::from_secs(seconds);
+        let spec = SilenceSpec::for_window(
+            vec![
+                Matcher {
+                    name: "namespace".into(),
+                    value: alert.namespace,
+                    is_regex: false,
+                    is_equal: true,
+                },
+                Matcher {
+                    name: "pod".into(),
+                    value: alert.pod,
+                    is_regex: false,
+                    is_equal: true,
+                },
+            ],
+            start..start + Duration::from_secs(3600),
+            "k10s".into(),
+            comment.clone(),
+        )
+        .expect("a one-hour silence");
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader
+            .create_silence(bound.clone(), spec.clone(), false, move |answer| {
+                let _ = tx.send(answer);
+            });
+        assert!(matches!(wait(&rx), SilenceOutcome::NeedsConfirm { .. }));
+        let Fetched::Ok(before) = runtime.block_on(alertmanager::fetch_silences(&client, &bound))
+        else {
+            panic!("read silences after review");
+        };
+        assert!(!before.truncated);
+        assert_eq!(before.dropped, 0);
+        assert!(
+            before
+                .items
+                .iter()
+                .all(|silence| silence.comment != comment),
+            "review created no silence"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader
+            .create_silence(bound.clone(), spec.clone(), true, move |answer| {
+                let _ = tx.send(answer);
+            });
+        let answer = wait(&rx);
+        let SilenceOutcome::Applied { id, .. } = answer else {
+            panic!("the confirmed silence must be written: {answer:?}");
+        };
+        written_id = Some(id.clone());
+        let Fetched::Ok(after) = runtime.block_on(alertmanager::fetch_silences(&client, &bound))
+        else {
+            panic!("read the created silence");
+        };
+        let silence = after
+            .items
+            .iter()
+            .find(|silence| silence.id == id)
+            .expect("the returned ID is stored in Alertmanager");
+        assert_eq!(silence.matchers, spec.matchers);
+        assert_eq!(silence.matchers_dropped, 0);
+        assert_eq!(silence.created_by, spec.created_by);
+        assert_eq!(silence.comment, spec.comment);
+        let timestamp = |value: &str| {
+            value
+                .parse::<k8s_openapi::jiff::Timestamp>()
+                .expect("a UTC timestamp")
+        };
+        // Alertmanager moves a past start to its acceptance time. The reviewed
+        // deadline stays exact; the silence cannot claim to cover the past.
+        let stored_start = timestamp(&silence.starts_at);
+        assert!(stored_start >= timestamp(&spec.starts_at));
+        assert!(
+            stored_start
+                <= k8s_openapi::jiff::Timestamp::try_from(std::time::SystemTime::now())
+                    .expect("the lab clock")
+        );
+        assert_eq!(timestamp(&silence.ends_at), timestamp(&spec.ends_at));
+        println!("live silence read back by ID: {silence:?}");
+        let suppressed = await_live_alert(
+            &sync.reader,
+            &alertname,
+            "silenced by the returned ID",
+            |alert| alert.silenced_by.contains(&id),
+        );
+        assert_eq!(suppressed.state, "suppressed");
+        assert_eq!(suppressed.namespace, "observability");
+        assert_eq!(suppressed.pod, pod);
+        assert!(matches!(
+            runtime.block_on(alertmanager::expire_silence(&client, &bound, &id, true)),
+            SilenceOutcome::Applied { .. }
+        ));
+        expired = true;
+        let resumed = await_live_alert(&sync.reader, &alertname, "active after expiry", |alert| {
+            alert.state == "active" && !alert.silenced_by.contains(&id)
+        });
+        println!("live alert after expiring the test silence: {resumed:?}");
+    }));
+
+    // Clean up before propagating an assertion failure. The unique rule comment
+    // also finds a write whose response was lost before its ID reached us.
+    let silence_cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            if !expired {
+                let Fetched::Ok(silences) = alertmanager::fetch_silences(&client, &bound).await
+                else {
+                    panic!("read silences for cleanup");
+                };
+                assert!(
+                    !silences.truncated,
+                    "cleanup must see the complete silence list"
+                );
+                for silence in silences.items.iter().filter(|silence| {
+                    silence.comment == comment || written_id.as_ref() == Some(&silence.id)
+                }) {
+                    let answer =
+                        alertmanager::expire_silence(&client, &bound, &silence.id, true).await;
+                    assert!(
+                        matches!(answer, SilenceOutcome::Applied { .. }),
+                        "expire only the test silence: {answer:?}"
+                    );
+                }
+            }
+        });
+    }));
+    runtime.block_on(async {
+        rules
+            .delete(
+                name,
+                &DeleteParams {
+                    preconditions: Some(Preconditions {
+                        uid: Some(uid.to_string()),
+                        resource_version: None,
+                    }),
+                    ..DeleteParams::default()
+                },
+            )
+            .await
+            .expect("delete the test rule by UID");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            await_condition(rules, name, conditions::is_deleted(uid)),
+        )
+        .await
+        .expect("rule cleanup within the budget")
+        .expect("rule deletion observed");
+    });
+    if let Err(panic) = outcome.and(silence_cleanup) {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+#[ignore = "needs the observability fixture and reader@k10s-lab"]
+fn a_read_only_account_cannot_create_a_live_alertmanager_silence() {
+    use k10s_data::alertmanager::{self, Matcher, SilenceOutcome, SilenceSpec};
+    let (_admin_plane, admin) = connect(None);
+    let (pod, _) = telemetry_probe_trace();
+    let admin_bound = live_alertmanager(&admin.reader);
+    let context = reader_context();
+    let (_reader_plane, restricted) = connect(Some(&context));
+    let bound = live_alertmanager(&restricted.reader);
+    assert_eq!(bound.transport, admin_bound.transport);
+    let now = std::time::SystemTime::now();
+    let comment = format!(
+        "k10s denied silence proof {}",
+        now.duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let spec = SilenceSpec::for_window(
+        vec![
+            Matcher {
+                name: "namespace".into(),
+                value: "observability".into(),
+                is_regex: false,
+                is_equal: true,
+            },
+            Matcher {
+                name: "pod".into(),
+                value: pod,
+                is_regex: false,
+                is_equal: true,
+            },
+        ],
+        now..now + Duration::from_secs(300),
+        "k10s".into(),
+        comment.clone(),
+    )
+    .expect("a valid silence");
+    let (tx, rx) = std::sync::mpsc::channel();
+    restricted
+        .reader
+        .create_silence(bound, spec, true, move |answer| {
+            let _ = tx.send(answer);
+        });
+    let answer = wait(&rx);
+    let stored = kube_runtime().block_on(async {
+        let client = kube::Client::try_default().await.expect("an admin client");
+        let Fetched::Ok(silences) = alertmanager::fetch_silences(&client, &admin_bound).await
+        else {
+            panic!("read back silences as admin");
+        };
+        assert!(!silences.truncated);
+        let ours: Vec<_> = silences
+            .items
+            .into_iter()
+            .filter(|silence| silence.comment == comment)
+            .collect();
+        // If the lab role became writable, remove the unexpected write before
+        // reporting that its denial fixture is no longer a denial fixture.
+        for silence in &ours {
+            assert!(matches!(
+                alertmanager::expire_silence(&client, &admin_bound, &silence.id, true).await,
+                SilenceOutcome::Applied { .. }
+            ));
+        }
+        ours
+    });
+    assert!(stored.is_empty(), "a read-only account created a silence");
+    assert_eq!(
+        answer,
+        SilenceOutcome::Denied {
+            what: "alertmanager",
+            why: "access denied for this account".into()
+        }
+    );
+    println!("live silence denial in {context}: {answer:?}");
 }

@@ -7,10 +7,10 @@
 //! because a panel that goes quiet is indistinguishable from a panel that is
 //! lying. When no cluster is connected the [`NullProvider`] answers every
 //! question with that fact, so the views degrade into the same labelled
-//! states they use for RBAC denial. One method mutates, and it is shaped so
-//! that the dry run and the apply are the same call: a conflict and a
-//! validation refusal are labelled states carrying what the server said, not
-//! error strings someone has to read twice.
+//! states they use for RBAC denial. Writes include apply, named day-2
+//! operations, Helm rollback, and Alertmanager silences. Confirmation belongs
+//! to the request being reviewed; a conflict or validation refusal carries
+//! what the server said.
 //!
 //! A cluster is chosen on screen now rather than on the command line, so the
 //! provider a view was built with is no longer the provider it must keep.
@@ -146,6 +146,53 @@ pub enum TableOutcome {
 pub struct EcosystemEntry {
     pub id: &'static str,
     pub outcome: TableOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlertPodOutcome {
+    Pod { namespace: String, pod: String },
+    Absent,
+    Denied(&'static str),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertmanagerEndpoint {
+    pub namespace: String,
+    pub service: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlertmanagerOutcome {
+    Ready(AlertmanagerEndpoint),
+    Absent,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertMatcher {
+    pub name: String,
+    pub value: String,
+    pub is_regex: bool,
+    pub is_equal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SilenceRequest {
+    pub endpoint: AlertmanagerEndpoint,
+    pub matchers: Vec<AlertMatcher>,
+    pub window: std::ops::Range<std::time::SystemTime>,
+    pub created_by: String,
+    pub comment: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SilenceOutcome {
+    Applied { id: String },
+    NeedsConfirm { starts_at: String, ends_at: String },
+    Denied { what: &'static str, why: String },
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,6 +853,12 @@ read_provider! {
     /// own table. Absent families stay hidden; one denied or failed family
     /// never hides the others.
     fn fetch_ecosystem(&self, reply: Reply<Vec<EcosystemEntry>>);
+    /// Re-read the chosen alert by fingerprint. Its namespace and pod labels
+    /// name the join; a table's display cells never supply object identity.
+    fn fetch_alert_pod(&self, fingerprint: String, reply: Reply<AlertPodOutcome>);
+    /// Discover the endpoint once so the silence review names its destination.
+    fn bind_alertmanager(&self, reply: Reply<AlertmanagerOutcome>);
+    fn create_silence(&self, request: &SilenceRequest, confirm: bool, reply: Reply<SilenceOutcome>);
     /// Explicit reveal of one Helm revision. The answer is for a scratch
     /// editor, never a table page.
     fn reveal_helm(
@@ -995,6 +1048,18 @@ impl ReadProvider for NullProvider {
         reply(Vec::new());
     }
 
+    fn fetch_alert_pod(&self, _: String, reply: Reply<AlertPodOutcome>) {
+        reply(AlertPodOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn bind_alertmanager(&self, reply: Reply<AlertmanagerOutcome>) {
+        reply(AlertmanagerOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
+    fn create_silence(&self, _: &SilenceRequest, _: bool, reply: Reply<SilenceOutcome>) {
+        reply(SilenceOutcome::Failed(NO_CLUSTER.to_string()));
+    }
+
     fn reveal_helm(&self, _: Option<String>, _: String, _: u32, reply: Reply<HelmRevealOutcome>) {
         reply(HelmRevealOutcome::Failed(NO_CLUSTER.to_string()));
     }
@@ -1041,7 +1106,7 @@ impl ProviderSlot {
     // answers synchronously, so a delegate that held the borrow across the
     // call would make any reply that reached back here a panic instead of an
     // answer. An `Rc` clone is the price and it is not a real one.
-    fn get(&self) -> Rc<dyn ReadProvider> {
+    pub(crate) fn get(&self) -> Rc<dyn ReadProvider> {
         self.0.borrow().clone()
     }
 }

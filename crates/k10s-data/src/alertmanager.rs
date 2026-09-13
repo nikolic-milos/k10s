@@ -32,6 +32,9 @@ pub const MAX_ALERTS: usize = 512;
 pub const MAX_SILENCES: usize = 256;
 pub const MAX_LABEL_CHARS: usize = 200;
 pub const MAX_MATCHERS: usize = 32;
+// A Kubernetes pod name can use all 253 bytes. Display clipping must not
+// change the object a join or an equality matcher names.
+const MAX_MATCHER_BYTES: usize = 253;
 
 const WHAT: &str = "alertmanager";
 const ALERTS: &str = "api/v2/alerts";
@@ -107,6 +110,34 @@ pub struct SilenceSpec {
     pub ends_at: String,
     pub created_by: String,
     pub comment: String,
+}
+
+impl SilenceSpec {
+    /// Fix the reviewed interval before confirmation, including its UTC encoding.
+    pub fn for_window(
+        matchers: Vec<Matcher>,
+        window: std::ops::Range<std::time::SystemTime>,
+        created_by: String,
+        comment: String,
+    ) -> Result<Self, String> {
+        if window.end <= window.start {
+            return Err("a silence must end after it starts; it is not sent".to_string());
+        }
+        let timestamp = |time| {
+            k8s_openapi::jiff::Timestamp::try_from(time)
+                .map(|stamp| stamp.to_string())
+                .map_err(|error| {
+                    format!("the silence time is outside the supported range: {error}")
+                })
+        };
+        Ok(Self {
+            matchers,
+            starts_at: timestamp(window.start)?,
+            ends_at: timestamp(window.end)?,
+            created_by,
+            comment,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,7 +476,7 @@ fn alert_of(value: &Value) -> Option<Alert> {
         namespace: clip(label("namespace")),
         name: clip(label("name")),
         cluster: clip(label("cluster")),
-        pod: clip(label("pod")),
+        pod: clip_at(label("pod"), MAX_MATCHER_BYTES),
         summary: clip(annotation("summary")),
         runbook_url: clip(annotation("runbook_url")),
         starts_at: clip(&wire.starts_at),
@@ -473,7 +504,7 @@ fn silence_of(value: &Value) -> Option<Silence> {
             .take(MAX_MATCHERS)
             .map(|matcher| Matcher {
                 name: clip(&matcher.name),
-                value: clip(&matcher.value),
+                value: clip_at(&matcher.value, MAX_MATCHER_BYTES),
                 is_regex: matcher.is_regex,
                 is_equal: matcher.is_equal,
             })
@@ -487,12 +518,11 @@ fn parse_created(bytes: &[u8]) -> Result<String, String> {
             "the Alertmanager silence answer is more than {MAX_BODY_BYTES} bytes; it is hidden"
         ));
     }
-    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-        return Ok(String::new());
-    }
     let created: WireCreated = serde_json::from_slice(bytes)
         .map_err(|error| format!("Alertmanager did not name a silenceID: {error}"))?;
-    Ok(clip(&created.silence_id))
+    silence_id_ok(&created.silence_id)
+        .map(str::to_string)
+        .map_err(|why| format!("Alertmanager did not return a usable silenceID: {why}"))
 }
 
 pub(crate) fn silence_post_body(spec: &SilenceSpec) -> Result<Vec<u8>, String> {
@@ -509,9 +539,9 @@ pub(crate) fn silence_post_body(spec: &SilenceSpec) -> Result<Vec<u8>, String> {
         if matcher.name.trim().is_empty() {
             return Err("a silence matcher with an empty name is not sent".to_string());
         }
-        if matcher.name.len() > MAX_LABEL_CHARS || matcher.value.len() > MAX_LABEL_CHARS {
+        if matcher.name.len() > MAX_MATCHER_BYTES || matcher.value.len() > MAX_MATCHER_BYTES {
             return Err(format!(
-                "a silence matcher exceeds {MAX_LABEL_CHARS} characters; it is not sent"
+                "a silence matcher exceeds {MAX_MATCHER_BYTES} bytes; it is not sent"
             ));
         }
     }
@@ -715,7 +745,11 @@ async fn tool_write(
 }
 
 fn clip(text: &str) -> String {
-    match text.char_indices().nth(MAX_LABEL_CHARS) {
+    clip_at(text, MAX_LABEL_CHARS)
+}
+
+fn clip_at(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
         Some((at, _)) => {
             let mut out = text[..at].to_string();
             out.push('\u{2026}');
