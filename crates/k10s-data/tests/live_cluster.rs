@@ -71,13 +71,11 @@
 //! `web` Deployment's pod is actually Running -- a Deployment that no kubelet
 //! ever scheduled satisfies the other tests and none of those.
 //!
-//! The usage tests also need a kubelet, and split on one more axis:
-//! `K10S_LIVE_METRICS_SERVER=1` runs the metrics-server row, `=0` runs the
-//! kubelet-fallback row (kill metrics-server first -- on k3s,
-//! `kubectl -n kube-system scale deploy/metrics-server --replicas=0` leaves
-//! the APIService registered and unanswering, which is the 503 half of the
-//! fallback decision; the scripted suite covers the 404 half), and unset
-//! skips both. Run the suite once per side to close the matrix.
+//! The usage matrix needs metrics-server initially healthy. Its absent case
+//! temporarily removes `v1beta1.metrics.k8s.io`, verifies the API returns 404,
+//! and restores its registration even if a sample assertion panics. It then
+//! waits for metrics-server usage to recover. This tests an unserved API, not
+//! an installed API whose backing Deployment merely stopped answering.
 //!
 //! Both client-side applies must stay client-side. Server-side apply writes no
 //! `last-applied-configuration`, so a fixture created with `--server-side`
@@ -832,11 +830,21 @@ fn has_kubelet() -> bool {
 fn running_pod(reader: &Reader, prefix: &str) -> String {
     let pods = kind(reader, "pods");
     let page = table(reader, pods.id);
+    let status = page
+        .columns
+        .iter()
+        .position(|column| column.name == "Status")
+        .expect("the pod table has a Status column");
+    let namespace = namespace();
     page.rows
         .iter()
-        .find(|row| row.name.starts_with(prefix))
+        .find(|row| {
+            row.namespace.as_deref() == Some(namespace.as_str())
+                && row.name.starts_with(prefix)
+                && row.cells.get(status).is_some_and(|cell| cell == "Running")
+        })
         .map(|row| row.name.clone())
-        .unwrap_or_else(|| panic!("a pod named {prefix}* is running"))
+        .unwrap_or_else(|| panic!("a pod named {namespace}/{prefix}* is running"))
 }
 
 // Exec, against a kubelet, for the first time.
@@ -1052,14 +1060,6 @@ fn a_port_forward_carries_real_bytes_from_the_pod() {
     );
 }
 
-// Which half of the usage matrix this cluster is: Some(true) has
-// metrics-server, Some(false) had it killed, None skips both rows.
-fn metrics_server() -> Option<bool> {
-    std::env::var("K10S_LIVE_METRICS_SERVER")
-        .ok()
-        .map(|value| value == "1")
-}
-
 fn nometrics_context() -> String {
     std::env::var("K10S_LIVE_NOMETRICS_CONTEXT")
         .unwrap_or_else(|_| "nometrics@k10s-lab".to_string())
@@ -1117,11 +1117,8 @@ fn assert_probe_bounds(sample: &UsageSample) {
 #[test]
 #[ignore = "needs a live cluster; see the module comment"]
 fn pod_usage_renders_from_metrics_server_with_its_requests_and_limits() {
-    if !has_kubelet() || metrics_server() != Some(true) {
-        eprintln!(
-            "skipped: set K10S_LIVE_KUBELET=1 and K10S_LIVE_METRICS_SERVER=1 \
-             on a cluster that runs metrics-server"
-        );
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
         return;
     }
     let (_plane, sync) = connect(None);
@@ -1166,38 +1163,146 @@ fn pod_usage_renders_from_metrics_server_with_its_requests_and_limits() {
 
 #[test]
 #[ignore = "needs a live cluster; see the module comment"]
-fn pod_usage_is_carried_by_the_kubelet_when_metrics_server_is_gone() {
-    if !has_kubelet() || metrics_server() != Some(false) {
-        eprintln!(
-            "skipped: set K10S_LIVE_KUBELET=1 and K10S_LIVE_METRICS_SERVER=0 \
-             on a cluster whose metrics-server was scaled away"
-        );
+fn pod_usage_is_carried_by_the_kubelet_when_the_metrics_api_is_absent() {
+    use k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService;
+    use kube::Api;
+    use kube::api::{DeleteParams, PostParams, Preconditions};
+    use kube::runtime::wait::{await_condition, conditions};
+
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
         return;
     }
     let (_plane, sync) = connect(None);
     let pod = running_pod(&sync.reader, "usage-probe-");
+    let (stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod.clone() });
+    await_sample(
+        &rx,
+        Duration::from_secs(180),
+        "a healthy metrics-server before withdrawing its API",
+        |sample| sample.source == UsageSource::MetricsServer && sample.cpu.is_some(),
+    );
+    drop(stop);
 
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("a client");
+    let services: Api<APIService> = Api::all(client.clone());
+    let name = "v1beta1.metrics.k8s.io";
+    let original = runtime
+        .block_on(services.get(name))
+        .expect("metrics API registration");
+    let uid = original
+        .metadata
+        .uid
+        .clone()
+        .expect("the registration has a UID");
+    let assert_absent = || {
+        let request = http::Request::get("/apis/metrics.k8s.io/v1beta1")
+            .body(Vec::new())
+            .expect("a group request");
+        let answer = runtime.block_on(client.request::<serde_json::Value>(request));
+        assert!(
+            matches!(&answer, Err(kube::Error::Api(error)) if error.code == 404),
+            "the API must be absent, not merely unavailable: {answer:?}"
+        );
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            services
+                .delete(
+                    name,
+                    &DeleteParams {
+                        preconditions: Some(Preconditions {
+                            uid: Some(uid.clone()),
+                            resource_version: original.metadata.resource_version.clone(),
+                        }),
+                        ..DeleteParams::default()
+                    },
+                )
+                .await
+                .expect("withdraw the same metrics API registration");
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                await_condition(services.clone(), name, conditions::is_deleted(&uid)),
+            )
+            .await
+            .expect("the registration disappears within the budget")
+            .expect("the registration deletion is observable");
+        });
+        assert_absent();
+        let (_stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod.clone() });
+        let first = await_sample(
+            &rx,
+            Duration::from_secs(60),
+            "a kubelet-carried memory sample",
+            |sample| sample.source == UsageSource::Kubelet && sample.memory.is_some(),
+        );
+        println!("live kubelet sample (memory first): {first:?}");
+        assert_probe_bounds(&first);
+        assert_eq!((first.pods_measured, first.pods_total), (1, 1));
+        assert!(!first.truncated);
+
+        let with_rate = await_sample(
+            &rx,
+            Duration::from_secs(120),
+            "a kubelet CPU rate",
+            |sample| sample.source == UsageSource::Kubelet && sample.cpu.is_some(),
+        );
+        println!("live kubelet sample (with rate): {with_rate:?}");
+        assert_probe_bounds(&with_rate);
+        assert!(with_rate.memory.is_some());
+        assert_eq!((with_rate.pods_measured, with_rate.pods_total), (1, 1));
+        assert_absent();
+    }));
+
+    // Restore before resuming an assertion panic. Do not overwrite a registration
+    // another actor recreated while the test was waiting for a sample.
+    let mut restored = original.clone();
+    restored.metadata.uid = None;
+    restored.metadata.resource_version = None;
+    restored.metadata.creation_timestamp = None;
+    restored.metadata.generation = None;
+    restored.metadata.managed_fields = None;
+    restored.status = None;
+    let registration = runtime.block_on(async {
+        match services
+            .get_opt(name)
+            .await
+            .expect("read the metrics registration for cleanup")
+        {
+            Some(registration) => registration,
+            None => services
+                .create(&PostParams::default(), &restored)
+                .await
+                .expect("restore the metrics API registration"),
+        }
+    });
+    assert_eq!(
+        registration.spec, original.spec,
+        "restore the original metrics route"
+    );
+    assert_eq!(registration.metadata.labels, original.metadata.labels);
+    assert_eq!(
+        registration.metadata.annotations,
+        original.metadata.annotations
+    );
     let (_stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod });
-    let first = await_sample(
+    let recovered = await_sample(
         &rx,
-        Duration::from_secs(60),
-        "a kubelet-carried sample",
-        |sample| sample.source == UsageSource::Kubelet && sample.memory.is_some(),
+        Duration::from_secs(180),
+        "metrics-server usage after restoring its API",
+        |sample| sample.source == UsageSource::MetricsServer && sample.cpu.is_some(),
     );
-    println!("live kubelet sample (memory first): {first:?}");
-    assert_probe_bounds(&first);
-
-    // CPU needs the counter to advance under the kubelet's own timestamps;
-    // one more scrape interval is enough, and the rate must arrive without
-    // metrics-server ever answering.
-    let with_rate = await_sample(
-        &rx,
-        Duration::from_secs(120),
-        "a kubelet CPU rate",
-        |sample| sample.source == UsageSource::Kubelet && sample.cpu.is_some(),
-    );
-    println!("live kubelet sample (with rate): {with_rate:?}");
-    assert_probe_bounds(&with_rate);
+    assert_probe_bounds(&recovered);
+    println!("live metrics-server sample after restoration: {recovered:?}");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[test]
@@ -1223,10 +1328,14 @@ fn denied_pod_metrics_is_a_labelled_denial_not_an_error_string() {
         "a 403 on pod metrics is a labelled state, and the kubelet is not \
          asked to route around it"
     );
+    println!("live usage denial: {outcome:?}");
     // Denied ends the poll itself: the sender is gone, so the channel closes
     // instead of carrying a retry.
     assert!(
-        rx.recv_timeout(Duration::from_secs(10)).is_err(),
-        "a denial is not retried"
+        matches!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ),
+        "a denial closes the poll instead of retrying or leaving it idle"
     );
 }
