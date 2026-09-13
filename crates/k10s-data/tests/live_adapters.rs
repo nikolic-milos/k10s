@@ -1,7 +1,7 @@
 //! Live coverage for the seams `live_cluster.rs` does not own.
 //!
 //! Apply, exec, logs, port-forward, and usage stay in that file. This one
-//! drives Helm, Argo, Flux, overlays, describe, tables, and day-2 against
+//! drives Helm, Argo, Flux, overlays, describe, tables, observability, and day-2 against
 //! the same cluster and the same two extra identities. Ignored by default
 //! for the same no-network reason.
 //!
@@ -17,10 +17,13 @@
 //! when the groups are not served, and as a table when they are -- never as
 //! an error. Day-2 mutates only `day2-probe` in `K10S_LIVE_NAMESPACE`. It
 //! does not scale `web`, and it does not cordon or drain the node.
-
-//! The monitoring proof requires `live_fixtures.sh --with observability`. It
-//! compares a scraped namespace creation time with Kubernetes metadata and
-//! reads the provisioned dashboards through a healthy Grafana.
+//!
+//! The observability tests require `live_fixtures.sh --with observability`.
+//! The monitoring test compares a scraped namespace creation time with
+//! Kubernetes metadata and reads dashboards through a healthy Grafana. The
+//! telemetry tests read a trace id from the producer's real container log,
+//! then retrieve that span from Tempo and the same line from Loki through
+//! the production Reader. A backend with no ingested data cannot satisfy them.
 
 use std::time::Duration;
 
@@ -615,4 +618,167 @@ fn prometheus_reads_the_lab_namespace_and_grafana_serves_its_dashboards() {
         catalog.extra_hits.len(),
         catalog.truncated
     );
+}
+
+fn telemetry_probe_trace() -> (String, String) {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::{ListParams, LogParams};
+
+    kube_runtime().block_on(async {
+        let client = kube::Client::try_default()
+            .await
+            .expect("a client from KUBECONFIG");
+        let pods: kube::Api<Pod> = kube::Api::namespaced(client, "observability");
+        let page = pods
+            .list(
+                &ListParams::default()
+                    .labels("app=k10s-telemetry-probe")
+                    .fields("status.phase=Running"),
+            )
+            .await
+            .expect("list the running telemetry producer");
+        assert_eq!(
+            page.items.len(),
+            1,
+            "one producer after the fixture rollout"
+        );
+        let pod = page.items[0]
+            .metadata
+            .name
+            .clone()
+            .expect("the pod has a name");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let logs = pods
+                .logs(
+                    &pod,
+                    &LogParams {
+                        container: Some("probe".to_string()),
+                        tail_lines: Some(10),
+                        ..LogParams::default()
+                    },
+                )
+                .await
+                .expect("read the producer's log");
+            for line in logs.lines().rev() {
+                let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if entry["message"] == "k10s telemetry probe"
+                    && entry["namespace"] == "observability"
+                    && entry["pod"] == pod
+                    && let Some(trace_id) = entry["trace_id"].as_str()
+                {
+                    assert_eq!(trace_id.len(), 32);
+                    assert!(trace_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                    return (pod, trace_id.to_string());
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the producer never sent a trace; recent log: {logs}"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+}
+
+#[test]
+#[ignore = "needs live_fixtures.sh --with observability"]
+fn tempo_returns_the_span_named_by_the_live_producer() {
+    let (_plane, sync) = connect(None);
+    let (pod, trace_id) = telemetry_probe_trace();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader.lookup_trace(trace_id.clone(), move |answer| {
+            let _ = tx.send(answer);
+        });
+        let answer = wait(&rx);
+        if let Fetched::Ok(Some(trace)) = &answer {
+            assert_eq!(trace.trace_id, trace_id);
+            assert_eq!(trace.spans.len(), 1, "each emission is a fresh trace");
+            let span = &trace.spans[0];
+            assert_eq!(span.name, "k10s-live-probe");
+            assert_eq!(span.service, "k10s-telemetry-probe");
+            assert_eq!(span.duration_us, 1000);
+            assert_eq!(span.status, "ok");
+            assert!(span.parent.is_empty());
+            println!("live trace from observability/{pod}: {trace:?}");
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Tempo never returned trace {trace_id}: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[test]
+#[ignore = "needs live_fixtures.sh --with observability"]
+fn loki_returns_the_producers_log_with_its_namespace_pod_and_trace_id() {
+    let (_plane, sync) = connect(None);
+    let (pod, trace_id) = telemetry_probe_trace();
+    let start_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time after the epoch")
+        .as_nanos() as u64
+        - 300_000_000_000;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let end_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after the epoch")
+            .as_nanos() as u64;
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader.query_loki(
+            k10s_data::loki::RangeQuery {
+                query: format!("{{namespace=\"observability\",pod=\"{pod}\"}} |= \"{trace_id}\""),
+                start_ns,
+                end_ns,
+                limit: 10,
+            },
+            move |answer| {
+                let _ = tx.send(answer);
+            },
+        );
+        let answer = wait(&rx);
+        if let Fetched::Ok(Some(logs)) = &answer {
+            for stream in &logs.streams {
+                for line in &stream.lines {
+                    let entry: serde_json::Value = serde_json::from_str(&line.line)
+                        .expect("the collector preserves the producer's JSON line");
+                    if entry["trace_id"] == trace_id {
+                        assert_eq!(entry["message"], "k10s telemetry probe");
+                        assert_eq!(entry["namespace"], "observability");
+                        assert_eq!(entry["pod"], pod);
+                        assert!(
+                            stream
+                                .labels
+                                .contains(&("namespace".to_string(), "observability".to_string()))
+                        );
+                        assert!(
+                            stream
+                                .labels
+                                .iter()
+                                .any(|(key, value)| key == "pod" && value == &pod)
+                        );
+                        assert!(!logs.truncated);
+                        assert_eq!(
+                            (logs.dropped_streams, logs.dropped_lines, logs.clipped_lines),
+                            (0, 0, 0)
+                        );
+                        println!("live collected log: {line:?}");
+                        return;
+                    }
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Loki never returned the producer's trace marker {trace_id}: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
