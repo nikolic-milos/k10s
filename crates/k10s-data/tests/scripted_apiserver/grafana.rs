@@ -58,7 +58,12 @@ fn a_dashboard_is_fetched_by_uid_through_the_same_proxy() {
         "GET",
         "/api/v1/namespaces/monitoring/services/grafana:3000/proxy/api/dashboards/uid/k8s",
         200,
-        r#"{"dashboard":{"uid":"k8s","title":"Cluster","panels":[]}}"#,
+        r#"{"dashboard":{"uid":"k8s","title":"Cluster","panels":[{
+            "id":1,"title":"Pods","type":"timeseries","targets":[{
+                "refId":"A","expr":"kube_pod_info",
+                "datasource":{"uid":"$datasource","type":"prometheus"}
+            }]
+        }]}}"#,
     );
     let runtime = runtime();
     let fetched =
@@ -68,8 +73,21 @@ fn a_dashboard_is_fetched_by_uid_through_the_same_proxy() {
     };
     assert_eq!(dash.uid, "k8s");
     assert_eq!(dash.title, "Cluster");
+    assert_eq!(dash.panels.len(), 1);
+    assert_eq!(dash.panels[0].queries.len(), 1);
+    let query = &dash.panels[0].queries[0];
+    assert_eq!(query.expr, "kube_pod_info");
+    assert_eq!(query.datasource.as_deref(), Some("$datasource"));
+    assert_eq!(query.dialect, k10s_data::grafana::QueryDialect::PromQL);
     let seen = script.requests_for("/proxy/api/dashboards/uid/k8s");
     assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].method, "GET");
+    assert_eq!(
+        seen[0].path,
+        "/api/v1/namespaces/monitoring/services/grafana:3000/proxy/api/dashboards/uid/k8s"
+    );
+    assert_eq!(seen[0].accept, "");
+    assert!(seen[0].body.is_empty());
 }
 
 #[test]

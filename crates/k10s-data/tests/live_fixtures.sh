@@ -8,6 +8,7 @@
 # suite that passed once, on the machine of the person who wrote it.
 #
 #   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh
+#   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh --with observability
 #
 # Then, and note the thread count, which is not optional:
 #
@@ -24,11 +25,36 @@
 # comparisons that still pass for the wrong reason.
 set -euo pipefail
 
+OBSERVABILITY=false
+while (($#)); do
+  case "$1" in
+    --with)
+      if [[ ${2:-} != observability ]]; then
+        echo "--with requires observability" >&2
+        exit 2
+      fi
+      OBSERVABILITY=true
+      shift 2
+      ;;
+    --help)
+      echo "usage: $0 [--with observability]"
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
 NS="${K10S_LIVE_NAMESPACE:-g2}"
 READER_GROUP="${K10S_LIVE_READER_GROUP:-k10s-readers}"
 KUBECTL=(kubectl)
 command -v kubectl >/dev/null || { echo "kubectl is not on PATH" >&2; exit 1; }
 : "${KUBECONFIG:?set KUBECONFIG to the cluster to set up}"
+if $OBSERVABILITY; then
+  command -v helm >/dev/null || { echo "helm is not on PATH" >&2; exit 1; }
+fi
 
 echo "namespace $NS"
 "${KUBECTL[@]}" create namespace "$NS" --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f - >/dev/null
@@ -90,7 +116,7 @@ spec:
     spec:
       containers:
       - name: web
-        image: nginx:1.27-alpine
+        image: nginx:1.30.4-alpine3.24@sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c
         ports:
         - containerPort: 80
 YAML
@@ -114,7 +140,7 @@ spec:
     spec:
       containers:
       - name: probe
-        image: busybox:1.36
+        image: busybox:1.38.0@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616
         command:
         - sh
         - -c
@@ -140,7 +166,7 @@ spec:
     spec:
       containers:
       - name: probe
-        image: busybox:1.36
+        image: busybox:1.38.0@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616
         command: ["sh", "-c", "while true; do sleep 3600; done"]
         resources:
           requests: { cpu: 10m, memory: 16Mi }
@@ -246,6 +272,86 @@ echo "waiting for the pods those tests exec into, forward to, and measure"
 for deployment in web forward-probe usage-probe; do
   "${KUBECTL[@]}" -n "$NS" rollout status "deployment/$deployment" --timeout=180s >/dev/null
 done
+
+if $OBSERVABILITY; then
+  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  helm repo update prometheus-community
+
+  helm upgrade --install monitoring prometheus-community/kube-prometheus-stack --version 90.0.0 \
+    --namespace observability --create-namespace --wait --timeout 10m --values - <<'YAML'
+# k3s embeds these control-plane components without their scrape endpoints.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+defaultRules:
+  rules:
+    kubeControllerManager: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    etcd: false
+    kubeProxy: false
+prometheusOperator:
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 512Mi}
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    retention: 24h
+    retentionSize: 3GB
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {memory: 2Gi}
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests: {storage: 4Gi}
+alertmanager:
+  alertmanagerSpec:
+    replicas: 1
+    retention: 24h
+    resources:
+      requests: {cpu: 20m, memory: 64Mi}
+      limits: {memory: 256Mi}
+grafana:
+  service:
+    port: 3000
+  persistence:
+    enabled: true
+    size: 1Gi
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 768Mi}
+  sidecar:
+    resources:
+      requests: {cpu: 10m, memory: 64Mi}
+      limits: {memory: 256Mi}
+  grafana.ini:
+    auth.anonymous:
+      enabled: true
+      org_role: Viewer
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+kube-state-metrics:
+  resources:
+    requests: {cpu: 30m, memory: 64Mi}
+    limits: {memory: 256Mi}
+prometheus-node-exporter:
+  resources:
+    requests: {cpu: 20m, memory: 32Mi}
+    limits: {memory: 128Mi}
+YAML
+fi
 
 echo
 echo "ready. One caveat that is not cosmetic:"

@@ -18,6 +18,10 @@
 //! an error. Day-2 mutates only `day2-probe` in `K10S_LIVE_NAMESPACE`. It
 //! does not scale `web`, and it does not cordon or drain the node.
 
+//! The monitoring proof requires `live_fixtures.sh --with observability`. It
+//! compares a scraped namespace creation time with Kubernetes metadata and
+//! reads the provisioned dashboards through a healthy Grafana.
+
 use std::time::Duration;
 
 use k10s_core::KindId;
@@ -508,4 +512,107 @@ fn a_reader_cannot_scale_and_a_configmap_is_not_a_scale_target() {
         }
         other => panic!("scaling a ConfigMap must fail before the wire: {other:?}"),
     }
+}
+
+#[test]
+#[ignore = "needs live_fixtures.sh --with observability"]
+fn prometheus_reads_the_lab_namespace_and_grafana_serves_its_dashboards() {
+    use k10s_data::grafana::QueryDialect;
+    use k10s_data::reach::{ToolKind, ToolReach, Transport};
+
+    let (_plane, sync) = connect(None);
+    let namespace = namespace();
+    let created = kube_runtime().block_on(async {
+        let client = kube::Client::try_default().await.expect("a client");
+        let namespaces: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
+        namespaces
+            .get(&namespace)
+            .await
+            .expect("the fixture namespace")
+            .metadata
+            .creation_timestamp
+            .expect("the namespace creation time")
+            .0
+            .as_second()
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let end = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs_f64();
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader.query_prometheus(
+            format!("kube_namespace_created{{namespace={namespace:?}}}"),
+            end - 60.0,
+            end,
+            "15s".into(),
+            move |answer| {
+                let _ = tx.send(answer);
+            },
+        );
+        let answer = wait(&rx);
+        let Fetched::Ok(Some(result)) = answer else {
+            panic!("Prometheus must answer through the provider's Reader: {answer:?}");
+        };
+        assert!(!result.truncated);
+        assert_eq!(result.dropped_series, 0);
+        if !result.series.is_empty() {
+            for series in &result.series {
+                assert!(
+                    series
+                        .labels
+                        .contains(&("namespace".into(), namespace.clone()))
+                );
+                assert!(!series.points.is_empty());
+                assert!(
+                    series
+                        .points
+                        .iter()
+                        .all(|(_, value)| *value == created as f64)
+                );
+            }
+            println!("live kube-state-metrics series: {result:?}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no namespace metric was scraped"
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader
+        .bind_tool(ToolKind::Grafana, ReachSettings::default(), move |answer| {
+            let _ = tx.send(answer);
+        });
+    let bound = wait(&rx);
+    assert!(
+        matches!(bound, ToolReach::Bound(ref ready) if matches!(ready.transport, Transport::Proxy { .. })),
+        "Grafana must answer its health probe: {bound:?}"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_grafana_catalog(move |answer| {
+        let _ = tx.send(answer);
+    });
+    let answer = wait(&rx);
+    let Fetched::Ok(catalog) = answer else {
+        panic!("the provisioned dashboards must be readable: {answer:?}");
+    };
+    assert!(catalog.served);
+    assert!(
+        catalog
+            .dashboards
+            .iter()
+            .flat_map(|dashboard| &dashboard.panels)
+            .flat_map(|panel| &panel.queries)
+            .any(|query| query.dialect == QueryDialect::PromQL && query.expr.contains("kube_"))
+    );
+    println!(
+        "live Grafana catalog: {} dashboards, {} extra titles, truncated={}",
+        catalog.dashboards.len(),
+        catalog.extra_hits.len(),
+        catalog.truncated
+    );
 }
