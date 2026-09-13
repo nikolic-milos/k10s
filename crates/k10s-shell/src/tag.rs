@@ -39,6 +39,7 @@ pub enum ItemTag {
     Mesh,
     Traces,
     Ecosystem,
+    Silence(String),
     HelmReport(String),
     Doc(String),
     Edit(String),
@@ -81,6 +82,7 @@ impl ItemTag {
             | ItemTag::Mesh
             | ItemTag::Traces
             | ItemTag::Ecosystem
+            | ItemTag::Silence(_)
             | ItemTag::HelmReport(_)
             | ItemTag::Doc(_)
             | ItemTag::Reveal(_)
@@ -126,6 +128,7 @@ mod tests {
             (ItemTag::Mesh, OnAdopt::Retire),
             (ItemTag::Traces, OnAdopt::Retire),
             (ItemTag::Ecosystem, OnAdopt::Retire),
+            (ItemTag::Silence("pod-uid".into()), OnAdopt::Retire),
             (ItemTag::HelmReport("ingress/3".into()), OnAdopt::Retire),
             (ItemTag::Doc("uid/name".into()), OnAdopt::Retire),
             // Revealed Helm values are the old cluster's secrets, not the

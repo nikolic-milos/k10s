@@ -73,6 +73,7 @@ pub mod ui;
 // is re-exported below under the name it has always had.
 mod actions;
 mod activity;
+mod alerts;
 mod bindings;
 mod chrome;
 mod cluster;

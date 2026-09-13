@@ -86,6 +86,10 @@ impl InventoryKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryEvent {
+    RevealPod {
+        namespace: String,
+        pod: String,
+    },
     NotServed {
         tag: ItemTag,
         what: &'static str,

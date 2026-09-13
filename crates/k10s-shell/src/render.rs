@@ -25,8 +25,8 @@ use crate::{
     ExecSelection, FindCluster, FindFile, LoadSavedView, LogsSelection, NewFile, NextItem,
     OpenArgo, OpenBrowser, OpenDay2, OpenEcosystem, OpenFile, OpenFlux, OpenFolder, OpenForwards,
     OpenHarbor, OpenKeymap, OpenMesh, OpenNodes, OpenObserve, OpenPalette, OpenPolicy,
-    OpenReleases, OpenSettings, OpenTraces, PrevItem, Quit, ShowStarmap, ToggleBottomDock,
-    ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    OpenReleases, OpenSettings, OpenTraces, PrevItem, Quit, ShowStarmap, SilenceSelection,
+    ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
 
 impl Render for Workspace {
@@ -382,6 +382,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenEcosystem, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Ecosystem, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SilenceSelection, window, cx| {
+                this.open_silence(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 this.toggle_terminal(window, cx);
