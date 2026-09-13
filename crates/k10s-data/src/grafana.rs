@@ -190,11 +190,11 @@ fn read_panel(panel: &Value, fallback_id: i64) -> Panel {
         .get("transformations")
         .and_then(Value::as_array)
         .is_some_and(|t| !t.is_empty());
-    let datasource = datasource_name(panel.get("datasource"));
+    let datasource = panel.get("datasource");
     let mut queries = Vec::new();
     if let Some(targets) = panel.get("targets").and_then(Value::as_array) {
         for target in targets.iter().take(MAX_QUERIES_PER_PANEL) {
-            if let Some(query) = read_query(target, datasource.as_deref()) {
+            if let Some(query) = read_query(target, datasource) {
                 queries.push(query);
             }
         }
@@ -208,7 +208,7 @@ fn read_panel(panel: &Value, fallback_id: i64) -> Panel {
     }
 }
 
-fn read_query(target: &Value, panel_datasource: Option<&str>) -> Option<PanelQuery> {
+fn read_query(target: &Value, panel_datasource: Option<&Value>) -> Option<PanelQuery> {
     let expr = target
         .get("expr")
         .and_then(Value::as_str)
@@ -218,10 +218,19 @@ fn read_query(target: &Value, panel_datasource: Option<&str>) -> Option<PanelQue
     if expr.is_empty() {
         return None;
     }
-    let datasource =
-        datasource_name(target.get("datasource")).or_else(|| panel_datasource.map(str::to_string));
+    let datasource = [target.get("datasource"), panel_datasource]
+        .into_iter()
+        .flatten()
+        .find_map(|value| datasource_name(Some(value)).map(|name| (name, value)));
+    // The declared type determines the language; a UID identifies one instance.
     let dialect = dialect_of(
-        datasource.as_deref(),
+        datasource.as_ref().map(|(name, value)| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|kind| !kind.is_empty())
+                .unwrap_or(name)
+        }),
         target.get("queryType").and_then(Value::as_str),
     );
     Some(PanelQuery {
@@ -232,7 +241,7 @@ fn read_query(target: &Value, panel_datasource: Option<&str>) -> Option<PanelQue
             .to_string(),
         expr: clip(expr, MAX_EXPR_CHARS),
         dialect,
-        datasource,
+        datasource: datasource.map(|(name, _)| name),
     })
 }
 

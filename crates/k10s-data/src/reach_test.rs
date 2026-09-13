@@ -80,6 +80,44 @@ fn prometheus_prefers_9090_even_when_another_port_is_first() {
 }
 
 #[test]
+fn a_monitoring_release_does_not_turn_its_exporters_into_prometheus() {
+    for (name, app, port) in [
+        ("monitoring-kube-prometheus-coredns", "coredns", 9153),
+        ("monitoring-kube-prometheus-kubelet", "kubelet", 10250),
+        (
+            "monitoring-prometheus-node-exporter",
+            "prometheus-node-exporter",
+            9100,
+        ),
+        ("query", "checkout", 9090),
+    ] {
+        let svc = service(
+            name,
+            "monitoring",
+            &[
+                ("app.kubernetes.io/name", app),
+                ("helm.sh/chart", "kube-prometheus-stack-90.0.0"),
+                ("release", "prometheus"),
+            ],
+            &[(port, "http")],
+        );
+        assert_eq!(match_service(ToolKind::Prometheus, &svc), None, "{name}");
+    }
+    for (name, labels) in [
+        ("monitoring-kube-prometheus-prometheus", vec![]),
+        ("query", vec![("app.kubernetes.io/name", "prometheus")]),
+        ("query", vec![("app", "prometheus")]),
+        ("query", vec![("k8s-app", "prometheus")]),
+    ] {
+        let svc = service(name, "monitoring", &labels, &[(8081, "web")]);
+        assert_eq!(
+            match_service(ToolKind::Prometheus, &svc).expect(name).port,
+            8081
+        );
+    }
+}
+
+#[test]
 fn loki_and_tempo_and_harbor_have_their_own_ports() {
     let loki = service("loki", "logging", &[], &[(3100, "http")]);
     assert_eq!(match_service(ToolKind::Loki, &loki).unwrap().port, 3100);

@@ -102,3 +102,72 @@ fn a_403_listing_services_is_a_labelled_hole_not_an_empty_cluster() {
         other => panic!("forbidden is Unbound, not {other:?}"),
     }
 }
+
+#[test]
+fn the_monitoring_charts_exporter_is_not_the_prometheus_endpoint() {
+    use k10s_data::reach::Transport;
+    for installed in [false, true] {
+        let script = Script::default();
+        let mut items = vec![serde_json::json!({
+            "metadata":{"name":"monitoring-kube-prometheus-coredns","namespace":"kube-system",
+                "labels":{"app":"coredns","helm.sh/chart":"kube-prometheus-stack-90.0.0","release":"prometheus"}},
+            "spec":{"ports":[{"name":"http-metrics","port":9153}]}
+        })];
+        if installed {
+            items.push(serde_json::json!({
+                "metadata":{"name":"monitoring-kube-prometheus-prometheus","namespace":"observability",
+                    "labels":{"app.kubernetes.io/name":"prometheus"}},
+                "spec":{"ports":[{"name":"web","port":9090}]}
+            }));
+        }
+        script.route(
+            "GET",
+            "/api/v1/services?",
+            200,
+            serde_json::json!({"kind":"ServiceList","apiVersion":"v1","items":items}).to_string(),
+        );
+        let path = "/api/v1/namespaces/observability/services/monitoring-kube-prometheus-prometheus:web/proxy/-/ready";
+        script.route("GET", path, 200, "Prometheus Server is Ready.");
+        let runtime = runtime();
+        let outcome = runtime.block_on(async {
+            bind(
+                &script.client(),
+                ToolKind::Prometheus,
+                &ReachSettings::default(),
+            )
+            .await
+        });
+        if installed {
+            let ToolReach::Bound(bound) = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(
+                bound.transport,
+                Transport::Proxy {
+                    namespace: "observability".into(),
+                    service: "monitoring-kube-prometheus-prometheus".into(),
+                    port: 9090,
+                }
+            );
+        } else {
+            assert!(matches!(
+                outcome,
+                ToolReach::Absent {
+                    kind: ToolKind::Prometheus
+                }
+            ));
+        }
+        let seen = script.seen();
+        assert_eq!(seen.len(), if installed { 2 } else { 1 });
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(seen[0].path, "/api/v1/services?&limit=200");
+        assert_eq!(seen[0].accept, "");
+        assert!(seen[0].body.is_empty());
+        if installed {
+            assert_eq!(seen[1].method, "GET");
+            assert_eq!(seen[1].path, path);
+            assert_eq!(seen[1].accept, "");
+            assert!(seen[1].body.is_empty());
+        }
+    }
+}
