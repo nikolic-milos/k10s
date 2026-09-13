@@ -275,7 +275,9 @@ done
 
 if $OBSERVABILITY; then
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-  helm repo update prometheus-community
+  helm repo add grafana-community https://grafana-community.github.io/helm-charts
+  helm repo add grafana https://grafana.github.io/helm-charts
+  helm repo update prometheus-community grafana-community grafana
 
   helm upgrade --install monitoring prometheus-community/kube-prometheus-stack --version 90.0.0 \
     --namespace observability --create-namespace --wait --timeout 10m --values - <<'YAML'
@@ -351,6 +353,195 @@ prometheus-node-exporter:
     requests: {cpu: 20m, memory: 32Mi}
     limits: {memory: 128Mi}
 YAML
+
+  helm upgrade --install loki grafana-community/loki --version 18.12.1 \
+    --namespace observability --create-namespace --wait --timeout 10m --values - <<'YAML'
+deploymentMode: Monolithic
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+  schemaConfig:
+    configs:
+      - from: "2026-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+  limits_config:
+    retention_period: 24h
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+  analytics:
+    reporting_enabled: false
+singleBinary:
+  replicas: 1
+  sidecar: false
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  persistence:
+    size: 2Gi
+    enableStatefulSetAutoDeletePVC: false
+backend:
+  replicas: 0
+read:
+  replicas: 0
+write:
+  replicas: 0
+gateway:
+  enabled: false
+lokiCanary:
+  enabled: false
+test:
+  enabled: false
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+YAML
+
+  # Promtail reached end of support on 2026-03-02. Keep the lab's requested
+  # collector on its published 3.6.11 image, not the chart's older default.
+  helm upgrade --install promtail grafana/promtail --version 6.17.1 \
+    --namespace observability --create-namespace --wait --timeout 10m --values - <<'YAML'
+image:
+  tag: "3.6.11@sha256:a761cb834cfaeee29745440d4884d6748f0a08d8f68928db1d707018c1dcfbe9"
+resources:
+  requests: {cpu: 50m, memory: 64Mi}
+  limits: {memory: 256Mi}
+config:
+  clients:
+    - url: http://loki.observability.svc:3100/loki/api/v1/push
+YAML
+
+  helm upgrade --install tempo grafana-community/tempo --version 2.3.0 \
+    --namespace observability --create-namespace --wait --timeout 10m --values - <<'YAML'
+replicas: 1
+tempo:
+  retention: 24h
+  reportingEnabled: false
+  memBallastSizeMbs: 0
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 768Mi}
+persistence:
+  enabled: true
+  size: 1Gi
+serviceMonitor:
+  enabled: true
+  additionalLabels:
+    release: monitoring
+YAML
+
+  "${KUBECTL[@]}" apply -f - <<'YAML'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k10s-telemetry-probe
+  namespace: observability
+data:
+  probe.py: |
+    import json
+    import os
+    import time
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    namespace = os.environ["POD_NAMESPACE"]
+    pod = os.environ["POD_NAME"]
+    attributes = [
+        {"key": key, "value": {"stringValue": value}}
+        for key, value in [
+            ("service.name", "k10s-telemetry-probe"),
+            ("k8s.namespace.name", namespace),
+            ("k8s.pod.name", pod),
+        ]
+    ]
+    while True:
+        trace_id = uuid.uuid4().hex
+        start = time.time_ns()
+        span = {
+            "traceId": trace_id,
+            "spanId": uuid.uuid4().hex[:16],
+            "name": "k10s-live-probe",
+            "kind": 1,
+            "startTimeUnixNano": str(start),
+            "endTimeUnixNano": str(start + 1_000_000),
+            "status": {"code": 1},
+        }
+        body = {"resourceSpans": [{
+            "resource": {"attributes": attributes},
+            "scopeSpans": [{"scope": {"name": "k10s-live-fixture"}, "spans": [span]}],
+        }]}
+        request = urllib.request.Request(
+            "http://tempo.observability.svc:4318/v1/traces",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                accepted = json.load(response)
+            if accepted.get("partialSuccess", {}).get("rejectedSpans", "0") not in (0, "0"):
+                raise ValueError(f"Tempo rejected the span: {accepted}")
+            print(json.dumps({
+                "message": "k10s telemetry probe",
+                "trace_id": trace_id,
+                "namespace": namespace,
+                "pod": pod,
+            }), flush=True)
+        except (OSError, ValueError) as error:
+            print(json.dumps({"error": str(error)}), flush=True)
+        time.sleep(10)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k10s-telemetry-probe
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: k10s-telemetry-probe}
+  template:
+    metadata:
+      labels: {app: k10s-telemetry-probe}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: probe
+        image: python:3.14.7-alpine3.24@sha256:c6ead215bfd31f1e433d968853b7a769989117115b728874824e6c0a27cb96fc
+        command: [python, -u, /etc/probe/probe.py]
+        env:
+        - name: POD_NAMESPACE
+          valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+        - name: POD_NAME
+          valueFrom: {fieldRef: {fieldPath: metadata.name}}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 96Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: probe, mountPath: /etc/probe, readOnly: true}
+      volumes:
+      - name: probe
+        configMap: {name: k10s-telemetry-probe}
+YAML
+  "${KUBECTL[@]}" -n observability rollout status deployment/k10s-telemetry-probe --timeout=180s
 fi
 
 echo
