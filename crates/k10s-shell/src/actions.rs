@@ -32,6 +32,7 @@ actions!(
         OpenMesh,
         OpenTraces,
         OpenEcosystem,
+        SilenceSelection,
         NextFamily,
         PrevFamily,
         RevealHelm,

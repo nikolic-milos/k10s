@@ -12,12 +12,11 @@
 //! to the request being reviewed; a conflict or validation refusal carries
 //! what the server said.
 //!
-//! A cluster is chosen on screen now rather than on the command line, so the
-//! provider a view was built with is no longer the provider it must keep.
-//! [`ProviderSlot`] is the one place it lives: every view clones the slot, and
-//! adopting a connection re-points all of them at once. And because the connect
-//! itself happens off the UI thread, what crosses back is a [`Connection`] --
-//! `Send`, carrying only what may be shown, with the `Rc` built at the far end.
+//! [`ProviderSlot`] lets read views follow the selected cluster. A silence
+//! document retains the provider named in its review and is retired when the
+//! context changes. Connecting happens off the UI thread: a [`Connection`]
+//! crosses back as `Send`, carrying only what may be shown, with the `Rc` built
+//! at the far end.
 //! [`LaunchProvider`] is that seam: kubeconfig contexts, a connect, and the
 //! generated starmap, all answered the same way `ReadProvider` answers.
 
