@@ -553,3 +553,31 @@ fn an_alert_whose_rule_dropped_cluster_says_so_rather_than_borrowing_one() {
     let page = table_page(Some(&alerts)).expect("rows");
     assert_eq!(page.rows[0].cells[7], "alert has no cluster context");
 }
+
+#[test]
+fn a_full_pod_name_stays_exact_in_the_silence_and_its_readback() {
+    let pod = "p".repeat(MAX_MATCHER_BYTES);
+    let mut spec = spec();
+    spec.matchers = vec![Matcher {
+        name: "pod".into(),
+        value: pod.clone(),
+        is_regex: false,
+        is_equal: true,
+    }];
+    let body = silence_post_body(&spec).expect("a full pod name");
+    let value: Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(value["matchers"][0]["value"], pod);
+    assert_eq!(value["matchers"][0]["isRegex"], false);
+    let stored = parse_silences(
+        serde_json::json!([{"id":"silence-id", "matchers":value["matchers"]}])
+            .to_string()
+            .as_bytes(),
+    )
+    .expect("stored silence");
+    assert_eq!(stored.items[0].matchers, spec.matchers);
+    spec.matchers[0].value.push('p');
+    assert!(
+        silence_post_body(&spec).is_err(),
+        "values beyond the cap are refused, never shortened"
+    );
+}

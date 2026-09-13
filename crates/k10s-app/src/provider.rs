@@ -392,6 +392,46 @@ impl k10s_shell::ReadProvider for PlaneProvider {
         });
     }
 
+    fn fetch_alert_pod(
+        &self,
+        fingerprint: String,
+        reply: k10s_shell::Reply<k10s_shell::AlertPodOutcome>,
+    ) {
+        self.reader.fetch_alertmanager_alerts(move |answer| {
+            reply(alert_pod_outcome(&fingerprint, answer));
+        });
+    }
+
+    fn bind_alertmanager(&self, reply: k10s_shell::Reply<k10s_shell::AlertmanagerOutcome>) {
+        self.reader.bind_tool(
+            k10s_data::reach::ToolKind::Alertmanager,
+            k10s_data::reach::ReachSettings::default(),
+            move |answer| reply(alertmanager_outcome(answer)),
+        );
+    }
+
+    fn create_silence(
+        &self,
+        request: &k10s_shell::SilenceRequest,
+        confirm: bool,
+        reply: k10s_shell::Reply<k10s_shell::SilenceOutcome>,
+    ) {
+        let spec = match silence_spec(request) {
+            Ok(spec) => spec,
+            Err(why) => {
+                reply(k10s_shell::SilenceOutcome::Failed(why));
+                return;
+            }
+        };
+        let window = spec.starts_at.clone()..spec.ends_at.clone();
+        self.reader.create_silence(
+            alertmanager_bound(&request.endpoint),
+            spec,
+            confirm,
+            move |answer| reply(silence_outcome(answer, window)),
+        );
+    }
+
     fn reveal_helm(
         &self,
         namespace: Option<String>,
@@ -506,6 +546,112 @@ fn schema_text_outcome(fetched: Fetched<String>) -> k10s_shell::SchemaTextOutcom
         Fetched::Ok(text) => k10s_shell::SchemaTextOutcome::Text(text),
         Fetched::Denied { what } => k10s_shell::SchemaTextOutcome::Denied(what),
         Fetched::Failed { why, .. } => k10s_shell::SchemaTextOutcome::Failed(why),
+    }
+}
+
+fn alert_pod_outcome(
+    fingerprint: &str,
+    fetched: Fetched<Option<k10s_data::alertmanager::Alerts>>,
+) -> k10s_shell::AlertPodOutcome {
+    use k10s_shell::AlertPodOutcome;
+    match fetched {
+        Fetched::Ok(None) => AlertPodOutcome::Absent,
+        Fetched::Ok(Some(alerts)) => {
+            let Some(alert) = alerts
+                .items
+                .into_iter()
+                .find(|alert| alert.fingerprint == fingerprint)
+            else {
+                return AlertPodOutcome::Failed(
+                    "the selected alert is no longer in the listing; refresh the alerts"
+                        .to_string(),
+                );
+            };
+            if alert.namespace.is_empty() || alert.pod.is_empty() {
+                return AlertPodOutcome::Failed(
+                    "this alert needs both namespace and pod labels to locate an object"
+                        .to_string(),
+                );
+            }
+            AlertPodOutcome::Pod {
+                namespace: alert.namespace,
+                pod: alert.pod,
+            }
+        }
+        Fetched::Denied { what } => AlertPodOutcome::Denied(what),
+        Fetched::Failed { why, .. } => AlertPodOutcome::Failed(why),
+    }
+}
+
+fn alertmanager_outcome(answer: k10s_data::reach::ToolReach) -> k10s_shell::AlertmanagerOutcome {
+    use k10s_data::reach::{ToolReach, Transport};
+    use k10s_shell::{AlertmanagerEndpoint, AlertmanagerOutcome};
+    match answer {
+        ToolReach::Absent { .. } => AlertmanagerOutcome::Absent,
+        ToolReach::Unbound(unbound) => AlertmanagerOutcome::Failed(unbound.why),
+        ToolReach::Bound(bound) => match bound.transport {
+            Transport::Proxy { namespace, service, port } => {
+                AlertmanagerOutcome::Ready(AlertmanagerEndpoint { namespace, service, port })
+            }
+            Transport::NeedsForward { .. } => AlertmanagerOutcome::Failed(
+                "Alertmanager cannot be reached through the API-server proxy; silence writes need that route".to_string(),
+            ),
+            Transport::Url { .. } => AlertmanagerOutcome::Failed(
+                "Alertmanager silence writes are only implemented on the API-server proxy".to_string(),
+            ),
+        },
+    }
+}
+
+fn alertmanager_bound(endpoint: &k10s_shell::AlertmanagerEndpoint) -> k10s_data::reach::Bound {
+    use k10s_data::reach::{Bound, ToolAuth, ToolKind, Transport};
+    Bound {
+        kind: ToolKind::Alertmanager,
+        found: None,
+        transport: Transport::Proxy {
+            namespace: endpoint.namespace.clone(),
+            service: endpoint.service.clone(),
+            port: endpoint.port,
+        },
+        auth: ToolAuth::Anonymous,
+    }
+}
+
+fn silence_spec(
+    request: &k10s_shell::SilenceRequest,
+) -> Result<k10s_data::alertmanager::SilenceSpec, String> {
+    use k10s_data::alertmanager::{Matcher, SilenceSpec};
+    SilenceSpec::for_window(
+        request
+            .matchers
+            .iter()
+            .map(|matcher| Matcher {
+                name: matcher.name.clone(),
+                value: matcher.value.clone(),
+                is_regex: matcher.is_regex,
+                is_equal: matcher.is_equal,
+            })
+            .collect(),
+        request.window.clone(),
+        request.created_by.clone(),
+        request.comment.clone(),
+    )
+}
+
+fn silence_outcome(
+    answer: k10s_data::alertmanager::SilenceOutcome,
+    window: std::ops::Range<String>,
+) -> k10s_shell::SilenceOutcome {
+    use k10s_data::alertmanager::SilenceOutcome as Plane;
+    use k10s_shell::SilenceOutcome as Shell;
+    match answer {
+        Plane::Applied { id, .. } => Shell::Applied { id },
+        Plane::NeedsConfirm { .. } => Shell::NeedsConfirm {
+            starts_at: window.start,
+            ends_at: window.end,
+        },
+        Plane::Denied { what, why } => Shell::Denied { what, why },
+        Plane::Failed { why, .. } => Shell::Failed(why),
     }
 }
 

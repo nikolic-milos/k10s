@@ -358,3 +358,198 @@ fn a_named_token_never_rides_the_service_proxy() {
     );
     drop(runtime);
 }
+
+#[test]
+fn the_reader_posts_the_reviewed_pod_matchers_to_the_reviewed_endpoint() {
+    use k10s_data::alertmanager::Matcher;
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
+    script.route("POST", path, 200, CREATED_JSON);
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+    let reviewed = SilenceSpec {
+        matchers: vec![
+            Matcher {
+                name: "namespace".into(),
+                value: "prod-eu".into(),
+                is_regex: false,
+                is_equal: true,
+            },
+            Matcher {
+                name: "pod".into(),
+                value: "api.v2-7d4f".into(),
+                is_regex: false,
+                is_equal: true,
+            },
+        ],
+        starts_at: "2026-09-12T03:00:00Z".into(),
+        ends_at: "2026-09-12T04:00:00Z".into(),
+        created_by: "k10s".into(),
+        comment: "Investigating this pod.".into(),
+    };
+    let requests_before = script.seen().len();
+    for confirm in [false, true] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader.create_silence(
+            am_bound(ToolAuth::Anonymous, proxy()),
+            reviewed.clone(),
+            confirm,
+            move |answer| {
+                let _ = tx.send(answer);
+            },
+        );
+        let answer = wait(&rx);
+        if confirm {
+            assert!(
+                matches!(answer, SilenceOutcome::Applied { ref id, .. } if id == "silence-watchdog")
+            );
+        } else {
+            assert!(matches!(answer, SilenceOutcome::NeedsConfirm { .. }));
+            assert_eq!(
+                script.seen().len(),
+                requests_before,
+                "review neither writes nor rebinds"
+            );
+        }
+    }
+    let seen = script.seen();
+    let added = &seen[requests_before..];
+    assert_eq!(
+        added.len(),
+        1,
+        "confirmation does not discover a new destination"
+    );
+    assert_eq!(added[0].method, "POST");
+    assert_eq!(added[0].path, path);
+    assert_eq!(added[0].accept, "");
+    assert_eq!(added[0].content_type, "application/json");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&added[0].body).expect("JSON"),
+        serde_json::json!({
+            "matchers": [
+                {"name":"namespace", "value":"prod-eu", "isRegex":false, "isEqual":true},
+                {"name":"pod", "value":"api.v2-7d4f", "isRegex":false, "isEqual":true}
+            ],
+            "startsAt":"2026-09-12T03:00:00Z", "endsAt":"2026-09-12T04:00:00Z",
+            "createdBy":"k10s", "comment":"Investigating this pod."
+        })
+    );
+}
+
+#[test]
+fn a_create_response_without_a_silence_id_does_not_claim_success() {
+    for body in ["", "{}", r#"{"silenceID":""}"#] {
+        let script = Script::default();
+        let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
+        script.route("POST", path, 200, body);
+        let runtime = runtime();
+        let answer = runtime.block_on(async {
+            create_silence(
+                &script.client(),
+                &am_bound(ToolAuth::Anonymous, proxy()),
+                &spec(),
+                true,
+            )
+            .await
+        });
+        assert!(
+            matches!(answer, SilenceOutcome::Failed { ref why, .. } if why.contains("silenceID")),
+            "{answer:?}"
+        );
+        let hits = script.seen();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].method, "POST");
+        assert_eq!(hits[0].path, path);
+        assert_eq!(hits[0].accept, "");
+        assert_eq!(hits[0].content_type, "application/json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&hits[0].body).expect("JSON")["matchers"][0]
+                ["value"],
+            "Watchdog"
+        );
+    }
+}
+
+#[test]
+fn the_alerts_read_preserves_the_namespace_and_full_pod_name_for_a_join() {
+    let script = Script::default();
+    let pod = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    assert_eq!(pod.len(), 253);
+    let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/alerts";
+    script.route("GET", path, 200, serde_json::json!([{
+        "fingerprint":"chosen", "labels":{"namespace":"prod", "pod":pod}, "status":{"state":"active"}
+    }]).to_string());
+    let runtime = runtime();
+    let answer = runtime.block_on(async {
+        fetch_alerts(&script.client(), &am_bound(ToolAuth::Anonymous, proxy())).await
+    });
+    let Fetched::Ok(alerts) = answer else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(alerts.items[0].namespace, "prod");
+    assert_eq!(alerts.items[0].pod, pod);
+    let hits = script.seen();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].method, "GET");
+    assert_eq!(hits[0].path, path);
+    assert_eq!(hits[0].accept, "");
+    assert_eq!(hits[0].body, "");
+}
+
+#[test]
+fn silence_write_denial_and_failure_keep_their_label_and_server_sentence() {
+    for (code, reason, sentence) in [
+        (403, "Forbidden", "creating silences is forbidden"),
+        (500, "InternalError", "silence store is read-only"),
+    ] {
+        let script = Script::default();
+        let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
+        script.route("POST", path, code, serde_json::json!({
+            "apiVersion":"v1", "kind":"Status", "status":"Failure", "code":code, "reason":reason, "message":sentence
+        }).to_string());
+        let runtime = runtime();
+        let answer = runtime.block_on(async {
+            create_silence(
+                &script.client(),
+                &am_bound(ToolAuth::Anonymous, proxy()),
+                &spec(),
+                true,
+            )
+            .await
+        });
+        if code == 403 {
+            assert_eq!(
+                answer,
+                SilenceOutcome::Denied {
+                    what: "alertmanager",
+                    why: "access denied for this account".into()
+                }
+            );
+        } else {
+            assert!(
+                matches!(answer, SilenceOutcome::Failed { ref why, .. } if why.contains(sentence)),
+                "{answer:?}"
+            );
+        }
+        let hits = script.seen();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].method, "POST");
+        assert_eq!(hits[0].path, path);
+        assert_eq!(hits[0].accept, "");
+        assert_eq!(hits[0].content_type, "application/json");
+        assert_eq!(
+            hits[0].body,
+            r#"{"matchers":[{"name":"alertname","value":"Watchdog","isRegex":false,"isEqual":true}],"startsAt":"2024-01-01T00:00:00Z","endsAt":"2024-01-02T00:00:00Z","createdBy":"k10s","comment":"quiet"}"#
+        );
+    }
+}
