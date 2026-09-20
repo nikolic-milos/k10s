@@ -677,10 +677,11 @@ fn a_kind_with_a_status_subresource_applies_without_its_status() {
         panic!("the server accepts a Deployment applied without status: {outcome:?}");
     };
     assert!(applied.dry_run);
-    assert!(
-        applied.yaml.contains("image: nginx:1.27"),
-        "and the spec survives:\n{}",
-        applied.yaml
+    let returned = payload(&applied.yaml, live.status_subresource);
+    assert_eq!(
+        sent(&returned),
+        sent(&built),
+        "the server preserves the submitted intent after removing its bookkeeping and status"
     );
 }
 
