@@ -306,7 +306,7 @@ fn a_dry_run_apply_sends_the_buffer_verbatim_and_answers_with_what_would_be_stor
     drop(runtime);
 }
 #[test]
-fn a_conflict_names_every_field_and_its_manager_and_only_forcing_asks_for_them() {
+fn a_conflict_names_fields_before_a_forced_preview_and_real_apply() {
     use k10s_data::apply::ApplyOutcome;
 
     let script = Script::default();
@@ -314,9 +314,7 @@ fn a_conflict_names_every_field_and_its_manager_and_only_forcing_asks_for_them()
     script_rules_review(&script);
     script_access_reviews(&script, true, 32);
     script_lists(&script);
-    // Routes are single-shot in registration order, so the first apply
-    // conflicts and the forced one succeeds -- the sequence a person walks
-    // through.
+    // The first dry run conflicts. A forced preview precedes the real write.
     script.route(
         "PATCH",
         "/api/v1/namespaces/prod/pods/api-1?",
@@ -327,12 +325,14 @@ fn a_conflict_names_every_field_and_its_manager_and_only_forcing_asks_for_them()
               "message":"conflict with \"kubectl\" using v1",
               "field":".spec.containers[name=\"app\"].image"}]}}"#,
     );
-    script.route(
-        "PATCH",
-        "/api/v1/namespaces/prod/pods/api-1?",
-        200,
-        pod_json("api-1", "uid-pod-1", false),
-    );
+    for _ in 0..2 {
+        script.route(
+            "PATCH",
+            "/api/v1/namespaces/prod/pods/api-1?",
+            200,
+            pod_json("api-1", "uid-pod-1", false),
+        );
+    }
 
     let runtime = runtime();
     let (sync, _live) = sync_on(&runtime, &script);
@@ -340,7 +340,7 @@ fn a_conflict_names_every_field_and_its_manager_and_only_forcing_asks_for_them()
     let sent = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: api-1\n";
     let (tx, rx) = std::sync::mpsc::channel();
     sync.reader
-        .apply(apply_request(sent, false, false), move |outcome| {
+        .apply(apply_request(sent, true, false), move |outcome| {
             let _ = tx.send(outcome);
         });
     let ApplyOutcome::Conflict {
@@ -357,29 +357,32 @@ fn a_conflict_names_every_field_and_its_manager_and_only_forcing_asks_for_them()
     assert_eq!(causes[0].field, ".spec.containers[name=\"app\"].image");
     assert_eq!(causes[0].manager, "kubectl");
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader
-        .apply(apply_request(sent, false, true), move |outcome| {
-            let _ = tx.send(outcome);
-        });
-    assert!(
-        matches!(wait(&rx), ApplyOutcome::Applied(applied) if !applied.dry_run),
-        "forcing takes the fields and stores the object"
-    );
+    for dry_run in [true, false] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader
+            .apply(apply_request(sent, dry_run, true), move |outcome| {
+                let _ = tx.send(outcome);
+            });
+        assert!(matches!(wait(&rx), ApplyOutcome::Applied(applied) if applied.dry_run == dry_run));
+    }
 
     let writes = script.requests_for("/pods/api-1?");
-    assert_eq!(writes.len(), 2);
-    assert!(!writes[0].path.contains("force"));
-    assert!(
-        writes[1].path.contains("force=true"),
-        "only the second one forces: {}",
-        writes[1].path
-    );
-    assert!(
-        !writes[1].path.contains("dryRun"),
-        "and it is not a dry run: {}",
-        writes[1].path
-    );
+    assert_eq!(writes.len(), 3);
+    let queries = [
+        "dryRun=All&fieldManager=k10s&fieldValidation=Strict",
+        "dryRun=All&force=true&fieldManager=k10s&fieldValidation=Strict",
+        "force=true&fieldManager=k10s&fieldValidation=Strict",
+    ];
+    for (write, query) in writes.iter().zip(queries) {
+        assert_eq!(write.method, "PATCH");
+        assert_eq!(
+            write.path,
+            format!("/api/v1/namespaces/prod/pods/api-1?&{query}")
+        );
+        assert_eq!(write.accept, "application/json");
+        assert_eq!(write.content_type, "application/apply-patch+yaml");
+        assert_eq!(write.body, sent);
+    }
 
     drop(runtime);
 }

@@ -1,11 +1,11 @@
 //! Every precondition a press has to clear, in one place.
 //!
-//! Applying is a second deliberate press and forcing is a third: the gate arms
-//! under the *name* of the thing being asked, so a press meant for one question
-//! never answers the other, and any recompute disarms because what was being
-//! confirmed is no longer what is on screen.
+//! Every write needs a server preview and two deliberate presses. After a
+//! conflict, force first asks for a forced dry run; that preview takes no fields
+//! and arms no write. The gate arms under the name of the question, so a press
+//! meant for one question never answers the other, and any recompute disarms.
 //!
-//! [`refuse`] is one pure function and none of these checks is anywhere else.
+//! [`prepare`] is one pure function and none of these checks is anywhere else.
 //! That is not tidiness. The two preconditions that ever failed were the two
 //! that lived somewhere else: the force check sat inside a key handler, so it
 //! guarded one way in while the palette went round it. A precondition reachable
@@ -32,6 +32,20 @@ pub(crate) enum Armed {
 pub(crate) enum Step {
     Ask,
     Go,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Preparation {
+    PreviewForce,
+    Confirm,
+}
+
+/// A server answer belongs to both the buffer and the ownership policy sent.
+/// A successful ordinary dry run cannot authorise taking someone else's fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Review {
+    pub(crate) stamp: BufferStamp,
+    pub(crate) force: bool,
 }
 
 /// Which request owns the wire. A bare flag was not enough: the clear lived
@@ -99,7 +113,7 @@ impl Flight {
 }
 
 /// Everything a press has to be true about before a write leaves this view,
-/// gathered so that [`refuse`] can be a pure function over it.
+/// gathered so that [`prepare`] can be a pure function over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Ready<'a> {
     /// Discovery says the server takes a patch for this kind at all.
@@ -112,8 +126,8 @@ pub(crate) struct Ready<'a> {
     pub(crate) reviewed: BufferStamp,
     /// The editor's buffer now, or None when the editor is gone.
     pub(crate) editor: Option<BufferStamp>,
-    /// The buffer the server has answered a dry run for.
-    pub(crate) dry_run: Option<BufferStamp>,
+    /// The buffer and ownership policy the server has answered a dry run for.
+    pub(crate) dry_run: Option<Review>,
     /// How many fields a conflict named, which is the only thing a force may
     /// take.
     pub(crate) conflicts: usize,
@@ -121,7 +135,7 @@ pub(crate) struct Ready<'a> {
     pub(crate) in_flight: Option<&'static str>,
 }
 
-/// Why this press must not become a request, or None when it may. Every rule
+/// Whether this press may confirm a write or must preview a force first. Every rule
 /// that guards the wire is here and nowhere else: the two that were not here
 /// were the two that let a write through -- a force whose precondition lived in
 /// a key handler, and a comparison the diff had refused to make.
@@ -129,51 +143,60 @@ pub(crate) struct Ready<'a> {
 /// The sentences say what the press did, not what the status line already says
 /// standing beside them: a refusal's own reason is the summary, and a blocked
 /// payload's reasons are their own piece of that line.
-pub(crate) fn refuse(wanted: Armed, at: Ready<'_>) -> Option<String> {
+pub(crate) fn prepare(wanted: Armed, at: Ready<'_>) -> Result<Preparation, String> {
     if !at.patchable {
-        return Some("the server serves this kind without a patch verb".to_string());
+        return Err("the server serves this kind without a patch verb".to_string());
     }
     // The reasons themselves are already on the status line, standing rather
     // than one-shot, so this says what the press did and not what the line
     // beside it says.
     if !at.blocked.is_empty() {
-        return Some("this document cannot be applied, so nothing was sent".to_string());
+        return Err("this document cannot be applied, so nothing was sent".to_string());
     }
     // A refusal is not agreement. Zero rows and zero counts mean the comparison
     // never happened, and applying what nobody compared is the thing the whole
     // view exists to prevent. The refusal's own sentence is the summary.
     if matches!(at.verdict, Verdict::Refused(_)) {
-        return Some("nothing here has been reviewed, so there is nothing to apply".to_string());
+        return Err("nothing here has been reviewed, so there is nothing to apply".to_string());
     }
     match at.editor {
         None => {
-            return Some("the editor this diff came from is gone; nothing to apply".to_string());
+            return Err("the editor this diff came from is gone; nothing to apply".to_string());
         }
         // The diff *is* the review. If the buffer moved since it was made, what
         // is on screen is not what would be sent, and the only honest answer is
         // to say so and re-compare -- never to send text nobody looked at.
         Some(stamp) if stamp != at.reviewed => {
-            return Some(
+            return Err(
                 "the buffer changed after this comparison; r compares it again".to_string(),
             );
         }
         Some(_) => {}
     }
+    if wanted == Armed::Force && at.conflicts == 0 {
+        return Err("nothing is owned elsewhere, so there is nothing to force".to_string());
+    }
+    if let Some(holder) = at.in_flight {
+        return Err(format!("{holder} is already in flight"));
+    }
+    if wanted == Armed::Force
+        && at.dry_run
+            != Some(Review {
+                stamp: at.reviewed,
+                force: true,
+            })
+    {
+        return Ok(Preparation::PreviewForce);
+    }
     // And the dry run *is* the diff's right-hand side. Opening the view against
     // live alone reaches a write whose payload the server never saw, defaulting
     // and admission included, which is a review of a guess.
-    if at.dry_run != Some(at.reviewed) {
-        return Some(
+    if !at.dry_run.is_some_and(|review| review.stamp == at.reviewed) {
+        return Err(
             "the server has not been asked what this would store; ctrl-alt-r asks it".to_string(),
         );
     }
-    if wanted == Armed::Force && at.conflicts == 0 {
-        return Some("nothing is owned elsewhere, so there is nothing to force".to_string());
-    }
-    if let Some(holder) = at.in_flight {
-        return Some(format!("{holder} is already in flight"));
-    }
-    None
+    Ok(Preparation::Confirm)
 }
 
 /// What a press that edits the buffer -- rather than the cluster -- has to be
@@ -194,7 +217,7 @@ pub(crate) struct Keepable {
 
 /// Why this hunk cannot be taken into the buffer, or None when it can.
 ///
-/// Kept apart from [`refuse`] because nothing here reaches the cluster and none
+/// Kept apart from [`prepare`] because nothing here reaches the cluster and none
 /// of that function's rules apply: an unpatchable kind, a blocked payload and a
 /// missing dry run all say nothing about whether a person may edit their own
 /// text. What is shared is the rule that a review is of one buffer -- ranges
@@ -289,6 +312,7 @@ pub(crate) struct Sent {
     pub(crate) generation: u64,
     pub(crate) stamp: BufferStamp,
     pub(crate) dry_run: bool,
+    pub(crate) force: bool,
     // What the prune did to the bytes that went out, worded for after the fact.
     pub(crate) note: String,
     // Which object the live document was read from *when this went out*. A real
@@ -372,8 +396,11 @@ pub(crate) fn stale_object_note() -> &'static str {
 /// because a comparison nobody could make is not a comparison that found
 /// nothing, and reading it as one told the user that applying a document the
 /// diff had refused to review would change nothing.
-pub(crate) fn reviewed(verdict: Verdict) -> Result<&'static str, String> {
+pub(crate) fn reviewed(verdict: Verdict, force: bool) -> Result<&'static str, String> {
     match verdict {
+        Verdict::Differs | Verdict::Agreed if force => {
+            Ok("forced dry run only; ctrl-shift-s asks to take the conflicting fields")
+        }
         Verdict::Differs => Ok("ctrl-s applies this"),
         Verdict::Agreed => Ok("the cluster already holds this; applying changes nothing"),
         Verdict::Refused(reason) => Err(format!("the server answered, but {reason}")),

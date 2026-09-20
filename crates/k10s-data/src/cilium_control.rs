@@ -1269,9 +1269,15 @@ pub fn table_page(inventory: &Inventory) -> Option<TablePage> {
             KindSet::Served {
                 items,
                 truncated: cap,
-                ..
+                unreadable,
             } => {
                 truncated |= *cap;
+                rows.extend(crate::browse::unreadable_row(
+                    kind.as_str(),
+                    *unreadable,
+                    4,
+                    3,
+                ));
                 for item in items {
                     let uid = if item.uid.is_empty() {
                         format!("{}/{}/{}", item.kind.as_str(), item.namespace, item.name)

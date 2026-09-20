@@ -39,6 +39,14 @@ impl TableState {
         }
     }
 
+    /// Navigation starts a new selection without receiving a new layout measurement.
+    pub fn reset(&mut self) {
+        *self = Self {
+            viewport: self.viewport,
+            ..Self::default()
+        };
+    }
+
     pub fn set_page(&mut self, page: TablePage) {
         let keep = self.selected_row().map(|row| row.uid.clone());
         self.page = page;
@@ -323,6 +331,69 @@ mod tests {
                 .collect(),
             truncated: token.is_some(),
             continue_token: token.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn navigation_reuses_the_measured_viewport_in_both_directions() {
+        let mut table = TableState::new();
+        table.set_viewport(6);
+        table.set_page(numbered_page(0..30, None));
+
+        for first in [100, 0] {
+            table.select_last();
+            table.reset();
+            table.set_page(numbered_page(first..first + 30, None));
+            assert_eq!(table.visible_rows(), 30);
+            assert_eq!(
+                table.visible_lines().len(),
+                6,
+                "navigation did not resize the window"
+            );
+            assert_eq!(table.selected_row().unwrap().uid, format!("u{first}"));
+            assert!(
+                table.visible_lines()[0].0,
+                "the new page starts at its first row"
+            );
+
+            table.page_by(1);
+            assert_eq!(table.selected_row().unwrap().uid, format!("u{}", first + 5));
+            assert_eq!(table.visible_lines().len(), 6);
+        }
+
+        table.set_viewport(3);
+        assert_eq!(
+            table.visible_lines().len(),
+            3,
+            "a later resize still takes effect"
+        );
+    }
+
+    #[test]
+    fn navigation_discards_the_previous_filter_selection_and_paging_state() {
+        for count in [30, MAX_ROWS + 1] {
+            let mut table = TableState::new();
+            table.set_viewport(4);
+            table.set_page(numbered_page(0..count, Some("next-page")));
+            table.push_filter("row");
+            table.select_last();
+            assert!(table.truncated());
+            assert_eq!(table.capped(), count > MAX_ROWS);
+
+            table.reset();
+            assert_eq!(table.total_rows(), 0);
+            assert!(table.visible_lines().is_empty());
+            assert!(table.header_line().is_empty());
+            assert!(table.filter.is_empty());
+            assert!(table.selected_row().is_none());
+            assert_eq!(table.continue_token(), None);
+            assert!(!table.truncated());
+            assert!(!table.capped());
+
+            table.set_page(page(&[("new", &["another kind", "Ready"])]));
+            assert_eq!(table.visible_rows(), 1);
+            assert_eq!(table.visible_lines().len(), 1);
+            assert_eq!(table.selected_row().unwrap().uid, "new");
         }
     }
 

@@ -6,8 +6,9 @@
 //! last) with `managedFields` dropped and hard caps on line count, line
 //! length, and depth -- a describe document is bounded by construction, like
 //! every other buffer in the repo. A Secret is fetched as
-//! `PartialObjectMetadata`, so its values never enter the process, and the
-//! document says so instead of showing an absence. Owners are walked upward
+//! `PartialObjectMetadata`, excluding its data and stringData fields. The
+//! declared copy in its last-applied annotation is removed before rendering,
+//! and the document labels the omission. Owners are walked upward
 //! through `ownerReferences` (metadata-only fetches, cycle-guarded); a denial
 //! anywhere degrades into a labelled line, never a lost document.
 
@@ -52,7 +53,7 @@ pub(crate) async fn fetch_describe(
         };
     };
 
-    let object =
+    let mut object =
         match fetch_object(client, target, request.namespace.as_deref(), &request.name).await {
             Ok(value) => value,
             Err(error) => return classify("describe", &error),
@@ -60,6 +61,7 @@ pub(crate) async fn fetch_describe(
 
     let mut doc = Doc::new();
     if is_secret(target) {
+        crate::manifest::strip_bookkeeping(&mut object);
         doc.push(0, "# values withheld: k10s reads Secret metadata only");
     }
     render_object(&object, &mut doc);

@@ -72,6 +72,8 @@ mod rbac;
 mod reach;
 #[path = "scripted_apiserver/schema.rs"]
 mod schema;
+#[path = "scripted_apiserver/secrets.rs"]
+mod secrets;
 #[path = "scripted_apiserver/tables.rs"]
 mod tables;
 #[path = "scripted_apiserver/tetragon.rs"]
@@ -351,6 +353,13 @@ fn api_status_subresource(kind: &str, plural: &str, namespaced: bool) -> String 
     )
 }
 fn script_discovery(script: &Script) {
+    script_discovery_with_secret(
+        script,
+        api_resource_without_patch("Secret", "secrets", true),
+    );
+}
+
+fn script_discovery_with_secret(script: &Script, secret: String) {
     script.route_accepting("GET", "/apis", "APIGroupDiscoveryList", 406, "{}");
     script.route_accepting("GET", "/api", "APIGroupDiscoveryList", 406, "{}");
 
@@ -403,10 +412,7 @@ fn script_discovery(script: &Script) {
             api_status_subresource("Pod", "pods", true),
             api_resource("Service", "services", true),
             api_resource("ConfigMap", "configmaps", true),
-            // A ConfigMap has no status subresource and a Secret is the kind
-            // this server serves without a patch verb, which is what lets one
-            // discovery fixture prove both refusals.
-            api_resource_without_patch("Secret", "secrets", true),
+            secret,
             api_resource("PersistentVolumeClaim", "persistentvolumeclaims", true),
         ),
     );

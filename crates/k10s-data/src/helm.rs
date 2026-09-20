@@ -445,10 +445,9 @@ pub fn table_page(releases: &Releases) -> TablePage {
             wide: false,
         })
         .collect();
-    let rows = releases
-        .releases
-        .iter()
-        .filter_map(|release| {
+    let rows = crate::browse::unreadable_row("Helm release Secret", releases.unreadable, 5, 3)
+        .into_iter()
+        .chain(releases.releases.iter().filter_map(|release| {
             let latest = release.latest()?;
             let revision = release.current().unwrap_or(latest);
             Some(TableRow {
@@ -463,7 +462,7 @@ pub fn table_page(releases: &Releases) -> TablePage {
                 namespace: Some(release.namespace.clone()),
                 uid: format!("{}/{}", release.namespace, release.name),
             })
-        })
+        }))
         .collect();
     TablePage {
         columns,

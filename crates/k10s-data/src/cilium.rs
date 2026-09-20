@@ -993,7 +993,15 @@ pub fn table_page(inventory: &Inventory) -> Option<TablePage> {
                     uid: format!("denied:{}", kind.as_str()),
                 });
             }
-            KindSet::Served { items, .. } => {
+            KindSet::Served {
+                items, unreadable, ..
+            } => {
+                rows.extend(crate::browse::unreadable_row(
+                    kind.as_str(),
+                    *unreadable,
+                    6,
+                    5,
+                ));
                 for item in items {
                     let uid = if item.uid.is_empty() {
                         format!("{}/{}/{}", item.kind.as_str(), item.namespace, item.name)

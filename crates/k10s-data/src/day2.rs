@@ -346,7 +346,7 @@ pub async fn delete(client: &Client, target: &KindTarget, request: &DeleteReques
         Some(secs) => DeleteParams::default().grace_period(secs),
         None => DeleteParams::default(),
     };
-    let built = match Request::new(path).delete(&request.name, &params) {
+    let mut built = match Request::new(path).delete(&request.name, &params) {
         Ok(built) => built,
         Err(error) => {
             return Day2Outcome::Failed {
@@ -354,6 +354,16 @@ pub async fn delete(client: &Client, target: &KindTarget, request: &DeleteReques
             };
         }
     };
+    if crate::describe::is_secret(target) {
+        // A finalizer can make DELETE return the object itself. Never accept
+        // the full Secret as a fallback to its metadata representation.
+        built.headers_mut().insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static(
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+            ),
+        );
+    }
     if let Err(outcome) = send(client, built, "delete").await {
         return outcome;
     }

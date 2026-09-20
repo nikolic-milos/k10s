@@ -49,6 +49,31 @@ pub struct TablePage {
     pub continue_token: Option<String>,
 }
 
+/// Decode failures belong in the table the provider actually delivers. The
+/// synthetic identity keeps a notice distinct from every stored object's row.
+pub(crate) fn unreadable_row(
+    kind: &str,
+    count: usize,
+    columns: usize,
+    detail: usize,
+) -> Option<TableRow> {
+    if count == 0 {
+        return None;
+    }
+    let mut cells = vec![String::new(); columns];
+    cells[0] = kind.to_string();
+    cells[detail] = format!(
+        "{count} {} could not be decoded",
+        if count == 1 { "object" } else { "objects" }
+    );
+    Some(TableRow {
+        cells,
+        name: kind.to_string(),
+        namespace: None,
+        uid: format!("unreadable:{kind}"),
+    })
+}
+
 #[derive(Deserialize)]
 struct WireTable {
     #[serde(default)]
