@@ -257,9 +257,10 @@ fn a_cluster_serving_neither_source_says_absent_once_and_is_not_retried() {
     let UsageOutcome::Absent { why } = &outcome else {
         panic!("neither source is served, which is absence: {outcome:?}");
     };
-    assert!(
-        why.contains("metrics-server is not installed") && why.contains("kubelet"),
-        "the reason names both consulted sources: {why}"
+    assert_eq!(
+        why,
+        "neither the pod metrics API nor the kubelet provided resource metrics; usage is hidden",
+        "missing responses do not establish whether metrics-server is installed"
     );
 
     // The poll is over: ticks at 50ms would have asked again many times over
@@ -431,7 +432,7 @@ fn a_kubelet_that_never_answers_is_a_failure_naming_the_deadline() {
     script_access_reviews(&script, true, 32);
     script_lists(&script);
     script.route("GET", "/api/v1/namespaces/prod/pods/api-1", 200, POD_JSON);
-    // metrics.k8s.io stays unscripted (404, not installed); the kubelet holds
+    // metrics.k8s.io stays unscripted (404, not served); the kubelet holds
     // its connection open instead of answering.
     script.route_hanging("GET", "/api/v1/nodes/n1/proxy/metrics/resource");
 

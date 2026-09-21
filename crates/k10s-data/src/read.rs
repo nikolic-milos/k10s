@@ -467,6 +467,21 @@ impl Reader {
         });
     }
 
+    /// Write to the Alertmanager endpoint that was reviewed. A new discovery
+    /// here could redirect the confirmation to a different service.
+    pub fn create_silence(
+        &self,
+        bound: reach::Bound,
+        spec: alertmanager::SilenceSpec,
+        confirm: bool,
+        reply: impl FnOnce(alertmanager::SilenceOutcome) + Send + 'static,
+    ) {
+        let client = self.client.clone();
+        self.handle.spawn(async move {
+            reply(alertmanager::create_silence(&client, &bound, &spec, confirm).await);
+        });
+    }
+
     /// Every ecosystem family, fetched concurrently and reduced to its own
     /// table. A family whose answer is [`Fetched::Ok`]`(None)` is not on
     /// this cluster and stays hidden; Denied and Failed stay labelled per

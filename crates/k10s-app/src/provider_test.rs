@@ -779,3 +779,122 @@ fn a_denied_mesh_group_stays_visible_next_to_the_one_that_answered() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn an_alert_join_uses_the_chosen_fingerprint_and_keeps_both_labels() {
+    let alerts = k10s_data::alertmanager::parse_alerts(
+        br#"[
+        {"fingerprint":"other", "labels":{"namespace":"wrong", "pod":"same-name"}},
+        {"fingerprint":"chosen", "labels":{"namespace":"prod", "pod":"same-name"}}
+    ]"#,
+    )
+    .expect("alerts");
+    assert_eq!(
+        alert_pod_outcome("chosen", Fetched::Ok(Some(alerts))),
+        k10s_shell::AlertPodOutcome::Pod {
+            namespace: "prod".into(),
+            pod: "same-name".into()
+        }
+    );
+    assert_eq!(
+        alert_pod_outcome("chosen", Fetched::Ok(None)),
+        k10s_shell::AlertPodOutcome::Absent
+    );
+    assert_eq!(
+        alert_pod_outcome(
+            "chosen",
+            Fetched::Denied {
+                what: "alertmanager"
+            }
+        ),
+        k10s_shell::AlertPodOutcome::Denied("alertmanager")
+    );
+    assert_eq!(
+        alert_pod_outcome(
+            "chosen",
+            Fetched::Failed {
+                what: "alertmanager",
+                why: "backend unavailable".into()
+            }
+        ),
+        k10s_shell::AlertPodOutcome::Failed("backend unavailable".into())
+    );
+    for labels in [
+        serde_json::json!({"namespace":"prod"}),
+        serde_json::json!({"pod":"same-name"}),
+        serde_json::json!({}),
+    ] {
+        let alerts = k10s_data::alertmanager::parse_alerts(
+            serde_json::json!([{"fingerprint":"chosen", "labels":labels}])
+                .to_string()
+                .as_bytes(),
+        )
+        .expect("alert");
+        assert!(
+            matches!(alert_pod_outcome("chosen", Fetched::Ok(Some(alerts))), k10s_shell::AlertPodOutcome::Failed(why) if why.contains("both namespace and pod"))
+        );
+    }
+    assert!(
+        matches!(alert_pod_outcome("gone", Fetched::Ok(Some(Default::default()))), k10s_shell::AlertPodOutcome::Failed(why) if why.contains("no longer"))
+    );
+}
+
+#[test]
+fn the_silence_adapter_preserves_matchers_interval_and_destination() {
+    use k10s_shell::{AlertMatcher, AlertmanagerEndpoint, SilenceRequest};
+    let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_789_182_000);
+    let request = SilenceRequest {
+        endpoint: AlertmanagerEndpoint {
+            namespace: "monitoring".into(),
+            service: "reviewed".into(),
+            port: 9093,
+        },
+        matchers: vec![
+            AlertMatcher {
+                name: "namespace".into(),
+                value: "prod".into(),
+                is_regex: false,
+                is_equal: true,
+            },
+            AlertMatcher {
+                name: "pod".into(),
+                value: "api.v2-7d4f".into(),
+                is_regex: false,
+                is_equal: true,
+            },
+        ],
+        window: start..start + std::time::Duration::from_secs(3600),
+        created_by: "k10s".into(),
+        comment: "Investigating this pod.".into(),
+    };
+    let spec = silence_spec(&request).expect("a valid interval");
+    assert_eq!(
+        spec.matchers,
+        vec![
+            k10s_data::alertmanager::Matcher {
+                name: "namespace".into(),
+                value: "prod".into(),
+                is_regex: false,
+                is_equal: true
+            },
+            k10s_data::alertmanager::Matcher {
+                name: "pod".into(),
+                value: "api.v2-7d4f".into(),
+                is_regex: false,
+                is_equal: true
+            },
+        ]
+    );
+    assert_eq!(spec.starts_at, "2026-09-12T03:00:00Z");
+    assert_eq!(spec.ends_at, "2026-09-12T04:00:00Z");
+    assert_eq!(spec.created_by, request.created_by);
+    assert_eq!(spec.comment, request.comment);
+    assert_eq!(
+        alertmanager_bound(&request.endpoint).transport,
+        k10s_data::reach::Transport::Proxy {
+            namespace: "monitoring".into(),
+            service: "reviewed".into(),
+            port: 9093,
+        }
+    );
+}

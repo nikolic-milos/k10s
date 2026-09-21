@@ -1108,7 +1108,7 @@ pub(crate) fn usage_lines(sample: &UsageSample) -> Vec<String> {
         lines.push(coverage);
     }
     if sample.source == UsageSource::Kubelet {
-        lines.push("via the kubelet; metrics-server is not installed".to_string());
+        lines.push("via the kubelet; pod metrics are unavailable from the metrics API".to_string());
     }
     lines
 }

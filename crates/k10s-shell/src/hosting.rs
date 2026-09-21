@@ -426,6 +426,9 @@ impl Workspace {
             view,
             window,
             |this, _, event: &InventoryEvent, window, cx| match event {
+                InventoryEvent::RevealPod { namespace, pod } => {
+                    this.reveal_alert_pod(namespace, pod, window, cx);
+                }
                 InventoryEvent::NotServed { tag, what } => {
                     this.close_tagged(tag, window, cx);
                     this.status_note = Some(format!("{what} is not served by this cluster"));
@@ -517,7 +520,7 @@ impl Workspace {
         });
     }
 
-    fn subscribe_absence<V: EventEmitter<InventoryEvent>>(
+    fn subscribe_inventory_events<V: EventEmitter<InventoryEvent>>(
         &mut self,
         view: &Entity<V>,
         window: &mut Window,
@@ -526,14 +529,104 @@ impl Workspace {
         cx.subscribe_in(
             view,
             window,
-            |this, _, event: &InventoryEvent, window, cx| {
-                if let InventoryEvent::NotServed { tag, what } = event {
+            |this, _, event: &InventoryEvent, window, cx| match event {
+                InventoryEvent::NotServed { tag, what } => {
                     this.close_tagged(tag, window, cx);
                     this.status_note = Some(format!("{what} is not served by this cluster"));
                     cx.notify();
                 }
+                InventoryEvent::RevealPod { namespace, pod } => {
+                    this.reveal_alert_pod(namespace, pod, window, cx)
+                }
+                _ => {}
             },
         )
+    }
+
+    fn reveal_alert_pod(
+        &mut self,
+        namespace: &str,
+        pod: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.map.read(cx).snapshot();
+        let found = crate::alerts::pod_uid(&snapshot, namespace, pod)
+            .is_some_and(|uid| self.map.update(cx, |map, cx| map.reveal(&uid, window, cx)));
+        if found {
+            self.activate_center(0, window, cx);
+            self.status_note = None;
+        } else {
+            self.status_note = Some(format!(
+                "the alert names {namespace}/{pod}, which is not on this cluster's map"
+            ));
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_silence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection.as_ref() else {
+            self.status_note = Some("pick a namespace or pod to silence its alerts".to_string());
+            cx.notify();
+            return;
+        };
+        let matchers = match crate::alerts::matchers(selection) {
+            Ok(matchers) => matchers,
+            Err(why) => {
+                self.status_note = Some(why);
+                cx.notify();
+                return;
+            }
+        };
+        let tag = ItemTag::Silence(selection.uid.to_string());
+        // Pin the provider as well as the endpoint. A context swap must never
+        // redirect a reviewed write through the shared slot.
+        let provider = self.slot.get();
+        let context = self.context.clone();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        provider.bind_alertmanager(Box::new(move |outcome| {
+            let _ = tx.send(outcome);
+        }));
+        self.status_note = Some("looking for Alertmanager...".to_string());
+        cx.notify();
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                let outcome = rx.await.unwrap_or_else(|_| {
+                    crate::provider::AlertmanagerOutcome::Failed(
+                        "the Alertmanager lookup was dropped".to_string(),
+                    )
+                });
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if !std::rc::Rc::ptr_eq(&provider, &this.slot.get()) {
+                        return;
+                    }
+                    match outcome {
+                        crate::provider::AlertmanagerOutcome::Ready(endpoint) => {
+                            this.status_note = None;
+                            this.open_item(tag, Place::Center, window, cx, |_, _, cx| {
+                                (
+                                    cx.new(|cx| {
+                                        crate::alerts::SilenceView::new(
+                                            provider, context, endpoint, matchers, cx,
+                                        )
+                                    }),
+                                    None,
+                                )
+                            });
+                        }
+                        crate::provider::AlertmanagerOutcome::Absent => {
+                            this.status_note =
+                                Some("Alertmanager is not served by this cluster".to_string())
+                        }
+                        crate::provider::AlertmanagerOutcome::Failed(why) => {
+                            this.status_note = Some(why)
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
     }
 
     pub(crate) fn open_observe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -546,7 +639,7 @@ impl Workspace {
                 let provider = this.provider();
                 let selection = this.selection.clone();
                 let view = cx.new(|cx| ObserveView::new(provider, selection.as_ref(), cx));
-                let subscription = this.subscribe_absence(&view, window, cx);
+                let subscription = this.subscribe_inventory_events(&view, window, cx);
                 (view, Some(subscription))
             },
         );
@@ -561,7 +654,7 @@ impl Workspace {
             |this, window, cx| {
                 let provider = this.provider();
                 let view = cx.new(|cx| EcosystemView::new(provider, cx));
-                let subscription = this.subscribe_absence(&view, window, cx);
+                let subscription = this.subscribe_inventory_events(&view, window, cx);
                 (view, Some(subscription))
             },
         );
@@ -633,7 +726,7 @@ impl Workspace {
             |this, window, cx| {
                 let provider = this.provider();
                 let view = cx.new(|cx| TracesView::new(provider, cx));
-                let subscription = this.subscribe_absence(&view, window, cx);
+                let subscription = this.subscribe_inventory_events(&view, window, cx);
                 (view, Some(subscription))
             },
         );

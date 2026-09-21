@@ -1,6 +1,6 @@
 //! Every ecosystem family the data plane can list, in one pane.
 //!
-//! The left column is the families this cluster actually serves — a family
+//! The left column is the families this cluster actually serves. A family
 //! whose adapter answered "not installed" is not a row here, so the pane
 //! shows what exists rather than a wall of empty sections. Selecting a
 //! family shows its table through the same [`TableState`] machine the other
@@ -8,6 +8,8 @@
 //! status: one broken adapter never hides the other fifteen. When nothing
 //! is served at all the pane emits [`InventoryEvent::NotServed`] and the
 //! workspace takes it down.
+//! Opening an Alertmanager row re-reads its labels by fingerprint before
+//! asking the workspace to reveal that namespace and pod on the map.
 
 use std::rc::Rc;
 
@@ -18,13 +20,13 @@ use gpui::{
 };
 
 use crate::lists::InventoryEvent;
-use crate::provider::{EcosystemEntry, ReadProvider, TableOutcome, TablePage};
+use crate::provider::{AlertPodOutcome, EcosystemEntry, ReadProvider, TableOutcome, TablePage};
 use crate::table::TableState;
 use crate::tag::ItemTag;
 use crate::ui::{LIST_ROW_HEIGHT, PANEL_HEADER_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
-    CancelInput, CommitInput, DeleteInputChar, EnterFilter, NextFamily, PrevFamily, Refresh,
-    RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
+    CancelInput, CommitInput, DeleteInputChar, EnterFilter, NextFamily, OpenRow, PrevFamily,
+    Refresh, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
 };
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
@@ -150,6 +152,7 @@ pub struct EcosystemView {
     status: Option<String>,
     filtering: bool,
     generation: u64,
+    alert_generation: u64,
     viewport: Viewport,
 }
 
@@ -167,6 +170,7 @@ impl EcosystemView {
             status: None,
             filtering: false,
             generation: 0,
+            alert_generation: 0,
             viewport: Viewport::default(),
         };
         view.fetch(cx);
@@ -256,6 +260,7 @@ impl EcosystemView {
             return;
         }
         self.selected = index;
+        self.alert_generation += 1;
         self.table.clear_filter();
         self.filtering = false;
         self.apply_selected();
@@ -289,6 +294,65 @@ impl EcosystemView {
             crumb.push_str(&format!("  filter: {}", self.table.filter));
         }
         crumb
+    }
+
+    fn reveal_alert(&mut self, cx: &mut Context<Self>) {
+        if self
+            .families
+            .get(self.selected)
+            .is_none_or(|entry| entry.meta.id != "alertmanager")
+        {
+            return;
+        }
+        let Some(row) = self.table.selected_row().filter(|row| !row.uid.is_empty()) else {
+            return;
+        };
+        let fingerprint = row.uid.clone();
+        let generation = self.generation;
+        self.alert_generation += 1;
+        let alert_generation = self.alert_generation;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.provider.fetch_alert_pod(
+            fingerprint.clone(),
+            Box::new(move |answer| {
+                let _ = tx.send(answer);
+            }),
+        );
+        self.status = Some("locating the alert's pod...".to_string());
+        cx.spawn(async move |this, cx| {
+            let answer = rx.await.unwrap_or_else(|_| {
+                AlertPodOutcome::Failed("the alert lookup was dropped".to_string())
+            });
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation || this.alert_generation != alert_generation {
+                    return;
+                }
+                this.status = None;
+                if this
+                    .families
+                    .get(this.selected)
+                    .is_some_and(|entry| entry.meta.id == "alertmanager")
+                    && this
+                        .table
+                        .selected_row()
+                        .is_some_and(|row| row.uid == fingerprint)
+                {
+                    match answer {
+                        AlertPodOutcome::Pod { namespace, pod } => {
+                            cx.emit(InventoryEvent::RevealPod { namespace, pod })
+                        }
+                        AlertPodOutcome::Absent => this.fetch(cx),
+                        AlertPodOutcome::Denied(what) => {
+                            this.status = Some(format!("{what}: access denied for this account"))
+                        }
+                        AlertPodOutcome::Failed(why) => this.status = Some(why),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn resize(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
@@ -460,6 +524,9 @@ impl Render for EcosystemView {
                 this.fetch(cx);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OpenRow, _, cx| {
+                this.reveal_alert(cx);
+            }))
             .on_action(cx.listener(|this, _: &EnterFilter, _, cx| {
                 this.filtering = true;
                 cx.notify();
@@ -564,11 +631,14 @@ impl Render for EcosystemView {
                                                         MouseButton::Left,
                                                         cx.listener(
                                                             move |this,
-                                                                  _: &MouseDownEvent,
+                                                                  event: &MouseDownEvent,
                                                                   _,
                                                                   cx| {
                                                                 this.table
                                                                     .select_visible_offset(offset);
+                                                                if event.click_count == 2 {
+                                                                    this.reveal_alert(cx);
+                                                                }
                                                                 cx.notify();
                                                             },
                                                         ),
@@ -611,7 +681,17 @@ impl Render for EcosystemView {
                     .text_color(rgb(theme.shell.text_muted))
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .child("tab family · / filter · r refresh"),
+                    .child(
+                        if self
+                            .families
+                            .get(self.selected)
+                            .is_some_and(|entry| entry.meta.id == "alertmanager")
+                        {
+                            "enter locates pod · tab family · / filter · r refresh"
+                        } else {
+                            "tab family · / filter · r refresh"
+                        },
+                    ),
             )
     }
 }

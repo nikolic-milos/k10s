@@ -73,6 +73,7 @@ pub mod ui;
 // is re-exported below under the name it has always had.
 mod actions;
 mod activity;
+mod alerts;
 mod bindings;
 mod chrome;
 mod cluster;
@@ -96,18 +97,19 @@ pub use actions::*;
 pub use bindings::{input_suppressors, keybindings};
 pub use item::{Item, ItemHandle};
 pub use provider::{
-    ApplyOutcome, ApplyRequest, Bytes, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest,
-    Connection, ContainersOutcome, ContextRow, Day2Op, Day2Outcome, Day2Request, DemoOutcome,
-    DescribeRequest, Detail, DocOutcome, EcosystemEntry, EventRow, ExecEvent, ExecRequest,
-    ExecSession, ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, GrafanaOutcome,
-    GrafanaPanelKind, GrafanaPanelRow, HelmReveal, HelmRevealOutcome, HelmRollbackOutcome, KindRow,
-    LaunchProvider, LogChunk, LogRequest, LogStop, LokiOutcome, ManifestOutcome, Millicores,
-    NullExecSession, NullLaunchProvider, NullProvider, ObserveReach, OverlayOutcome, OverlayStamp,
-    PodPostureView, PostureOutcome, PromOutcome, PromSeriesView, ProviderFactory, ProviderSlot,
-    QueryDialect, ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome,
-    SchemaSource, SchemaTextOutcome, SpanView, TableColumn, TableOutcome, TablePage, TableRow,
-    ToolPresence, TraceOutcome, UsageOutcome, UsageRequest, UsageSample, UsageSource, UsageTarget,
-    WorkloadLogRequest,
+    AlertMatcher, AlertPodOutcome, AlertmanagerEndpoint, AlertmanagerOutcome, ApplyOutcome,
+    ApplyRequest, Bytes, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest, Connection,
+    ContainersOutcome, ContextRow, Day2Op, Day2Outcome, Day2Request, DemoOutcome, DescribeRequest,
+    Detail, DocOutcome, EcosystemEntry, EventRow, ExecEvent, ExecRequest, ExecSession,
+    ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, GrafanaOutcome, GrafanaPanelKind,
+    GrafanaPanelRow, HelmReveal, HelmRevealOutcome, HelmRollbackOutcome, KindRow, LaunchProvider,
+    LogChunk, LogRequest, LogStop, LokiOutcome, ManifestOutcome, Millicores, NullExecSession,
+    NullLaunchProvider, NullProvider, ObserveReach, OverlayOutcome, OverlayStamp, PodPostureView,
+    PostureOutcome, PromOutcome, PromSeriesView, ProviderFactory, ProviderSlot, QueryDialect,
+    ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome, SchemaSource,
+    SchemaTextOutcome, SilenceOutcome, SilenceRequest, SpanView, TableColumn, TableOutcome,
+    TablePage, TableRow, ToolPresence, TraceOutcome, UsageOutcome, UsageRequest, UsageSample,
+    UsageSource, UsageTarget, WorkloadLogRequest,
 };
 pub use selection::{LogTarget, Selection};
 pub use workspace::{ConfigPaths, Workspace};

@@ -1,5 +1,53 @@
 use super::*;
 
+#[test]
+fn datasource_types_outrank_opaque_uids_and_target_identity_outranks_the_panel() {
+    use serde_json::json;
+    for (target_source, panel_source, expected, identity) in [
+        (
+            json!({"uid":"opaque", "type":"prometheus"}),
+            json!({"uid":"logs", "type":"loki"}),
+            QueryDialect::PromQL,
+            "opaque",
+        ),
+        (
+            json!({"uid":"prometheus-named", "type":"loki"}),
+            json!(null),
+            QueryDialect::LogQL,
+            "prometheus-named",
+        ),
+        (
+            json!(null),
+            json!({"uid":"$datasource", "type":"prometheus"}),
+            QueryDialect::PromQL,
+            "$datasource",
+        ),
+        (
+            json!(""),
+            json!({"uid":"logs", "type":"loki"}),
+            QueryDialect::LogQL,
+            "logs",
+        ),
+        (
+            json!({"uid":"opaque"}),
+            json!({"uid":"metrics", "type":"prometheus"}),
+            QueryDialect::Unknown,
+            "opaque",
+        ),
+        (
+            json!({"uid":"prometheus-named", "type":"influxdb"}),
+            json!(null),
+            QueryDialect::Unknown,
+            "prometheus-named",
+        ),
+    ] {
+        let target = json!({"expr":"up", "datasource":target_source});
+        let query = read_query(&target, Some(&panel_source)).expect("a query");
+        assert_eq!(query.dialect, expected, "{target}");
+        assert_eq!(query.datasource.as_deref(), Some(identity));
+    }
+}
+
 fn dashboard_json() -> &'static str {
     r#"{
       "uid": "k8s-resources",

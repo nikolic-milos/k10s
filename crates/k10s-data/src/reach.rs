@@ -1,13 +1,15 @@
 //! Reach an in-cluster tool without installing anything.
 //!
-//! Discovery is label, name, and port. Binding prefers the API-server
-//! service proxy, then a port-forward the shell already knows how to open,
-//! then a URL the user named in settings. Auth is never a Secret scraped in
-//! the background: anonymous, a token the user named, or one field they
-//! explicitly revealed. A tool the cluster does not run is [`ToolReach::Absent`]
-//! and must stay invisible. A tool that is there but will not bind is
-//! [`ToolReach::Unbound`]: a labelled hole, with an optional system-browser
-//! URL, never a blank panel.
+//! Discovery uses tool names, application identity labels, and ports. A
+//! chart or release label does not identify the application a Service serves.
+//! A configured URL takes precedence. Otherwise binding probes an identified
+//! Service through the API-server proxy; a failed probe leaves a
+//! [`Transport::NeedsForward`] candidate for the caller to open or label.
+//! No matching Service and no override means [`ToolReach::Absent`], which
+//! stays invisible. Blocked discovery or authentication is [`ToolReach::Unbound`],
+//! with a reason and an optional browser URL. Auth is never a Secret scraped
+//! in the background: it is anonymous, a token the user named, or one field
+//! they explicitly revealed.
 //!
 //! First paint never waits on this module. A section that wants a tool asks
 //! after the cluster is already on screen.
@@ -351,21 +353,32 @@ fn name_or_labels_match(
     labels: Option<&std::collections::BTreeMap<String, String>>,
     spec: &Fingerprint,
 ) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if spec
-        .names
-        .iter()
-        .any(|want| lower == *want || lower.contains(want))
-    {
+    let named = |value: &str| {
+        let lower = value.to_ascii_lowercase();
+        spec.names.iter().any(|want| {
+            lower == *want
+                || lower
+                    .strip_suffix(want)
+                    .is_some_and(|prefix| prefix.ends_with('-'))
+        })
+    };
+    if named(name) {
         return true;
     }
     let Some(labels) = labels else {
         return false;
     };
-    labels.values().any(|value| {
-        let lower = value.to_ascii_lowercase();
-        spec.needles.iter().any(|needle| lower.contains(needle))
-    })
+    ["app.kubernetes.io/name", "app", "k8s-app"]
+        .iter()
+        .any(|key| {
+            labels.get(*key).is_some_and(|value| {
+                named(value)
+                    || spec
+                        .needles
+                        .iter()
+                        .any(|needle| value.eq_ignore_ascii_case(needle))
+            })
+        })
 }
 
 struct PickedPort {
