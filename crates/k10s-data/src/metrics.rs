@@ -318,8 +318,8 @@ async fn tick(
                 why,
             },
             KubeletAnswer::NotServed => UsageOutcome::Absent {
-                why: "metrics-server is not installed and the kubelet does not serve \
-                      resource metrics; usage is hidden"
+                why: "neither the pod metrics API nor the kubelet provided resource metrics; \
+                      usage is hidden"
                     .to_string(),
             },
         },
@@ -415,10 +415,9 @@ enum MetricsAnswer {
     Failed(String),
 }
 
-// The fallback-order decision: 404 is "not installed", 503 is "registered but
-// not answering" -- both fall through to the kubelet. 403 is an answer and is
-// never routed around. Everything else is a failure of this path, not
-// evidence about the other one.
+// A 403 is an answer, never a reason to route around policy. Missing or
+// unavailable metrics can fall back to the kubelet; other failures retain
+// the server's explanation.
 fn after_metrics_api(error: &kube::Error) -> MetricsAnswer {
     if let kube::Error::Api(response) = error {
         if response.code == 403 {

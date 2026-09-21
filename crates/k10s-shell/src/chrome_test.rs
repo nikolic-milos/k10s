@@ -143,7 +143,7 @@ fn an_unmeasured_value_says_sampling_and_never_renders_as_zero() {
         [
             "CPU sampling… · request 500m · no limit",
             "Memory 32Mi · request 64Mi (50%) · limit 128Mi (25%)",
-            "via the kubelet; metrics-server is not installed",
+            "via the kubelet; pod metrics are unavailable from the metrics API",
         ],
         "no rate yet means no percentage against the request either"
     );
