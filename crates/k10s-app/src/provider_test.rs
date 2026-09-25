@@ -840,6 +840,27 @@ fn an_alert_join_uses_the_chosen_fingerprint_and_keeps_both_labels() {
 }
 
 #[test]
+fn the_omitted_alerts_row_names_no_pod() {
+    let mut alerts = k10s_data::alertmanager::parse_alerts(
+        br#"[{"fingerprint":"fdfff9b4ee24368c", "labels":{"namespace":"prod", "pod":"api-0"}}]"#,
+    )
+    .expect("alert");
+    alerts.dropped = 2;
+    let k10s_shell::TableOutcome::Table(page) = optional_table_outcome(Fetched::Ok(
+        k10s_data::alertmanager::table_page(Some(&alerts)),
+    )) else {
+        panic!("Alertmanager answered");
+    };
+    assert_eq!(
+        omitted_notice_answer(&page.rows[0].uid),
+        Some(k10s_shell::AlertPodOutcome::Failed(
+            "this row counts alerts that are not shown; it names no pod".into()
+        ))
+    );
+    assert_eq!(omitted_notice_answer(&page.rows[1].uid), None);
+}
+
+#[test]
 fn the_silence_adapter_preserves_matchers_interval_and_destination() {
     use k10s_shell::{AlertMatcher, AlertmanagerEndpoint, SilenceRequest};
     let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_789_182_000);

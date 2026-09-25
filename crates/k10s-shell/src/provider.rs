@@ -1,16 +1,16 @@
 //! The seam the shell reads the cluster through.
 //!
 //! The shell knows nothing about how detail is fetched: it hands a
-//! [`ReadProvider`] a request and a boxed reply callback and gets a value
-//! back on some other thread; each view bridges the reply onto the UI
-//! executor itself. Every outcome is labelled -- denial, failure, absence --
-//! because a panel that goes quiet is indistinguishable from a panel that is
-//! lying. When no cluster is connected the [`NullProvider`] answers every
-//! question with that fact, so the views degrade into the same labelled
-//! states they use for RBAC denial. Writes include apply, named day-2
-//! operations, Helm rollback, and Alertmanager silences. Confirmation belongs
-//! to the request being reviewed; a conflict or validation refusal carries
-//! what the server said.
+//! [`ReadProvider`] a request and a boxed reply callback, which may run at
+//! once on the calling thread or later on another; each view bridges the
+//! reply onto the UI executor itself. Every outcome is labelled -- denial,
+//! failure, absence -- because a panel that goes quiet is indistinguishable
+//! from a panel that is lying. When no cluster is connected the
+//! [`NullProvider`] answers every question with that fact, so the views
+//! degrade into the same labelled states they use for RBAC denial. Writes
+//! include apply, named day-2 operations, Helm rollback, and Alertmanager
+//! silences. Confirmation belongs to the request being reviewed; a conflict
+//! or validation refusal carries what the server said.
 //!
 //! [`ProviderSlot`] lets read views follow the selected cluster. A silence
 //! document retains the provider named in its review and is retired when the
@@ -852,9 +852,12 @@ read_provider! {
     /// own table. Absent families stay hidden; one denied or failed family
     /// never hides the others.
     fn fetch_ecosystem(&self, reply: Reply<Vec<EcosystemEntry>>);
-    /// Re-read the chosen alert by fingerprint. Its namespace and pod labels
-    /// name the join; a table's display cells never supply object identity.
-    fn fetch_alert_pod(&self, fingerprint: String, reply: Reply<AlertPodOutcome>);
+    /// Locate the pod behind a selected Alertmanager row. `uid` is the row's
+    /// identity: an alert's fingerprint, whose alert is re-read so its
+    /// namespace and pod labels name the join, or the identity of the row
+    /// counting omitted alerts, which names no alert, so the lookup is
+    /// answered without a request. Table cells never supply object identity.
+    fn fetch_alert_pod(&self, uid: String, reply: Reply<AlertPodOutcome>);
     /// Discover the endpoint once so the silence review names its destination.
     fn bind_alertmanager(&self, reply: Reply<AlertmanagerOutcome>);
     fn create_silence(&self, request: &SilenceRequest, confirm: bool, reply: Reply<SilenceOutcome>);

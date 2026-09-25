@@ -1,7 +1,8 @@
 //! The shell's provider seam, adapted to the data plane.
 //!
-//! The shell never sees kube; it sees labelled outcomes. Every reply callback
-//! runs on the data plane's runtime and the shell bridges onto its own
+//! The shell never sees kube; it sees labelled outcomes. A reply callback
+//! either runs at once on the calling thread, before any request, or on the
+//! data plane's runtime; either way the view bridges it onto its own
 //! executor, so no thread is parked waiting for an answer. Each reply is
 //! translated by a named function rather than a closure, so the mapping from
 //! a data-plane answer to a shell outcome is a value a test can call.
@@ -392,13 +393,13 @@ impl k10s_shell::ReadProvider for PlaneProvider {
         });
     }
 
-    fn fetch_alert_pod(
-        &self,
-        fingerprint: String,
-        reply: k10s_shell::Reply<k10s_shell::AlertPodOutcome>,
-    ) {
+    fn fetch_alert_pod(&self, uid: String, reply: k10s_shell::Reply<k10s_shell::AlertPodOutcome>) {
+        if let Some(outcome) = omitted_notice_answer(&uid) {
+            reply(outcome);
+            return;
+        }
         self.reader.fetch_alertmanager_alerts(move |answer| {
-            reply(alert_pod_outcome(&fingerprint, answer));
+            reply(alert_pod_outcome(&uid, answer));
         });
     }
 
@@ -547,6 +548,14 @@ fn schema_text_outcome(fetched: Fetched<String>) -> k10s_shell::SchemaTextOutcom
         Fetched::Denied { what } => k10s_shell::SchemaTextOutcome::Denied(what),
         Fetched::Failed { why, .. } => k10s_shell::SchemaTextOutcome::Failed(why),
     }
+}
+
+fn omitted_notice_answer(uid: &str) -> Option<k10s_shell::AlertPodOutcome> {
+    k10s_data::alertmanager::is_omitted_notice(uid).then(|| {
+        k10s_shell::AlertPodOutcome::Failed(
+            "this row counts alerts that are not shown; it names no pod".to_string(),
+        )
+    })
 }
 
 fn alert_pod_outcome(

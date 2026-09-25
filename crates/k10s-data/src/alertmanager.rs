@@ -40,6 +40,7 @@ const WHAT: &str = "alertmanager";
 const ALERTS: &str = "api/v2/alerts";
 const SILENCES: &str = "api/v2/silences";
 const JSON: &str = "application/json";
+const OMITTED_NOTICE: &str = "omitted:alerts";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alert {
@@ -284,7 +285,7 @@ pub fn table_page(alerts: Option<&Alerts>) -> Option<TablePage> {
             cells,
             name: "Alerts".to_string(),
             namespace: None,
-            uid: "omitted:alerts".to_string(),
+            uid: OMITTED_NOTICE.to_string(),
         });
     }
     rows.extend(alerts.items.iter().map(|alert| {
@@ -329,6 +330,13 @@ pub fn table_page(alerts: Option<&Alerts>) -> Option<TablePage> {
         truncated: alerts.truncated,
         continue_token: None,
     })
+}
+
+/// Whether `uid` is the identity of [`table_page`]'s row counting omitted
+/// alerts. That row names no alert; Alertmanager's own fingerprints are
+/// hexadecimal, so none of them equals it.
+pub fn is_omitted_notice(uid: &str) -> bool {
+    uid == OMITTED_NOTICE
 }
 
 /// POST `/api/v2/silences`. `confirm=false` returns [`SilenceOutcome::NeedsConfirm`]

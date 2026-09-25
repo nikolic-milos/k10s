@@ -8,8 +8,10 @@
 //! status: one broken adapter never hides the other fifteen. When nothing
 //! is served at all the pane emits [`InventoryEvent::NotServed`] and the
 //! workspace takes it down.
-//! Opening an Alertmanager row re-reads its labels by fingerprint before
-//! asking the workspace to reveal that namespace and pod on the map.
+//! Opening an Alertmanager row re-reads that alert by fingerprint before
+//! asking the workspace to reveal its namespace and pod on the map; the row
+//! counting omitted alerts names no alert, so its lookup is answered with a
+//! status, without a request.
 
 use std::rc::Rc;
 
@@ -307,13 +309,13 @@ impl EcosystemView {
         let Some(row) = self.table.selected_row().filter(|row| !row.uid.is_empty()) else {
             return;
         };
-        let fingerprint = row.uid.clone();
+        let uid = row.uid.clone();
         let generation = self.generation;
         self.alert_generation += 1;
         let alert_generation = self.alert_generation;
         let (tx, rx) = futures::channel::oneshot::channel();
         self.provider.fetch_alert_pod(
-            fingerprint.clone(),
+            uid.clone(),
             Box::new(move |answer| {
                 let _ = tx.send(answer);
             }),
@@ -332,10 +334,7 @@ impl EcosystemView {
                     .families
                     .get(this.selected)
                     .is_some_and(|entry| entry.meta.id == "alertmanager")
-                    && this
-                        .table
-                        .selected_row()
-                        .is_some_and(|row| row.uid == fingerprint)
+                    && this.table.selected_row().is_some_and(|row| row.uid == uid)
                 {
                     match answer {
                         AlertPodOutcome::Pod { namespace, pod } => {
