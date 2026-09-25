@@ -20,10 +20,7 @@ use crate::provider::{
 use crate::table::TableState;
 use crate::tag::ItemTag;
 use crate::text::TextState;
-use crate::ui::{
-    CONTENT_PADDING, LIST_ROW_HEIGHT, PANEL_HEADER_HEIGHT, STATUS_BAR_HEIGHT, Viewport,
-    panel_header,
-};
+use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
     CancelInput, CommitInput, DeleteInputChar, EnterFilter, OpenRow, Refresh, RowDown, RowEnd,
     RowHome, RowPageDown, RowPageUp, RowUp,
@@ -422,14 +419,12 @@ impl ObserveView {
         if !self.viewport.update(width, height) {
             return;
         }
-        let chrome = PANEL_HEADER_HEIGHT
-            + TABLE_HEADER_HEIGHT
-            + QUERY_HEIGHT
-            + STATUS_BAR_HEIGHT
-            + CONTENT_PADDING;
-        let rows = self.viewport.rows(chrome, 0.0, LIST_ROW_HEIGHT, 400).max(4) / 2;
-        self.table.set_viewport(rows.max(4));
-        self.results.set_viewport(rows.max(4));
+        // The results region is measured; the Grafana table above it, when
+        // shown, is the same flex share of the view, so the same height to
+        // within a pixel.
+        let rows = self.viewport.rows(0.0, 0.0, LIST_ROW_HEIGHT, 400);
+        self.table.set_viewport(rows);
+        self.results.set_viewport(rows);
         cx.notify();
     }
 }
@@ -472,22 +467,6 @@ impl Render for ObserveView {
             .bg(rgb(theme.shell.panel_background))
             .font_family(fonts.ui_family.clone())
             .text_color(rgb(theme.shell.text))
-            .child(
-                canvas(
-                    move |bounds, _, cx| {
-                        let _ = view.update(cx, |this, cx| {
-                            this.resize(
-                                f32::from(bounds.size.width),
-                                f32::from(bounds.size.height),
-                                cx,
-                            );
-                        });
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
             .on_action(cx.listener(|this, _: &RowUp, _, cx| {
                 if this.grafana == ToolPresence::Missing {
                     this.results.scroll_by(-1);
@@ -625,114 +604,140 @@ impl Render for ObserveView {
                 cx.notify();
             }))
             .child(panel_header(&theme, &fonts, self.breadcrumb()))
-            .children(show_grafana.then(|| {
-                div()
-                    .h(px(TABLE_HEADER_HEIGHT))
-                    .flex_none()
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .bg(rgb(theme.shell.editor_background))
-                    .border_b_1()
-                    .border_color(rgb(theme.shell.border_variant))
-                    .font_family(fonts.buffer_family.clone())
-                    .text_size(px(fonts.small()))
-                    .text_color(rgb(theme.shell.text_muted))
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .child(self.table.header_line())
-            }))
-            .children(show_grafana.then(|| {
-                div()
-                    .id("observe-rows")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .role(Role::ListBox)
-                    .aria_label("Grafana queries")
-                    .children(self.table.visible_lines().into_iter().enumerate().map(
-                        |(offset, (selected, line))| {
-                            let mut row = div()
-                                .id(("observe-row", offset))
-                                .h(px(LIST_ROW_HEIGHT))
-                                .flex_none()
-                                .px(px(12.0))
-                                .flex()
-                                .items_center()
-                                .font_family(fonts.buffer_family.clone())
-                                .text_size(px(fonts.small()))
-                                .text_color(rgb(theme.shell.editor_foreground))
-                                .whitespace_nowrap()
-                                .overflow_hidden()
-                                .cursor_pointer()
-                                .role(Role::ListBoxOption)
-                                .aria_label(line.clone())
-                                .aria_selected(selected)
-                                .hover(|style| style.bg(rgb(theme.shell.element_hover)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                        this.table.select_visible_offset(offset);
-                                        cx.notify();
-                                    }),
-                                );
-                            if selected {
-                                row = row.bg(rgb(theme.shell.element_selected));
-                            }
-                            row.child(line)
-                        },
-                    ))
-            }))
-            .children(show_query.then(|| {
-                div()
-                    .h(px(QUERY_HEIGHT))
-                    .flex_none()
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .bg(rgb(theme.shell.editor_background))
-                    .border_t_1()
-                    .border_color(rgb(theme.shell.border_variant))
-                    .font_family(fonts.buffer_family.clone())
-                    .text_size(px(fonts.small()))
-                    .child(format!("{query_label}: "))
-                    .child(if self.typing {
-                        format!("{}_", self.query)
-                    } else if self.query.is_empty() {
-                        "q types a query · tab switches PromQL/LogQL".to_string()
-                    } else {
-                        self.query.clone()
-                    })
-            }))
             .child(
                 div()
-                    .id("observe-results")
                     .flex_1()
                     .min_h(px(0.0))
-                    .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .bg(rgb(theme.shell.editor_background))
-                    .children(self.results.visible().map(|(index, line)| {
+                    .overflow_hidden()
+                    .children(show_grafana.then(|| {
                         div()
-                            .id(("observe-result", index))
-                            .h(px(LIST_ROW_HEIGHT))
+                            .h(px(TABLE_HEADER_HEIGHT))
                             .flex_none()
                             .px(px(12.0))
                             .flex()
                             .items_center()
+                            .bg(rgb(theme.shell.editor_background))
+                            .border_b_1()
+                            .border_color(rgb(theme.shell.border_variant))
                             .font_family(fonts.buffer_family.clone())
                             .text_size(px(fonts.small()))
-                            .text_color(rgb(theme.shell.editor_foreground))
+                            .text_color(rgb(theme.shell.text_muted))
                             .whitespace_nowrap()
                             .overflow_hidden()
-                            .child(line.to_string())
+                            .child(self.table.header_line())
                     }))
+                    .children(show_grafana.then(|| {
+                        div()
+                            .id("observe-rows")
+                            .flex_1()
+                            .min_h(px(LIST_ROW_HEIGHT))
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .role(Role::ListBox)
+                            .aria_label("Grafana queries")
+                            .children(self.table.visible_lines().into_iter().enumerate().map(
+                                |(offset, (selected, line))| {
+                                    let mut row = div()
+                                        .id(("observe-row", offset))
+                                        .h(px(LIST_ROW_HEIGHT))
+                                        .flex_none()
+                                        .px(px(12.0))
+                                        .flex()
+                                        .items_center()
+                                        .font_family(fonts.buffer_family.clone())
+                                        .text_size(px(fonts.small()))
+                                        .text_color(rgb(theme.shell.editor_foreground))
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .cursor_pointer()
+                                        .role(Role::ListBoxOption)
+                                        .aria_label(line.clone())
+                                        .aria_selected(selected)
+                                        .hover(|style| style.bg(rgb(theme.shell.element_hover)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                                this.table.select_visible_offset(offset);
+                                                cx.notify();
+                                            }),
+                                        );
+                                    if selected {
+                                        row = row.bg(rgb(theme.shell.element_selected));
+                                    }
+                                    row.child(line)
+                                },
+                            ))
+                    }))
+                    .children(show_query.then(|| {
+                        div()
+                            .h(px(QUERY_HEIGHT))
+                            .flex_none()
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .bg(rgb(theme.shell.editor_background))
+                            .border_t_1()
+                            .border_color(rgb(theme.shell.border_variant))
+                            .font_family(fonts.buffer_family.clone())
+                            .text_size(px(fonts.small()))
+                            .child(format!("{query_label}: "))
+                            .child(if self.typing {
+                                format!("{}_", self.query)
+                            } else if self.query.is_empty() {
+                                "q types a query · tab switches PromQL/LogQL".to_string()
+                            } else {
+                                self.query.clone()
+                            })
+                    }))
+                    .child(
+                        div()
+                            .id("observe-results")
+                            .flex_1()
+                            .min_h(px(LIST_ROW_HEIGHT))
+                            .overflow_hidden()
+                            .relative()
+                            .flex()
+                            .flex_col()
+                            .bg(rgb(theme.shell.editor_background))
+                            .child(
+                                canvas(
+                                    move |bounds, _, cx| {
+                                        let _ = view.update(cx, |this, cx| {
+                                            this.resize(
+                                                f32::from(bounds.size.width),
+                                                f32::from(bounds.size.height),
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .children(self.results.visible().map(|(index, line)| {
+                                div()
+                                    .id(("observe-result", index))
+                                    .h(px(LIST_ROW_HEIGHT))
+                                    .flex_none()
+                                    .px(px(12.0))
+                                    .flex()
+                                    .items_center()
+                                    .font_family(fonts.buffer_family.clone())
+                                    .text_size(px(fonts.small()))
+                                    .text_color(rgb(theme.shell.editor_foreground))
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .child(line.to_string())
+                            })),
+                    )
                     .children(self.status.clone().map(|status| {
                         div()
+                            .flex_none()
                             .p(px(12.0))
                             .text_size(px(fonts.ui_size))
                             .text_color(rgb(theme.shell.text))

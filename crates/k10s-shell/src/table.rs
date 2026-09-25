@@ -369,6 +369,28 @@ mod tests {
         );
     }
 
+    // A status line appearing under a full table takes its height from the
+    // rows region, so the viewport shrinks while the selection may sit on the
+    // last visible row. The table scrolls rather than hide the row the person
+    // is on.
+    #[test]
+    fn a_shrinking_viewport_keeps_the_selected_row_on_screen() {
+        let mut table = TableState::new();
+        table.set_viewport(10);
+        table.set_page(numbered_page(0..30, None));
+        table.move_selection(9);
+        assert!(
+            table.visible_lines()[9].0,
+            "the last visible row is selected"
+        );
+
+        table.set_viewport(8);
+        let lines = table.visible_lines();
+        assert_eq!(lines.len(), 8);
+        assert!(lines[7].0, "the selected row is still on screen, now last");
+        assert_eq!(table.selected_row().unwrap().uid, "u9");
+    }
+
     #[test]
     fn navigation_discards_the_previous_filter_selection_and_paging_state() {
         for count in [30, MAX_ROWS + 1] {
