@@ -493,10 +493,6 @@ pub struct DiffView {
     // could not tell a document from its replacement, because a reload restarts
     // the count.
     stamp: BufferStamp,
-    // The buffer the server has answered a dry run for. The dry run is the
-    // right-hand side of the review, so an apply of anything else is an apply
-    // of bytes the server has never seen. Cleared by every recompute.
-    reviewed: Option<Review>,
     // Which object the live document was read from, and which object the server
     // last answered a dry run about. They differ when the object was deleted or
     // replaced since the read, which is the difference between an apply that
@@ -536,7 +532,6 @@ impl DiffView {
             state: DiffState::new(),
             payload: k10s_edit::Payload::default(),
             stamp: sources.stamp,
-            reviewed: None,
             uid: None,
             answered: None,
             patchable: false,
@@ -595,7 +590,7 @@ impl DiffView {
         self.title = format!("{title} (diff)").into();
         self.payload = payload;
         self.stamp = stamp;
-        self.reviewed = None;
+        self.flight.forget_review();
         self.uid = uid;
         self.answered = None;
         self.patchable = patchable;
@@ -632,7 +627,7 @@ impl DiffView {
             verdict: self.state.diff().verdict(),
             reviewed: self.stamp,
             editor,
-            dry_run: self.reviewed,
+            dry_run: self.flight.reviewed(),
             conflicts: self.conflict.len(),
             in_flight: self.flight.busy().then(|| self.flight.holder()),
         }
@@ -786,7 +781,7 @@ impl DiffView {
                     Ok(outcome) if speaks => this.settle(outcome, &sent, cx),
                     Ok(_) => {}
                     Err(_) if speaks => {
-                        this.status = Some("the request ended without an answer".to_string());
+                        this.status = Some(dropped_note(sent.dry_run).to_string());
                     }
                     Err(_) => {}
                 }
@@ -806,7 +801,7 @@ impl DiffView {
             self.forget_conflicts();
         }
         if sent.dry_run {
-            self.reviewed = None;
+            self.flight.forget_review();
         }
         match outcome {
             ApplyOutcome::Applied { yaml, dry_run, uid } if dry_run => {
@@ -819,7 +814,7 @@ impl DiffView {
                 self.state.set(Mode::DryRun, live, None, yaml);
                 self.status = Some(match reviewed(self.state.diff().verdict(), sent.force) {
                     Ok(note) => {
-                        self.reviewed = Some(Review {
+                        self.flight.record_review(Review {
                             stamp: sent.stamp,
                             force: sent.force,
                         });
@@ -1011,6 +1006,18 @@ pub(crate) fn status_line(at: Line<'_>) -> String {
         pieces.push(status.to_string());
     }
     pieces.join("  ·  ")
+}
+
+// The sentence a request whose answer never arrived shows. A dry run writes
+// nothing; a real apply may have been served before the answer was lost, so
+// its sentence must not read as a write that did not happen.
+pub(crate) fn dropped_note(dry_run: bool) -> &'static str {
+    if dry_run {
+        "the dry run ended without an answer"
+    } else {
+        "the apply ended without an answer; it may have landed, so reload the object before \
+         sending it again"
+    }
 }
 
 // The sentence a landed apply shows. `reloaded` is the editor's answer, not a

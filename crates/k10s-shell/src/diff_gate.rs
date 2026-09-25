@@ -1,9 +1,10 @@
 //! Every precondition a press has to clear, in one place.
 //!
-//! Every write needs a server preview and two deliberate presses. After a
-//! conflict, force first asks for a forced dry run; that preview takes no fields
-//! and arms no write. The gate arms under the name of the question, so a press
-//! meant for one question never answers the other, and any recompute disarms.
+//! Every write needs a server preview and two deliberate presses, and a preview
+//! authorises one write. After a conflict, force first asks for a forced dry
+//! run; that preview takes no fields and arms no write. The gate arms under the
+//! name of the question, so a press meant for one question never answers the
+//! other, and any recompute disarms.
 //!
 //! [`prepare`] is one pure function and none of these checks is anywhere else.
 //! That is not tidiness. The two preconditions that ever failed were the two
@@ -53,7 +54,8 @@ pub(crate) struct Review {
 /// so a recompute during an apply stranded the flag and every later apply was
 /// refused as "already in flight". A ticket separates the two questions -- who
 /// holds the wire, and whose answer is still wanted -- and only the first one
-/// decides when it is released.
+/// decides when it is released. The flight also holds the review a real
+/// apply needs, because taking the wire for one is what spends it.
 #[derive(Debug, Default)]
 pub(crate) struct Flight {
     holder: Option<u64>,
@@ -68,10 +70,19 @@ pub(crate) struct Flight {
     // queued: a write has to be the press the user just made.
     owed: bool,
     issued: u64,
+    // The buffer and policy the server has answered a dry run for. The dry run
+    // is the right-hand side of the review, so an apply of anything else is an
+    // apply of bytes the server has never seen. Recorded when a dry run's
+    // answer arrives, forgotten by every recompute and by the next dry run's
+    // answer, and spent by a real apply taking the wire whatever comes back,
+    // so a write that did not land cleanly is never resent without a new one.
+    reviewed: Option<Review>,
 }
 
 impl Flight {
-    /// A ticket, or None when a request is already out.
+    /// A ticket, or None when a request is already out. A real apply's ticket
+    /// spends the review: whatever answer comes back, the next apply needs a
+    /// new dry run.
     pub(crate) fn take(&mut self, dry_run: bool) -> Option<u64> {
         if self.holder.is_some() {
             return None;
@@ -79,7 +90,22 @@ impl Flight {
         self.issued += 1;
         self.holder = Some(self.issued);
         self.holds_apply = !dry_run;
+        if !dry_run {
+            self.reviewed = None;
+        }
         self.holder
+    }
+
+    pub(crate) fn reviewed(&self) -> Option<Review> {
+        self.reviewed
+    }
+
+    pub(crate) fn record_review(&mut self, review: Review) {
+        self.reviewed = Some(review);
+    }
+
+    pub(crate) fn forget_review(&mut self) {
+        self.reviewed = None;
     }
 
     /// Remember that a comparison was asked for while the wire was busy.

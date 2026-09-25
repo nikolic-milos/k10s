@@ -242,6 +242,44 @@ fn the_wire_is_released_by_its_holder_even_when_its_answer_is_no_longer_wanted()
     assert!(!flight.busy());
 }
 
+// A real apply that does not land cleanly (a transport error, a dropped reply,
+// a refusal) used to leave its review standing, so two more presses resent the
+// same bytes with nothing asked of the server again. Taking the wire for a
+// real apply spends the review, whatever answer follows.
+#[test]
+fn a_real_apply_spends_its_review_when_it_takes_the_wire() {
+    let stamp = BufferStamp::of(1, 4);
+    let review = Review {
+        stamp,
+        force: false,
+    };
+    let mut flight = Flight::default();
+    flight.record_review(review);
+    let ticket = flight.take(false).expect("the wire is free");
+    assert_eq!(flight.reviewed(), None);
+    flight.release(ticket);
+    let mut at = ready(&[], Verdict::Differs);
+    at.dry_run = flight.reviewed();
+    assert_eq!(
+        prepare(Armed::Apply, at),
+        Err("the server has not been asked what this would store; ctrl-alt-r asks it".to_string()),
+        "the next press asks for a new review"
+    );
+
+    flight.record_review(review);
+    let ticket = flight.take(true).expect("free again");
+    assert_eq!(flight.reviewed(), Some(review), "a dry run spends nothing");
+    assert_eq!(flight.take(false), None, "one request at a time");
+    assert_eq!(
+        flight.reviewed(),
+        Some(review),
+        "and an apply refused the wire spends nothing either"
+    );
+    flight.release(ticket);
+    at.dry_run = flight.reviewed();
+    assert_eq!(prepare(Armed::Apply, at), Ok(Preparation::Confirm));
+}
+
 // A dry run asked for while the wire is held used to be dropped, under a
 // message calling the holder "an apply" when it was another dry run: the
 // tab then sat in the local comparison waiting for an answer nobody had
@@ -897,6 +935,19 @@ fn an_applied_note_says_whether_the_buffer_followed_the_write() {
         "an edit made during the flight must be said to have survived: {moved}"
     );
     assert!(moved.contains("; landed on another object"));
+}
+
+// A reply that never arrived used to read "the request ended without an
+// answer" for a real apply too, which says nothing about the write that may
+// already have been served.
+#[test]
+fn a_real_apply_without_an_answer_says_it_may_have_landed() {
+    assert_eq!(dropped_note(true), "the dry run ended without an answer");
+    assert_eq!(
+        dropped_note(false),
+        "the apply ended without an answer; it may have landed, so reload the object before \
+         sending it again"
+    );
 }
 
 #[test]
