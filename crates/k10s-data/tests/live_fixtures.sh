@@ -10,6 +10,9 @@
 #   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh
 #   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh --with observability
 #
+# kubectl and helm must be on PATH: the base fixtures install the rollback-probe
+# chart from tests/fixtures/helm.
+#
 # Then, and note the thread count, which is not optional:
 #
 #   KUBECONFIG=/path/to/kubeconfig cargo test -p k10s-data --test live_cluster \
@@ -51,10 +54,8 @@ NS="${K10S_LIVE_NAMESPACE:-g2}"
 READER_GROUP="${K10S_LIVE_READER_GROUP:-k10s-readers}"
 KUBECTL=(kubectl)
 command -v kubectl >/dev/null || { echo "kubectl is not on PATH" >&2; exit 1; }
+command -v helm >/dev/null || { echo "helm is not on PATH" >&2; exit 1; }
 : "${KUBECONFIG:?set KUBECONFIG to the cluster to set up}"
-if $OBSERVABILITY; then
-  command -v helm >/dev/null || { echo "helm is not on PATH" >&2; exit 1; }
-fi
 
 echo "namespace $NS"
 "${KUBECTL[@]}" create namespace "$NS" --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f - >/dev/null
@@ -263,6 +264,15 @@ kind: Widget
 metadata: { name: sprocket, namespace: $NS }
 spec: { size: 7, flavour: vanilla }
 YAML
+
+# A release this file owns, so the stored-manifest apply has something to roll
+# back that no other test depends on: a ConfigMap to recreate and a Secret the
+# apply must leave alone. Helm is therefore a requirement of the base fixtures.
+# An upgrade given no values reuses the last revision's, and a live test
+# upgrades with values of its own, so the chart's are reset here.
+echo "helm release rollback-probe"
+helm upgrade --install rollback-probe "$(dirname "$0")/fixtures/helm/rollback-probe" \
+  --namespace "$NS" --reset-values --wait >/dev/null
 
 # Accepted is not running. Exec, port-forward and the usage poll all need a
 # started container, and without this wait the first run after a fixture
