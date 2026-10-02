@@ -42,8 +42,8 @@ pub use lod::{LodPolicy, StageBlend, StageMachine, WorkloadPresentation};
 pub use motion::{FLY_SECONDS, FlyTo, Motion, Step};
 pub use pacing::FramePacer;
 pub use scene::{
-    BlockNode, CellNode, Edge, EdgeIndex, EdgeSegment, Endpoint, Level, Rect, RegionNode, Scene,
-    Totals,
+    BlockNode, CellNode, ChildIndices, Edge, EdgeIndex, EdgeSegment, Endpoint, Level, Rect,
+    RegionNode, Scene, Totals,
 };
 pub use stats::{
     CounterStats, DrawnCounts, FrameSpans, FrameStats, SegmentCounters, TextCacheCounts,

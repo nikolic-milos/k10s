@@ -11,8 +11,8 @@ use k10s_core::layout::{
     SAT_RING0_GAP, SAT_SIZE, WL_GAP, WL_HEADER, WL_PAD,
 };
 use k10s_core::{
-    EdgeInst, Endpoint, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent, Severity, SlotIds,
-    State, ToolId,
+    ChildIndices, EdgeInst, Endpoint, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent,
+    Severity, SlotIds, State, ToolId,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 
@@ -776,7 +776,7 @@ fn upsert_pod(
     }
     if inserted || moved {
         dirt.wl_pod = true;
-        topology.pod_rects[index] = place_pod(topology, slot, workload, mode);
+        topology.pod_rects[index] = place_pod(topology, &dirt.pods, slot, workload, mode);
         if parent_has_link_sats(topology, workload) {
             dirt.edges = true;
         }
@@ -1067,7 +1067,6 @@ fn parent_has_link_sats(topology: &Topology, workload: u32) -> bool {
         &topology.block_sats,
         workload as usize,
     )
-    .into_iter()
     .any(|sat| extra_edge_kind(topology.sat_kinds[sat]))
 }
 
@@ -1238,27 +1237,37 @@ fn place_workload(topology: &mut Topology, slot: u32, namespace: u32, mode: Layo
     grow_namespace(topology, namespace, card);
 }
 
-fn place_pod(topology: &mut Topology, slot: u32, workload: u32, mode: LayoutMode) -> Rect {
+fn place_pod(
+    topology: &mut Topology,
+    changed_pods: &[u32],
+    slot: u32,
+    workload: u32,
+    mode: LayoutMode,
+) -> Rect {
     let card = topology.wl_card_rects[workload as usize];
     let (pad, header) = match mode {
         LayoutMode::Spread => (CARD_PAD, CARD_HEADER),
         LayoutMode::Dense => (WL_PAD, WL_HEADER),
     };
-    // One pass over the pod slots collects this workload's occupied corners;
-    // probing then costs the candidate count, not candidates x every pod in
-    // the world. Positions compare exactly because every pod rect comes from
-    // the same formula below.
-    let occupied: HashSet<(u32, u32)> = (0..topology.pod_slots.slots())
-        .filter(|&index| {
-            topology.pod_slots.is_active(index)
-                && index != slot as usize
-                && topology.pod_wl[index] == workload
-        })
-        .map(|index| {
-            let rect = topology.pod_rects[index];
-            (rect.x.to_bits(), rect.y.to_bits())
-        })
-        .collect();
+    // Adjacency describes the start of the batch. The changed slots add new
+    // children; checking current ownership excludes departures and tombstones.
+    // Positions compare exactly because every pod uses the same grid formula.
+    let occupied: HashSet<(u32, u32)> = children(
+        &topology.wl_pod_range,
+        &topology.block_cells,
+        workload as usize,
+    )
+    .chain(changed_pods.iter().map(|&pod| pod as usize))
+    .filter(|&index| {
+        topology.pod_slots.is_active(index)
+            && index != slot as usize
+            && topology.pod_wl[index] == workload
+    })
+    .map(|index| {
+        let rect = topology.pod_rects[index];
+        (rect.x.to_bits(), rect.y.to_bits())
+    })
+    .collect();
     // The grid widens to the shape the batch engine would have chosen, and
     // widening is free: a pod's rect is fixed by its column and row, and adding
     // a column changes neither for any pod already placed -- it only makes the
@@ -1332,19 +1341,8 @@ fn place_satellite(topology: &mut Topology, slot: u32, workload: u32) -> Rect {
 // already contiguous and in order, so an empty `indices` is not an empty scene --
 // it means the range *is* the answer. Reading the range without checking would
 // silently visit nothing on exactly the scenes that are cheapest to lay out.
-fn children(ranges: &[Range<u32>], indices: &[u32], parent: usize) -> Vec<usize> {
-    let Some(range) = ranges.get(parent) else {
-        return Vec::new();
-    };
-    let (start, end) = (range.start as usize, range.end as usize);
-    if indices.is_empty() {
-        return (start..end).collect();
-    }
-    let end = end.min(indices.len());
-    if start >= end {
-        return Vec::new();
-    }
-    indices[start..end].iter().map(|&at| at as usize).collect()
+fn children<'a>(ranges: &[Range<u32>], indices: &'a [u32], parent: usize) -> ChildIndices<'a> {
+    ChildIndices::new(ranges.get(parent).cloned().unwrap_or(0..0), indices)
 }
 
 // Bring the scene back down to what is actually in it.
@@ -1526,7 +1524,8 @@ fn repack_pod_grid(
         return;
     }
 
-    let mut order = children(&topology.wl_pod_range, &topology.block_cells, workload);
+    let mut order: Vec<usize> =
+        children(&topology.wl_pod_range, &topology.block_cells, workload).collect();
     order.sort_unstable_by_key(|&pod| {
         let rect = topology.pod_rects[pod];
         let column = ((rect.x - card.x - pad) / POD_PITCH).round().max(0.0) as u32;
@@ -1572,9 +1571,8 @@ fn reorbit_satellites(topology: &mut Topology, dirt_sats: &mut Vec<u32>, workloa
     let card = topology.wl_card_rects[workload];
     let (center_x, center_y) = card.center();
     let base_radius = 0.5 * (card.w * card.w + card.h * card.h).sqrt() + SAT_RING0_GAP;
-    for (position, sat) in children(&topology.wl_sat_range, &topology.block_sats, workload)
-        .into_iter()
-        .enumerate()
+    for (position, sat) in
+        children(&topology.wl_sat_range, &topology.block_sats, workload).enumerate()
     {
         const RING_SLOTS: usize = 12;
         let ring = position / RING_SLOTS;

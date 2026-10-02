@@ -18,8 +18,6 @@ mod topology;
 // costs nothing at runtime. Splitting the *implementation* the same way did
 // cost something -- see benchmarks/README.md -- which is why it is still here.
 #[cfg(test)]
-mod edge_test;
-#[cfg(test)]
 mod filter_test;
 #[cfg(test)]
 mod publish_test;
@@ -29,6 +27,8 @@ mod spawn_test;
 mod stability_test;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod topology_test;
 
 use std::ops::Range;
 use std::sync::Arc;

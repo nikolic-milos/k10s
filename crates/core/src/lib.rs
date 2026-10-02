@@ -27,7 +27,8 @@ pub use ingest::{
     IntakeStats, Op, Payload, ResourceEvent,
 };
 pub use k10s_atlas::{
-    BlockNode, CellNode, Edge, EdgeIndex, Endpoint, Level, Rect, RegionNode, Scene, Totals,
+    BlockNode, CellNode, ChildIndices, Edge, EdgeIndex, Endpoint, Level, Rect, RegionNode, Scene,
+    Totals,
 };
 pub use model::{
     BUILTIN_KIND_COUNT, BUILTIN_KINDS, BUILTIN_REASON_COUNT, BUILTIN_REASONS, BUILTIN_TOOL_COUNT,

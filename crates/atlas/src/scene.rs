@@ -952,7 +952,9 @@ pub struct ChildIndices<'a> {
 }
 
 impl<'a> ChildIndices<'a> {
-    fn new(range: Range<u32>, adjacency: &'a [u32]) -> Self {
+    /// Borrow a direct child range or the corresponding indirect adjacency.
+    /// The range must be covered by the adjacency when it is nonempty.
+    pub fn new(range: Range<u32>, adjacency: &'a [u32]) -> Self {
         let indirect = if adjacency.is_empty() {
             None
         } else {

@@ -130,3 +130,61 @@ fn a_resized_card_refreshes_geometry_when_the_edge_endpoints_stay_the_same() {
     assert_ne!(bench.snapshot().edge_segments, geometry);
     assert_eq!(held.edge_segments, geometry);
 }
+
+#[test]
+fn a_batch_places_arrivals_moves_and_reused_slots_without_overlapping() {
+    let mut bench = fixture(true);
+    let mut events = vec![replay::owner(
+        "wl-new",
+        "prod",
+        "new",
+        KindId::DEPLOYMENT,
+        Op::Added,
+    )];
+    for pod in 0..12 {
+        events.push(replay::instance(
+            &format!("wl-new-{pod}"),
+            "prod",
+            "wl-new",
+            State::OK,
+            Op::Added,
+        ));
+    }
+    for (uid, parent, op) in [
+        ("wl-api-0", "wl-new", Op::Modified),
+        ("wl-api-1", "wl-api", Op::Deleted),
+        ("reused", "wl-side", Op::Added),
+        ("wl-api-1", "wl-api", Op::Added),
+        ("wl-new-0", "wl-api", Op::Modified),
+    ] {
+        events.push(replay::instance(uid, "prod", parent, State::OK, op));
+    }
+    bench.apply_events(&events);
+    bench.run_publish();
+    topology::verify_derived_state(&mut bench.world);
+    let after = bench.snapshot();
+    assert_published_matches_full(&bench.world, &after);
+    assert_eq!(after.totals.cells, 45);
+    for (block, owner) in after.blocks.iter().enumerate() {
+        let children: Vec<usize> = after.block_cell_indices(block).collect();
+        for (position, &pod) in children.iter().enumerate() {
+            let rect = after.cells[pod].rect;
+            assert!(owner.inner.contains(&rect));
+            for &other in &children[position + 1..] {
+                assert!(
+                    !rect.intersects(&after.cells[other].rect),
+                    "pods {pod} and {other} overlap in {}",
+                    owner.label
+                );
+            }
+        }
+    }
+    let new = workload_named(&after, "new").0;
+    let children: Vec<&str> = after
+        .block_cell_indices(new)
+        .map(|pod| after.ids.cells[pod].as_ref())
+        .collect();
+    assert_eq!(children.len(), 12);
+    assert!(children.contains(&"wl-api-0"));
+    assert!(!children.contains(&"wl-new-0"));
+}
