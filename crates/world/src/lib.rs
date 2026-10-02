@@ -18,6 +18,8 @@ mod topology;
 // costs nothing at runtime. Splitting the *implementation* the same way did
 // cost something -- see benchmarks/README.md -- which is why it is still here.
 #[cfg(test)]
+mod edge_test;
+#[cfg(test)]
 mod filter_test;
 #[cfg(test)]
 mod publish_test;
@@ -1017,9 +1019,11 @@ fn patch_structural_into(
             .region_edges
             .extend(topo.ns_edge_range.iter().cloned());
         scene.cross_edges = topo.cross_edge_range.clone();
-        scene.rebuild_edge_indexes();
     }
 
+    // The endpoint IDs can stay unchanged while their cards resize or their
+    // pods move. Cached segments and index bounds must follow the geometry.
+    scene.rebuild_edge_indexes();
     scene.rebuild_spatial_index();
 }
 

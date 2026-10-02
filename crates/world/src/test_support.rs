@@ -284,6 +284,10 @@ pub(crate) fn assert_published_matches_full(world: &World, snap: &SceneSnapshot)
     assert_eq!(snap.block_sats, full.block_sats, "block_sats diverged");
     assert_eq!(snap.edges, full.edges, "edges diverged");
     assert_eq!(
+        snap.edge_segments, full.edge_segments,
+        "edge geometry diverged"
+    );
+    assert_eq!(
         snap.region_edges, full.region_edges,
         "region_edges diverged"
     );

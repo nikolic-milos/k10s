@@ -769,6 +769,7 @@ fn upsert_pod(
         dirt.wls.push(old_workload);
         dirt.nss.push(topology.wl_ns[old_workload as usize]);
         dirt.grids.push(old_workload);
+        dirt.edges |= parent_has_link_sats(topology, old_workload);
         // A move is a departure from where it was, so the card it left may now
         // be bigger than what remains in it.
         dirt.shrank = true;
@@ -824,7 +825,9 @@ fn upsert_satellite(
     let (slot, inserted) = topology.sat_slots.insert(resource.uid.clone());
     let index = slot as usize;
     ensure_satellite(topology, index + 1);
-    let moved = !inserted && topology.sat_wl[index] != workload;
+    let old_workload = topology.sat_wl[index];
+    let old_kind = topology.sat_kinds[index];
+    let moved = !inserted && old_workload != workload;
     topology.sat_labels[index] = resource.name.clone();
     topology.sat_kinds[index] = kind;
     topology.sat_details[index] = detail.clone();
@@ -833,14 +836,21 @@ fn upsert_satellite(
     if inserted {
         dirt.identity = true;
     }
+    if moved && topology.wl_slots.is_active(old_workload as usize) {
+        dirt.wls.push(old_workload);
+        dirt.nss.push(topology.wl_ns[old_workload as usize]);
+        dirt.shrank = true;
+    }
+    if (inserted || moved || old_kind != kind)
+        && (extra_edge_kind(kind) || (!inserted && extra_edge_kind(old_kind)))
+    {
+        dirt.edges = true;
+    }
     if inserted || moved {
         dirt.wl_sat = true;
         dirt.wls.push(workload);
         dirt.nss.push(topology.wl_ns[workload as usize]);
         topology.sat_rects[index] = place_satellite(topology, slot, workload);
-        if extra_edge_kind(kind) {
-            dirt.edges = true;
-        }
     }
 }
 

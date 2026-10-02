@@ -1,0 +1,132 @@
+use std::sync::Arc;
+
+use k10s_core::{IngestEvent, KindId, Op, Payload, ResourceEvent, State, replay};
+
+use crate::test_support::{assert_published_matches_full, workload_named};
+use crate::{LayoutMode, PublishBench, SNAPSHOT_POOL_DEPTH, topology};
+
+fn satellite(parent: &str, kind: KindId) -> IngestEvent {
+    IngestEvent::Resource(ResourceEvent {
+        kind,
+        uid: "sat-api".into(),
+        namespace: "prod".into(),
+        name: "api".into(),
+        resource_version: 0,
+        parent: Some(parent.into()),
+        op: Op::Modified,
+        payload: Payload::Attached {
+            kind,
+            detail: Arc::from(""),
+        },
+    })
+}
+
+fn fixture(linked: bool) -> PublishBench {
+    let mut api = replay::owner("wl-api", "prod", "api", KindId::DEPLOYMENT, Op::Added);
+    if let IngestEvent::Resource(resource) = &mut api
+        && let Payload::Owner { depends_on, .. } = &mut resource.payload
+    {
+        depends_on.push("wl-side".into());
+    }
+    let mut events = vec![
+        replay::scope("ns-prod", "prod", Op::Added),
+        api,
+        replay::owner("wl-side", "prod", "side", KindId::DEPLOYMENT, Op::Added),
+    ];
+    for parent in ["wl-api", "wl-side"] {
+        for pod in 0..16 {
+            events.push(replay::instance(
+                &format!("{parent}-{pod}"),
+                "prod",
+                parent,
+                State::OK,
+                Op::Added,
+            ));
+        }
+    }
+    if linked {
+        events.push(satellite("wl-api", KindId::SERVICE));
+    }
+    let mut bench = PublishBench::new(&events, LayoutMode::Spread);
+    for _ in 0..SNAPSHOT_POOL_DEPTH {
+        bench.flip_pods(1);
+        bench.run_publish();
+    }
+    bench
+}
+
+#[test]
+fn a_pod_leaving_a_linked_parent_drops_its_old_service_edge() {
+    let mut bench = fixture(true);
+    let held = bench.snapshot();
+    let old_edges = held.edges.clone();
+    let old_segments = held.edge_segments.clone();
+    let patches = bench.stats().structural_patches;
+    bench.apply_events(&[replay::instance(
+        "wl-api-0",
+        "prod",
+        "wl-side",
+        State::OK,
+        Op::Modified,
+    )]);
+    bench.run_publish();
+    let after = bench.snapshot();
+    assert_eq!(after.edges.len(), old_edges.len() - 1);
+    assert!(bench.stats().structural_patches > patches);
+    topology::verify_derived_state(&mut bench.world);
+    assert_published_matches_full(&bench.world, &after);
+    assert_eq!(held.edges, old_edges);
+    assert_eq!(held.edge_segments, old_segments);
+}
+
+#[test]
+fn a_satellite_move_refits_both_parents_and_retargets_its_edges() {
+    let mut bench = fixture(true);
+    let held = bench.snapshot();
+    let old_api = workload_named(&held, "api").1.clone();
+    assert_ne!(old_api.rect, old_api.inner);
+    bench.apply_events(&[satellite("wl-side", KindId::SERVICE)]);
+    bench.run_publish();
+    let after = bench.snapshot();
+    let api = workload_named(&after, "api").1;
+    assert_eq!(api.rect, api.inner, "the departed satellite leaves no halo");
+    topology::verify_derived_state(&mut bench.world);
+    assert_published_matches_full(&bench.world, &after);
+    assert_eq!(workload_named(&held, "api").1, &old_api);
+}
+
+#[test]
+fn changing_a_satellite_kind_rebuilds_its_relations_without_a_move() {
+    let mut bench = fixture(true);
+    for kind in [KindId::CONFIG_MAP, KindId::VOLUME, KindId::SERVICE] {
+        bench.apply_events(&[satellite("wl-api", kind)]);
+        bench.run_publish();
+        topology::verify_derived_state(&mut bench.world);
+        assert_published_matches_full(&bench.world, &bench.snapshot());
+    }
+}
+
+#[test]
+fn a_resized_card_refreshes_geometry_when_the_edge_endpoints_stay_the_same() {
+    let mut bench = fixture(false);
+    let held = bench.snapshot();
+    let edges = held.edges.clone();
+    let geometry = held.edge_segments.clone();
+    let patches = bench.stats().structural_patches;
+    for pod in 16..32 {
+        bench.apply_events(&[replay::instance(
+            &format!("wl-api-{pod}"),
+            "prod",
+            "wl-api",
+            State::OK,
+            Op::Added,
+        )]);
+        bench.run_publish();
+        let after = bench.snapshot();
+        assert_eq!(after.edges, edges);
+        assert_published_matches_full(&bench.world, &after);
+    }
+    assert!(bench.stats().structural_patches > patches);
+    assert_ne!(bench.snapshot().edge_segments, geometry);
+    assert_eq!(held.edge_segments, geometry);
+}
