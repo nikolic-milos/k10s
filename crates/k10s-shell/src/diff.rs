@@ -995,6 +995,10 @@ impl DiffView {
             });
         })
         .detach();
+        // The in-flight sentence replaces the line that asked for this press,
+        // the armed prompt or the conflict's offer of a forced preview, which
+        // would otherwise stay on screen asking for the press just made.
+        cx.notify();
     }
 
     // `reload` is what the sending editor did with a real apply that landed.
