@@ -24,9 +24,9 @@ use serde_json::Value;
 
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::reach::{
-    Bound, FoundService, MAX_BODY_BYTES, PROBE_DEADLINE, ToolAuth, Transport, proxy_path, tool_get,
+    Bound, FoundService, MAX_BODY_BYTES, ToolAuth, Transport, proxy_path, tool_get,
 };
-use crate::read::{Fetched, classify};
+use crate::read::Fetched;
 
 pub const MAX_ALERTS: usize = 512;
 pub const MAX_SILENCES: usize = 256;
@@ -367,15 +367,22 @@ pub async fn create_silence(
         return SilenceOutcome::NeedsConfirm { summary };
     }
     match tool_write(client, bound, http::Method::POST, SILENCES, Some(body)).await {
-        Fetched::Ok(bytes) => match parse_created(&bytes) {
+        Ok(bytes) => match parse_created(&bytes) {
             Ok(id) => SilenceOutcome::Applied { id, summary },
-            Err(why) => failed_outcome(why),
+            Err(why) => failed_outcome(format!(
+                "the silence was created, but its answer could not be read: {why}"
+            )),
         },
-        Fetched::Denied { .. } => SilenceOutcome::Denied {
-            what: WHAT,
-            why: "access denied for this account".to_string(),
-        },
-        Fetched::Failed { why, .. } => failed_outcome(why),
+        Err(WriteFailure::Unshown(why)) => {
+            failed_outcome(format!("the silence was created, but {why}"))
+        }
+        Err(WriteFailure::Denied(why)) => denied_outcome(why),
+        Err(WriteFailure::NotSent(why)) => failed_outcome(format!("nothing was sent: {why}")),
+        Err(WriteFailure::Answered(why)) => failed_outcome(why),
+        Err(WriteFailure::Unconfirmed(why)) => failed_outcome(format!(
+            "the silence may exist, so look at Alertmanager's silences before creating it \
+             again: {why}"
+        )),
     }
 }
 
@@ -406,15 +413,18 @@ pub async fn expire_silence(
     )
     .await
     {
-        Fetched::Ok(_) => SilenceOutcome::Applied {
+        // An answer too large to show is still a 2xx: the silence expired.
+        Ok(_) | Err(WriteFailure::Unshown(_)) => SilenceOutcome::Applied {
             id: id.to_string(),
             summary,
         },
-        Fetched::Denied { .. } => SilenceOutcome::Denied {
-            what: WHAT,
-            why: "access denied for this account".to_string(),
-        },
-        Fetched::Failed { why, .. } => failed_outcome(why),
+        Err(WriteFailure::Denied(why)) => denied_outcome(why),
+        Err(WriteFailure::NotSent(why)) => failed_outcome(format!("nothing was sent: {why}")),
+        Err(WriteFailure::Answered(why)) => failed_outcome(why),
+        Err(WriteFailure::Unconfirmed(why)) => failed_outcome(format!(
+            "the silence may have expired, so look at Alertmanager's silences before \
+             expiring it again: {why}"
+        )),
     }
 }
 
@@ -692,43 +702,43 @@ fn failed_outcome(why: String) -> SilenceOutcome {
     SilenceOutcome::Failed { what: WHAT, why }
 }
 
+fn denied_outcome(why: String) -> SilenceOutcome {
+    SilenceOutcome::Denied { what: WHAT, why }
+}
+
 async fn tool_write(
     client: &Client,
     bound: &Bound,
     method: http::Method,
     rest: &str,
     body: Option<Vec<u8>>,
-) -> Fetched<Vec<u8>> {
+) -> Result<Vec<u8>, WriteFailure> {
     let Transport::Proxy {
         namespace,
         service,
         port,
     } = &bound.transport
     else {
-        return Fetched::Failed {
-            what: WHAT,
-            why: match &bound.transport {
-                Transport::NeedsForward { .. } => {
-                    "Alertmanager needs a port-forward before a silence can be written; open one \
+        return Err(WriteFailure::NotSent(match &bound.transport {
+            Transport::NeedsForward { .. } => {
+                "Alertmanager needs a port-forward before a silence can be written; open one \
                      from the forwards panel"
-                        .to_string()
-                }
-                Transport::Url { .. } => {
-                    "Alertmanager silence writes are only implemented on the API-server proxy"
-                        .to_string()
-                }
-                Transport::Proxy { .. } => unreachable!("matched above"),
-            },
-        };
+                    .to_string()
+            }
+            Transport::Url { .. } => {
+                "Alertmanager silence writes are only implemented on the API-server proxy"
+                    .to_string()
+            }
+            Transport::Proxy { .. } => unreachable!("matched above"),
+        }));
     };
     if body
         .as_ref()
         .is_some_and(|bytes| bytes.len() > MAX_BODY_BYTES)
     {
-        return Fetched::Failed {
-            what: WHAT,
-            why: "the silence itself exceeds 8 MiB; it is not sent".to_string(),
-        };
+        return Err(WriteFailure::NotSent(
+            "the silence itself exceeds 8 MiB; it is not sent".to_string(),
+        ));
     }
     let found = FoundService {
         kind: bound.kind,
@@ -745,29 +755,47 @@ async fn tool_write(
     } else {
         builder.header(http::header::CONTENT_TYPE, JSON)
     };
-    let request = match builder.body(bytes) {
-        Ok(request) => request,
+    let request = builder
+        .body(bytes)
+        .map_err(|error| WriteFailure::NotSent(error.to_string()))?;
+    // Bounded by the interactive client's deadline, like every confirmed
+    // write: a timer of its own here would also run through connecting and
+    // a credential's refresh, and blame Alertmanager for either.
+    match crate::connect::send_write(client, request).await {
+        Ok(text) if text.len() > MAX_BODY_BYTES => Err(WriteFailure::Unshown(format!(
+            "Alertmanager answered with more than {MAX_BODY_BYTES} bytes; the body is hidden"
+        ))),
+        Ok(text) => Ok(text.into_bytes()),
+        Err(kube::Error::Api(status)) => Err(match status.code {
+            401 | 403 => WriteFailure::Denied(crate::connect::status_sentence(&status)),
+            _ => WriteFailure::Answered(crate::connect::status_sentence(&status)),
+        }),
         Err(error) => {
-            return Fetched::Failed {
-                what: WHAT,
-                why: error.to_string(),
-            };
+            let error = &error as &(dyn std::error::Error + 'static);
+            let why = crate::connect::describe(error);
+            Err(if crate::connect::never_sent(error) {
+                WriteFailure::NotSent(why)
+            } else {
+                WriteFailure::Unconfirmed(why)
+            })
         }
-    };
-    match tokio::time::timeout(PROBE_DEADLINE, client.request_text(request)).await {
-        Err(_) => Fetched::Failed {
-            what: WHAT,
-            why: "Alertmanager did not answer within 4 seconds".to_string(),
-        },
-        Ok(Ok(text)) if text.len() > MAX_BODY_BYTES => Fetched::Failed {
-            what: WHAT,
-            why: format!(
-                "Alertmanager answered with more than {MAX_BODY_BYTES} bytes; the body is hidden"
-            ),
-        },
-        Ok(Ok(text)) => Fetched::Ok(text.into_bytes()),
-        Ok(Err(error)) => classify(WHAT, &error),
     }
+}
+
+/// Why a write to Alertmanager has nothing to show, for each caller to word:
+/// "the silence may exist" is true after a create that went unconfirmed and
+/// false after an expire.
+enum WriteFailure {
+    NotSent(String),
+    Denied(String),
+    // Refused, in the server's words.
+    Answered(String),
+    // Accepted, with an answer too large to show: the write happened.
+    Unshown(String),
+    // No verdict: the connection broke after it was made, the deadline passed,
+    // or the answer was a redirect or a 5xx (`connect::NoVerdict`). The write may have
+    // happened.
+    Unconfirmed(String),
 }
 
 fn clip(text: &str) -> String {

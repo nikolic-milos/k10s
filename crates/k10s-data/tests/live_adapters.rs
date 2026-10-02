@@ -28,6 +28,10 @@
 //! and its monitoring-grafana PVC. A generated pod holds a SQLite lock without
 //! changing data. It is deleted even when a check panics; run this suite alone.
 //!
+//! The drain proof requires `live_fixtures.sh --with kwok`: it drains a fake
+//! kwok node whose one pod sits under a PodDisruptionBudget with no disruption
+//! allowed, and deletes the node and its namespace even when a check panics.
+//!
 //! The observability tests require `live_fixtures.sh --with observability`.
 //! The monitoring test compares a scraped namespace creation time with
 //! Kubernetes metadata and reads dashboards through a healthy Grafana. The
@@ -156,11 +160,15 @@ fn apply(reader: &Reader, request: ApplyRequest) -> ApplyOutcome {
 }
 
 fn day2(reader: &Reader, kind: KindId, call: Day2Call) -> Day2Outcome {
+    let requests = match &call {
+        Day2Call::Drain(request) if request.confirm => 2 + k10s_data::day2::MAX_DRAIN_PODS as u32,
+        _ => 1,
+    };
     let (tx, rx) = std::sync::mpsc::channel();
     reader.day2(kind, call, move |outcome| {
         let _ = tx.send(outcome);
     });
-    wait_interactive(&rx, 1)
+    wait_interactive(&rx, requests)
 }
 
 fn scale_call(name: &str, current: i32, replicas: i32, confirm: bool) -> Day2Call {
@@ -361,9 +369,7 @@ impl Drop for RestoreRelease {
 
 fn admin_request(request: http::Request<Vec<u8>>) -> Result<serde_json::Value, kube::Error> {
     kube_runtime().block_on(async {
-        let client = kube::Client::try_default()
-            .await
-            .expect("a client from KUBECONFIG");
+        let client = kube::Client::try_default().await?;
         client.request::<serde_json::Value>(request).await
     })
 }
@@ -1641,12 +1647,207 @@ fn a_read_only_account_cannot_create_a_live_alertmanager_silence() {
         ours
     });
     assert!(stored.is_empty(), "a read-only account created a silence");
-    assert_eq!(
-        answer,
-        SilenceOutcome::Denied {
-            what: "alertmanager",
-            why: "access denied for this account".into()
-        }
+    let SilenceOutcome::Denied { what, why } = &answer else {
+        panic!("the restricted account's silence was not denied: {answer:?}");
+    };
+    assert_eq!(*what, "alertmanager");
+    // The chosen context's username may differ; its server denial must survive.
+    assert!(why.contains("is forbidden: User \""), "{why}");
+    assert!(
+        why.contains("cannot create resource \"services/proxy\""),
+        "{why}"
     );
     println!("live silence denial in {context}: {answer:?}");
+}
+
+const DRAIN_PROBE: &str = "k10s-live-drain";
+
+// A tainted kwok node with one tolerating pod under a budget that allows no
+// disruption, deleted with its namespace however the test ends.
+struct DrainProbe;
+
+impl DrainProbe {
+    fn create() -> Self {
+        let probe = DrainProbe;
+        let objects = [
+            (
+                "/api/v1/nodes".to_string(),
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "Node",
+                    "metadata": {"name": DRAIN_PROBE,
+                        "annotations": {"kwok.x-k8s.io/node": "fake"},
+                        "labels": {"type": "kwok", "kubernetes.io/hostname": DRAIN_PROBE}},
+                    "spec": {"taints": [{"key": "kwok.x-k8s.io/node", "value": "fake", "effect": "NoExecute"}]},
+                }),
+            ),
+            (
+                "/api/v1/namespaces".to_string(),
+                serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": DRAIN_PROBE}}),
+            ),
+            (
+                format!("/apis/apps/v1/namespaces/{DRAIN_PROBE}/deployments"),
+                serde_json::json!({
+                    "apiVersion": "apps/v1", "kind": "Deployment",
+                    "metadata": {"name": DRAIN_PROBE},
+                    "spec": {"replicas": 1,
+                        "selector": {"matchLabels": {"app": DRAIN_PROBE}},
+                        "template": {"metadata": {"labels": {"app": DRAIN_PROBE}},
+                            "spec": {"nodeSelector": {"kubernetes.io/hostname": DRAIN_PROBE},
+                                "tolerations": [{"key": "kwok.x-k8s.io/node", "operator": "Exists", "effect": "NoExecute"}],
+                                "containers": [{"name": "fake", "image": "fake-image"}]}}},
+                }),
+            ),
+            (
+                format!("/apis/policy/v1/namespaces/{DRAIN_PROBE}/poddisruptionbudgets"),
+                serde_json::json!({
+                    "apiVersion": "policy/v1", "kind": "PodDisruptionBudget",
+                    "metadata": {"name": DRAIN_PROBE},
+                    "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": DRAIN_PROBE}}},
+                }),
+            ),
+        ];
+        for (path, object) in objects {
+            let request = kube::api::Request::new(&path)
+                .create(
+                    &kube::api::PostParams::default(),
+                    serde_json::to_vec(&object).expect("JSON"),
+                )
+                .expect("a create request");
+            if let Err(error) = admin_request(request) {
+                panic!("creating the drain probe at {path}: {}", said(&error));
+            }
+        }
+        let budget = format!("/apis/policy/v1/namespaces/{DRAIN_PROBE}/poddisruptionbudgets");
+        for _ in 0..60 {
+            let request = kube::api::Request::new(&budget)
+                .get(DRAIN_PROBE, &kube::api::GetParams::default())
+                .expect("a get request");
+            let pdb = admin_request(request).expect("the budget");
+            if pdb["status"]["currentHealthy"] == 1 && pdb["status"]["disruptionsAllowed"] == 0 {
+                return probe;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        panic!("the kwok pod never became healthy under its budget; is kwok installed?");
+    }
+}
+
+impl Drop for DrainProbe {
+    fn drop(&mut self) {
+        // A kwok node has no kubelet to finish a graceful pod deletion. Stop
+        // new pods by deleting the namespace, then remove its fake pods with
+        // no grace before deleting the node.
+        let pods = format!("/api/v1/namespaces/{DRAIN_PROBE}/pods");
+        for (what, request) in [
+            (
+                "namespace",
+                kube::api::Request::new("/api/v1/namespaces")
+                    .delete(DRAIN_PROBE, &kube::api::DeleteParams::default()),
+            ),
+            (
+                "pods",
+                kube::api::Request::new(&pods).delete_collection(
+                    &kube::api::DeleteParams {
+                        grace_period_seconds: Some(0),
+                        ..Default::default()
+                    },
+                    &kube::api::ListParams::default(),
+                ),
+            ),
+            (
+                "node",
+                kube::api::Request::new("/api/v1/nodes")
+                    .delete(DRAIN_PROBE, &kube::api::DeleteParams::default()),
+            ),
+        ] {
+            let request = request.expect("a cleanup request");
+            if let Err(error) = admin_request(request) {
+                eprintln!("deleting the drain probe's {what}: {}", said(&error));
+            }
+        }
+        // A namespace still being deleted refuses to be created again, so the
+        // probe waits, bounded, until both are gone, and the next run starts
+        // clean instead of failing on this one's leftovers.
+        for path in ["/api/v1/namespaces", "/api/v1/nodes"] {
+            let gone = (0..60).any(|_| {
+                let request = kube::api::Request::new(path)
+                    .get(DRAIN_PROBE, &kube::api::GetParams::default())
+                    .expect("a get request");
+                let gone = matches!(
+                    admin_request(request),
+                    Err(kube::Error::Api(status)) if status.code == 404
+                );
+                if !gone {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                gone
+            });
+            if !gone {
+                let message = format!("{path}/{DRAIN_PROBE} is still there after 60 s");
+                if std::thread::panicking() {
+                    eprintln!("{message}");
+                } else {
+                    panic!("{message}");
+                }
+            }
+        }
+    }
+}
+
+// A failed admin request in the server's words and code, rather than kube's
+// rendering of the whole Status.
+fn said(error: &kube::Error) -> String {
+    match error {
+        kube::Error::Api(status) => format!("{} ({})", status.message, status.code),
+        other => other.to_string(),
+    }
+}
+
+// A drain meeting a budget used to have each refused eviction resent by the
+// client's retry: sixteen POSTs over six minutes for one pod on this lab. The
+// drain must now name the budget in the server's words within five seconds.
+// The scripted and socket tests count requests; this fixture measures latency.
+#[test]
+#[ignore = "needs a live cluster with kwok; see the module comment"]
+fn a_drain_names_the_disruption_budget_promptly() {
+    use k10s_data::day2::DrainRequest;
+    let (_plane, sync) = connect(None);
+    let _probe = DrainProbe::create();
+    let started = std::time::Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.day2(
+        KindId::NODE,
+        Day2Call::Drain(DrainRequest {
+            name: DRAIN_PROBE.to_string(),
+            force: false,
+            confirm: true,
+            caps: Caps::default(),
+        }),
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    );
+    // One pod list, one cordon and the fixture's single eviction.
+    let outcome = wait_interactive(&rx, 3);
+    let took = started.elapsed();
+    println!("live drain answered in {took:?}");
+    let Day2Outcome::Applied(applied) = outcome else {
+        panic!("the drain reports: {outcome:?}");
+    };
+    assert_eq!(
+        applied.summary,
+        format!(
+            "cordoned {DRAIN_PROBE}; evicted 0 pods; 1 blocked by a PodDisruptionBudget (The \
+             disruption budget {DRAIN_PROBE} needs 1 healthy pods and has 1 currently)"
+        )
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "one eviction, answered: {took:?}"
+    );
+    let request = kube::api::Request::new("/api/v1/nodes")
+        .get(DRAIN_PROBE, &kube::api::GetParams::default())
+        .expect("a get request");
+    let node = admin_request(request).expect("the node");
+    assert_eq!(node["spec"]["unschedulable"], true, "the node is cordoned");
 }

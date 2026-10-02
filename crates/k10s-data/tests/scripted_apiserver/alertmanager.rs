@@ -286,6 +286,40 @@ fn create_silence_posts_the_v2_body() {
     drop(runtime);
 }
 
+// A silence write waits as long as any confirmed write, the interactive
+// client's deadline, and has no shorter timer of its own: an answer after the
+// four seconds a probe gets is still the answer. The clock is paused, so the
+// test does not wait them out.
+#[test]
+fn a_silence_answered_after_a_probes_deadline_is_created() {
+    let script = Script::default();
+    script.route_delayed(
+        "POST",
+        "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences",
+        200,
+        CREATED_JSON,
+        Duration::from_secs(6),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("a runtime");
+    let outcome = runtime.block_on(async {
+        create_silence(
+            &script.client(),
+            &am_bound(ToolAuth::Anonymous, proxy()),
+            &spec(),
+            true,
+        )
+        .await
+    });
+    match outcome {
+        SilenceOutcome::Applied { id, .. } => assert_eq!(id, "silence-watchdog"),
+        other => panic!("a late answer is still the answer: {other:?}"),
+    }
+}
+
 #[test]
 fn expire_silence_deletes_the_v2_path() {
     let script = Script::default();
@@ -409,15 +443,14 @@ fn the_reader_posts_the_reviewed_pod_matchers_to_the_reviewed_endpoint() {
             );
         } else {
             assert!(matches!(answer, SilenceOutcome::NeedsConfirm { .. }));
-            assert_eq!(
-                script.seen().len(),
-                requests_before,
-                "review neither writes nor rebinds"
+            assert!(
+                after_sync(&script, requests_before).is_empty(),
+                "review neither writes nor rebinds: {:?}",
+                after_sync(&script, requests_before)
             );
         }
     }
-    let seen = script.seen();
-    let added = &seen[requests_before..];
+    let added = after_sync(&script, requests_before);
     assert_eq!(
         added.len(),
         1,
@@ -440,8 +473,36 @@ fn the_reader_posts_the_reviewed_pod_matchers_to_the_reviewed_endpoint() {
     );
 }
 
+// An answer too large to show is still a 2xx: the silence exists.
 #[test]
-fn a_create_response_without_a_silence_id_does_not_claim_success() {
+fn a_create_answered_too_large_to_show_says_the_silence_was_created() {
+    let script = Script::default();
+    let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
+    let huge = format!(
+        r#"{{"silenceID":"s","pad":"{}"}}"#,
+        "x".repeat(k10s_data::reach::MAX_BODY_BYTES)
+    );
+    script.route("POST", path, 200, huge);
+    let runtime = runtime();
+    let answer = runtime.block_on(async {
+        create_silence(
+            &script.client(),
+            &am_bound(ToolAuth::Anonymous, proxy()),
+            &spec(),
+            true,
+        )
+        .await
+    });
+    assert!(
+        matches!(answer, SilenceOutcome::Failed { ref why, .. }
+            if why.starts_with("the silence was created, but Alertmanager answered with more than ")),
+        "{answer:?}"
+    );
+    assert_eq!(script.seen().len(), 1);
+}
+
+#[test]
+fn a_create_answered_without_a_silence_id_says_it_was_created_without_one() {
     for body in ["", "{}", r#"{"silenceID":""}"#] {
         let script = Script::default();
         let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
@@ -456,8 +517,11 @@ fn a_create_response_without_a_silence_id_does_not_claim_success() {
             )
             .await
         });
+        // A 2xx means the silence exists; only its id could not be read.
         assert!(
-            matches!(answer, SilenceOutcome::Failed { ref why, .. } if why.contains("silenceID")),
+            matches!(answer, SilenceOutcome::Failed { ref why, .. }
+                if why.starts_with("the silence was created, but its answer could not be read: ")
+                    && why.contains("silenceID")),
             "{answer:?}"
         );
         let hits = script.seen();
@@ -506,11 +570,36 @@ fn the_alerts_read_preserves_the_namespace_and_full_pod_name_for_a_join() {
     assert_eq!(hits[0].body, "");
 }
 
+// A denial keeps its label. The API server's own 500, recorded on the lab for
+// an admission webhook it could not reach (C1/lab/internal-error), is no
+// verdict like any 5xx, so the silence may exist.
 #[test]
-fn silence_write_denial_and_failure_keep_their_label_and_server_sentence() {
-    for (code, reason, sentence) in [
-        (403, "Forbidden", "creating silences is forbidden"),
-        (500, "InternalError", "silence store is read-only"),
+fn a_denied_silence_write_keeps_its_label_and_a_5xx_says_it_may_exist() {
+    let internal = "Internal error occurred: failed calling webhook \"unreachable.closeout.k10s.test\": \
+                    failed to call webhook: Post \"https://nobody.closeout-ie.svc:443/?timeout=10s\": \
+                    service \"nobody\" not found";
+    for (code, reason, sentence, expected) in [
+        (
+            403,
+            "Forbidden",
+            "creating silences is forbidden",
+            SilenceOutcome::Denied {
+                what: "alertmanager",
+                why: "creating silences is forbidden".into(),
+            },
+        ),
+        (
+            500,
+            "InternalError",
+            internal,
+            SilenceOutcome::Failed {
+                what: "alertmanager",
+                why: format!(
+                    "the silence may exist, so look at Alertmanager's silences before creating it \
+                     again: {internal}"
+                ),
+            },
+        ),
     ] {
         let script = Script::default();
         let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
@@ -527,20 +616,7 @@ fn silence_write_denial_and_failure_keep_their_label_and_server_sentence() {
             )
             .await
         });
-        if code == 403 {
-            assert_eq!(
-                answer,
-                SilenceOutcome::Denied {
-                    what: "alertmanager",
-                    why: "access denied for this account".into()
-                }
-            );
-        } else {
-            assert!(
-                matches!(answer, SilenceOutcome::Failed { ref why, .. } if why.contains(sentence)),
-                "{answer:?}"
-            );
-        }
+        assert_eq!(answer, expected);
         let hits = script.seen();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].method, "POST");
@@ -550,6 +626,104 @@ fn silence_write_denial_and_failure_keep_their_label_and_server_sentence() {
         assert_eq!(
             hits[0].body,
             r#"{"matchers":[{"name":"alertname","value":"Watchdog","isRegex":false,"isEqual":true}],"startsAt":"2024-01-01T00:00:00Z","endsAt":"2024-01-02T00:00:00Z","createdBy":"k10s","comment":"quiet"}"#
+        );
+    }
+}
+
+// A redirect does not confirm or refuse the write. A status without a
+// message names its code.
+#[test]
+fn a_redirect_is_not_a_created_silence_and_an_empty_answer_names_its_code() {
+    let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
+    let runtime = runtime();
+    let create = |script: &Script| {
+        runtime.block_on(async {
+            create_silence(
+                &script.client(),
+                &am_bound(ToolAuth::Anonymous, proxy()),
+                &spec(),
+                true,
+            )
+            .await
+        })
+    };
+    let script = Script::default();
+    script.route("POST", path, 302, "Found");
+    assert_eq!(
+        create(&script),
+        SilenceOutcome::Failed {
+            what: "alertmanager",
+            why: "the silence may exist, so look at Alertmanager's silences before creating it again: answered with status 302 and no Location".to_string()
+        },
+        "a redirect leaves the write unconfirmed"
+    );
+
+    for (code, why) in [
+        (400, "answered with status 400 and no message".to_string()),
+        (
+            500,
+            "the silence may exist, so look at Alertmanager's silences before creating it again: \
+             answered with status 500 and no message"
+                .to_string(),
+        ),
+    ] {
+        let script = Script::default();
+        script.route(
+            "POST",
+            path,
+            code,
+            format!(
+                r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"","code":{code}}}"#
+            ),
+        );
+        assert_eq!(
+            create(&script),
+            SilenceOutcome::Failed {
+                what: "alertmanager",
+                why
+            }
+        );
+    }
+}
+
+#[test]
+fn a_redirected_create_may_have_stored_the_silence() {
+    for code in [301, 302, 303, 307, 308] {
+        let script = Script::default();
+        let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
+        script.route("POST", path, code, "");
+        let runtime = runtime();
+        let outcome = runtime.block_on(async {
+            create_silence(
+                &script.client(),
+                &am_bound(ToolAuth::Anonymous, proxy()),
+                &spec(),
+                true,
+            )
+            .await
+        });
+        assert_eq!(
+            outcome,
+            SilenceOutcome::Failed {
+                what: "alertmanager",
+                why: format!(
+                    "the silence may exist, so look at Alertmanager's silences before creating it again: answered with status {code} and no Location"
+                )
+            }
+        );
+        let sent = script.requests_for(path);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].method, "POST");
+        assert_eq!(sent[0].path, path);
+        assert_eq!(sent[0].accept, "");
+        assert_eq!(sent[0].content_type, "application/json");
+        let body: serde_json::Value = serde_json::from_str(&sent[0].body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "matchers": [{"name": "alertname", "value": "Watchdog", "isRegex": false, "isEqual": true}],
+                "startsAt": "2024-01-01T00:00:00Z", "endsAt": "2024-01-02T00:00:00Z", "createdBy": "k10s", "comment": "quiet"
+            })
         );
     }
 }
@@ -592,4 +766,176 @@ fn a_silence_takes_the_interactive_client() {
     let stray = after_sync(&sync, before);
     assert!(stray.is_empty(), "nothing on the sync client: {stray:?}");
     drop(runtime);
+}
+
+// An expire answered 2xx with a body too large to show still expired the
+// silence: a 2xx is done, whatever its body.
+#[test]
+fn an_expire_answered_with_a_body_too_large_to_show_is_done() {
+    let script = Script::default();
+    script.route(
+        "DELETE",
+        "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silence/abc",
+        200,
+        "0".repeat(k10s_data::reach::MAX_BODY_BYTES + 1),
+    );
+    let runtime = runtime();
+    let expired = runtime.block_on(async {
+        expire_silence(
+            &script.client(),
+            &am_bound(ToolAuth::Anonymous, proxy()),
+            "abc",
+            true,
+        )
+        .await
+    });
+    assert!(
+        matches!(&expired, SilenceOutcome::Applied { id, .. } if id == "abc"),
+        "{expired:?}"
+    );
+}
+
+// An unconfirmed create may have made the silence, and the answer
+// says so; a create the server refused says only what the server said. The
+// same unconfirmed state on an expire says it may have expired.
+#[test]
+fn an_unconfirmed_silence_create_says_the_silence_may_exist() {
+    let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
+    let timeout = serde_json::json!({
+        "apiVersion":"v1", "kind":"Status", "status":"Failure", "code":504,
+        "reason":"Timeout", "message":"the proxy timed out waiting for Alertmanager"
+    })
+    .to_string();
+    // The service proxy answers 503 whether or not Alertmanager read the POST
+    // (measured: C1/lab/proxy-502 and proxy-503), so a 503 is no verdict.
+    let unavailable = serde_json::json!({
+        "apiVersion":"v1", "kind":"Status", "status":"Failure", "code":503,
+        "reason":"ServiceUnavailable", "message":"error trying to reach service: EOF"
+    })
+    .to_string();
+    let may_exist =
+        "the silence may exist, so look at Alertmanager's silences before creating it again: ";
+    let runtime = runtime();
+    let create = |script: &Script| {
+        runtime.block_on(async {
+            create_silence(
+                &script.client(),
+                &am_bound(ToolAuth::Anonymous, proxy()),
+                &spec(),
+                true,
+            )
+            .await
+        })
+    };
+
+    let script = Script::default();
+    script.route("POST", path, 504, timeout.clone());
+    assert_eq!(
+        create(&script),
+        SilenceOutcome::Failed {
+            what: "alertmanager",
+            why: format!("{may_exist}the proxy timed out waiting for Alertmanager")
+        }
+    );
+
+    let script = Script::default();
+    script.route_lost("POST", path);
+    let SilenceOutcome::Failed { why, .. } = create(&script) else {
+        panic!("a lost create is a failure");
+    };
+    assert!(why.starts_with(may_exist), "{why}");
+
+    // A create whose credential failed never left the process: no silence
+    // can exist, and the sentence does not send the person looking for one.
+    let script = Script::default();
+    script.route_unsent("POST", path);
+    let SilenceOutcome::Failed { why, .. } = create(&script) else {
+        panic!("an unsent create is a failure");
+    };
+    assert_eq!(
+        why,
+        "nothing was sent: exec-plugin response did not contain a status"
+    );
+
+    let script = Script::default();
+    script.route("POST", path, 503, unavailable);
+    assert_eq!(
+        create(&script),
+        SilenceOutcome::Failed {
+            what: "alertmanager",
+            why: format!("{may_exist}error trying to reach service: EOF")
+        }
+    );
+
+    // Alertmanager's own refusal is its JSON, not a Status, with a code that is
+    // not the HTTP status (recorded on the lab: C1/lab/alertmanager-refusal),
+    // and says only what it said.
+    let script = Script::default();
+    script.route(
+        "POST",
+        path,
+        422,
+        r#"{"code":612,"message":"matchers in body should have at least 1 items"}"#,
+    );
+    assert_eq!(
+        create(&script),
+        SilenceOutcome::Failed {
+            what: "alertmanager",
+            why: "matchers in body should have at least 1 items".to_string()
+        }
+    );
+
+    let script = Script::default();
+    script.route(
+        "DELETE",
+        "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silence/abc",
+        504,
+        timeout,
+    );
+    let expired = runtime.block_on(async {
+        expire_silence(
+            &script.client(),
+            &am_bound(ToolAuth::Anonymous, proxy()),
+            "abc",
+            true,
+        )
+        .await
+    });
+    assert_eq!(
+        expired,
+        SilenceOutcome::Failed {
+            what: "alertmanager",
+            why: "the silence may have expired, so look at Alertmanager's silences before \
+                  expiring it again: the proxy timed out waiting for Alertmanager"
+                .to_string()
+        }
+    );
+
+    let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silence/abc";
+    let script = Script::default();
+    script.route_unsent("DELETE", path);
+    let expired = runtime.block_on(async {
+        expire_silence(
+            &script.client(),
+            &am_bound(ToolAuth::Anonymous, proxy()),
+            "abc",
+            true,
+        )
+        .await
+    });
+    assert_eq!(
+        expired,
+        SilenceOutcome::Failed {
+            what: "alertmanager",
+            why: "nothing was sent: exec-plugin response did not contain a status".to_string(),
+        }
+    );
+    let sent = script.seen();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        (sent[0].method.as_str(), sent[0].path.as_str()),
+        ("DELETE", path)
+    );
+    assert!(sent[0].accept.is_empty());
+    assert!(sent[0].body.is_empty());
 }

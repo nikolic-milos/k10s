@@ -572,7 +572,7 @@ mod clients {
 
     use super::*;
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     enum Answer {
         // A Status carrying this code, whose message names the code.
         Status(u16),
@@ -580,6 +580,8 @@ mod clients {
         Stall,
         // Nothing at all.
         Silence,
+        // These bytes, exactly.
+        Raw(String),
         // These bytes to a connection's first request, and nothing to any
         // later one on it.
         FirstThenSilence(&'static str),
@@ -609,6 +611,7 @@ mod clients {
                 }
                 let counted = counted.clone();
                 let seen = seen.clone();
+                let answer = answer.clone();
                 tokio::spawn(async move {
                     let mut earlier = 0;
                     while let Some(head) = read_request(&mut socket).await {
@@ -625,7 +628,7 @@ mod clients {
                             counted.fetch_sub(1, Ordering::SeqCst);
                             return;
                         }
-                        let reply = match answer {
+                        let reply = match &answer {
                             Answer::Status(code) => {
                                 let body = format!(
                                     r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"the listener answered {code}","code":{code}}}"#
@@ -637,6 +640,7 @@ mod clients {
                             }
                             Answer::Stall => "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n{".to_string(),
                             Answer::Silence => String::new(),
+                            Answer::Raw(bytes) => bytes.to_string(),
                             Answer::FirstThenSilence(bytes) if earlier == 0 => bytes.to_string(),
                             Answer::FirstThenSilence(_) => String::new(),
                         };
@@ -756,7 +760,7 @@ mod clients {
     // words a person reads rather than kube's "ServiceError".
     async fn interactive_answers_within_its_deadline(config_for: impl Fn(&str) -> Config) {
         for answer in [Answer::Silence, Answer::Stall] {
-            let listener = listen(answer, usize::MAX).await;
+            let listener = listen(answer.clone(), usize::MAX).await;
             let clients = clients_with(config_for(&listener.url), Duration::from_millis(200))
                 .expect("clients");
             let started = Instant::now();
@@ -897,6 +901,230 @@ mod clients {
             .count();
         std::fs::remove_dir_all(&dir).expect("cleanup");
         assert_eq!(count, 3);
+    }
+
+    // What a failed request proves about the wire: a credential that could
+    // not be had, or a connection never made, sent nothing; a deadline and an
+    // answer say nothing of the kind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_failed_credential_or_connection_proves_nothing_was_sent() {
+        let chain = |error: &kube::Error| never_sent(error as &(dyn std::error::Error + 'static));
+        assert!(chain(&kube::Error::Auth(AuthError::ExecPluginFailed)));
+        assert!(chain(&kube::Error::Service(Box::new(
+            AuthError::ExecPluginFailed
+        ))));
+
+        // Bound and never listening: a connect to it is refused, and nothing
+        // else can take the port while the socket lives.
+        let closed = tokio::net::TcpSocket::new_v4().expect("a socket");
+        closed
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a port");
+        let url = format!("http://{}", closed.local_addr().expect("an address"));
+        let clients = clients_with(plain(&url), INTERACTIVE_DEADLINE).expect("clients");
+        for (name, client) in [
+            ("interactive", &clients.interactive),
+            ("sync", &clients.sync),
+        ] {
+            let error = client
+                .request_text(request("POST"))
+                .await
+                .expect_err("nothing listens there");
+            assert!(chain(&error), "{name}: {error:?}");
+        }
+
+        let silent = listen(Answer::Silence, usize::MAX).await;
+        let clients =
+            clients_with(plain(&silent.url), Duration::from_millis(200)).expect("clients");
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            clients.interactive.request_text(request("POST")),
+        )
+        .await
+        .expect("the deadline ends it, not this bound")
+        .expect_err("a silent server runs out the deadline");
+        assert!(
+            !chain(&error),
+            "a deadline may have delivered it: {error:?}"
+        );
+
+        let answered = listen(Answer::Status(500), 1).await;
+        let clients = clients_with(plain(&answered.url), INTERACTIVE_DEADLINE).expect("clients");
+        let error = clients
+            .interactive
+            .request_text(request("POST"))
+            .await
+            .expect_err("a 500");
+        assert!(!chain(&error), "an answer is not a request that never left");
+    }
+
+    // A credential that cannot be had on the request's own refresh (the
+    // plugin fails on its fourth run, after the three a kube build makes)
+    // proves through the real chain that nothing was sent.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_that_fails_on_the_request_proves_nothing_was_sent() {
+        let dir = std::env::temp_dir().join(format!("k10s-exec-fails-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let listener = listen(Answer::Status(200), usize::MAX).await;
+        let config = exec_plugin_then(
+            &dir.join("runs"),
+            r#"{"token":"t","expirationTimestamp":"2000-01-01T00:00:00Z"}"#,
+            "exit 7",
+        )(&listener.url);
+        let clients = clients_with(config, INTERACTIVE_DEADLINE).expect("clients");
+        let error = clients
+            .interactive
+            .request_text(request("POST"))
+            .await
+            .expect_err("the plugin fails");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+        assert!(
+            never_sent(&error as &(dyn std::error::Error + 'static)),
+            "{error:?}"
+        );
+        assert!(
+            listener
+                .authorizations
+                .lock()
+                .expect("not poisoned")
+                .is_empty(),
+            "nothing reached the server"
+        );
+    }
+
+    // A write is done when its status is 2xx, whatever the body; a redirect
+    // is not success and says where it pointed; an error status keeps the
+    // server's sentence and its own code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_is_judged_by_its_status() {
+        assert_eq!(
+            answered("HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .expect("a 201"),
+            "ok"
+        );
+
+        let error =
+            answered("HTTP/1.1 302 Found\r\nlocation: /login\r\ncontent-length: 5\r\n\r\nFound")
+                .await
+                .expect_err("a 302 is no verdict on the write");
+        assert!(no_verdict(&error), "{error:?}");
+        assert_eq!(
+            describe(&error),
+            "answered with status 302, redirected to /login"
+        );
+
+        // The lab's answer to a write over the body limit, recorded.
+        match answered("HTTP/1.1 413 Request Entity Too Large\r\ncontent-type: application/json\r\ncontent-length: 167\r\n\r\n{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"Request entity too large: limit is 3145728\",\"reason\":\"RequestEntityTooLarge\",\"code\":413}").await {
+            Err(kube::Error::Api(status)) => assert_eq!(
+                (status.code, status.message.as_str(), status.reason.as_str()),
+                (413, "Request entity too large: limit is 3145728", "RequestEntityTooLarge")
+            ),
+            other => panic!("the server's refusal is its verdict, Status whole: {other:?}"),
+        }
+
+        // A refusal from something in front is still a refusal, in its words.
+        match answered("HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 13\r\n\r\nUnauthorized\n").await {
+            Err(kube::Error::Api(status)) => {
+                assert_eq!((status.code, status.message.as_str()), (401, "Unauthorized"))
+            }
+            other => panic!("a 401 is a refusal: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_is_no_verdict_on_a_write_with_or_without_location() {
+        for code in [300, 301, 302, 303, 304, 305, 306, 307, 308, 399] {
+            for location in [None, Some("/api/v2/silence/stored")] {
+                let header = location.map_or_else(String::new, |to| format!("location: {to}\r\n"));
+                let raw = format!("HTTP/1.1 {code} Redirect\r\n{header}content-length: 0\r\n\r\n");
+                let error = answered(&raw).await.expect_err("a redirect is no verdict");
+                assert!(no_verdict(&error), "{code}: {error:?}");
+                assert!(!never_sent(&error), "an answer followed the request");
+                let why = match location {
+                    Some(to) => format!("answered with status {code}, redirected to {to}"),
+                    None => format!("answered with status {code} and no Location"),
+                };
+                assert_eq!(describe(&error), why);
+            }
+        }
+    }
+
+    // A refusal is capped like every reason shown here, whether it came as a
+    // proxy's page or as the server's Status: a status line wraps, and an
+    // answer of any length must not take the view it is shown in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_is_capped_like_every_reason() {
+        let page = "x".repeat(1000);
+        let raw: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 403 Forbidden\r\ncontent-type: text/html\r\ncontent-length: 1000\r\n\r\n{page}"
+            )
+            .into_boxed_str(),
+        );
+        let capped = format!("{}...", "x".repeat(400));
+        match answered(raw).await {
+            Err(kube::Error::Api(status)) => assert_eq!(status.message, capped),
+            other => panic!("a 403 is a refusal: {other:?}"),
+        }
+        let status = kube::core::Status::failure(&page, "Forbidden").with_code(403);
+        assert_eq!(status_sentence(&status), capped);
+    }
+
+    // A 5xx is no verdict on the write, whoever wrote it and whatever its
+    // body's own code says. Recorded on the lab: kubectl proxy's plain 500 and
+    // the API server's service proxy's 503, to writes their upstream had read
+    // in full; the server's own 500 for a field its schema lacks, before
+    // storage; and its own 500 for a conversion webhook that failed on the
+    // answer, after storage, the object stored. The last two carry no reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_5xx_is_no_verdict_whoever_wrote_it() {
+        let no_verdict = |answer: Result<String, kube::Error>| match answer {
+            Err(error) if no_verdict(&error as &(dyn std::error::Error + 'static)) => {
+                describe(&error as &(dyn std::error::Error + 'static))
+            }
+            other => panic!("no verdict: {other:?}"),
+        };
+        assert_eq!(
+            no_verdict(answered("HTTP/1.1 504 Gateway Timeout\r\ncontent-type: application/json\r\ncontent-length: 32\r\n\r\n{\"message\":\"upstream timed out\"}").await),
+            "answered with status 504: upstream timed out"
+        );
+        assert_eq!(
+            no_verdict(answered("HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 3\r\n\r\nEOF").await),
+            "answered with status 500: EOF"
+        );
+        assert_eq!(
+            no_verdict(answered("HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: 142\r\n\r\n{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"message\":\"error trying to reach service: EOF\",\"reason\":\"ServiceUnavailable\",\"code\":503}").await),
+            "error trying to reach service: EOF"
+        );
+        assert_eq!(
+            no_verdict(answered("HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n").await),
+            "answered with status 502 and no message"
+        );
+        // A plain body keeps its words and drops its trailing newline.
+        assert_eq!(
+            no_verdict(
+                answered("HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain\r\ncontent-length: 12\r\n\r\nBad Gateway\n")
+                    .await
+            ),
+            "answered with status 502: Bad Gateway"
+        );
+        assert_eq!(
+            no_verdict(answered("HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 200\r\n\r\n{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"failed to create typed patch object (g2/settings; /v1, Kind=ConfigMap): .dataz: field not declared in schema\",\"code\":500}").await),
+            "failed to create typed patch object (g2/settings; /v1, Kind=ConfigMap): .dataz: field not declared in schema"
+        );
+        assert_eq!(
+            no_verdict(answered("HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 201\r\n\r\n{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"conversion webhook for closeout.k10s.test/v1, Kind=Widget failed: this webhook refuses every conversion to v2\",\"code\":500}").await),
+            "conversion webhook for closeout.k10s.test/v1, Kind=Widget failed: this webhook refuses every conversion to v2"
+        );
+    }
+
+    // One write to a listener that answers these bytes.
+    async fn answered(raw: &str) -> Result<String, kube::Error> {
+        let listener = listen(Answer::Raw(raw.to_string()), 1).await;
+        let clients = clients_with(plain(&listener.url), INTERACTIVE_DEADLINE).expect("clients");
+        send_write(&clients.interactive, request("POST")).await
     }
 
     fn token_kubeconfig(url: &str) -> String {

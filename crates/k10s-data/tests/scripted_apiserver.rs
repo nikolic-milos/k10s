@@ -115,9 +115,22 @@ struct Route {
     accept_contains: Option<&'static str>,
     status: u16,
     body: String,
-    hang: bool,
+    fate: Fate,
     delay: Option<Duration>,
     used: bool,
+}
+// What a route does with the request it takes.
+#[derive(Clone, Copy, PartialEq)]
+enum Fate {
+    Answer,
+    // Never answers, like a server holding a follow open.
+    Hang,
+    // The connection fails before any answer, so the request may or may
+    // not have reached the server: what a reset or a dead peer looks like.
+    Lose,
+    // The credential could not be had, so nothing was written: what a failed
+    // exec plugin looks like to the caller.
+    Unsent,
 }
 #[derive(Default)]
 struct State {
@@ -142,7 +155,7 @@ impl Script {
             accept_contains: None,
             status,
             body: body.into(),
-            hang: false,
+            fate: Fate::Answer,
             delay: None,
             used: false,
         });
@@ -163,7 +176,7 @@ impl Script {
             accept_contains: Some(accept_contains),
             status,
             body: body.into(),
-            hang: false,
+            fate: Fate::Answer,
             delay: None,
             used: false,
         });
@@ -180,7 +193,36 @@ impl Script {
             accept_contains: None,
             status: 0,
             body: String::new(),
-            hang: true,
+            fate: Fate::Hang,
+            delay: None,
+            used: false,
+        });
+        self
+    }
+
+    // A route whose connection fails without an answer.
+    fn route_lost(&self, method: &'static str, matches: &str) -> &Self {
+        self.state.lock().expect("script lock").routes.push(Route {
+            method,
+            matches: matches.to_string(),
+            accept_contains: None,
+            status: 0,
+            body: String::new(),
+            fate: Fate::Lose,
+            delay: None,
+            used: false,
+        });
+        self
+    }
+
+    fn route_unsent(&self, method: &'static str, matches: &str) -> &Self {
+        self.state.lock().expect("script lock").routes.push(Route {
+            method,
+            matches: matches.to_string(),
+            accept_contains: None,
+            status: 0,
+            body: String::new(),
+            fate: Fate::Unsent,
             delay: None,
             used: false,
         });
@@ -204,7 +246,7 @@ impl Script {
             accept_contains: None,
             status,
             body: body.into(),
-            hang: false,
+            fate: Fate::Answer,
             delay: Some(delay),
             used: false,
         });
@@ -280,16 +322,14 @@ impl Service<http::Request<Body>> for Script {
                     && r.accept_contains.is_none_or(|want| accept.contains(want))
             });
             let answer = match hit {
-                Some(route) if route.hang => {
-                    route.used = true;
-                    None
-                }
                 Some(route) => {
                     route.used = true;
-                    Some((route.status, route.body.clone(), route.delay))
+                    (route.fate != Fate::Hang)
+                        .then(|| (route.fate, route.status, route.body.clone(), route.delay))
                 }
                 None if path.contains("watch=true") => None,
                 None => Some((
+                    Fate::Answer,
                     404,
                     r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":404,"reason":"NotFound","message":"unscripted"}"#
                         .to_string(),
@@ -306,9 +346,16 @@ impl Service<http::Request<Body>> for Script {
             if let Some(seen) = shared.lock().expect("script lock").seen.get_mut(at) {
                 seen.body = read;
             }
-            let Some((status, response, delay)) = answer else {
+            let Some((fate, status, response, delay)) = answer else {
                 return std::future::pending().await;
             };
+            if fate == Fate::Lose {
+                return Err("the scripted connection was lost".into());
+            }
+            if fate == Fate::Unsent {
+                return Err(Box::new(kube::client::AuthError::ExecPluginFailed)
+                    as Box<dyn std::error::Error + Send + std::marker::Sync>);
+            }
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }

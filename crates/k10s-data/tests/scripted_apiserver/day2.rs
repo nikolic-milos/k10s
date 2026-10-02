@@ -104,6 +104,17 @@ fn drain_caps() -> Caps {
     }
 }
 
+// The answers the lab's API server (k3s v1.36.2) gave, recorded verbatim in
+// the close-out: a budget with no disruption allowed, and a pod under two
+// budgets. The budget's own sentence is a cause with reason DisruptionBudget.
+const PDB_429: &str = r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"Cannot evict pod as it would violate the pod's disruption budget.","reason":"TooManyRequests","details":{"causes":[{"reason":"DisruptionBudget","message":"The disruption budget c1-pdb-probe needs 1 healthy pods and has 1 currently"}]},"code":429}"#;
+const TWO_BUDGETS_500: &str = r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"This pod has more than one PodDisruptionBudget, which the eviction subresource does not support.","code":500}"#;
+// API Priority and Fairness throttling, a 429 that is not a budget, as the
+// lab's API server sent it: `text/plain`, not a Status, with a trailing
+// newline (recorded in the close-out). The harness labels every answer JSON,
+// which kube's client does not read; it parses the body or keeps its text.
+const THROTTLED_429: &str = "Too many requests, please try again later.\n";
+
 fn ok_json() -> &'static str {
     r#"{"kind":"Status","apiVersion":"v1","status":"Success"}"#
 }
@@ -162,6 +173,42 @@ fn a_scale_sends_a_merge_patch_to_the_apps_v1_scale_subresource() {
     );
     assert_eq!(write.content_type, "application/merge-patch+json");
     assert_eq!(write.body, r#"{"spec":{"replicas":5}}"#);
+}
+
+// A day-2 write is judged by its status: a 2xx is done even when its body
+// cannot be read, rather than a write that may or may not have landed.
+#[test]
+fn a_write_answered_2xx_is_done_whatever_its_body() {
+    let script = Script::default();
+    script.route(
+        "PATCH",
+        "/apis/apps/v1/namespaces/prod/deployments/web/scale?",
+        200,
+        "not json",
+    );
+    let outcome = run(&script, |client| async move {
+        day2::scale(
+            &client,
+            &deploy(),
+            &ScaleRequest {
+                namespace: Some("prod".to_string()),
+                name: "web".to_string(),
+                current: 3,
+                replicas: 5,
+                confirm: true,
+                caps: patch_caps(),
+            },
+        )
+        .await
+    });
+    let Day2Outcome::Applied(applied) = outcome else {
+        panic!("a 200 is the scale done: {outcome:?}");
+    };
+    assert!(
+        applied.summary.contains("from 3 to 5"),
+        "{}",
+        applied.summary
+    );
 }
 
 #[test]
@@ -563,13 +610,13 @@ fn an_evict_posts_policy_v1_eviction_json() {
 }
 
 #[test]
-fn an_eviction_refused_by_a_pdb_is_labelled_not_retried() {
+fn an_eviction_refused_by_a_pdb_names_its_budget() {
     let script = Script::default();
     script.route(
         "POST",
         "/api/v1/namespaces/prod/pods/api-1/eviction?",
         429,
-        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":429,"reason":"TooManyRequests","message":"Cannot evict pod as it would violate the pod's PDB"}"#,
+        PDB_429,
     );
     script.route(
         "POST",
@@ -594,9 +641,18 @@ fn an_eviction_refused_by_a_pdb_is_labelled_not_retried() {
     let Day2Outcome::Failed { why } = outcome else {
         panic!("a 429 is a labelled PDB refusal: {outcome:?}");
     };
-    assert!(why.contains("PodDisruptionBudget"), "{why}");
+    assert_eq!(
+        why,
+        "a PodDisruptionBudget refused this eviction: Cannot evict pod as it would violate the \
+         pod's disruption budget. The disruption budget c1-pdb-probe needs 1 healthy pods and has \
+         1 currently"
+    );
     let writes = script.requests_for("/eviction");
-    assert_eq!(writes.len(), 1, "a 429 is not retried: {writes:?}");
+    assert_eq!(
+        writes.len(),
+        1,
+        "one eviction is sent for one pod: {writes:?}"
+    );
 }
 
 #[test]
@@ -797,7 +853,7 @@ fn a_pdb_429_during_drain_is_labelled_and_the_rest_of_the_press_continues() {
         "POST",
         "/api/v1/namespaces/prod/pods/blocked/eviction?",
         429,
-        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":429,"reason":"TooManyRequests","message":"Cannot evict pod as it would violate the pod's PDB"}"#,
+        PDB_429,
     );
     script.route(
         "POST",
@@ -822,15 +878,15 @@ fn a_pdb_429_during_drain_is_labelled_and_the_rest_of_the_press_continues() {
     let Day2Outcome::Applied(applied) = outcome else {
         panic!("a PDB on one pod does not fail the drain: {outcome:?}");
     };
-    assert!(
-        applied.summary.contains("PodDisruptionBudget"),
-        "{}",
-        applied.summary
+    assert_eq!(
+        applied.summary,
+        "cordoned worker-1; evicted 1 pod; 1 blocked by a PodDisruptionBudget (The disruption \
+         budget c1-pdb-probe needs 1 healthy pods and has 1 currently)"
     );
     assert_eq!(
         script.requests_for("/pods/blocked/eviction").len(),
         1,
-        "the 429 is not retried"
+        "one eviction is sent for the blocked pod"
     );
     assert_eq!(script.requests_for("/pods/ok/eviction").len(), 1);
 }
@@ -1107,4 +1163,562 @@ fn a_confirmed_scale_takes_the_interactive_client() {
     let stray = after_sync(&sync, before);
     assert!(stray.is_empty(), "nothing on the sync client: {stray:?}");
     drop(runtime);
+}
+
+fn evict_once(script: &Script) -> Day2Outcome {
+    run(script, |client| async move {
+        day2::evict(
+            &client,
+            &pod(),
+            &EvictRequest {
+                namespace: "prod".to_string(),
+                name: "api-1".to_string(),
+                grace_period_seconds: None,
+                confirm: true,
+                caps: create_caps(),
+            },
+        )
+        .await
+    })
+}
+
+// A 429 is a budget only when it carries the DisruptionBudget cause: one with
+// another cause is a refusal in its own words, not a budget.
+#[test]
+fn a_429_with_another_cause_is_a_refusal_not_a_budget() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[
+            pod_on("throttled", "prod", "ReplicaSet", "Running"),
+            pod_on("ok", "prod", "ReplicaSet", "Running"),
+        ]),
+    );
+    script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/throttled/eviction?",
+        429,
+        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"too many requests","reason":"TooManyRequests","details":{"causes":[{"reason":"FieldValueInvalid","message":"not a budget"}]},"code":429}"#,
+    );
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/ok/eviction?",
+        201,
+        ok_json(),
+    );
+    let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+        panic!("a refused eviction does not fail the drain");
+    };
+    assert_eq!(
+        applied.summary,
+        "cordoned worker-1; evicted 1 pod; 1 eviction failed: too many requests"
+    );
+}
+
+// An eviction that never left the process (its credential failed) stops the
+// drain there, and the summary counts it and the rest as not sent, in the
+// credential's own words.
+#[test]
+fn an_eviction_that_never_left_stops_the_drain_as_not_sent() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[
+            pod_on("first", "prod", "ReplicaSet", "Running"),
+            pod_on("second", "prod", "ReplicaSet", "Running"),
+            pod_on("third", "prod", "ReplicaSet", "Running"),
+        ]),
+    );
+    script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/first/eviction?",
+        201,
+        ok_json(),
+    );
+    script.route_unsent("POST", "/api/v1/namespaces/prod/pods/second/eviction?");
+    let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+        panic!("a drain that stopped still reports what it did");
+    };
+    assert!(
+        applied
+            .summary
+            .starts_with("cordoned worker-1; evicted 1 pod; 2 evictions not sent: "),
+        "{}",
+        applied.summary
+    );
+    assert!(
+        !applied.summary.contains("may have happened"),
+        "{}",
+        applied.summary
+    );
+    assert!(script.requests_for("/pods/third/eviction").is_empty());
+}
+
+// Two refusals name the first and say it is the first, so two causes never
+// read as one.
+#[test]
+fn two_refused_evictions_name_the_first_as_the_first() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[
+            pod_on("a", "prod", "ReplicaSet", "Running"),
+            pod_on("b", "prod", "ReplicaSet", "Running"),
+        ]),
+    );
+    script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+    // Each pod deleted between the listing and its eviction.
+    for pod in ["a", "b"] {
+        script.route(
+            "POST",
+            &format!("/api/v1/namespaces/prod/pods/{pod}/eviction?"),
+            404,
+            format!(
+                r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"pods \"{pod}\" not found","reason":"NotFound","code":404}}"#
+            ),
+        );
+    }
+    let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+        panic!("refused evictions do not fail the drain");
+    };
+    assert_eq!(
+        applied.summary,
+        "cordoned worker-1; evicted 0 pods; 2 evictions failed, the first: pods \"a\" not found"
+    );
+}
+
+// An eviction answered 201 is done even when its body cannot be read: the
+// status decides, not the body.
+#[test]
+fn an_eviction_answered_201_is_done_whatever_its_body() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[
+            pod_on("garbled", "prod", "ReplicaSet", "Running"),
+            pod_on("ok", "prod", "ReplicaSet", "Running"),
+        ]),
+    );
+    script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/garbled/eviction?",
+        201,
+        "not json",
+    );
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/ok/eviction?",
+        201,
+        ok_json(),
+    );
+    let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+        panic!("an unreadable answer does not fail the drain");
+    };
+    assert_eq!(applied.summary, "cordoned worker-1; evicted 2 pods");
+    assert_eq!(script.requests_for("/pods/ok/eviction").len(), 1);
+}
+
+// Two pods under two budgets: the count is two, and the one cause shown says it
+// is the first, so it cannot read as one budget blocking both.
+#[test]
+fn two_budget_refusals_name_the_first_cause_as_the_first() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[
+            pod_on("a", "prod", "ReplicaSet", "Running"),
+            pod_on("b", "prod", "ReplicaSet", "Running"),
+        ]),
+    );
+    script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/a/eviction?",
+        429,
+        PDB_429,
+    );
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/b/eviction?",
+        429,
+        PDB_429.replace("c1-pdb-probe", "second-budget"),
+    );
+    let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+        panic!("budget refusals do not fail the drain");
+    };
+    assert_eq!(
+        applied.summary,
+        "cordoned worker-1; evicted 0 pods; 2 blocked by a PodDisruptionBudget (the first: The \
+         disruption budget c1-pdb-probe needs 1 healthy pods and has 1 currently)"
+    );
+}
+
+fn drain_worker(script: &Script, confirm: bool) -> Day2Outcome {
+    run(script, move |client| async move {
+        day2::drain(
+            &client,
+            &node(),
+            &DrainRequest {
+                name: "worker-1".to_string(),
+                force: false,
+                confirm,
+                caps: drain_caps(),
+            },
+        )
+        .await
+    })
+}
+
+// Throttling answers 429 too, and used to be called a disruption budget; it
+// carries no DisruptionBudget cause, so it is the server's sentence.
+#[test]
+fn a_throttled_eviction_is_not_called_a_disruption_budget() {
+    let script = Script::default();
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/api-1/eviction?",
+        429,
+        THROTTLED_429,
+    );
+    let outcome = evict_once(&script);
+    assert_eq!(
+        outcome,
+        Day2Outcome::Failed {
+            why: "Too many requests, please try again later.".to_string()
+        }
+    );
+}
+
+// A pod under two budgets is refused with a 500 and no cause: not one blocked
+// by a budget, and, like any 5xx, no verdict, since the server answers its own
+// 500 after storing a write too (C1/lab/after-storage). The drain names it in
+// the server's words, which say what happened.
+#[test]
+fn a_pod_under_two_budgets_is_an_unknown_eviction_in_the_servers_words() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[
+            pod_on("doubled", "prod", "ReplicaSet", "Running"),
+            pod_on("ds-1", "kube-system", "DaemonSet", "Running"),
+        ]),
+    );
+    script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/doubled/eviction?",
+        500,
+        TWO_BUDGETS_500,
+    );
+    let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+        panic!("a refused eviction does not fail the drain");
+    };
+    // The server's sentence ends in a period; before the next clause it goes,
+    // so the summary never reads ".;".
+    assert_eq!(
+        applied.summary,
+        "cordoned worker-1; evicted 0 pods; 1 eviction whose outcome is unknown, so it may have \
+         happened: This pod has more than one PodDisruptionBudget, which the eviction \
+         subresource does not support; 1 DaemonSet pod skipped"
+    );
+}
+
+// A cordon that got no answer may or may not have happened, and no pod was
+// evicted after it: the drain says both, naming the cordon, ahead of its answer.
+#[test]
+fn a_drain_whose_cordon_gets_no_answer_names_it_and_evicts_nothing() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[pod_on("api-1", "prod", "ReplicaSet", "Running")]),
+    );
+    script.route_lost("PATCH", "/api/v1/nodes/worker-1?");
+    let Day2Outcome::Failed { why } = drain_worker(&script, true) else {
+        panic!("a cordon with no answer fails the drain");
+    };
+    assert_eq!(
+        why,
+        "the drain stopped at the cordon of worker-1, so no pod was evicted: the write may or \
+         may not have reached the cluster, so read the object again before retrying: the \
+         scripted connection was lost"
+    );
+    assert!(
+        script.requests_for("/eviction").is_empty(),
+        "nothing evicted"
+    );
+}
+
+// A cordon the server refused did not happen, and nothing was evicted after
+// it: a denial stays a denial and a rejection a rejection, each with the
+// drain's clause ahead of the server's words.
+#[test]
+fn a_drain_whose_cordon_is_refused_keeps_the_refusal_and_evicts_nothing() {
+    for (code, body, expected) in [
+        (
+            403,
+            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"nodes \"worker-1\" is forbidden","reason":"Forbidden","code":403}"#,
+            Day2Outcome::Denied {
+                what: "cordon",
+                why: "the drain stopped at the cordon of worker-1, so no pod was evicted: nodes \
+                      \"worker-1\" is forbidden"
+                    .to_string(),
+            },
+        ),
+        (
+            422,
+            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"Node \"worker-1\" is invalid","reason":"Invalid","code":422}"#,
+            Day2Outcome::Rejected {
+                message: "the drain stopped at the cordon of worker-1, so no pod was evicted: \
+                          Node \"worker-1\" is invalid"
+                    .to_string(),
+            },
+        ),
+    ] {
+        let script = Script::default();
+        script.route(
+            "GET",
+            "/api/v1/pods?",
+            200,
+            pod_list(&[pod_on("api-1", "prod", "ReplicaSet", "Running")]),
+        );
+        script.route("PATCH", "/api/v1/nodes/worker-1?", code, body);
+        assert_eq!(drain_worker(&script, true), expected, "{code}");
+        assert!(
+            script.requests_for("/eviction").is_empty(),
+            "{code}: nothing evicted"
+        );
+    }
+}
+
+// A 504 is no verdict: the eviction may have happened, and since something
+// answered, the drain goes on.
+#[test]
+fn a_504_eviction_is_unconfirmed_and_the_drain_goes_on() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[
+            pod_on("slow", "prod", "ReplicaSet", "Running"),
+            pod_on("ok", "prod", "ReplicaSet", "Running"),
+        ]),
+    );
+    script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/slow/eviction?",
+        504,
+        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"Timeout: request did not complete within requested timeout","reason":"Timeout","code":504}"#,
+    );
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/ok/eviction?",
+        201,
+        ok_json(),
+    );
+    let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+        panic!("a 504 does not fail the drain");
+    };
+    assert_eq!(
+        applied.summary,
+        "cordoned worker-1; evicted 1 pod; 1 eviction whose outcome is unknown, so it may have \
+         happened: Timeout: request did not complete within requested timeout"
+    );
+    assert_eq!(script.requests_for("/pods/ok/eviction").len(), 1);
+}
+
+// When nothing answers, every eviction still to send would go the same way,
+// a deadline each if the server is silent, so the drain stops and says how
+// many it did not send, and why.
+#[test]
+fn a_drain_stops_at_a_lost_connection_and_counts_the_rest_as_not_sent() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[
+            pod_on("first", "prod", "ReplicaSet", "Running"),
+            pod_on("second", "prod", "ReplicaSet", "Running"),
+            pod_on("third", "prod", "ReplicaSet", "Running"),
+        ]),
+    );
+    script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+    script.route_lost("POST", "/api/v1/namespaces/prod/pods/first/eviction?");
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/second/eviction?",
+        201,
+        ok_json(),
+    );
+    let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+        panic!("a lost eviction ends the press, not the drain's report");
+    };
+    assert_eq!(
+        applied.summary,
+        "cordoned worker-1; evicted 0 pods; 1 eviction whose outcome is unknown, so it may have \
+         happened; 2 evictions not sent after one ended with no answer: the scripted connection \
+         was lost"
+    );
+    assert!(script.requests_for("/pods/second/eviction").is_empty());
+    assert!(script.requests_for("/pods/third/eviction").is_empty());
+}
+
+#[test]
+fn a_drain_names_its_last_lost_eviction_even_when_nothing_remains_unsent() {
+    for earlier_unknown in [false, true] {
+        let script = Script::default();
+        let mut pods = Vec::new();
+        if earlier_unknown {
+            pods.push(pod_on("first", "prod", "ReplicaSet", "Running"));
+            script.route(
+                "POST",
+                "/api/v1/namespaces/prod/pods/first/eviction?",
+                504,
+                "upstream timed out",
+            );
+        }
+        pods.push(pod_on("last", "prod", "ReplicaSet", "Running"));
+        script.route("GET", "/api/v1/pods?", 200, pod_list(&pods));
+        script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+        script.route_lost("POST", "/api/v1/namespaces/prod/pods/last/eviction?");
+        let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+            panic!("the drain reports its partial outcome");
+        };
+        let unknown = if earlier_unknown {
+            "2 evictions whose outcome is unknown, so they may have happened, the first: answered with status 504: upstream timed out"
+        } else {
+            "1 eviction whose outcome is unknown, so it may have happened"
+        };
+        assert_eq!(
+            applied.summary,
+            format!(
+                "cordoned worker-1; evicted 0 pods; {unknown}; the last eviction ended with no answer: the scripted connection was lost"
+            )
+        );
+        let sent = script.requests_for("/pods/last/eviction");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].method, "POST");
+        assert_eq!(sent[0].path, "/api/v1/namespaces/prod/pods/last/eviction?");
+        assert_eq!(sent[0].accept, "");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&sent[0].body).unwrap(),
+            serde_json::json!({
+                "apiVersion": "policy/v1", "kind": "Eviction", "metadata": {"name": "last", "namespace": "prod"}
+            })
+        );
+    }
+}
+
+#[test]
+fn a_budget_cause_is_capped_by_characters_in_both_eviction_and_drain() {
+    let mut status: serde_json::Value = serde_json::from_str(PDB_429).unwrap();
+    status["details"]["causes"][0]["message"] = "界".repeat(450).into();
+    let cause = format!("{}...", "界".repeat(400));
+    let message = status["message"].as_str().unwrap();
+    let script = Script::default();
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/api-1/eviction?",
+        429,
+        status.to_string(),
+    );
+    assert_eq!(
+        evict_once(&script),
+        Day2Outcome::Failed {
+            why: format!("a PodDisruptionBudget refused this eviction: {message} {cause}")
+        }
+    );
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/pods?",
+        200,
+        pod_list(&[pod_on("api-1", "prod", "ReplicaSet", "Running")]),
+    );
+    script.route("PATCH", "/api/v1/nodes/worker-1?", 200, ok_json());
+    script.route(
+        "POST",
+        "/api/v1/namespaces/prod/pods/api-1/eviction?",
+        429,
+        status.to_string(),
+    );
+    let Day2Outcome::Applied(applied) = drain_worker(&script, true) else {
+        panic!("the budget refused the eviction after the cordon");
+    };
+    assert_eq!(
+        applied.summary,
+        format!("cordoned worker-1; evicted 0 pods; 1 blocked by a PodDisruptionBudget ({cause})")
+    );
+}
+
+// The drain's one read sends nothing: its failure says so, and a 429 on it
+// is throttling, not a disruption budget.
+#[test]
+fn a_failed_pod_list_says_nothing_was_sent() {
+    for (status, body, said) in [
+        (
+            429,
+            THROTTLED_429,
+            "the node's pods could not be read, so nothing was sent: Too many requests, please \
+             try again later.",
+        ),
+        (
+            503,
+            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"the server is currently unable to handle the request","code":503}"#,
+            "the node's pods could not be read, so nothing was sent: the server is currently \
+             unable to handle the request",
+        ),
+    ] {
+        // The confirming press is the one that would cordon and evict after
+        // the read; the ask never writes whatever the read says.
+        let script = Script::default();
+        script.route("GET", "/api/v1/pods?", status, body);
+        assert_eq!(
+            drain_worker(&script, true),
+            Day2Outcome::Failed {
+                why: said.to_string()
+            },
+            "{status}"
+        );
+        assert!(
+            script.requests_for("/api/v1/nodes").is_empty(),
+            "{status}: no cordon"
+        );
+        assert!(
+            script.requests_for("/eviction").is_empty(),
+            "{status}: no eviction"
+        );
+    }
+    let script = Script::default();
+    script.route_lost("GET", "/api/v1/pods?");
+    let Day2Outcome::Failed { why } = drain_worker(&script, true) else {
+        panic!("a lost pod list is a failure");
+    };
+    assert!(
+        why.starts_with("the node's pods could not be read, so nothing was sent: "),
+        "{why}"
+    );
+    assert!(
+        script.requests_for("/api/v1/nodes").is_empty(),
+        "lost: no cordon"
+    );
 }

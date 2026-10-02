@@ -613,8 +613,17 @@ pub(crate) fn describe(err: &(dyn std::error::Error + 'static)) -> String {
         if let Some(late) = e.downcast_ref::<NoAnswer>() {
             return late.to_string();
         }
+        if let Some(gateway) = e.downcast_ref::<NoVerdict>() {
+            return cap(gateway.to_string());
+        }
         link = e.source();
     }
+    // These wrappers name the stack, not the failure inside it.
+    let err = match err.downcast_ref::<kube::Error>() {
+        Some(kube::Error::Service(inner)) => inner.as_ref() as &(dyn std::error::Error + 'static),
+        Some(kube::Error::HyperError(inner)) => inner as &(dyn std::error::Error + 'static),
+        _ => err,
+    };
     let mut out = err.to_string();
     let mut source = err.source();
     while let Some(e) = source {
@@ -626,6 +635,153 @@ pub(crate) fn describe(err: &(dyn std::error::Error + 'static)) -> String {
         source = e.source();
     }
     cap(out)
+}
+
+/// Whether a request that failed provably never left this process: its
+/// credential could not be had (an exec plugin, OIDC or a token file failed
+/// before anything was written), or no connection was made. A deadline says
+/// nothing either way, since connecting is inside it, and neither does a
+/// connection lost after it was made; both may have delivered the request.
+pub(crate) fn never_sent(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut link = Some(err);
+    while let Some(e) = link {
+        if e.is::<AuthError>() {
+            return true;
+        }
+        if e.downcast_ref::<hyper_util::client::legacy::Error>()
+            .is_some_and(|legacy| legacy.is_connect())
+        {
+            return true;
+        }
+        link = e.source();
+    }
+    false
+}
+
+/// A write judged by its answer. A 2xx is done, whatever its body says; a
+/// body cut short fails the request inside the interactive client's deadline,
+/// status and all, like a lost connection. A 5xx is [`NoVerdict`], whoever
+/// wrote it. So is a redirect: lab frontends answered 302 and 303 after
+/// Alertmanager stored a silence, pointing to the result. A redirect is no
+/// confirmation of the write, and no refusal either. It names its Location
+/// and is never followed.
+/// Anything else is an Api error whose code is the HTTP status: the body's
+/// code is never trusted, since kube reads a Status without one as 0.
+pub(crate) async fn send_write(
+    client: &Client,
+    request: http::Request<Vec<u8>>,
+) -> Result<String, kube::Error> {
+    let response = client.send(request.map(Body::from)).await?;
+    let code = response.status();
+    let location = response
+        .headers()
+        .get(http::header::LOCATION)
+        .map(|to| String::from_utf8_lossy(to.as_bytes()).into_owned());
+    let bytes = http_body_util::BodyExt::collect(response.into_body())
+        .await?
+        .to_bytes();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if code.is_success() {
+        return Ok(text);
+    }
+    let body = error_body(&text);
+    if code.is_server_error() {
+        let sentence = match &body {
+            ErrorBody::Status(status) if !status.message.trim().is_empty() => {
+                status.message.trim().to_string()
+            }
+            ErrorBody::Other(message) if !message.is_empty() => {
+                format!("answered with status {}: {message}", code.as_u16())
+            }
+            _ => unworded(code.as_u16()),
+        };
+        return Err(kube::Error::Service(Box::new(NoVerdict(sentence))));
+    }
+    let status = match (body, location) {
+        (_, Some(to)) if code.is_redirection() => kube::core::Status::failure(
+            &format!("answered with status {}, redirected to {to}", code.as_u16()),
+            "",
+        ),
+        (_, None) if code.is_redirection() => kube::core::Status::failure(
+            &format!("answered with status {} and no Location", code.as_u16()),
+            "",
+        ),
+        (ErrorBody::Status(status), _) => *status,
+        (ErrorBody::Other(message), _) => kube::core::Status::failure(&message, ""),
+    };
+    if code.is_redirection() {
+        return Err(kube::Error::Service(Box::new(NoVerdict(status.message))));
+    }
+    Err(kube::Error::Api(status.with_code(code.as_u16()).boxed()))
+}
+
+/// An answer that is no verdict on the write it answers, from [`send_write`]:
+/// a redirect or a 5xx, whoever wrote it. Lab frontends returned 302 and 303
+/// after Alertmanager stored a silence. Measured on the lab, gateways answer
+/// a 5xx after their upstream has read the whole request (the API server's
+/// service proxy 503, kubectl proxy 500 "EOF"), and the API server answers its
+/// own 500 both
+/// before storage (an admission webhook it cannot reach, reason
+/// InternalError; a field its schema lacks, no reason) and after it (a
+/// conversion webhook that fails on the answer, no reason, the object
+/// stored). Neither the status nor its reason tells those apart, so the write
+/// may have happened.
+#[derive(Debug)]
+pub(crate) struct NoVerdict(pub(crate) String);
+
+impl std::fmt::Display for NoVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoVerdict {}
+
+/// Whether a failed write's answer was [`NoVerdict`].
+pub(crate) fn no_verdict(err: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(err), |e| e.source()).any(|e| e.is::<NoVerdict>())
+}
+
+// What an error body is. Only its kind makes it a Kubernetes Status, the
+// server's own answer: a gateway's JSON deserialises into the same struct with
+// every field defaulted. Any other body gives its "message" if it has one,
+// else its text, trimmed (API Priority and Fairness answers 429 as plain text
+// with a trailing newline).
+enum ErrorBody {
+    Status(Box<kube::core::Status>),
+    Other(String),
+}
+
+fn error_body(text: &str) -> ErrorBody {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok();
+    if let Some(value) = &value
+        && value.get("kind").and_then(serde_json::Value::as_str) == Some("Status")
+        && let Ok(status) = serde_json::from_value::<kube::core::Status>(value.clone())
+    {
+        return ErrorBody::Status(status.boxed());
+    }
+    let message = value
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(text);
+    ErrorBody::Other(cap(message.trim().to_string()))
+}
+
+/// A refusal in the words it came with, capped like every reason shown here:
+/// its message, or what was answered when it carries none. It never names who
+/// answered, since a proxy in front may have.
+pub(crate) fn status_sentence(status: &kube::core::Status) -> String {
+    let message = status.message.trim();
+    if message.is_empty() {
+        unworded(status.code)
+    } else {
+        cap(message.to_string())
+    }
+}
+
+fn unworded(code: u16) -> String {
+    format!("answered with status {code} and no message")
 }
 
 fn describe_auth(err: &AuthError) -> String {
@@ -737,7 +893,7 @@ fn digits(s: &str) -> Option<(&str, &str)> {
 
 const MAX_REASON_CHARS: usize = 400;
 
-fn cap(text: String) -> String {
+pub(crate) fn cap(text: String) -> String {
     match text.char_indices().nth(MAX_REASON_CHARS) {
         Some((cut, _)) => format!("{}...", &text[..cut]),
         None => text,

@@ -388,3 +388,94 @@ fn a_stored_manifest_apply_takes_the_interactive_client_with_its_reveal() {
     assert!(stray.is_empty(), "nothing on the sync client: {stray:?}");
     drop(runtime);
 }
+
+// The reveal decides what is applied, so a reveal that fails applies
+// nothing, and the answer says so.
+#[test]
+fn a_failed_reveal_says_nothing_was_applied() {
+    use k10s_data::read::Fetched;
+
+    for (code, body, words) in [
+        (
+            503,
+            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":503,"message":"the server is currently unable to handle the request"}"#,
+            "the server is currently unable to handle the request",
+        ),
+        (
+            500,
+            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":500,"message":""}"#,
+            "answered with status 500 and no message",
+        ),
+    ] {
+        let script = Script::default();
+        script_discovery_with_secret(&script, api_resource("Secret", "secrets", true));
+        script_rules_review(&script);
+        script_access_reviews(&script, true, 32);
+        script_lists(&script);
+        script.route("GET", "/api/v1/namespaces/prod/secrets?", code, body);
+
+        let runtime = runtime();
+        let (sync, _live) = sync_on(&runtime, &script);
+        let before = script.seen().len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader.rollback_helm_revision(
+            Some("prod".to_string()),
+            "rollback-probe".to_string(),
+            1,
+            move |fetched| {
+                let _ = tx.send(fetched);
+            },
+        );
+        let Fetched::Failed { why, .. } = wait(&rx) else {
+            panic!("{code}: a failed reveal is a failure");
+        };
+        assert_eq!(
+            why,
+            format!("nothing was applied: {words}"),
+            "the server's own sentence, or its code when it has none, not kube's rendering"
+        );
+        let patches = script.seen()[before..]
+            .iter()
+            .filter(|seen| seen.method == "PATCH")
+            .count();
+        assert_eq!(patches, 0);
+        drop(runtime);
+    }
+
+    // A reveal this account may not make is a denial, named as one, and nothing
+    // is applied.
+    let script = Script::default();
+    script_discovery_with_secret(&script, api_resource("Secret", "secrets", true));
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/secrets?",
+        403,
+        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"secrets is forbidden"}"#,
+    );
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.rollback_helm_revision(
+        Some("prod".to_string()),
+        "rollback-probe".to_string(),
+        1,
+        move |fetched| {
+            let _ = tx.send(fetched);
+        },
+    );
+    let outcome = wait(&rx);
+    assert!(
+        matches!(
+            outcome,
+            Fetched::Denied {
+                what: "helm revision"
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert!(script.seen().iter().all(|seen| seen.method != "PATCH"));
+    drop(runtime);
+}

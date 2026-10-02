@@ -86,6 +86,17 @@ pub(crate) fn classify<T>(what: &'static str, error: &kube::Error) -> Fetched<T>
     }
 }
 
+/// A failed read in the server's own words: an API status's message, or its
+/// code when it carries none, and anything else as [`crate::connect::describe`]
+/// words it. kube's Display of an API error is a Debug rendering of the whole
+/// Status, which is not a sentence.
+pub(crate) fn server_sentence(error: &kube::Error) -> String {
+    match error {
+        kube::Error::Api(status) => crate::connect::status_sentence(status),
+        other => crate::connect::describe(other as &(dyn std::error::Error + 'static)),
+    }
+}
+
 // The same classification flattened to one displayable line, for states that
 // carry text rather than a Fetched (a forward's Dead reason).
 pub(crate) fn classify_text(what: &'static str, error: &kube::Error) -> String {
@@ -1493,7 +1504,10 @@ async fn rollback_helm_revision(
             Fetched::Ok(helm_reveal::rollback(client, targets, &revealed).await)
         }
         Fetched::Denied { what } => Fetched::Denied { what },
-        Fetched::Failed { what, why } => Fetched::Failed { what, why },
+        Fetched::Failed { what, why } => Fetched::Failed {
+            what,
+            why: format!("nothing was applied: {why}"),
+        },
     }
 }
 

@@ -33,7 +33,7 @@ use crate::describe::is_secret;
 use crate::discover::KindTarget;
 use crate::helm;
 use crate::reach::Scratch;
-use crate::read::{Fetched, classify, collection_path};
+use crate::read::{Fetched, collection_path};
 
 const RELEASE_TYPE: &str = "helm.sh/release.v1";
 const OWNER_SELECTOR: &str = "owner=helm";
@@ -420,7 +420,7 @@ async fn fetch_encoded(
         };
         let page = match client.request::<WireList>(request).await {
             Ok(page) => page,
-            Err(error) => return classify("helm revision", &error),
+            Err(error) => return revision_failure(&error),
         };
         for secret in page.items {
             if let Some(encoded) = encoded_of(secret) {
@@ -468,7 +468,21 @@ async fn get_conventional(
                 why: format!("no stored revision {revision} of {name}"),
             },
         },
-        Err(error) => classify("helm revision", &error),
+        Err(error) => revision_failure(&error),
+    }
+}
+
+// A revision that could not be read, in the server's words: a rollback's
+// refusal is read by the person deciding what to do next.
+fn revision_failure<T>(error: &kube::Error) -> Fetched<T> {
+    match error {
+        kube::Error::Api(status) if matches!(status.code, 401 | 403) => Fetched::Denied {
+            what: "helm revision",
+        },
+        _ => Fetched::Failed {
+            what: "helm revision",
+            why: crate::read::server_sentence(error),
+        },
     }
 }
 

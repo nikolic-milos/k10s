@@ -24,8 +24,16 @@
 //! skipping DaemonSet pods unless asked to force, and labels a PDB 429
 //! rather than retrying it: every call here runs on the interactive client,
 //! which sends a request once and waits at most
-//! [`crate::connect::INTERACTIVE_DEADLINE`] for each answer. A truncated flag
-//! means there was more to evict than this press would touch.
+//! [`crate::connect::INTERACTIVE_DEADLINE`] for each answer. A 429 is a
+//! budget's refusal only when the server attaches its DisruptionBudget cause;
+//! a drain counts from each eviction's result, not from its sentence, and
+//! stops when nothing answers at all. A write is judged by its answer's status,
+//! a 2xx being done whatever its body says, and a request that provably never
+//! left the process (its credential failed, or no connection was made) says
+//! nothing was sent. The drain's one read, the node's pods, writes nothing: any
+//! failure on it says nothing was sent, a denial names what was denied, and a
+//! rejection carries the server's sentence. A truncated flag means there was
+//! more to evict than this press would touch.
 
 use kube::Client;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Request};
@@ -40,6 +48,9 @@ pub const DEBUG_CONTAINER: &str = "k10s-debug";
 pub const RESTART_ANNOTATION: &str = "kubectl.kubernetes.io/restartedAt";
 
 const DRAIN_LIST_LIMIT: u32 = 64;
+// The one read a drain makes, labelled apart from the writes: nothing has
+// been sent when it fails, and a 429 on it is not a disruption budget.
+const POD_LIST: &str = "pod list";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Caps {
@@ -191,7 +202,7 @@ pub async fn scale(client: &Client, target: &KindTarget, request: &ScaleRequest)
     }
     let path = match collection(target, request.namespace.as_deref()) {
         Ok(path) => path,
-        Err(outcome) => return outcome,
+        Err(why) => return Day2Outcome::Failed { why },
     };
     let body = serde_json::json!({ "spec": { "replicas": request.replicas } });
     let built = match merge_patch(path, &request.name, Some("scale"), body) {
@@ -304,7 +315,7 @@ pub async fn rollout(
     }
     let path = match collection(target, request.namespace.as_deref()) {
         Ok(path) => path,
-        Err(outcome) => return outcome,
+        Err(why) => return Day2Outcome::Failed { why },
     };
     let built = match merge_patch(path, &request.name, None, body) {
         Ok(built) => built,
@@ -342,7 +353,7 @@ pub async fn delete(client: &Client, target: &KindTarget, request: &DeleteReques
     }
     let path = match collection(target, request.namespace.as_deref()) {
         Ok(path) => path,
-        Err(outcome) => return outcome,
+        Err(why) => return Day2Outcome::Failed { why },
     };
     let params = match request.grace_period_seconds {
         Some(secs) => DeleteParams::default().grace_period(secs),
@@ -404,7 +415,7 @@ pub async fn evict(client: &Client, target: &KindTarget, request: &EvictRequest)
     .await
     {
         Ok(()) => applied(summary),
-        Err(outcome) => outcome,
+        Err(eviction) => eviction.into_outcome(),
     }
 }
 
@@ -492,16 +503,46 @@ pub async fn drain(client: &Client, target: &KindTarget, request: &DrainRequest)
         return wait;
     }
     if let Err(outcome) = patch_unschedulable(client, target, &request.name, true).await {
-        return outcome;
+        return uncordoned(&request.name, outcome);
     }
     let mut evicted = 0usize;
-    let mut pdb = 0usize;
+    let mut blocked = 0usize;
+    let mut first_cause = None;
+    let mut unknown = 0usize;
+    let mut first_unknown = None;
     let mut failed = 0usize;
-    for pod in &plan.evict {
+    let mut first_refusal = None;
+    let mut not_sent = 0usize;
+    let mut unsent_why = None;
+    let mut lost_why = None;
+    for (at, pod) in plan.evict.iter().enumerate() {
         match post_eviction(client, &pod_target(), &pod.namespace, &pod.name, None).await {
             Ok(()) => evicted += 1,
-            Err(Day2Outcome::Failed { why }) if why.contains("PodDisruptionBudget") => pdb += 1,
-            Err(_) => failed += 1,
+            Err(Eviction::Blocked { cause, .. }) => {
+                blocked += 1;
+                first_cause.get_or_insert(cause);
+            }
+            Err(Eviction::Unknown { why, lost, .. }) => {
+                unknown += 1;
+                // Nothing answered: every eviction still to send would go
+                // the way this one went, a deadline each if the server is
+                // silent, and each is a pod taken down with no word of it.
+                if lost {
+                    not_sent = plan.evict.len() - at - 1;
+                    lost_why = Some(why);
+                    break;
+                }
+                first_unknown.get_or_insert(why);
+            }
+            Err(Eviction::NotSent { why, .. }) => {
+                not_sent = plan.evict.len() - at;
+                unsent_why = Some(why);
+                break;
+            }
+            Err(Eviction::Refused { why, .. }) => {
+                failed += 1;
+                first_refusal.get_or_insert(why);
+            }
         }
     }
     let mut done = format!(
@@ -509,11 +550,52 @@ pub async fn drain(client: &Client, target: &KindTarget, request: &DrainRequest)
         request.name,
         if evicted == 1 { "pod" } else { "pods" },
     );
-    if pdb > 0 {
-        done.push_str(&format!("; {pdb} blocked by a PodDisruptionBudget"));
+    // A count above one names only the first cause or refusal, and says so:
+    // three pods under three budgets must not read as one budget blocking all.
+    if let Some(cause) = first_cause {
+        let first = if blocked > 1 { "the first: " } else { "" };
+        done.push_str(&format!(
+            "; {blocked} blocked by a PodDisruptionBudget ({first}{})",
+            clause(&cause)
+        ));
     }
-    if failed > 0 {
-        done.push_str(&format!("; {failed} eviction(s) failed"));
+    match unknown {
+        0 => {}
+        1 => done.push_str("; 1 eviction whose outcome is unknown, so it may have happened"),
+        n => done.push_str(&format!(
+            "; {n} evictions whose outcome is unknown, so they may have happened"
+        )),
+    }
+    // An answer with no verdict is named, the first when there are more; an
+    // eviction that stopped the drain is named with the ones it left unsent.
+    if let Some(why) = first_unknown {
+        let first = if unknown > 1 { ", the first" } else { "" };
+        done.push_str(&format!("{first}: {}", clause(&why)));
+    }
+    if let Some(refusal) = first_refusal {
+        let first = if failed > 1 { ", the first" } else { "" };
+        done.push_str(&format!(
+            "; {} failed{first}: {}",
+            evictions(failed),
+            clause(&refusal)
+        ));
+    }
+    match (unsent_why, lost_why) {
+        (Some(why), _) => done.push_str(&format!(
+            "; {} not sent: {}",
+            evictions(not_sent),
+            clause(&why)
+        )),
+        (None, Some(why)) if not_sent > 0 => done.push_str(&format!(
+            "; {} not sent after one ended with no answer: {}",
+            evictions(not_sent),
+            clause(&why)
+        )),
+        (None, Some(why)) => done.push_str(&format!(
+            "; the last eviction ended with no answer: {}",
+            clause(&why)
+        )),
+        _ => {}
     }
     if plan.skipped_ds > 0 {
         done.push_str(&format!(
@@ -526,6 +608,46 @@ pub async fn drain(client: &Client, target: &KindTarget, request: &DrainRequest)
         summary: done,
         truncated: plan.truncated,
     })
+}
+
+// "1 eviction", "2 evictions".
+fn evictions(n: usize) -> String {
+    if n == 1 {
+        "1 eviction".to_string()
+    } else {
+        format!("{n} evictions")
+    }
+}
+
+// A server's sentence joined into the summary loses its final period.
+// A truncation mark stays intact.
+fn clause(sentence: &str) -> &str {
+    if sentence.ends_with("...") {
+        sentence
+    } else {
+        sentence.strip_suffix('.').unwrap_or(sentence)
+    }
+}
+
+// A drain whose cordon was refused or unconfirmed evicted nothing, and says
+// so ahead of the cordon's own answer, which is what says whether the cordon
+// may have happened.
+fn uncordoned(node: &str, outcome: Day2Outcome) -> Day2Outcome {
+    let before = format!("the drain stopped at the cordon of {node}, so no pod was evicted");
+    match outcome {
+        Day2Outcome::Denied { what, why } => Day2Outcome::Denied {
+            what,
+            why: format!("{before}: {why}"),
+        },
+        Day2Outcome::Rejected { message } => Day2Outcome::Rejected {
+            message: format!("{before}: {message}"),
+        },
+        Day2Outcome::Failed { why } => Day2Outcome::Failed {
+            why: format!("{before}: {why}"),
+        },
+        // A cordon fails in one of the three above; anything else passes on.
+        answered => answered,
+    }
 }
 
 pub async fn debug(client: &Client, target: &KindTarget, request: &DebugRequest) -> Day2Outcome {
@@ -563,7 +685,7 @@ pub async fn debug(client: &Client, target: &KindTarget, request: &DebugRequest)
     }
     let path = match collection(target, Some(&request.namespace)) {
         Ok(path) => path,
-        Err(outcome) => return outcome,
+        Err(why) => return Day2Outcome::Failed { why },
     };
     let body = serde_json::json!({
         "apiVersion": "v1",
@@ -657,14 +779,12 @@ fn named(target: &KindTarget, namespace: Option<&str>, name: &str) -> String {
     }
 }
 
-fn collection(target: &KindTarget, namespace: Option<&str>) -> Result<String, Day2Outcome> {
+fn collection(target: &KindTarget, namespace: Option<&str>) -> Result<String, String> {
     if target.namespaced && namespace.map(str::is_empty).unwrap_or(true) {
-        return Err(Day2Outcome::Failed {
-            why: format!(
-                "{} is namespaced, so a namespace is required",
-                target.kind()
-            ),
-        });
+        return Err(format!(
+            "{} is namespaced, so a namespace is required",
+            target.kind()
+        ));
     }
     Ok(collection_path(target, namespace))
 }
@@ -724,7 +844,7 @@ async fn send(
     request: http::Request<Vec<u8>>,
     what: &'static str,
 ) -> Result<(), Day2Outcome> {
-    match client.request::<serde_json::Value>(request).await {
+    match crate::connect::send_write(client, request).await {
         Ok(_) => Ok(()),
         Err(error) => Err(classify(&error, what)),
     }
@@ -747,24 +867,123 @@ async fn patch_unschedulable(
     .await
 }
 
+/// How one eviction ended, for a drain to count from rather than read back
+/// from the sentence it would print.
+enum Eviction {
+    // A PodDisruptionBudget refused it; `cause` is the budget's own sentence.
+    Blocked {
+        cause: String,
+        outcome: Day2Outcome,
+    },
+    // No verdict this process could read, so it may have happened. `why` is
+    // the answer's sentence, or what ended the request. `lost` is set when
+    // nothing answered, the connection broken or the deadline passed, and the
+    // drain stops there; an answer that is no verdict still came from
+    // something that is there, and the drain goes on.
+    Unknown {
+        why: String,
+        lost: bool,
+        outcome: Day2Outcome,
+    },
+    // It never left the process: its credential failed, or no connection was
+    // made. Every eviction after it would fail the same way. `why` is the
+    // reason alone, for the drain's summary.
+    NotSent {
+        why: String,
+        outcome: Day2Outcome,
+    },
+    // The server refused it, or it could not be built; `why` is the refusal
+    // alone, for the drain's summary.
+    Refused {
+        why: String,
+        outcome: Day2Outcome,
+    },
+}
+
+impl Eviction {
+    fn into_outcome(self) -> Day2Outcome {
+        match self {
+            Eviction::Blocked { outcome, .. }
+            | Eviction::Unknown { outcome, .. }
+            | Eviction::NotSent { outcome, .. }
+            | Eviction::Refused { outcome, .. } => outcome,
+        }
+    }
+}
+
 async fn post_eviction(
     client: &Client,
     target: &KindTarget,
     namespace: &str,
     name: &str,
     grace_period_seconds: Option<u32>,
-) -> Result<(), Day2Outcome> {
-    let path = collection(target, Some(namespace))?;
+) -> Result<(), Eviction> {
+    let refused = |why: String| Eviction::Refused {
+        outcome: Day2Outcome::Failed { why: why.clone() },
+        why,
+    };
+    let path = collection(target, Some(namespace)).map_err(refused)?;
     let body = eviction_body(namespace, name, grace_period_seconds);
-    let bytes = serde_json::to_vec(&body).map_err(|error| Day2Outcome::Failed {
-        why: error.to_string(),
-    })?;
+    let bytes = serde_json::to_vec(&body).map_err(|error| refused(error.to_string()))?;
     let built = Request::new(path)
         .create_subresource("eviction", name, &PostParams::default(), bytes)
-        .map_err(|error| Day2Outcome::Failed {
-            why: error.to_string(),
-        })?;
-    send(client, built, "evict").await
+        .map_err(|error| refused(error.to_string()))?;
+    let Err(error) = crate::connect::send_write(client, built).await else {
+        return Ok(());
+    };
+    // The budget's refusal is the one sentence built here: the server's
+    // message then the budget's own cause, both its words.
+    if let kube::Error::Api(status) = &error
+        && status.code == 429
+        && let Some(cause) = disruption_budget(status)
+    {
+        let cause = crate::connect::cap(cause.to_string());
+        return Err(Eviction::Blocked {
+            outcome: Day2Outcome::Failed {
+                why: format!(
+                    "a PodDisruptionBudget refused this eviction: {} {cause}",
+                    crate::connect::status_sentence(status)
+                ),
+            },
+            cause,
+        });
+    }
+    let outcome = classify(&error, "evict");
+    let chain = &error as &(dyn std::error::Error + 'static);
+    let why = crate::connect::describe(chain);
+    Err(match &error {
+        kube::Error::Api(status) => Eviction::Refused {
+            why: crate::connect::status_sentence(status),
+            outcome,
+        },
+        _ if crate::connect::no_verdict(chain) => Eviction::Unknown {
+            why,
+            lost: false,
+            outcome,
+        },
+        _ if crate::connect::never_sent(chain) => Eviction::NotSent { why, outcome },
+        // The connection broke after it was made, the answer's body stopped
+        // short, or the interactive deadline passed.
+        _ => Eviction::Unknown {
+            why,
+            lost: true,
+            outcome,
+        },
+    })
+}
+
+// The API server attaches a cause with reason DisruptionBudget to every
+// eviction a budget refuses (recorded on the lab: "The disruption budget
+// NAME needs 1 healthy pods and has 1 currently"). A 429 without one is
+// throttling, and says so in its own words.
+fn disruption_budget(status: &Status) -> Option<&str> {
+    status
+        .details
+        .as_ref()?
+        .causes
+        .iter()
+        .find(|cause| cause.reason == "DisruptionBudget")
+        .map(|cause| cause.message.as_str())
 }
 
 fn eviction_body(namespace: &str, name: &str, grace: Option<u32>) -> serde_json::Value {
@@ -849,7 +1068,7 @@ async fn plan_drain(client: &Client, node: &str, force: bool) -> Result<DrainPla
         })?;
     let page = match client.request::<WireList>(built).await {
         Ok(page) => page,
-        Err(error) => return Err(classify(&error, "drain")),
+        Err(error) => return Err(classify(&error, POD_LIST)),
     };
     let more_pages = !page.metadata.cont.is_empty();
     let mut evict = Vec::new();
@@ -907,38 +1126,49 @@ fn pod_target() -> KindTarget {
     }
 }
 
+// What a failed request says. Where this code adds its own clause to the
+// server's sentence, the clause comes first and the server's words after a
+// colon, so a sentence the server ended with a period stays one.
 fn classify(error: &kube::Error, what: &'static str) -> Day2Outcome {
     if let kube::Error::Api(status) = error {
         return match status.code {
             401 | 403 => Day2Outcome::Denied {
                 what,
-                why: message_of(status, what),
+                why: crate::connect::status_sentence(status),
+            },
+            // A read refused has no document to reject.
+            _ if what == POD_LIST => Day2Outcome::Failed {
+                why: format!(
+                    "the node's pods could not be read, so nothing was sent: {}",
+                    crate::connect::status_sentence(status)
+                ),
             },
             400 | 422 => Day2Outcome::Rejected {
-                message: message_of(status, what),
+                message: crate::connect::status_sentence(status),
             },
             404 if what == "debug" => Day2Outcome::Failed {
                 why: "the ephemeralcontainers subresource is not served; this cluster is too old \
                       for debug containers"
                     .to_string(),
             },
-            429 if what == "evict" || what == "drain" => Day2Outcome::Failed {
-                why: format!(
-                    "a PodDisruptionBudget refused this eviction: {}",
-                    message_of(status, what)
-                ),
-            },
             _ => Day2Outcome::Failed {
-                why: message_of(status, what),
+                why: crate::connect::status_sentence(status),
             },
         };
     }
-    let why = crate::connect::describe(error as &(dyn std::error::Error + 'static));
+    let error = error as &(dyn std::error::Error + 'static);
+    let why = crate::connect::describe(error);
     Day2Outcome::Failed {
-        why: format!(
-            "{why}; the {what} may or may not have reached the cluster, so read the object again \
-             before retrying"
-        ),
+        why: if what == POD_LIST {
+            format!("the node's pods could not be read, so nothing was sent: {why}")
+        } else if crate::connect::never_sent(error) {
+            format!("nothing was sent: {why}")
+        } else {
+            format!(
+                "the write may or may not have reached the cluster, so read the object again \
+                 before retrying: {why}"
+            )
+        },
     }
 }
 
@@ -979,16 +1209,6 @@ pub async fn run(client: &Client, target: &KindTarget, call: &Day2Call) -> Day2O
         Day2Call::Drain(request) => drain(client, target, request).await,
         Day2Call::Debug(request) => debug(client, target, request).await,
     }
-}
-
-fn message_of(status: &Status, what: &'static str) -> String {
-    if status.message.is_empty() {
-        return format!(
-            "the API server refused the {what} with status {}",
-            status.code
-        );
-    }
-    status.message.clone()
 }
 
 #[cfg(test)]

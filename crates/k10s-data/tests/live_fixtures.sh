@@ -9,6 +9,7 @@
 #
 #   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh
 #   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh --with observability
+#   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh --with kwok
 #
 # kubectl and helm must be on PATH: the base fixtures install the rollback-probe
 # chart from tests/fixtures/helm.
@@ -29,18 +30,22 @@
 set -euo pipefail
 
 OBSERVABILITY=false
+KWOK=false
 while (($#)); do
   case "$1" in
     --with)
-      if [[ ${2:-} != observability ]]; then
-        echo "--with requires observability" >&2
-        exit 2
-      fi
-      OBSERVABILITY=true
+      case ${2:-} in
+        observability) OBSERVABILITY=true ;;
+        kwok) KWOK=true ;;
+        *)
+          echo "--with requires observability or kwok" >&2
+          exit 2
+          ;;
+      esac
       shift 2
       ;;
     --help)
-      echo "usage: $0 [--with observability]"
+      echo "usage: $0 [--with observability] [--with kwok]"
       exit 0
       ;;
     *)
@@ -56,6 +61,26 @@ KUBECTL=(kubectl)
 command -v kubectl >/dev/null || { echo "kubectl is not on PATH" >&2; exit 1; }
 command -v helm >/dev/null || { echo "helm is not on PATH" >&2; exit 1; }
 : "${KUBECONFIG:?set KUBECONFIG to the cluster to set up}"
+
+if $KWOK; then
+  # The drain proof evicts from a fake node, which kwok runs without a
+  # kubelet. The release manifests are applied as downloaded, so they are
+  # pinned by digest.
+  command -v curl >/dev/null || { echo "curl is not on PATH" >&2; exit 1; }
+  echo "kwok v0.8.0"
+  kwok_dir=$(mktemp -d)
+  for manifest in \
+    kwok.yaml:a4c16e6431e382dcb5c1903139344b7a68652f16a6460337fe17a678a426f405 \
+    stage-fast.yaml:2f28d95564ec43056c0873f7a25ac7d2a5bba4c8496c72f8b3ee73fd4f54ee24; do
+    name=${manifest%%:*}
+    curl -fsSL "https://github.com/kubernetes-sigs/kwok/releases/download/v0.8.0/$name" \
+      -o "$kwok_dir/$name"
+    echo "${manifest##*:}  $kwok_dir/$name" | sha256sum -c --quiet
+    "${KUBECTL[@]}" apply -f "$kwok_dir/$name" >/dev/null
+  done
+  rm -rf "$kwok_dir"
+  "${KUBECTL[@]}" -n kube-system rollout status deployment/kwok-controller --timeout=120s >/dev/null
+fi
 
 echo "namespace $NS"
 "${KUBECTL[@]}" create namespace "$NS" --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f - >/dev/null
