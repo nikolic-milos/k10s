@@ -9,7 +9,12 @@
 //! an error message. Error text shown to a person is redaction-filtered
 //! because exec credential plugins leak their environment through `Debug`.
 //! The `kube::Client` seam is a `tower` service, which is what lets
-//! `tests/scripted_apiserver.rs` be the API server.
+//! `tests/scripted_apiserver.rs` be the API server. A connection hands out two
+//! clients over one transport: a confirmed write, and every read that decides
+//! it, goes through the interactive one, which never resends a request it has
+//! written and answers within a deadline; watches, streams, follows and every
+//! list outside a confirmed write stay on the sync one, which retries 429, 503
+//! and 504 with backoff and waits as long as a stream needs.
 
 pub mod alertmanager;
 pub mod apply;
@@ -21,6 +26,7 @@ pub mod cilium_control;
 pub mod cnpg;
 pub mod connect;
 pub mod day2;
+mod deadline;
 pub mod describe;
 pub mod discover;
 pub mod eso;
@@ -292,7 +298,7 @@ async fn cold_start(
     let connect_ms = ms(started);
 
     let mut sync = sync_from(
-        connection.client,
+        connection.clients,
         &connection.default_namespace,
         options,
         sink,
@@ -307,7 +313,7 @@ async fn cold_start(
 }
 
 pub async fn sync_from(
-    client: kube::Client,
+    clients: connect::Clients,
     default_namespace: &str,
     options: &Options,
     sink: EventSink,
@@ -315,6 +321,10 @@ pub async fn sync_from(
 ) -> Result<Sync, DataError> {
     let started = Instant::now();
     let mut report = ClusterReport::default();
+    let connect::Clients {
+        sync: client,
+        interactive,
+    } = clients;
 
     let mut catalog = Catalog::new();
     for reason in mapping::known_reasons() {
@@ -497,6 +507,7 @@ pub async fn sync_from(
     let inspector = inspect::Inspector::new(client.clone());
     let reader = read::Reader::new(
         client.clone(),
+        interactive,
         discovered.targets.clone(),
         &verdict_list,
         &caps_list,

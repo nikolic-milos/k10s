@@ -1059,3 +1059,52 @@ fn a_reader_who_can_list_cannot_scale_and_does_not_touch_the_wire() {
     );
     drop(runtime);
 }
+
+// A confirmed day-2 call takes the interactive client. `Reader::day2` hands
+// that one client to `day2::run` for every request a call makes, so a drain's
+// plan read, cordon and evictions follow the same route a scale does.
+#[test]
+fn a_confirmed_scale_takes_the_interactive_client() {
+    use k10s_core::KindId;
+    use k10s_data::day2::Day2Call;
+
+    let sync = Script::default();
+    script_discovery(&sync);
+    script_rules_review_admin(&sync);
+    script_access_reviews(&sync, true, 32);
+    script_lists(&sync);
+    let interactive = Script::default();
+    interactive.route(
+        "PATCH",
+        "/apis/apps/v1/namespaces/prod/deployments/web/scale?",
+        200,
+        ok_json(),
+    );
+
+    let runtime = runtime();
+    let (data, _live) = sync_on_split(&runtime, &sync, &interactive);
+    let before = sync.seen().len();
+    let (tx, rx) = std::sync::mpsc::channel();
+    data.reader.day2(
+        KindId::DEPLOYMENT,
+        Day2Call::Scale(ScaleRequest {
+            namespace: Some("prod".to_string()),
+            name: "web".to_string(),
+            current: 1,
+            replicas: 2,
+            confirm: true,
+            caps: Caps::default(),
+        }),
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    );
+    let outcome = wait(&rx);
+    assert!(matches!(outcome, Day2Outcome::Applied(_)), "{outcome:?}");
+    let sent = interactive.seen();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].method, "PATCH");
+    let stray = after_sync(&sync, before);
+    assert!(stray.is_empty(), "nothing on the sync client: {stray:?}");
+    drop(runtime);
+}

@@ -553,3 +553,43 @@ fn silence_write_denial_and_failure_keep_their_label_and_server_sentence() {
         );
     }
 }
+
+// A silence is a confirmed write and takes the interactive client.
+#[test]
+fn a_silence_takes_the_interactive_client() {
+    let sync = Script::default();
+    script_discovery(&sync);
+    script_rules_review(&sync);
+    script_access_reviews(&sync, true, 32);
+    script_lists(&sync);
+    let interactive = Script::default();
+    let path = "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/silences";
+    interactive.route("POST", path, 200, CREATED_JSON);
+
+    let runtime = runtime();
+    let (data, _live) = sync_on_split(&runtime, &sync, &interactive);
+    let before = sync.seen().len();
+    let (tx, rx) = std::sync::mpsc::channel();
+    data.reader.create_silence(
+        am_bound(ToolAuth::Anonymous, proxy()),
+        spec(),
+        true,
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
+    let answer = wait(&rx);
+    assert!(
+        matches!(answer, SilenceOutcome::Applied { .. }),
+        "{answer:?}"
+    );
+    let sent = interactive.seen();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        (sent[0].method.as_str(), sent[0].path.as_str()),
+        ("POST", path)
+    );
+    let stray = after_sync(&sync, before);
+    assert!(stray.is_empty(), "nothing on the sync client: {stray:?}");
+    drop(runtime);
+}

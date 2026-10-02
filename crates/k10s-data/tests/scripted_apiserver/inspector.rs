@@ -49,7 +49,7 @@ fn the_inspector_reads_events_and_logs_and_labels_a_denial() {
     let sync = runtime
         .block_on(async {
             sync_from(
-                script.client(),
+                script.clients(),
                 "prod",
                 &options(),
                 tx,
@@ -162,7 +162,7 @@ fn a_crash_looping_pod_tails_the_instance_that_died_and_says_so() {
     let sync = runtime
         .block_on(async {
             sync_from(
-                script.client(),
+                script.clients(),
                 "prod",
                 &options(),
                 tx,

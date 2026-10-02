@@ -33,6 +33,8 @@ tower-http.workspace = true
 http-body-util.workspace = true
 
 [dev-dependencies]
+# A paused clock proves the production deadline without waiting 35 s for it.
+tokio = { workspace = true, features = ["test-util"] }
 k10s-world.workspace = true
 # Test-only, and the reason is the live matrix: proving the write path end to end
 # means building the payload with the same prune the shell uses, and that prune

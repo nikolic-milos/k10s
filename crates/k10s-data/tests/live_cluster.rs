@@ -230,6 +230,12 @@ fn wait<T: Send + 'static>(rx: &std::sync::mpsc::Receiver<T>) -> T {
         .expect("a reply within the budget")
 }
 
+fn wait_interactive<T: Send + 'static>(rx: &std::sync::mpsc::Receiver<T>, requests: u32) -> T {
+    let budget = k10s_data::connect::INTERACTIVE_DEADLINE * requests + Duration::from_secs(5);
+    rx.recv_timeout(budget)
+        .expect("an interactive reply within its request budgets")
+}
+
 fn manifest(reader: &Reader, kind: KindId, name: &str) -> k10s_data::manifest::Manifest {
     let (tx, rx) = std::sync::mpsc::channel();
     reader.fetch_manifest(
@@ -265,7 +271,7 @@ fn apply(reader: &Reader, request: ApplyRequest) -> ApplyOutcome {
     reader.apply(request, move |outcome| {
         let _ = tx.send(outcome);
     });
-    wait(&rx)
+    wait_interactive(&rx, 1)
 }
 
 fn request(kind: KindId, name: &str, yaml: String, dry_run: bool, force: bool) -> ApplyRequest {
@@ -858,7 +864,7 @@ fn secret_delete_works_with_and_without_a_finalizer() {
                 let _ = tx.send(outcome);
             },
         );
-        let outcome = wait(&rx);
+        let outcome = wait_interactive(&rx, 1);
         assert!(matches!(outcome, Day2Outcome::Applied(_)), "{outcome:?}");
         let stored = probe.read();
         if finalizer {

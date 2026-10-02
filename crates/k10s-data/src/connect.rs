@@ -1,7 +1,8 @@
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hyper_timeout::TimeoutConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -12,9 +13,15 @@ use kube::client::retry::RetryPolicy;
 use kube::client::{Body, ClientBuilder, ConfigExt, DynBody};
 use kube::config::{KubeConfigOptions, Kubeconfig, KubeconfigError};
 use kube::{Client, Config};
-use tower::{BoxError, ServiceBuilder, ServiceExt as _};
+use tower::buffer::Buffer;
+use tower::layer::layer_fn;
+use tower::retry::RetryLayer;
+use tower::util::option_layer;
+use tower::{BoxError, Layer as _, ServiceBuilder};
 use tower_http::ServiceExt as _;
 use tower_http::decompression::DecompressionLayer;
+
+use crate::deadline::{Deadline, NoAnswer};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -276,7 +283,35 @@ pub fn resolve_context(cfg: &Kubeconfig, requested: Option<&str>) -> Result<Stri
 
 const CREDENTIAL_SKEW_SECS: i64 = 30;
 
-/// The kube client, assembled here rather than by `Client::try_from`.
+/// A confirmed write waits at most this long for its whole answer, connecting
+/// included, and so is a credential refresh an exec plugin or OIDC makes for
+/// it, which runs inside the request: the exec half is tested with a plugin
+/// that sleeps past a short deadline, the OIDC half is read in kube's auth
+/// layer, not tested. A plugin still running at the deadline is not stopped:
+/// kube runs it on a blocking thread that finishes on its own, and its
+/// credential is thrown away, so that press reads as a write that may have
+/// landed although nothing was sent. It is a ceiling on how long a person
+/// waits, not a measured budget: mutating admission webhooks run one after
+/// another and each may take up to 30 s, so a slow but legitimate chain can
+/// land a write after the client has stopped waiting, and the answer then has
+/// to say the write may have landed.
+pub const INTERACTIVE_DEADLINE: Duration = Duration::from_secs(35);
+
+/// The two clients one connection hands out, over one transport and one
+/// credential. `sync` keeps kube's retry of 429, 503 and 504 with backoff and
+/// waits as long as a watch needs. `interactive` carries the confirmed writes
+/// and the reads that decide them, and answers within [`INTERACTIVE_DEADLINE`].
+/// It never resends a request it has written: a person pressed once and is
+/// waiting for that answer (a disruption budget's 429 was sent sixteen times
+/// over six minutes on the lab), and a write resent after a 504 can happen
+/// twice.
+#[derive(Clone)]
+pub struct Clients {
+    pub sync: Client,
+    pub interactive: Client,
+}
+
+/// The kube clients, assembled here rather than by `Client::try_from`.
 ///
 /// kube 4.2 builds its hyper client behind a private function, and the
 /// connector it builds speaks HTTP/1.1 with TCP_NODELAY left off, hyper-util's
@@ -285,17 +320,49 @@ const CREDENTIAL_SKEW_SECS: i64 = 30;
 /// each request body until the previous segment was acknowledged and Linux
 /// delayed that acknowledgement by 40 ms; with the option on, 7 to 11 ms, and
 /// three of eight cold starts finished the whole data plane in 19 ms. So the
-/// same public layers kube itself stacks are stacked here in the same order,
-/// with the one connector line kube does not offer. Two configs keep kube's
-/// own path. A proxied one, because its tunnelling is not worth reproducing
-/// for a rare case and a proxy hop makes the loopback stall this fixes
-/// irrelevant anyway. And one that runs an exec plugin, because the expiry of
-/// the identity that plugin hands back is computed behind a method kube does
-/// not export, and `Connector` reconnects on exactly that expiry; a client
-/// that never reported one would sit on a dead certificate.
-fn client_from(config: Config) -> Result<Client, kube::Error> {
+/// public layers kube itself stacks are stacked here, with the one connector
+/// line kube does not offer, and with retry moved out of the stack onto the
+/// sync client alone. Two configs keep kube's own path. A proxied one, because
+/// its tunnelling is not worth reproducing for a rare case and a proxy hop
+/// makes the loopback stall this fixes irrelevant anyway. And one that runs an
+/// exec plugin, because the expiry of the identity that plugin hands back is
+/// computed behind a method kube does not export, and `Connector` reconnects on
+/// exactly that expiry; a client that never reported one would sit on a dead
+/// certificate.
+///
+/// Either way one base carries both [`Clients`]: the retry sits on the sync
+/// client alone, above the base, so a retried request is authorised again.
+pub(crate) fn clients_from(config: Config) -> Result<Clients, kube::Error> {
+    clients_with(config, INTERACTIVE_DEADLINE)
+}
+
+fn clients_with(mut config: Config, deadline: Duration) -> Result<Clients, kube::Error> {
+    let retry = option_layer(
+        config
+            .default_retry
+            .then(|| RetryLayer::new(RetryPolicy::server_retry())),
+    );
+    let namespace = config.default_namespace.clone();
     if config.proxy_url.is_some() || config.auth_info.exec.is_some() {
-        return Client::try_from(config);
+        // kube would put its retry inside the stack both clients share. Its
+        // service is not Clone, so a buffer is the one handle both hold, at
+        // the cost of one more channel hop on this path's sync requests.
+        config.default_retry = false;
+        let shared = OnceCell::new();
+        let sync = ClientBuilder::try_from(config)?
+            .with_layer(&layer_fn(|base| {
+                let buffered = Buffer::new(base, 1024);
+                assert!(
+                    shared.set(buffered.clone()).is_ok(),
+                    "with_layer runs its layer once"
+                );
+                buffered
+            }))
+            .with_layer(&retry)
+            .build();
+        let base = shared.into_inner().expect("with_layer ran its layer");
+        let interactive = ClientBuilder::new(Deadline(deadline).layer(base), namespace).build();
+        return Ok(Clients { sync, interactive });
     }
     let mut http = HttpConnector::new();
     http.enforce_http(false);
@@ -318,26 +385,18 @@ fn client_from(config: Config) -> Result<Client, kube::Error> {
                 .gzip(!config.disable_compression),
         )
         .into_inner();
-    let service = ServiceBuilder::new()
+    let base = ServiceBuilder::new()
         .layer(stack)
-        .option_layer(
-            config
-                .default_retry
-                .then_some(tower::retry::RetryLayer::new(RetryPolicy::server_retry())),
-        )
         .option_layer(config.auth_layer()?)
         .layer(config.extra_headers_layer()?)
         .map_err(BoxError::from)
-        .service(transport);
-    Ok(ClientBuilder::new(
-        service
-            .map_response_body(|body| {
-                Box::new(http_body_util::BodyExt::map_err(body, BoxError::from)) as Box<DynBody>
-            })
-            .boxed(),
-        config.default_namespace,
-    )
-    .build())
+        .service(transport)
+        .map_response_body(|body| {
+            Box::new(http_body_util::BodyExt::map_err(body, BoxError::from)) as Box<DynBody>
+        });
+    let sync = ClientBuilder::new(retry.layer(base.clone()), namespace.clone()).build();
+    let interactive = ClientBuilder::new(Deadline(deadline).layer(base), namespace).build();
+    Ok(Clients { sync, interactive })
 }
 
 pub fn credential_is_fresh(expires_at: Option<i64>, now_secs: Option<i64>) -> bool {
@@ -357,7 +416,7 @@ fn now_secs() -> Option<i64> {
 
 #[derive(Clone)]
 pub struct Connection {
-    pub client: Client,
+    pub clients: Clients,
     pub context: Option<String>,
     pub cluster_url: String,
     pub default_namespace: String,
@@ -381,7 +440,7 @@ struct Cached {
 pub struct Connector {
     source: Source,
     kubeconfig: Option<Kubeconfig>,
-    clients: HashMap<String, Cached>,
+    cache: HashMap<String, Cached>,
 }
 
 impl Connector {
@@ -398,7 +457,7 @@ impl Connector {
                         return Ok(Connector {
                             source,
                             kubeconfig: Some(cfg),
-                            clients: HashMap::new(),
+                            cache: HashMap::new(),
                         });
                     }
                     Err(why) => failures.push((source, why)),
@@ -407,7 +466,7 @@ impl Connector {
                     return Ok(Connector {
                         source,
                         kubeconfig: None,
-                        clients: HashMap::new(),
+                        cache: HashMap::new(),
                     });
                 }
             }
@@ -419,7 +478,7 @@ impl Connector {
         Connector {
             source: Source::Kubeconfig(Vec::new()),
             kubeconfig: Some(kubeconfig),
-            clients: HashMap::new(),
+            cache: HashMap::new(),
         }
     }
 
@@ -432,7 +491,7 @@ impl Connector {
             Ok(cfg) => Ok(Connector {
                 source: Source::Kubeconfig(files),
                 kubeconfig: Some(cfg),
-                clients: HashMap::new(),
+                cache: HashMap::new(),
             }),
             Err(why) => Err(ConnectError::NoUsableSource(vec![(
                 Source::Kubeconfig(files),
@@ -469,7 +528,7 @@ impl Connector {
     pub async fn connect(&mut self, context: Option<&str>) -> Result<Connection, ConnectError> {
         let resolved = self.resolve(context)?;
         let key = resolved.clone().unwrap_or_default();
-        if let Some(cached) = self.clients.get(&key)
+        if let Some(cached) = self.cache.get(&key)
             && credential_is_fresh(cached.expires_at, now_secs())
         {
             return Ok(cached.connection.clone());
@@ -478,16 +537,16 @@ impl Connector {
         let config = self.config_for(resolved.as_deref()).await?;
         let cluster_url = config.cluster_url.to_string();
         let default_namespace = config.default_namespace.clone();
-        let client = client_from(config)
+        let clients = clients_from(config)
             .map_err(|e| ConnectError::Client(describe(&e as &dyn std::error::Error)))?;
-        let expires_at = client.valid_until().as_ref().map(|t| t.as_second());
+        let expires_at = clients.sync.valid_until().as_ref().map(|t| t.as_second());
         let connection = Connection {
-            client,
+            clients,
             context: resolved,
             cluster_url,
             default_namespace,
         };
-        self.clients.insert(
+        self.cache.insert(
             key,
             Cached {
                 connection: connection.clone(),
@@ -550,6 +609,9 @@ pub(crate) fn describe(err: &(dyn std::error::Error + 'static)) -> String {
         }
         if let Some(cfg) = e.downcast_ref::<KubeconfigError>() {
             return cap(describe_kubeconfig(cfg));
+        }
+        if let Some(late) = e.downcast_ref::<NoAnswer>() {
+            return late.to_string();
         }
         link = e.source();
     }

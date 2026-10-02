@@ -1,9 +1,15 @@
 //! The read seam: one handle the UI pulls detail through.
 //!
-//! A [`Reader`] carries the client, the runtime handle, what discovery found,
-//! and the probe's capability verdicts. Every method is fire-and-forget onto
-//! the data plane's runtime with the answer handed to a caller-supplied
-//! callback -- the render thread never blocks on the cluster -- and every
+//! A [`Reader`] carries both clients, the runtime handle, what discovery
+//! found, and the probe's capability verdicts. The four writes a person
+//! confirms (an apply, a day-2 call, a stored-manifest apply and a silence)
+//! go through the interactive client, with every read inside them that decides
+//! the write; any write added later belongs there too. Everything else, the
+//! long-lived streams included, uses the sync client.
+//!
+//! Every method is fire-and-forget onto the data plane's runtime with the
+//! answer handed to a caller-supplied callback -- the render thread never
+//! blocks on the cluster -- and every
 //! outcome is a labelled [`Fetched`]: an account the cluster refuses -- 401 or
 //! 403, the same pair a watch calls forbidden -- arrives as `Denied`, never as
 //! an empty panel or an error string a person has to diagnose. Errors that
@@ -151,6 +157,7 @@ pub struct ObserveTools {
 #[derive(Clone)]
 pub struct Reader {
     client: Client,
+    interactive: Client,
     handle: tokio::runtime::Handle,
     targets: Arc<[KindTarget]>,
     verdicts: Arc<HashMap<KindId, Capability>>,
@@ -166,6 +173,7 @@ impl Reader {
 
     pub(crate) fn new(
         client: Client,
+        interactive: Client,
         targets: Vec<KindTarget>,
         verdicts: &[(KindId, Capability)],
         caps: &[(KindId, day2::Caps)],
@@ -177,6 +185,7 @@ impl Reader {
                 handle.clone(),
             ))),
             client,
+            interactive,
             handle,
             targets: targets.into(),
             verdicts: Arc::new(verdicts.iter().copied().collect()),
@@ -257,7 +266,7 @@ impl Reader {
     // reach the apply without having been able to reach the dry run. Day-2
     // clicks are a different method; they are not documents.
     pub fn apply(&self, request: ApplyRequest, reply: impl FnOnce(ApplyOutcome) + Send + 'static) {
-        let client = self.client.clone();
+        let client = self.interactive.clone();
         let targets = self.targets.clone();
         self.handle.spawn(async move {
             reply(apply::apply(&client, &targets, &request).await);
@@ -476,7 +485,7 @@ impl Reader {
         confirm: bool,
         reply: impl FnOnce(alertmanager::SilenceOutcome) + Send + 'static,
     ) {
-        let client = self.client.clone();
+        let client = self.interactive.clone();
         self.handle.spawn(async move {
             reply(alertmanager::create_silence(&client, &bound, &spec, confirm).await);
         });
@@ -495,7 +504,10 @@ impl Reader {
 
     /// Scale, rollout, delete, evict, cordon, drain, debug. Caps are filled
     /// here from the probe so a caller cannot skip the gate; confirm still
-    /// lives on the request, so the first press never touches the wire.
+    /// lives on the request, so the first press never writes (a drain's ask
+    /// reads the node's pods). Each request waits at most the interactive
+    /// deadline, and a drain makes at most eighteen: its plan read, the
+    /// cordon and sixteen evictions.
     pub fn day2(
         &self,
         kind: KindId,
@@ -518,7 +530,7 @@ impl Reader {
                 .unwrap_or_default();
             *restarted_at = flux::rfc3339(elapsed.as_secs(), elapsed.subsec_nanos());
         }
-        let client = self.client.clone();
+        let client = self.interactive.clone();
         self.handle.spawn(async move {
             reply(day2::run(&client, &target, &call).await);
         });
@@ -851,7 +863,10 @@ impl Reader {
     }
 
     /// Server-side apply of a stored revision. The report's note is always
-    /// [`helm_reveal::NOT_HELM_ROLLBACK`].
+    /// [`helm_reveal::NOT_HELM_ROLLBACK`]. Each request waits at most the
+    /// interactive deadline: the list of the revision's release Secret
+    /// (selected by name and version), a read of it by its conventional name
+    /// when the list finds none, and one apply per document.
     pub fn rollback_helm_revision(
         &self,
         namespace: Option<String>,
@@ -859,7 +874,7 @@ impl Reader {
         revision: u32,
         reply: impl FnOnce(Fetched<helm_reveal::RollbackReport>) + Send + 'static,
     ) {
-        let client = self.client.clone();
+        let client = self.interactive.clone();
         let targets = self.targets.clone();
         self.handle.spawn(async move {
             reply(

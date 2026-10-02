@@ -546,3 +546,43 @@ fn a_denied_apply_is_a_denial_and_a_kind_with_no_patch_verb_never_reaches_the_wi
 
     drop(runtime);
 }
+
+// An apply and its dry run are the same request with one parameter between
+// them, and both take the interactive client: a confirmed write never retries
+// and never waits without bound, and the dry run decides it.
+#[test]
+fn an_apply_and_its_dry_run_take_the_interactive_client() {
+    use k10s_data::apply::ApplyOutcome;
+
+    let sync = Script::default();
+    script_discovery(&sync);
+    script_rules_review(&sync);
+    script_access_reviews(&sync, true, 32);
+    script_lists(&sync);
+    let interactive = Script::default();
+    let pod = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-1","namespace":"prod","uid":"uid-pod"}}"#;
+    interactive.route("PATCH", "/api/v1/namespaces/prod/pods/api-1?", 200, pod);
+    interactive.route("PATCH", "/api/v1/namespaces/prod/pods/api-1?", 200, pod);
+
+    let runtime = runtime();
+    let (data, _live) = sync_on_split(&runtime, &sync, &interactive);
+    let before = sync.seen().len();
+    for dry_run in [true, false] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        data.reader.apply(
+            apply_request("kind: Pod\n", dry_run, false),
+            move |outcome| {
+                let _ = tx.send(outcome);
+            },
+        );
+        let outcome = wait(&rx);
+        assert!(matches!(outcome, ApplyOutcome::Applied(_)), "{outcome:?}");
+    }
+    let sent = interactive.seen();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[0].path.contains("dryRun=All"), "{:?}", sent[0].path);
+    assert!(!sent[1].path.contains("dryRun"), "{:?}", sent[1].path);
+    let stray = after_sync(&sync, before);
+    assert!(stray.is_empty(), "nothing on the sync client: {stray:?}");
+    drop(runtime);
+}

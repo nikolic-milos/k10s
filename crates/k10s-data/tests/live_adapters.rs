@@ -92,6 +92,12 @@ fn wait<T: Send + 'static>(rx: &std::sync::mpsc::Receiver<T>) -> T {
         .expect("a reply within the budget")
 }
 
+fn wait_interactive<T: Send + 'static>(rx: &std::sync::mpsc::Receiver<T>, requests: u32) -> T {
+    let budget = k10s_data::connect::INTERACTIVE_DEADLINE * requests + Duration::from_secs(5);
+    rx.recv_timeout(budget)
+        .expect("an interactive reply within its request budgets")
+}
+
 fn kube_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -146,7 +152,7 @@ fn apply(reader: &Reader, request: ApplyRequest) -> ApplyOutcome {
     reader.apply(request, move |outcome| {
         let _ = tx.send(outcome);
     });
-    wait(&rx)
+    wait_interactive(&rx, 1)
 }
 
 fn day2(reader: &Reader, kind: KindId, call: Day2Call) -> Day2Outcome {
@@ -154,7 +160,7 @@ fn day2(reader: &Reader, kind: KindId, call: Day2Call) -> Day2Outcome {
     reader.day2(kind, call, move |outcome| {
         let _ = tx.send(outcome);
     });
-    wait(&rx)
+    wait_interactive(&rx, 1)
 }
 
 fn scale_call(name: &str, current: i32, replicas: i32, confirm: bool) -> Day2Call {
@@ -1460,7 +1466,7 @@ fn a_firing_live_alert_keeps_its_pod_join_and_is_silenced_by_exact_matchers() {
             .create_silence(bound.clone(), spec.clone(), true, move |answer| {
                 let _ = tx.send(answer);
             });
-        let answer = wait(&rx);
+        let answer = wait_interactive(&rx, 1);
         let SilenceOutcome::Applied { id, .. } = answer else {
             panic!("the confirmed silence must be written: {answer:?}");
         };
@@ -1611,7 +1617,7 @@ fn a_read_only_account_cannot_create_a_live_alertmanager_silence() {
         .create_silence(bound, spec, true, move |answer| {
             let _ = tx.send(answer);
         });
-    let answer = wait(&rx);
+    let answer = wait_interactive(&rx, 1);
     let stored = kube_runtime().block_on(async {
         let client = kube::Client::try_default().await.expect("an admin client");
         let Fetched::Ok(silences) = alertmanager::fetch_silences(&client, &admin_bound).await

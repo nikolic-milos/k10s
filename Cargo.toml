@@ -115,7 +115,7 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macr
 # this costs the dependency budget nothing; they become direct edges only.
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 hyper-timeout = "0.5"
-tower = { version = "0.5", features = ["util", "retry"] }
+tower = { version = "0.5", features = ["util", "retry", "buffer"] }
 tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip", "map-response-body"] }
 http-body-util = "0.1"
 

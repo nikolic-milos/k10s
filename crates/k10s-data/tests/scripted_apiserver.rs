@@ -9,6 +9,12 @@
 //!
 //! Cargo builds only the top-level files in `tests/` as binaries, so the suites
 //! below are modules of this one binary and share a single compiled harness.
+//!
+//! A connection hands the data plane two clients. Here both are clients of a
+//! `Script`, retry-free like the interactive client but with no deadline, so a
+//! suite pins request shapes and which client a request took, never the
+//! bound; `connect_test.rs` proves the bound and the retry split against a
+//! listener. A suite that asserts routing gives each client its own Script.
 
 #[path = "scripted_apiserver/alertmanager.rs"]
 mod alertmanager;
@@ -86,6 +92,7 @@ mod vault;
 mod velero;
 
 use k10s_core::{Capability, IngestEvent, KindId, Op, Payload, ResourceEvent, Severity};
+use k10s_data::connect::Clients;
 use k10s_data::{IngestMetrics, Options, Sync, sync_from};
 use kube::client::Body;
 use std::sync::{Arc, Mutex};
@@ -217,6 +224,13 @@ impl Script {
 
     fn client(&self) -> kube::Client {
         kube::Client::new(self.clone(), "default")
+    }
+
+    fn clients(&self) -> Clients {
+        Clients {
+            sync: self.client(),
+            interactive: self.client(),
+        }
     }
 }
 impl Service<http::Request<Body>> for Script {
@@ -446,6 +460,27 @@ fn script_rules_review(script: &Script) {
                       "resourceRules":[{"apiGroups":["*"],"resources":["*"],"verbs":["get","list","watch"]}]}}"#,
     );
 }
+// A rules review granting every verb, so the probe's caps let a write
+// through to the wire; the routing tests need a write to reach a Script.
+fn script_rules_review_admin(script: &Script) {
+    script.route(
+        "POST",
+        "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+        201,
+        r#"{"kind":"SelfSubjectRulesReview","apiVersion":"authorization.k8s.io/v1","spec":{},
+            "status":{"incomplete":false,"nonResourceRules":[],
+                      "resourceRules":[{"apiGroups":["*"],"resources":["*"],"verbs":["*"]}]}}"#,
+    );
+}
+// What a sync Script saw after the sync, without the watches it keeps open:
+// the routing tests assert a write left it untouched.
+fn after_sync(script: &Script, before: usize) -> Vec<Seen> {
+    script.seen()[before..]
+        .iter()
+        .filter(|seen| !seen.path.contains("watch=true"))
+        .cloned()
+        .collect()
+}
 fn list(items: &[String], kind: &str) -> String {
     format!(
         r#"{{"kind":"{kind}List","apiVersion":"v1","metadata":{{"resourceVersion":"1000"}},"items":[{}]}}"#,
@@ -602,9 +637,8 @@ fn run_live(
         .expect("a runtime");
     let sync = runtime
         .block_on(async {
-            let client = script.client();
             sync_from(
-                client,
+                script.clients(),
                 "prod",
                 &options,
                 tx,
@@ -678,11 +712,25 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("a runtime")
 }
 fn sync_on(runtime: &tokio::runtime::Runtime, script: &Script) -> (Sync, EventReceiver) {
+    sync_on_split(runtime, script, script)
+}
+// The data plane over a sync Script and an interactive Script, for the suites
+// that assert which client a request took. The clients are made inside the
+// runtime because `kube::Client::new` puts every service behind a tower Buffer
+// and spawns its worker there.
+fn sync_on_split(
+    runtime: &tokio::runtime::Runtime,
+    sync: &Script,
+    interactive: &Script,
+) -> (Sync, EventReceiver) {
     let (tx, rx) = crossbeam_channel::unbounded();
-    let sync = runtime
+    let data = runtime
         .block_on(async {
             sync_from(
-                script.client(),
+                Clients {
+                    sync: sync.client(),
+                    interactive: interactive.client(),
+                },
                 "prod",
                 &options(),
                 tx,
@@ -691,7 +739,7 @@ fn sync_on(runtime: &tokio::runtime::Runtime, script: &Script) -> (Sync, EventRe
             .await
         })
         .expect("the scripted cluster syncs");
-    (sync, rx)
+    (data, rx)
 }
 type EventReceiver = crossbeam_channel::Receiver<IngestEvent>;
 fn wait<T: Send + 'static>(rx: &std::sync::mpsc::Receiver<T>) -> T {

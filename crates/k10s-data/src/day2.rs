@@ -22,8 +22,10 @@
 //!
 //! Drain cordons, then evicts at most [`MAX_DRAIN_PODS`] pods on that node,
 //! skipping DaemonSet pods unless asked to force, and labels a PDB 429
-//! rather than retrying it forever. A truncated flag means there was more
-//! to evict than this press would touch.
+//! rather than retrying it: every call here runs on the interactive client,
+//! which sends a request once and waits at most
+//! [`crate::connect::INTERACTIVE_DEADLINE`] for each answer. A truncated flag
+//! means there was more to evict than this press would touch.
 
 use kube::Client;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Request};

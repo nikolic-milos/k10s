@@ -327,3 +327,64 @@ fn a_stored_manifest_apply_patches_each_document_and_skips_the_secret() {
 
     drop(runtime);
 }
+
+// The stored-manifest apply, its reveal included, takes the interactive
+// client: the reveal decides what is written.
+#[test]
+fn a_stored_manifest_apply_takes_the_interactive_client_with_its_reveal() {
+    use k10s_data::read::Fetched;
+
+    let sync = Script::default();
+    script_discovery_with_secret(&sync, api_resource("Secret", "secrets", true));
+    script_rules_review(&sync);
+    script_access_reviews(&sync, true, 32);
+    script_lists(&sync);
+    let interactive = Script::default();
+    interactive.route(
+        "GET",
+        "/api/v1/namespaces/prod/secrets?",
+        200,
+        format!(
+            r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
+            release_secret(
+                "sh.helm.release.v1.rollback-probe.v1",
+                "rollback-probe",
+                1,
+                "deployed",
+                ROLLBACK_MANIFEST
+            ),
+        ),
+    );
+    interactive.route(
+        "PATCH",
+        "/api/v1/namespaces/prod/configmaps/rollback-probe?",
+        200,
+        r#"{"apiVersion":"v1","kind":"ConfigMap",
+            "metadata":{"name":"rollback-probe","namespace":"prod","uid":"uid-cm"},
+            "data":{"proof":"stored"}}"#,
+    );
+
+    let runtime = runtime();
+    let (data, _live) = sync_on_split(&runtime, &sync, &interactive);
+    let before = sync.seen().len();
+    let (tx, rx) = std::sync::mpsc::channel();
+    data.reader.rollback_helm_revision(
+        Some("prod".to_string()),
+        "rollback-probe".to_string(),
+        1,
+        move |fetched| {
+            let _ = tx.send(fetched);
+        },
+    );
+    let outcome = wait(&rx);
+    assert!(matches!(outcome, Fetched::Ok(_)), "{outcome:?}");
+    let sent: Vec<_> = interactive
+        .seen()
+        .into_iter()
+        .map(|seen| seen.method)
+        .collect();
+    assert_eq!(sent, ["GET", "PATCH"]);
+    let stray = after_sync(&sync, before);
+    assert!(stray.is_empty(), "nothing on the sync client: {stray:?}");
+    drop(runtime);
+}
