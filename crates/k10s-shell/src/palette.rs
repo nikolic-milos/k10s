@@ -24,11 +24,30 @@ pub struct Command {
     pub display: String,
 }
 
-pub fn commands(cx: &App) -> Vec<Command> {
-    let mut commands: Vec<Command> = cx
-        .all_action_names()
+/// The k10s actions among every name gpui registered. gpui lists an action's
+/// deprecated aliases among its names; an old name kept so that a keymap
+/// written before a rename still binds is not an action of its own, so the
+/// palette does not show it and the keymap schema does not complete it.
+pub(crate) fn k10s_action_names<'a>(
+    names: &'a [&'static str],
+    deprecated: impl Fn(&str) -> bool + 'a,
+) -> impl Iterator<Item = &'static str> + 'a {
+    names
         .iter()
+        .copied()
         .filter(|name| name.starts_with("k10s_shell::") || name.starts_with("k10s_map::"))
+        .filter(move |name| !deprecated(name))
+}
+
+/// The k10s actions this build registered, for the palette and the keymap
+/// schema alike, so the two cannot disagree about what an action is.
+pub(crate) fn k10s_actions(cx: &App) -> impl Iterator<Item = &'static str> + '_ {
+    let deprecated = cx.deprecated_actions_to_preferred_actions();
+    k10s_action_names(cx.all_action_names(), |name| deprecated.contains_key(name))
+}
+
+pub fn commands(cx: &App) -> Vec<Command> {
+    let mut commands: Vec<Command> = k10s_actions(cx)
         .filter(|name| palette_visible(name))
         .map(|name| Command {
             name,
@@ -653,7 +672,7 @@ mod tests {
     #[test]
     fn the_write_path_commands_are_all_reachable_from_the_palette() {
         for visible in [
-            "k10s_shell::DiffAgainstLive",
+            "k10s_shell::DiffAgainstLoadedCopy",
             "k10s_shell::ApplyDryRun",
             "k10s_shell::ApplyToCluster",
             "k10s_shell::ForceApply",
@@ -672,8 +691,45 @@ mod tests {
             "shell: apply to cluster"
         );
         assert_eq!(
-            humanize("k10s_shell::DiffAgainstLive"),
-            "shell: diff against live"
+            humanize("k10s_shell::DiffAgainstLoadedCopy"),
+            "shell: diff against loaded copy"
+        );
+    }
+
+    // The local comparison and taking a hunk are against the copy this editor
+    // read, and their names say so; a keymap written for an old name still
+    // binds it.
+    #[test]
+    fn the_local_diff_and_take_keep_their_old_names_as_aliases() {
+        assert_eq!(
+            <crate::DiffAgainstLoadedCopy as gpui::Action>::deprecated_aliases(),
+            ["k10s_shell::DiffAgainstLive"]
+        );
+        assert_eq!(
+            <crate::TakeFromLoadedCopy as gpui::Action>::deprecated_aliases(),
+            ["k10s_shell::KeepTheirs"]
+        );
+        assert_eq!(
+            humanize("k10s_shell::TakeFromLoadedCopy"),
+            "shell: take from loaded copy"
+        );
+    }
+
+    // An alias is a name gpui resolves, not a command: the palette and the
+    // keymap schema both leave it out.
+    #[test]
+    fn an_old_name_kept_for_keymaps_is_not_offered_as_an_action() {
+        let names = [
+            "k10s_shell::DiffAgainstLive",
+            "k10s_shell::DiffAgainstLoadedCopy",
+            "menu::Confirm",
+            "k10s_map::FitView",
+        ];
+        let offered: Vec<_> =
+            k10s_action_names(&names, |name| name == "k10s_shell::DiffAgainstLive").collect();
+        assert_eq!(
+            offered,
+            ["k10s_shell::DiffAgainstLoadedCopy", "k10s_map::FitView"]
         );
     }
 }

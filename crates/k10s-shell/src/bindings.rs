@@ -173,7 +173,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", EditorCancel, editor),
         KeyBinding::new("ctrl-s", EditorSave, editor),
         KeyBinding::new("ctrl-shift-s", EditorSaveAs, editor),
-        KeyBinding::new("ctrl-alt-d", DiffAgainstLive, editor),
+        KeyBinding::new("ctrl-alt-d", DiffAgainstLoadedCopy, editor),
         // The diff surface reuses the document scrolling actions rather than
         // declaring six of its own: the keys a reader already knows move a
         // diff the same way they move a describe document.
@@ -189,9 +189,9 @@ pub fn keybindings() -> Vec<KeyBinding> {
         // The one key in this context that changes a document. It edits the
         // buffer rather than the cluster, so it needs no second press: undo is
         // in the editor where the change lands.
-        KeyBinding::new("t", KeepTheirs, diff),
+        KeyBinding::new("t", TakeFromLoadedCopy, diff),
         KeyBinding::new("r", Refresh, diff),
-        KeyBinding::new("ctrl-alt-d", DiffAgainstLive, diff),
+        KeyBinding::new("ctrl-alt-d", DiffAgainstLoadedCopy, diff),
         KeyBinding::new("ctrl-alt-r", ApplyDryRun, diff),
         // The write, and the one that takes a field from another manager. Both
         // need a second press; neither can answer the other's question.

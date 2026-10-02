@@ -306,9 +306,9 @@ fn a_region_the_base_never_declared_is_not_called_a_conflict() {
 
     // And the shape a reviewer found: the buffer deletes the defaulted line
     // instead of retyping it, so only the cluster holds text here. That used
-    // to be `Theirs` -- "the cluster changed this; applying reverts it" --
-    // which is the same false promise one arm over: an apply does not revert
-    // a field this client never declared.
+    // to be `Theirs`, whose label promised that applying reverts it, which is
+    // the same false promise one arm over: an apply does not revert a field
+    // this client never declared.
     let deleted = "kind: Pod\nz: 1\n";
     let diff = three_way(Sides {
         base: Some(base),
@@ -362,12 +362,12 @@ fn a_change_the_buffer_already_agrees_with_is_not_a_change() {
     assert_eq!(
         diff.verdict(),
         Verdict::Agreed,
-        "the buffer holds what the cluster holds, so an apply changes nothing"
+        "the buffer holds the copy the caller read, so the comparison agrees"
     );
 }
 
 #[test]
-fn a_theirs_hunk_is_what_an_apply_would_revert() {
+fn a_theirs_hunk_differs_from_the_copy_the_caller_read() {
     let base = "replicas: 1\nimage: nginx\n";
     let live = "replicas: 5\nimage: nginx\n";
     let buffer = "replicas: 1\nimage: nginx\n";

@@ -250,9 +250,11 @@ impl BufferStamp {
     }
 }
 
-// What a diff needs from the buffer that produced it. `live` is the text the
-// fetch returned, held pristine: the buffer is what it became, and comparing a
-// buffer with itself would show nothing.
+// What a diff needs from the buffer that produced it. `live` is the copy of
+// the object this editor read, held pristine: the buffer is what it became,
+// and comparing a buffer with itself would show nothing. It is the local
+// comparison's left side only; a dry run's left side is the read made with
+// it, because this copy can be behind the cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffSources {
     pub request: DescribeRequest,
@@ -299,8 +301,9 @@ pub struct EditorView {
     pub(crate) meta: DocMeta,
     pub(crate) schema: Rc<RefCell<SchemaStore>>,
     pub(crate) schema_root: Option<Arc<SchemaNode>>,
-    // The cluster's own text for this object, as fetched. The buffer diverges
-    // from it the moment anything is typed, and the diff needs both.
+    // The copy of this object the editor read, as fetched. The buffer diverges
+    // from it the moment anything is typed, and the local comparison needs
+    // both.
     pub(crate) live: Option<String>,
     // The `last-applied-configuration`, rendered: a three-way diff's base.
     pub(crate) base: Option<String>,
@@ -497,11 +500,11 @@ impl EditorView {
         &self.source
     }
 
-    /// Whether there is a live version of this buffer to compare against, which
-    /// is the same question `diff_sources` answers by building the whole
+    /// Whether this buffer has a copy read from the cluster to compare with,
+    /// which is the same question `diff_sources` answers by building the whole
     /// comparison -- two copies of the document plus a prune walk -- and then
     /// being asked only `is_some()`.
-    pub fn has_live_version(&self) -> bool {
+    pub fn has_loaded_copy(&self) -> bool {
         matches!(self.source, EditorSource::Cluster(_)) && self.live.is_some()
     }
 

@@ -226,11 +226,8 @@ pub fn settings_root(registry: &ThemeRegistry, families: &[String]) -> Arc<Schem
 }
 
 pub fn keymap_root(cx: &gpui::App) -> Arc<SchemaNode> {
-    let mut actions: Vec<String> = cx
-        .all_action_names()
-        .iter()
-        .filter(|name| name.starts_with("k10s_shell::") || name.starts_with("k10s_map::"))
-        .map(|name| (*name).to_string())
+    let mut actions: Vec<String> = crate::palette::k10s_actions(cx)
+        .map(str::to_string)
         .collect();
     actions.sort();
     keymap_shape(actions)

@@ -1,7 +1,7 @@
 //! What the diff view claims, checked without a window.
 //!
-//! The two things worth testing here are the classification -- an edit, drift
-//! the apply would revert, or a collision -- and the preconditions a *press*
+//! The two things worth testing here are the classification -- an edit, a
+//! change in the read copy, or a collision -- and the preconditions a *press*
 //! has to clear. The second is why [`crate::diff_gate::prepare`] is one pure
 //! function: the two preconditions that ever failed were the two that lived
 //! somewhere else, guarding one way in while another way round stayed open.
@@ -89,18 +89,21 @@ fn a_two_way_comparison_says_it_has_no_base() {
 }
 
 #[test]
-fn drift_the_apply_would_revert_is_labelled_as_the_clusters_own() {
+fn drift_in_the_copy_read_is_labelled_as_changed_since_the_last_apply() {
     let base = LIVE;
     let live = LIVE.replace("nginx:1.27", "nginx:1.29");
     let buffer = LIVE;
     let state = local(&live, Some(base), buffer);
     let lines = texts(&state);
     assert!(
-        lines.contains(&"  the cluster changed this; applying reverts it".to_string()),
+        lines.contains(&"  changed since the last apply, in the copy this editor read".to_string()),
         "{lines:?}"
     );
-    assert!(state.summary().contains("1 reverted by applying"));
-    assert!(!state.summary().contains("two-way"));
+    assert_eq!(
+        state.summary(),
+        "against the copy this editor read  ·  +1 -1  ·  1 changed since the last apply  ·  t \
+         takes a hunk from the copy this editor read  ·  folded"
+    );
 }
 
 #[test]
@@ -485,7 +488,7 @@ fn a_buffer_replaced_since_the_review_is_refused_even_at_the_same_version() {
     );
 }
 
-// The dry run is the diff's right-hand side. Opening the view against live
+// The dry run is the diff's right-hand side. Opening against the loaded copy
 // alone and pressing ctrl-s twice used to reach a write whose payload the
 // server had never seen -- defaulting, admission and merge all unasked.
 #[test]
@@ -841,10 +844,10 @@ fn the_hunk_under_the_reader_is_the_one_the_header_heads() {
     assert_ne!(first, second, "a different hunk, not the same one twice");
 }
 
-// The acting half of the classification: naming drift an apply would revert
+// The acting half of the classification: naming drift since the last apply
 // is half an answer while the only way to keep it is to retype it.
 #[test]
-fn keeping_the_clusters_side_edits_the_buffer_into_the_clusters_document() {
+fn taking_a_hunk_edits_the_buffer_into_the_copy_this_editor_read() {
     let base = "replicas: 1\nimage: nginx\n";
     let live = "replicas: 5\nimage: nginx\n";
     let buffer = "replicas: 1\nimage: nginx\n";
@@ -859,8 +862,8 @@ fn keeping_the_clusters_side_edits_the_buffer_into_the_clusters_document() {
     assert_eq!(text, live);
     assert_eq!(
         kept_note(Origin::Theirs, &keep),
-        "kept the cluster's change: 1 line in place of 1; ctrl-alt-r asks the server about \
-         the result"
+        "kept the change in the copy this editor read: 1 line in place of 1; ctrl-alt-r asks the \
+         server about the result"
     );
 }
 
@@ -877,9 +880,14 @@ fn a_hunk_of_the_servers_own_answer_is_never_spliced_into_the_buffer() {
         reviewed: stamp,
         editor: Some(stamp),
     };
-    let why = refuse_keep(at).expect("refused");
-    assert!(why.contains("the server's own answer"), "{why}");
-    assert!(why.contains("ctrl-alt-d"), "and names the way back: {why}");
+    assert_eq!(
+        refuse_keep(at).as_deref(),
+        Some(
+            "this compares the server's own answer; ctrl-alt-d compares with the copy this \
+             editor read, whose hunks can be kept"
+        ),
+        "and names the way back"
+    );
 
     let local = Keepable {
         mode: Some(Mode::Local),
@@ -925,13 +933,13 @@ fn there_is_nothing_to_keep_where_the_documents_agree() {
         reviewed: stamp,
         editor: Some(stamp),
     };
-    let why = refuse_keep(at).expect("refused");
-    assert!(why.contains("nothing here differs"), "{why}");
-    assert!(
-        why.contains("n moves to the next change"),
-        "and names the key that moves: {why}"
+    let nothing =
+        Some("nothing here differs from the copy this editor read; n moves to the next change");
+    assert_eq!(refuse_keep(at).as_deref(), nothing);
+    assert_eq!(
+        refuse_keep(Keepable { origin: None, ..at }).as_deref(),
+        nothing
     );
-    assert!(refuse_keep(Keepable { origin: None, ..at }).is_some());
 
     for origin in [
         Origin::Mine,
@@ -945,7 +953,7 @@ fn there_is_nothing_to_keep_where_the_documents_agree() {
                 ..at
             }),
             None,
-            "{origin:?} has a cluster side to keep"
+            "{origin:?} has a side in the copy read to take"
         );
     }
 }
@@ -960,15 +968,21 @@ fn what_was_kept_is_named_by_the_classification_it_came_from() {
     };
     assert!(
         kept_note(Origin::Theirs, &keep(1, 0))
-            .starts_with("kept the cluster's change: added 1 line")
+            .starts_with("kept the change in the copy this editor read: added 1 line")
     );
     assert!(
         kept_note(Origin::Mine, &keep(0, 2))
-            .starts_with("put the cluster's own text back: dropped 2 lines")
+            .starts_with("put back the text of the copy this editor read: dropped 2 lines")
     );
-    assert!(kept_note(Origin::Conflict, &keep(3, 1)).contains("3 lines in place of 1"));
-    assert!(
-        kept_note(Origin::Undeclared, &keep(1, 1)).contains("ctrl-alt-r"),
+    assert_eq!(
+        kept_note(Origin::Conflict, &keep(3, 1)),
+        "took the side of the copy this editor read: 3 lines in place of 1; ctrl-alt-r asks the \
+         server about the result"
+    );
+    assert_eq!(
+        kept_note(Origin::Undeclared, &keep(1, 1)),
+        "took the value in the copy this editor read: 1 line in place of 1; ctrl-alt-r asks the \
+         server about the result",
         "the dry run that authorised an apply is void, and the sentence says which key asks again"
     );
 }

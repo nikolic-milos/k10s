@@ -1,14 +1,15 @@
 //! The diff item: what an apply would change, reviewed before it happens.
 //!
 //! Two comparisons live in one view because they answer the same question at
-//! different distances. The local one is three-way -- the object as the cluster
-//! has it, the object as it was last declared, and the buffer -- and its value
-//! is the classification: a hunk only the buffer changed is an edit, a hunk only
-//! the cluster changed is drift the apply would revert, and a hunk both changed
-//! is a collision. The dry-run one is two-way and authoritative: the API server
-//! is handed the payload with `?dryRun=All`, and what comes back is what it
-//! *would* store, defaulting and admission webhooks included, so the diff is
-//! against the real outcome rather than a client's guess at merge semantics.
+//! different distances. The local one is three-way -- the copy of the object
+//! this editor read, the object as it was last declared, and the buffer -- and
+//! its value is the classification: a hunk only the buffer changed is an edit,
+//! a hunk only the copy changed is drift since the last apply, as that copy
+//! shows it, and a hunk both changed is a collision. The dry-run one is two-way
+//! and authoritative: the API server is handed the payload with `?dryRun=All`,
+//! and what comes back is what it *would* store, defaulting and admission
+//! webhooks included, so the diff is against the real outcome rather than a
+//! client's guess at merge semantics.
 //! Its left side is the object as the server holds it, read with the dry run,
 //! never the copy the editor loaded: a write that landed since, an apply of
 //! this view's that went unconfirmed included, shows there instead of hiding
@@ -73,7 +74,8 @@ pub(crate) const MAX_SHOWN_CAUSES: usize = 12;
 /// so the labelling is not cosmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Live, last-applied and the buffer, from the editor alone.
+    /// The copy this editor read, last-applied and the buffer, from the editor
+    /// alone. It authorises no write.
     Local,
     /// The object as the dry run read it against what the server answered it
     /// would store.
@@ -296,7 +298,7 @@ impl DiffState {
         match (self.mode, origin) {
             (Some(Mode::DryRun), _) => "the apply would change this",
             (_, Origin::Mine) => "you changed this",
-            (_, Origin::Theirs) => "the cluster changed this; applying reverts it",
+            (_, Origin::Theirs) => "changed since the last apply, in the copy this editor read",
             (_, Origin::Conflict) => "both changed this since the last apply",
             // Not "both changed this": nobody declared it, so nothing was taken
             // from anyone and no refusal is coming. What an apply does to a field
@@ -324,12 +326,12 @@ impl DiffState {
         Some(self.diff.hunks.get(hunk)?.origin)
     }
 
-    /// The buffer edit that keeps the cluster's side of one hunk. The two
-    /// documents its ranges point into are this state's own, which is why the
-    /// call lives here: in [`Mode::DryRun`] the right-hand document is the
-    /// server's answer rather than the editor's buffer, so an edit derived from
-    /// it would splice one document's ranges into another. [`refuse_keep`] is
-    /// what keeps that press from arriving.
+    /// The buffer edit that takes one hunk as the copy this editor read has it.
+    /// The two documents its ranges point into are this state's own, which is
+    /// why the call lives here: in [`Mode::DryRun`] the right-hand document is
+    /// the server's answer rather than the editor's buffer, so an edit derived
+    /// from it would splice one document's ranges into another. [`refuse_keep`]
+    /// is what keeps that press from arriving.
     pub(crate) fn keep(&self, hunk: usize) -> Option<diff::Keep> {
         debug_assert_eq!(
             self.mode,
@@ -351,7 +353,7 @@ impl DiffState {
         let counts = self.diff.counts;
         let mut pieces = Vec::new();
         pieces.push(match mode {
-            Mode::Local => "against live".to_string(),
+            Mode::Local => "against the copy this editor read".to_string(),
             Mode::DryRun => "against the server's dry run".to_string(),
         });
         if verdict == Verdict::Agreed {
@@ -362,7 +364,7 @@ impl DiffState {
                 pieces.push(format!("{} yours", counts.mine));
             }
             if counts.theirs > 0 {
-                pieces.push(format!("{} reverted by applying", counts.theirs));
+                pieces.push(format!("{} changed since the last apply", counts.theirs));
             }
             if counts.conflict > 0 {
                 pieces.push(format!("{} conflicting", counts.conflict));
@@ -387,7 +389,7 @@ impl DiffState {
         // every hunk header: the action is in the registry, so the palette lists
         // it with its key like every other command.
         if mode == Mode::Local && verdict == Verdict::Differs {
-            pieces.push("t keeps the cluster's side of a hunk".to_string());
+            pieces.push("t takes a hunk from the copy this editor read".to_string());
         }
         if self.folded && verdict == Verdict::Differs {
             pieces.push("folded".to_string());
@@ -673,14 +675,15 @@ impl DiffView {
         self.send(false, force, cx);
     }
 
-    // Take the cluster's side of the hunk being read. The classification names
-    // drift an apply would revert; until this existed the only way to keep it was
-    // to retype it, and the ranges to do it with were already in the comparison.
+    // Take the hunk being read as the copy this editor read has it. The
+    // classification names drift since the last apply; until this existed the
+    // only way to keep it was to retype it, and the ranges to do it with were
+    // already in the comparison.
     //
     // Nothing goes on the wire, so `prepare` is not the gate here and there is no
     // two-press latch: an edit to a buffer is undoable, and the editor's own undo
     // is what undoes it.
-    fn keep_theirs(&mut self, cx: &mut Context<Self>) {
+    fn take_from_loaded_copy(&mut self, cx: &mut Context<Self>) {
         let editor = self.editor.upgrade();
         let hunk = self.state.hunk_at_top();
         let at = Keepable {
@@ -716,9 +719,9 @@ impl DiffView {
             return;
         }
         // The buffer is not the buffer the dry run answered for any more, so the
-        // comparison is remade against live and the server is asked again on
-        // purpose rather than automatically: this is an edit, and edits are what
-        // the review comes after.
+        // comparison is remade against the copy this editor read and the server is
+        // asked again on purpose rather than automatically: this is an edit, and
+        // edits are what the review comes after.
         self.refresh_from_editor(false, cx);
         self.status = Some(note);
         cx.notify();
@@ -1218,8 +1221,8 @@ pub(crate) fn row_color(theme: &Theme, painted: &Painted<'_>) -> u32 {
         (Origin::Theirs, Some(Side::Live)) => theme.shell.warning,
         (Origin::Theirs, Some(Side::Buffer)) => theme.shell.text_muted,
         // Undeclared is not an error colour: nothing was taken from anyone and
-        // no refusal is coming. The cluster's side is what is there and nobody
-        // asked for, the buffer's is what would be sent.
+        // no refusal is coming. The left side is what is there and nobody asked
+        // for, the buffer's is what would be sent.
         (Origin::Undeclared, Some(Side::Live)) => theme.shell.warning,
         (Origin::Undeclared, Some(Side::Buffer)) => theme.shell.success,
         (Origin::Conflict, _) => theme.shell.error,
@@ -1305,8 +1308,8 @@ impl Render for DiffView {
                 this.state.toggle_folded();
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &crate::KeepTheirs, _, cx| {
-                this.keep_theirs(cx);
+            .on_action(cx.listener(|this, _: &crate::TakeFromLoadedCopy, _, cx| {
+                this.take_from_loaded_copy(cx);
             }))
             .on_action(cx.listener(|this, _: &crate::Refresh, _, cx| {
                 let dry_run = this.state.mode() == Some(Mode::DryRun);
@@ -1315,9 +1318,11 @@ impl Render for DiffView {
             .on_action(cx.listener(|this, _: &crate::ApplyDryRun, _, cx| {
                 this.refresh_from_editor(true, cx);
             }))
-            .on_action(cx.listener(|this, _: &crate::DiffAgainstLive, _, cx| {
-                this.refresh_from_editor(false, cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::DiffAgainstLoadedCopy, _, cx| {
+                    this.refresh_from_editor(false, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &crate::ApplyToCluster, _, cx| {
                 this.apply(false, cx);
             }))

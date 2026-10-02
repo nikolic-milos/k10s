@@ -3,10 +3,10 @@
 //! The names here are load-bearing beyond Rust. `actions!` stamps each struct
 //! with the `k10s_shell` namespace, so an action is known to the keymap file,
 //! the command palette and the settings schema as `"k10s_shell::OpenPalette"` --
-//! a string three other modules filter on by prefix and one of them hands
-//! straight to `App::build_action`. Renaming a struct here silently unbinds
-//! whatever a person had bound to it, so a rename is a keymap migration and not
-//! a tidy-up. Which keys reach these is [`crate::bindings`]; which of them a
+//! a string the shared filter in `palette` admits to both the palette and the
+//! keymap schema, and the keymap loader hands to `App::build_action`. A rename
+//! needs an alias for the old name or it silently unbinds a person's keymap.
+//! Which keys reach these is [`crate::bindings`]; which of them a
 //! given surface listens for is the element that declares the context.
 
 use gpui::actions;
@@ -137,14 +137,21 @@ actions!(
         OpenSettings,
         OpenKeymap,
         PickParent,
-        DiffAgainstLive,
+        // Compares the buffer with the copy of the object this editor read,
+        // not with the cluster, so it is not named "live"; the old name stays
+        // an alias so a keymap that bound it still works.
+        #[action(deprecated_aliases = ["k10s_shell::DiffAgainstLive"])]
+        DiffAgainstLoadedCopy,
         ApplyDryRun,
         ApplyToCluster,
         ForceApply,
         NextChange,
         PrevChange,
         ToggleFolded,
-        KeepTheirs,
+        // Takes a hunk as the copy this editor read has it, for the same reason
+        // as the comparison's own name; the old name stays an alias.
+        #[action(deprecated_aliases = ["k10s_shell::KeepTheirs"])]
+        TakeFromLoadedCopy,
     ]
 );
 
@@ -176,8 +183,8 @@ mod tests {
     /// The namespace comes from the first argument to `actions!`, not from the
     /// module the invocation sits in -- which is what makes moving this list
     /// between modules safe, and is worth an executable claim rather than an
-    /// argument. Three other places match these strings by their
-    /// `"k10s_shell::"` prefix and one hands them to `App::build_action`, so a
+    /// argument. The palette's shared filter matches the `"k10s_shell::"`
+    /// prefix, and the keymap loader hands names to `App::build_action`, so a
     /// namespace that quietly became `"actions::"` would unbind every user
     /// keymap and empty the command palette with nothing failing to compile.
     #[test]
@@ -192,7 +199,7 @@ mod tests {
         for name in [
             OpenPalette.name(),
             ChooseCluster.name(),
-            KeepTheirs.name(),
+            TakeFromLoadedCopy.name(),
             PickParent.name(),
         ] {
             assert!(

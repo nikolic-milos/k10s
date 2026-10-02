@@ -1029,7 +1029,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(sources) = editor.read(cx).diff_sources() else {
-            self.status_note = Some("this buffer has no live version to compare with".to_string());
+            self.status_note = Some(
+                "this buffer was not read from the cluster, so there is no copy to compare it with"
+                    .to_string(),
+            );
             cx.notify();
             return;
         };

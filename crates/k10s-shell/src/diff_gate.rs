@@ -218,8 +218,8 @@ pub(crate) fn prepare(wanted: Armed, at: Ready<'_>) -> Result<Preparation, Strin
         return Ok(Preparation::PreviewForce);
     }
     // And the dry run *is* the diff's right-hand side. Opening the view against
-    // live alone reaches a write whose payload the server never saw, defaulting
-    // and admission included, which is a review of a guess.
+    // the loaded copy alone reaches a write whose payload the server never saw,
+    // defaulting and admission included, which is a review of a guess.
     if !at.dry_run.is_some_and(|review| review.stamp == at.reviewed) {
         // The server was asked; its answer compared two objects. The race's
         // own sentence stands on the line, so this says what the press did.
@@ -271,15 +271,16 @@ pub(crate) fn refuse_keep(at: Keepable) -> Option<String> {
     }
     if at.mode != Some(Mode::Local) {
         return Some(
-            "this compares the server's own answer, not the cluster's; ctrl-alt-d compares \
-             against live"
+            "this compares the server's own answer; ctrl-alt-d compares with the copy this \
+             editor read, whose hunks can be kept"
                 .to_string(),
         );
     }
     match at.origin {
-        None | Some(Origin::Common) => {
-            Some("nothing here differs from the cluster; n moves to the next change".to_string())
-        }
+        None | Some(Origin::Common) => Some(
+            "nothing here differs from the copy this editor read; n moves to the next change"
+                .to_string(),
+        ),
         Some(_) => None,
     }
 }
@@ -290,10 +291,10 @@ pub(crate) fn refuse_keep(at: Keepable) -> Option<String> {
 /// names the key that asks again.
 pub(crate) fn kept_note(origin: Origin, keep: &diff::Keep) -> String {
     let what = match origin {
-        Origin::Theirs => "kept the cluster's change",
-        Origin::Mine => "put the cluster's own text back",
-        Origin::Conflict => "took the cluster's side of the conflict",
-        Origin::Undeclared => "took the value the cluster holds",
+        Origin::Theirs => "kept the change in the copy this editor read",
+        Origin::Mine => "put back the text of the copy this editor read",
+        Origin::Conflict => "took the side of the copy this editor read",
+        Origin::Undeclared => "took the value in the copy this editor read",
         Origin::Common => "changed nothing",
     };
     let lines = match (keep.taken, keep.dropped) {

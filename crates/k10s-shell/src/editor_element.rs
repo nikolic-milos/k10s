@@ -447,21 +447,25 @@ impl Render for EditorView {
             .on_action(cx.listener(|this, _: &crate::EditorSave, _, cx| {
                 this.save(cx);
             }))
-            .on_action(cx.listener(|this, _: &crate::DiffAgainstLive, _, cx| {
-                // The predicate, not the comparison: the workspace builds the
-                // sources itself, and building them here only to drop them
-                // copies the document twice and walks the tree for a prune
-                // whose answer is thrown away.
-                if this.has_live_version() {
-                    cx.emit(EditorEvent::DiffRequested { dry_run: false });
-                } else {
-                    this.status =
-                        Some("only a cluster document has a live version to diff".to_string());
-                    cx.notify();
-                }
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::DiffAgainstLoadedCopy, _, cx| {
+                    // The predicate, not the comparison: the workspace builds the
+                    // sources itself, and building them here only to drop them
+                    // copies the document twice and walks the tree for a prune
+                    // whose answer is thrown away.
+                    if this.has_loaded_copy() {
+                        cx.emit(EditorEvent::DiffRequested { dry_run: false });
+                    } else {
+                        this.status = Some(
+                            "only a document read from the cluster has a copy to compare with"
+                                .to_string(),
+                        );
+                        cx.notify();
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &crate::ApplyDryRun, _, cx| {
-                if this.has_live_version() {
+                if this.has_loaded_copy() {
                     cx.emit(EditorEvent::DiffRequested { dry_run: true });
                 } else {
                     this.status = Some("only a cluster document can be applied".to_string());

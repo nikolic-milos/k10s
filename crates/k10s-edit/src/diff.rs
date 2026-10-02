@@ -1,12 +1,15 @@
-//! Three-way line diff: what an apply would change, and who changed it first.
+//! Three-way line diff: what changed since the last apply, and who changed it.
 //!
 //! §5.2's row asks for a three-way view -- live, last-applied, editor -- and the
-//! third document is the whole point. A region only the buffer changed is the
-//! user's own edit; a region only the cluster changed is drift an apply would
-//! revert; a region both changed is a conflict. Without the base document those
-//! three collapse into one indistinguishable "differs", which is why an object
-//! carrying no `last-applied-configuration` is a labelled two-way diff rather
-//! than a three-way one that guesses.
+//! third document is the whole point. The live document is the object as a
+//! caller last read it, which the cluster may have moved on from since; this
+//! crate cannot tell how old it is, so "the cluster" below means that copy. A
+//! region only the buffer changed is the user's own edit; a region only the
+//! cluster changed is drift since the last apply; a region both changed is a
+//! conflict. Without the base document those three collapse into one
+//! indistinguishable "differs", which is why an object carrying no
+//! `last-applied-configuration` is a labelled two-way diff rather than a
+//! three-way one that guesses.
 //!
 //! The alignment underneath is deliberately not a minimal edit script. Lines
 //! intern to `u32`, common prefix and suffix are trimmed, and what is left is
@@ -35,8 +38,8 @@
 //!
 //! A [`Hunk`] carries one thing its rows cannot supply: the span it covers on
 //! the *buffer* side, positioned even when the buffer has no lines there. That
-//! is what makes [`keep_theirs`] possible -- taking the cluster's side of one
-//! hunk is an edit to the buffer, and text only the cluster has still has a
+//! is what makes [`keep_theirs`] possible -- taking the read copy's side of one
+//! hunk is an edit to the buffer, and text only the read copy has still has a
 //! place in the buffer where it belongs. Summing row lengths afterwards would
 //! have derived the same number until the two sides spelled a line ending
 //! differently, and then it would have spliced at the wrong byte.
@@ -69,7 +72,7 @@ pub const MAX_SIDE_LINES: usize = 1 << 16;
 /// Which of the three documents a row's text lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
-    /// The object as the cluster has it now.
+    /// The object as the caller last read it from the cluster.
     Live,
     /// The `last-applied-configuration`: what was declared last time.
     Base,
@@ -77,16 +80,16 @@ pub enum Side {
     Buffer,
 }
 
-/// Who changed a region, which is what decides whether applying it is an edit,
-/// a revert, or a collision.
+/// Who changed a region since the last apply: the buffer, the comparison
+/// copy, or both. The server's dry run decides what an apply would change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    /// All three documents agree here, so an apply changes nothing.
+    /// All three documents agree here.
     Common,
     /// The buffer alone moved away from the base: the user's own edit.
     Mine,
-    /// The cluster alone moved away from the base, so applying the buffer
-    /// reverts whatever moved it.
+    /// The comparison copy alone moved away from the base: drift since the
+    /// last apply.
     Theirs,
     /// Cluster and buffer both moved away from the base, differently.
     Conflict,
@@ -131,7 +134,7 @@ pub struct Hunk {
 
 impl Hunk {
     /// The bytes of the buffer this hunk covers -- empty, but *positioned*, when
-    /// the buffer has no lines here. An edit that takes the cluster's side of a
+    /// the buffer has no lines here. An edit that takes the read copy's side of a
     /// hunk the buffer is missing entirely has to know where the missing lines
     /// belong, and the answer is a line boundary rather than nothing.
     pub fn buffer(&self) -> Range<usize> {
@@ -398,7 +401,7 @@ impl Build<'_> {
     // grouped out of the finished rows afterwards because this is the only place
     // that knows the buffer coordinate: a region with no buffer rows in it has
     // no trace of the buffer left in its rows, and its place in the buffer is
-    // what an edit taking the cluster's side of it needs.
+    // what an edit taking the read copy's side of it needs.
     fn open(&mut self, origin: Origin, buffer_lines: Range<usize>) {
         let span = self.buffer_span(buffer_lines);
         match self.hunks.last_mut() {
@@ -492,38 +495,37 @@ fn classify(base: &[u32], live: &[u32], buffer: &[u32]) -> Origin {
         //
         // This covers *both* remaining shapes, which is the correction a reviewer
         // found: the buffer holding different text, and the buffer holding none.
-        // The second one used to be `Theirs`, whose label says "the cluster
-        // changed this; applying reverts it" -- and an apply does not revert a
-        // field this client never declared, so that was the same false promise
-        // one arm over.
+        // The second one used to be `Theirs`, whose label promised that
+        // applying reverts it -- and an apply does not revert a field this
+        // client never declared, so that was the same false promise one arm
+        // over.
         (true, _) if base.is_empty() => Origin::Undeclared,
         (true, false) => Origin::Theirs,
         (true, true) => Origin::Conflict,
     }
 }
 
-/// The buffer edit that makes one hunk read the way the cluster reads it: which
+/// The buffer edit that makes one hunk match the comparison copy: which
 /// bytes of the buffer to replace, and with what.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keep {
     pub range: Range<usize>,
     pub text: String,
-    /// Lines taken from the cluster's document, and lines of the buffer they
+    /// Lines taken from the comparison copy, and lines of the buffer they
     /// replace, so a view can say what it did rather than that something
     /// happened.
     pub taken: usize,
     pub dropped: usize,
 }
 
-/// The edit that keeps the cluster's side of one hunk, or None when there is
+/// The edit that keeps the comparison copy's side of one hunk, or None when there is
 /// nothing to keep: no such hunk, or one the three documents agree about.
 ///
-/// This is the acting half of the three-way classification. Naming drift an
-/// apply would revert is only half an answer if the only way to keep it is to
-/// retype it, and the ranges to do it with are already here -- the hunk's rows
-/// on the cluster's side, and the hunk's own span on the buffer's.
+/// This is the acting half of the three-way classification. Drift since the
+/// last apply can be kept without retyping it: the hunk already has the copy's
+/// rows and the buffer span to replace.
 ///
-/// The replacement is composed line by line from the cluster's rows rather than
+/// The replacement is composed line by line from the copy's rows rather than
 /// sliced whole out of the live document, so a line ending spelled differently
 /// on the two sides stays on its own side instead of being pasted into the
 /// buffer. Where the buffer has no lines at all the span is empty but placed at
@@ -568,8 +570,7 @@ pub fn keep_theirs(diff: &Diff, hunk: usize, live: &str, buffer: &str) -> Option
 }
 
 // How the line before `at` was terminated, so an edit spells its own line
-// endings the way the document around it does rather than the way the cluster's
-// emitter does.
+// endings the way the document around it does rather than the read copy's.
 fn line_ending(text: &str, at: usize) -> &'static str {
     match text.get(..at) {
         Some(before) if before.ends_with("\r\n") => "\r\n",
