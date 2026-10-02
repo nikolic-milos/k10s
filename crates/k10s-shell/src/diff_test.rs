@@ -77,13 +77,62 @@ fn a_change_carries_a_header_naming_who_made_it() {
     assert!(state.summary().contains("1 yours"));
 }
 
+// The status line's remarks are formatted when the comparison changes and
+// stored. A fold is not such a change: it formats nothing, so the stored
+// strings are the same allocations after it, and "folded" is the line's own
+// borrowed piece.
+#[test]
+fn a_fold_formats_nothing_and_the_line_says_folded() {
+    let buffer = LIVE.replace("nginx:1.27", "nginx:1.28");
+    let mut state = local(LIVE, Some(LIVE), &buffer);
+    let (summary, hints) = (state.summary().as_ptr(), state.hints().as_ptr());
+    state.toggle_folded();
+    assert_eq!(
+        (state.summary().as_ptr(), state.hints().as_ptr()),
+        (summary, hints)
+    );
+    assert!(!state.hints().contains("folded"), "{}", state.hints());
+    let line = |folded| {
+        status_line(Line {
+            folded,
+            ..line_at(&[], None)
+        })
+    };
+    assert_eq!(line(true), "3 hunks  ·  folded");
+    assert_eq!(line(false), "3 hunks");
+}
+
+#[test]
+fn the_fold_note_requires_a_comparison_with_differences() {
+    let mut state = local(LIVE, Some(LIVE), LIVE);
+    assert!(state.folded());
+    assert!(!state.folded_note());
+    state.set(
+        Mode::Local,
+        LIVE.into(),
+        Some(LIVE.into()),
+        LIVE.replace("nginx:1.27", "nginx:1.28"),
+    );
+    assert!(state.folded_note());
+    state.toggle_folded();
+    assert!(!state.folded_note());
+    assert!(!DiffState::new().folded_note());
+}
+
+// A state nobody has given a comparison says so, whichever way it was made.
+#[test]
+fn a_new_state_is_comparing() {
+    assert_eq!(DiffState::new().summary(), "comparing...");
+    assert_eq!(DiffState::default().summary(), "comparing...");
+}
+
 #[test]
 fn a_two_way_comparison_says_it_has_no_base() {
     let buffer = LIVE.replace("nginx:1.27", "nginx:1.28");
     let state = local(LIVE, None, &buffer);
     assert!(
         state
-            .summary()
+            .hints()
             .contains("no last-applied-configuration, so this is two-way")
     );
 }
@@ -101,9 +150,13 @@ fn drift_in_the_copy_read_is_labelled_as_changed_since_the_last_apply() {
     );
     assert_eq!(
         state.summary(),
-        "against the copy this editor read  ·  +1 -1  ·  1 changed since the last apply  ·  t \
-         takes a hunk from the copy this editor read  ·  folded"
+        "against the copy this editor read  ·  +1 -1  ·  1 changed since the last apply"
     );
+    assert_eq!(
+        state.hints(),
+        "t takes a hunk from the copy this editor read"
+    );
+    assert!(!state.hints().contains("two-way"));
 }
 
 #[test]
@@ -139,7 +192,7 @@ fn the_dry_run_mode_labels_the_change_as_the_servers_own_answer() {
         "{lines:?}"
     );
     assert!(state.summary().contains("against the server's dry run"));
-    assert!(!state.summary().contains("two-way"));
+    assert!(!state.hints().contains("two-way"));
 }
 
 #[test]
@@ -546,8 +599,8 @@ fn the_first_conflict_needs_a_forced_preview_before_confirming_a_write() {
     });
     assert_eq!(prepare(Armed::Force, at), Ok(Preparation::Confirm));
     let mut gate = ApplyGate::default();
-    assert_eq!(gate.step(Armed::Force), Step::Ask);
-    assert_eq!(gate.step(Armed::Force), Step::Go);
+    assert_eq!(gate.step(Armed::Force, true), Step::Ask);
+    assert_eq!(gate.step(Armed::Force, true), Step::Go);
 }
 
 #[test]
@@ -1081,19 +1134,23 @@ fn a_dry_run_is_compared_with_its_own_read_of_the_object() {
 #[test]
 fn the_gate_arms_under_its_own_name_and_a_different_press_re_asks() {
     let mut gate = ApplyGate::default();
-    assert_eq!(gate.step(Armed::Apply), Step::Ask);
-    assert_eq!(gate.step(Armed::Force), Step::Ask, "a different question");
-    assert_eq!(gate.step(Armed::Force), Step::Go);
+    assert_eq!(gate.step(Armed::Apply, true), Step::Ask);
     assert_eq!(
-        gate.step(Armed::Force),
+        gate.step(Armed::Force, true),
+        Step::Ask,
+        "a different question"
+    );
+    assert_eq!(gate.step(Armed::Force, true), Step::Go);
+    assert_eq!(
+        gate.step(Armed::Force, true),
         Step::Ask,
         "firing disarms, so the next force asks again"
     );
     gate.disarm();
-    assert_eq!(gate.step(Armed::Apply), Step::Ask);
+    assert_eq!(gate.step(Armed::Apply, true), Step::Ask);
     gate.disarm();
     assert_eq!(
-        gate.step(Armed::Apply),
+        gate.step(Armed::Apply, true),
         Step::Ask,
         "a recompute makes the next press the first one again"
     );
@@ -1117,6 +1174,29 @@ fn an_applied_note_says_whether_the_buffer_followed_the_write() {
         applied_note("", "", Reload::Gone)
             .ends_with("the editor it came from is closed, so nothing was reloaded"),
         "a closed editor did not have its buffer move"
+    );
+}
+
+#[test]
+fn a_scrolled_prompt_is_revealed_without_spending_the_confirmation() {
+    for wanted in [Armed::Apply, Armed::Force] {
+        let mut gate = ApplyGate::default();
+        assert_eq!(gate.step(wanted, false), Step::Ask);
+        assert_eq!(gate.armed(), Some(wanted));
+        assert_eq!(gate.step(wanted, false), Step::Reveal);
+        assert_eq!(gate.step(wanted, false), Step::Reveal);
+        assert_eq!(gate.armed(), Some(wanted), "revealing keeps the question");
+        assert_eq!(gate.step(wanted, true), Step::Go);
+        assert_eq!(gate.armed(), None, "only a visible confirmation spends it");
+        assert_eq!(gate.step(wanted, true), Step::Ask);
+    }
+    let mut gate = ApplyGate::default();
+    assert_eq!(gate.step(Armed::Apply, true), Step::Ask);
+    assert_eq!(gate.step(Armed::Force, false), Step::Ask);
+    assert_eq!(
+        gate.armed(),
+        Some(Armed::Force),
+        "a different question re-arms"
     );
 }
 
@@ -1178,7 +1258,8 @@ fn a_rejection_names_its_causes_bounded_or_falls_back_to_the_message() {
 
 fn line_at<'a>(conflict: &'a [Conflicted], armed: Option<Armed>) -> Line<'a> {
     Line {
-        summary: "3 hunks".to_string(),
+        summary: "3 hunks",
+        hints: "",
         blocked: &[],
         kept: &[],
         armed,
@@ -1188,6 +1269,7 @@ fn line_at<'a>(conflict: &'a [Conflicted], armed: Option<Armed>) -> Line<'a> {
         unknown_write: false,
         status: None,
         context: Some("prod-eu"),
+        folded: false,
     }
 }
 
@@ -1280,6 +1362,55 @@ fn an_apply_that_may_still_land_stays_on_the_line_whatever_the_status_says() {
     );
     assert!(line.contains("ctrl-s applies this"), "{line}");
     assert!(!status_line(line_at(&[], None)).contains("may still land"));
+}
+
+// The line runs in the order a person acts on it: the prompt, the payload's
+// standing refusals of the press, then the answer, what stands about the
+// object and its owners, and the comparison's own remarks last.
+#[test]
+fn the_status_line_puts_what_a_person_acts_on_before_the_hints() {
+    let conflict = [Conflicted {
+        field: ".data.a".to_string(),
+        manager: "rival".to_string(),
+    }];
+    let line = status_line(Line {
+        hints: "the final newline differs",
+        seen: Seen::Replaced,
+        unknown_write: true,
+        status: Some("the last answer"),
+        blocked: &["a blocked field"],
+        kept: &["metadata.managedFields".to_string()],
+        ..line_at(&conflict, Some(Armed::Apply))
+    });
+    let at = |piece: &str| {
+        line.find(piece)
+            .unwrap_or_else(|| panic!("{piece} in {line}"))
+    };
+    let order = [
+        at("ctrl-s again"),
+        at("3 hunks"),
+        at("cannot be applied"),
+        at("still carries the server's own"),
+        at("the last answer"),
+        at(stale_object_note()),
+        at(standing_note()),
+        at("owned elsewhere"),
+        at("the final newline differs"),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{line}");
+}
+
+#[test]
+fn the_armed_prompt_precedes_even_a_summary_taller_than_the_status_region() {
+    let summary = "a long comparison summary\n".repeat(50);
+    for armed in [Armed::Apply, Armed::Force] {
+        let line = status_line(Line {
+            summary: &summary,
+            ..line_at(&[], Some(armed))
+        });
+        assert!(line.starts_with("ctrl-"), "{line}");
+        assert!(line.find("again").unwrap() < line.find(&summary).unwrap());
+    }
 }
 
 // A comparison asked for while a real apply was out is not sent after it, and

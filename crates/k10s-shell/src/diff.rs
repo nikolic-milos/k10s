@@ -44,8 +44,10 @@ use std::borrow::Cow;
 use std::rc::Rc;
 
 use gpui::{
-    Context, FocusHandle, IntoElement, ParentElement, Render, Role, ScrollWheelEvent, SharedString,
-    Styled, WeakEntity, Window, canvas, div, prelude::*, px, rgb,
+    AnyElement, App, Bounds, Context, Div, Element, ElementId, FocusHandle, GlobalElementId,
+    Hitbox, InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, Render, Role,
+    ScrollHandle, ScrollWheelEvent, SharedString, Styled, WeakEntity, Window, canvas, div,
+    prelude::*, px, relative, rgb,
 };
 
 use k10s_edit::diff::{self, Origin, Side, Verdict};
@@ -115,7 +117,7 @@ impl Painted<'_> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DiffState {
     live: String,
     base: Option<String>,
@@ -126,15 +128,35 @@ pub struct DiffState {
     top: usize,
     viewport: usize,
     folded: bool,
+    // Formatted when the comparison changes, and borrowed by every render of
+    // the status line; neither depends on the fold, so a fold formats nothing.
+    summary: String,
+    hints: String,
+}
+
+impl Default for DiffState {
+    fn default() -> DiffState {
+        DiffState::new()
+    }
 }
 
 impl DiffState {
     pub fn new() -> DiffState {
-        DiffState {
+        let mut state = DiffState {
+            live: String::new(),
+            base: None,
+            other: String::new(),
+            mode: None,
+            diff: diff::Diff::default(),
+            cells: Vec::new(),
+            top: 0,
             viewport: 4,
             folded: true,
-            ..DiffState::default()
-        }
+            summary: String::new(),
+            hints: String::new(),
+        };
+        state.summary = state.summary_text();
+        state
     }
 
     pub fn set(&mut self, mode: Mode, live: String, base: Option<String>, other: String) {
@@ -147,6 +169,8 @@ impl DiffState {
             live: &self.live,
             buffer: &self.other,
         });
+        self.summary = self.summary_text();
+        self.hints = self.hints_text();
         self.rebuild();
         self.top = 0;
     }
@@ -173,6 +197,10 @@ impl DiffState {
 
     pub fn folded(&self) -> bool {
         self.folded
+    }
+
+    pub(crate) fn folded_note(&self) -> bool {
+        self.folded && self.diff.verdict() == Verdict::Differs
     }
 
     pub fn toggle_folded(&mut self) {
@@ -341,8 +369,17 @@ impl DiffState {
         diff::keep_theirs(&self.diff, hunk, &self.live, &self.other)
     }
 
-    /// One line naming what the comparison found, for the footer.
-    pub fn summary(&self) -> String {
+    /// What the comparison found, for the status line.
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    /// What the comparison says about itself that a press rarely turns on.
+    pub fn hints(&self) -> &str {
+        &self.hints
+    }
+
+    fn summary_text(&self) -> String {
         let Some(mode) = self.mode else {
             return "comparing...".to_string();
         };
@@ -376,6 +413,18 @@ impl DiffState {
                 pieces.push(format!("{} undeclared", counts.undeclared));
             }
         }
+        pieces.join("  ·  ")
+    }
+
+    fn hints_text(&self) -> String {
+        let Some(mode) = self.mode else {
+            return String::new();
+        };
+        let verdict = self.diff.verdict();
+        if matches!(verdict, Verdict::Refused(_)) {
+            return String::new();
+        }
+        let mut pieces = Vec::new();
         if mode == Mode::Local && self.diff.two_way {
             pieces.push("no last-applied-configuration, so this is two-way".to_string());
         }
@@ -390,9 +439,6 @@ impl DiffState {
         // it with its key like every other command.
         if mode == Mode::Local && verdict == Verdict::Differs {
             pieces.push("t takes a hunk from the copy this editor read".to_string());
-        }
-        if self.folded && verdict == Verdict::Differs {
-            pieces.push("folded".to_string());
         }
         pieces.join("  ·  ")
     }
@@ -482,6 +528,108 @@ pub(crate) fn mark_of(side: Side, origin: Origin) -> char {
     }
 }
 
+// The status has one child and only needs a pixel offset. Div's tracked scroll
+// handle rebuilds a vector of child bounds every prepaint for item navigation.
+// Use the same interactivity with the child's size directly, so tracking the
+// prompt adds no bounds allocation to a paint.
+struct StatusBar {
+    chrome: gpui::Stateful<Div>,
+    text: AnyElement,
+}
+
+impl IntoElement for StatusBar {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for StatusBar {
+    type RequestLayoutState = LayoutId;
+    type PrepaintState = Option<Hitbox>;
+
+    fn id(&self) -> Option<ElementId> {
+        Some("diff-status".into())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, LayoutId) {
+        let text = &mut self.text;
+        let mut child = None;
+        let layout = self.chrome.interactivity().request_layout(
+            id,
+            inspector,
+            window,
+            cx,
+            |style, window, cx| {
+                window.with_text_style(style.text_style().cloned(), |window| {
+                    let text_layout = text.request_layout(window, cx);
+                    child = Some(text_layout);
+                    window.request_layout(style, [text_layout], cx)
+                })
+            },
+        );
+        (layout, child.expect("the status text has a layout"))
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        child: &mut LayoutId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Hitbox> {
+        let content = window.layout_bounds(*child).size;
+        let text = &mut self.text;
+        self.chrome.interactivity().prepaint(
+            id,
+            inspector,
+            bounds,
+            content,
+            window,
+            cx,
+            |_, offset, hitbox, window, cx| {
+                window.with_element_offset(offset, |window| text.prepaint(window, cx));
+                hitbox
+            },
+        )
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut LayoutId,
+        hitbox: &mut Option<Hitbox>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let text = &mut self.text;
+        self.chrome.interactivity().paint(
+            id,
+            inspector,
+            bounds,
+            hitbox.as_ref(),
+            window,
+            cx,
+            |_, window, cx| text.paint(window, cx),
+        );
+    }
+}
+
 pub struct DiffView {
     focus: FocusHandle,
     provider: Rc<dyn ReadProvider>,
@@ -513,6 +661,8 @@ pub struct DiffView {
     unknown_write: bool,
     patchable: bool,
     status: Option<String>,
+    status_scroll: ScrollHandle,
+    status_text: SharedString,
     gate: ApplyGate,
     conflict: Vec<Conflicted>,
     // The server named more conflicts than the bounded review carries. What is
@@ -548,6 +698,8 @@ impl DiffView {
             unknown_write: false,
             patchable: false,
             status: None,
+            status_scroll: ScrollHandle::new(),
+            status_text: SharedString::default(),
             gate: ApplyGate::default(),
             conflict: Vec::new(),
             conflict_truncated: false,
@@ -666,13 +818,19 @@ impl DiffView {
             }
             Ok(Preparation::Confirm) => {}
         }
-        if self.gate.step(wanted) == Step::Ask {
+        match self
+            .gate
+            .step(wanted, self.status_scroll.offset().y == px(0.0))
+        {
+            Step::Reveal => {
+                self.status_scroll.set_offset(Default::default());
+                cx.notify();
+            }
             // The prompt itself comes from the latch in `status_line`, so there
             // is nothing to remember here and nothing that can go stale.
-            cx.notify();
-            return;
+            Step::Ask => cx.notify(),
+            Step::Go => self.send(false, force, cx),
         }
-        self.send(false, force, cx);
     }
 
     // Take the hunk being read as the copy this editor read has it. The
@@ -928,12 +1086,12 @@ impl DiffView {
             return;
         }
         let rows = self.viewport.rows(
-            STATUS_BAR_HEIGHT,
+            0.0,
             CONTENT_PADDING * 2.0,
             k10s_theme::typography(cx).line_height(),
             400,
         );
-        self.state.set_viewport(rows.max(4));
+        self.state.set_viewport(rows);
         cx.notify();
     }
 
@@ -949,6 +1107,7 @@ impl DiffView {
     fn status_line(&self) -> String {
         status_line(Line {
             summary: self.state.summary(),
+            hints: self.state.hints(),
             blocked: &self.payload.blocked,
             kept: &self.payload.kept,
             armed: self.gate.armed(),
@@ -958,6 +1117,7 @@ impl DiffView {
             unknown_write: self.unknown_write,
             status: self.status.as_deref(),
             context: self.context.as_deref(),
+            folded: self.state.folded_note(),
         })
     }
 }
@@ -966,7 +1126,8 @@ impl DiffView {
 // as `diff_gate::Ready`, so the sentence the user acts on can be checked
 // without a window.
 pub(crate) struct Line<'a> {
-    pub(crate) summary: String,
+    pub(crate) summary: &'a str,
+    pub(crate) hints: &'a str,
     pub(crate) blocked: &'a [&'static str],
     pub(crate) kept: &'a [String],
     pub(crate) armed: Option<Armed>,
@@ -979,6 +1140,8 @@ pub(crate) struct Line<'a> {
     /// The kubeconfig context this write would land in. `None` is an
     /// in-cluster account, which has no context name to print.
     pub(crate) context: Option<&'a str>,
+    /// Unchanged text is folded away in a comparison that differs.
+    pub(crate) folded: bool,
 }
 
 /// How a write names where it lands. An unnamed context is the in-cluster
@@ -990,27 +1153,21 @@ fn target(context: Option<&str>) -> String {
     }
 }
 
+// The pieces go in the order a person acts on them: what the next press does,
+// what the comparison is, the payload's standing refusals of that press, the
+// last answer, what stands about the object and this view's writes, who owns
+// what, and last what the comparison says about itself. The line wraps rather
+// than cutting, so the order is for reading, not for what survives a narrow
+// window. Changed text returns the status to its top; unchanged text keeps
+// its scroll position. One vector of borrowed and owned pieces, joined once.
 pub(crate) fn status_line(at: Line<'_>) -> String {
-    let mut pieces = vec![at.summary];
-    // The prune's own two answers, before the press rather than after it.
-    // `kept` names server-owned fields still in the bytes -- a review that
-    // says what was taken out and not what stayed describes a document that
-    // is not the one being sent.
-    if !at.blocked.is_empty() {
-        pieces.push(format!("cannot be applied: {}", at.blocked.join("; ")));
-    }
-    if !at.kept.is_empty() {
-        pieces.push(format!(
-            "still carries the server's own {}",
-            at.kept.join(", ")
-        ));
-    }
+    let mut pieces: Vec<Cow<'_, str>> = Vec::with_capacity(1 + usize::from(at.armed.is_some()));
     // Derived, never remembered: a one-shot message can be overwritten by
     // the next action while the latch stays armed, and a press that fires a
     // write with no prompt on screen is the one surprise this view must not
     // have.
     if let Some(armed) = at.armed {
-        pieces.push(match armed {
+        pieces.push(Cow::Owned(match armed {
             // Which cluster, by name, in the sentence that fires the write.
             // A confirm that says "the cluster" is the same sentence in every
             // context a person has open, and that is how the wrong one gets
@@ -1021,7 +1178,39 @@ pub(crate) fn status_line(at: Line<'_>) -> String {
                 taken(at.conflict.len(), at.conflict_truncated),
                 target(at.context)
             ),
-        });
+        }));
+    }
+    pieces.push(Cow::Borrowed(at.summary));
+    // The prune's own two answers, before the press rather than after it.
+    // `kept` names server-owned fields still in the bytes -- a review that
+    // says what was taken out and not what stayed describes a document that
+    // is not the one being sent.
+    if !at.blocked.is_empty() {
+        pieces.push(Cow::Owned(format!(
+            "cannot be applied: {}",
+            at.blocked.join("; ")
+        )));
+    }
+    if !at.kept.is_empty() {
+        pieces.push(Cow::Owned(format!(
+            "still carries the server's own {}",
+            at.kept.join(", ")
+        )));
+    }
+    if let Some(status) = at.status {
+        pieces.push(Cow::Borrowed(status));
+    }
+    // Derived rather than remembered, for the same reason the armed prompt is:
+    // it stands for as long as the comparison does, and a one-shot message
+    // would be overwritten by the next thing that happened.
+    match at.seen {
+        Seen::Replaced => pieces.push(Cow::Borrowed(stale_object_note())),
+        Seen::Gone => pieces.push(Cow::Borrowed(gone_note())),
+        Seen::Raced => pieces.push(Cow::Borrowed(raced_note())),
+        Seen::Same | Seen::Unknown => {}
+    }
+    if at.unknown_write {
+        pieces.push(Cow::Borrowed(standing_note()));
     }
     if !at.conflict.is_empty() {
         let fields: Vec<String> = at
@@ -1041,22 +1230,13 @@ pub(crate) fn status_line(at: Line<'_>) -> String {
             listed
                 .push_str(", and further fields the server named that this review does not carry");
         }
-        pieces.push(format!("owned elsewhere: {listed}"));
+        pieces.push(Cow::Owned(format!("owned elsewhere: {listed}")));
     }
-    // Derived rather than remembered, for the same reason the armed prompt is:
-    // it stands for as long as the comparison does, and a one-shot message
-    // would be overwritten by the next thing that happened.
-    match at.seen {
-        Seen::Replaced => pieces.push(stale_object_note().to_string()),
-        Seen::Gone => pieces.push(gone_note().to_string()),
-        Seen::Raced => pieces.push(raced_note().to_string()),
-        Seen::Same | Seen::Unknown => {}
+    if !at.hints.is_empty() {
+        pieces.push(Cow::Borrowed(at.hints));
     }
-    if at.unknown_write {
-        pieces.push(standing_note().to_string());
-    }
-    if let Some(status) = at.status {
-        pieces.push(status.to_string());
+    if at.folded {
+        pieces.push(Cow::Borrowed("folded"));
     }
     pieces.join("  ·  ")
 }
@@ -1234,6 +1414,11 @@ impl Render for DiffView {
         let theme = k10s_theme::active(cx).clone();
         let fonts = k10s_theme::typography(cx).clone();
         let view = cx.entity();
+        let status = self.status_line();
+        if status != self.status_text.as_ref() {
+            self.status_scroll.set_offset(Default::default());
+            self.status_text = status.into();
+        }
         let rows: Vec<(SharedString, u32)> = self
             .state
             .visible()
@@ -1252,22 +1437,6 @@ impl Render for DiffView {
             .flex_col()
             .bg(rgb(theme.shell.editor_background))
             .font_family(fonts.buffer_family.clone())
-            .child(
-                canvas(
-                    move |bounds, _, cx| {
-                        let _ = view.update(cx, |this, cx| {
-                            this.resize(
-                                f32::from(bounds.size.width),
-                                f32::from(bounds.size.height),
-                                cx,
-                            );
-                        });
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
             .on_action(cx.listener(|this, _: &crate::DocScrollUp, _, cx| {
                 this.state.scroll_by(-1);
                 cx.notify();
@@ -1332,53 +1501,91 @@ impl Render for DiffView {
             .on_action(cx.listener(|this, _: &crate::ForceApply, _, cx| {
                 this.apply(true, cx);
             }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                let row = k10s_theme::typography(cx).line_height();
-                let delta = f32::from(event.delta.pixel_delta(px(row)).y);
-                this.state.scroll_by(-(delta / row).round() as i64);
-                cx.notify();
-            }))
             .child(
+                // The body measures itself: the status below wraps and takes
+                // its height from here, and a row count taken from the whole
+                // view would hide the last rows behind it. The canvas fills
+                // this unpadded region, and the rows are its height less the
+                // padding of the column inside it.
                 div()
                     .id("diff-body")
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_hidden()
-                    .p(px(CONTENT_PADDING))
-                    .flex()
-                    .flex_col()
+                    .relative()
                     .role(Role::Document)
                     .aria_label(self.title.clone())
-                    .children(rows.into_iter().map(|(text, color)| {
-                        div()
-                            .h(px(fonts.line_height()))
-                            .flex_none()
-                            .overflow_hidden()
-                            .text_size(px(fonts.buffer_size))
-                            .whitespace_nowrap()
-                            .text_color(rgb(color))
-                            .child(text)
-                    })),
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        let row = k10s_theme::typography(cx).line_height();
+                        let delta = f32::from(event.delta.pixel_delta(px(row)).y);
+                        this.state.scroll_by(-(delta / row).round() as i64);
+                        cx.notify();
+                    }))
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.resize(
+                                        f32::from(bounds.size.width),
+                                        f32::from(bounds.size.height),
+                                        cx,
+                                    );
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(div().p(px(CONTENT_PADDING)).flex().flex_col().children(
+                        rows.into_iter().map(|(text, color)| {
+                            div()
+                                .h(px(fonts.line_height()))
+                                .flex_none()
+                                .overflow_hidden()
+                                .text_size(px(fonts.buffer_size))
+                                .whitespace_nowrap()
+                                .text_color(rgb(color))
+                                .child(text)
+                        }),
+                    )),
             )
             .child(
-                div()
-                    .h(px(STATUS_BAR_HEIGHT))
-                    .flex_none()
-                    .px(px(CONTENT_PADDING))
-                    .flex()
-                    .items_center()
-                    .bg(rgb(theme.shell.panel_background))
-                    .border_t_1()
-                    .border_color(rgb(theme.shell.border_variant))
-                    .text_size(px(fonts.small()))
-                    .text_color(if self.status.is_some() {
-                        rgb(theme.shell.text)
-                    } else {
-                        rgb(theme.shell.text_muted)
-                    })
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .child(SharedString::from(self.status_line())),
+                // Wrapped, never cut, and never more than half the view: at a
+                // narrow window the standing note, a conflict's key or a landed
+                // note would otherwise be off screen with nothing to say so,
+                // and a long answer would take the rows it is about. What does
+                // not fit in that half scrolls. One row is the bar's height,
+                // and the row inside it centres a line that fits in one.
+                StatusBar {
+                    chrome: div()
+                        .id("diff-status")
+                        .flex_none()
+                        .max_h(relative(0.5))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.status_scroll)
+                        .bg(rgb(theme.shell.panel_background))
+                        .border_t_1()
+                        .border_color(rgb(theme.shell.border_variant)),
+                    text: div()
+                        .min_h(px(STATUS_BAR_HEIGHT))
+                        .px(px(CONTENT_PADDING))
+                        .flex()
+                        .items_center()
+                        .text_size(px(fonts.small()))
+                        .text_color(if self.status.is_some() {
+                            rgb(theme.shell.text)
+                        } else {
+                            rgb(theme.shell.text_muted)
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(self.status_text.clone()),
+                        )
+                        .into_any_element(),
+                },
             )
     }
 }

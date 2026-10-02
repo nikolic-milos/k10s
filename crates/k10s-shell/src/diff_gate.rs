@@ -4,7 +4,8 @@
 //! authorises one write. After a conflict, force first asks for a forced dry
 //! run; that preview takes no fields and arms no write. The gate arms under the
 //! name of the question, so a press meant for one question never answers the
-//! other, and any recompute disarms.
+//! other, and any recompute disarms. A confirmation whose prompt is scrolled
+//! away first reveals it and keeps the question armed.
 //!
 //! [`prepare`] is one pure function and none of these checks is anywhere else.
 //! That is not tidiness. The two preconditions that ever failed were the two
@@ -33,6 +34,7 @@ pub(crate) enum Armed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     Ask,
+    Reveal,
     Go,
 }
 
@@ -320,8 +322,11 @@ pub(crate) struct ApplyGate {
 }
 
 impl ApplyGate {
-    pub(crate) fn step(&mut self, wanted: Armed) -> Step {
+    pub(crate) fn step(&mut self, wanted: Armed, prompt_visible: bool) -> Step {
         if self.armed == Some(wanted) {
+            if !prompt_visible {
+                return Step::Reveal;
+            }
             self.armed = None;
             return Step::Go;
         }
