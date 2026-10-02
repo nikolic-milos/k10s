@@ -11,7 +11,7 @@
 # and never outside it. Pass --uninstall to remove exactly what it installed.
 #
 # Usage:
-#   crates/k10s-assets/assets/linux/install-desktop-entry.sh [--uninstall]
+#   crates/assets/assets/linux/install-desktop-entry.sh [--uninstall]
 
 set -eu
 

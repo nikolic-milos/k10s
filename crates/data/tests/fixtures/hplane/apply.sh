@@ -6,7 +6,7 @@
 # Does not touch namespace g2, Traefik, or metrics-server.
 #
 #   KUBECONFIG=/home/Losmi/.rancher/k3s/k3s.yaml \
-#     ./crates/k10s-data/tests/fixtures/hplane/apply.sh
+#     ./crates/data/tests/fixtures/hplane/apply.sh
 #
 # Uses the rancher kubectl by absolute path. Never puts that directory on PATH
 # (BusyBox ar in it breaks Rust builds).

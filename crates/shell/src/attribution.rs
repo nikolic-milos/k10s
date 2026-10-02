@@ -5,8 +5,8 @@
 //! document is compiled in rather than left next to the source. Print it with
 //! `k10s --attribution`.
 
-/// The notice as shipped. Identical to `crates/k10s-map/assets/icons/ATTRIBUTION.md`.
-pub const DOCUMENT: &str = include_str!("../../k10s-map/assets/icons/ATTRIBUTION.md");
+/// The notice as shipped. Identical to `crates/map/assets/icons/ATTRIBUTION.md`.
+pub const DOCUMENT: &str = include_str!("../../map/assets/icons/ATTRIBUTION.md");
 
 /// SVG filenames named in a CC BY paragraph of `document`.
 ///

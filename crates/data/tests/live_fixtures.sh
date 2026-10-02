@@ -7,9 +7,9 @@
 # are needed that the comment never mentioned. A setup nobody can reproduce is a
 # suite that passed once, on the machine of the person who wrote it.
 #
-#   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh
-#   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh --with observability
-#   KUBECONFIG=/path/to/kubeconfig ./crates/k10s-data/tests/live_fixtures.sh --with kwok
+#   KUBECONFIG=/path/to/kubeconfig ./crates/data/tests/live_fixtures.sh
+#   KUBECONFIG=/path/to/kubeconfig ./crates/data/tests/live_fixtures.sh --with observability
+#   KUBECONFIG=/path/to/kubeconfig ./crates/data/tests/live_fixtures.sh --with kwok
 #
 # kubectl and helm must be on PATH: the base fixtures install the rollback-probe
 # chart from tests/fixtures/helm.

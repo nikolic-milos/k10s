@@ -27,13 +27,13 @@ is kept current.
 
 Icons: workload kind glyphs derive from the Kubernetes icon set (CC BY 4.0),
 tool logos come from [simple-icons](https://github.com/simple-icons/simple-icons)
-(CC0). Details in `crates/k10s-map/assets/icons/ATTRIBUTION.md`.
+(CC0). Details in `crates/map/assets/icons/ATTRIBUTION.md`.
 
 Typography: Inter, Lilex and League Spartan are embedded from
-`crates/k10s-assets/assets/fonts` under the SIL Open Font License; each family's
+`crates/assets/assets/fonts` under the SIL Open Font License; each family's
 licence file sits beside it. Nothing is fetched at runtime.
 
-Desktop integration: `crates/k10s-assets/assets/linux/README.md` says where the
+Desktop integration: `crates/assets/assets/linux/README.md` says where the
 desktop entry and the hicolor icon set install, and why the window's app id has
 to equal the desktop file's basename.
 

@@ -74,7 +74,7 @@ else
     run map-alloc.json cargo bench --locked -p k10s-map --bench walk --features testing,bench-alloc
     echo "==> map-paint.json"
     CARGO_BUILD_JOBS=1 RUST_MIN_STACK=67108864 ${pin[@]+"${pin[@]}"} cargo run --release --locked \
-        --manifest-path tools/k10s-paint-bench/Cargo.toml -- --json >"$RESULT_DIR/map-paint.json"
+        --manifest-path tools/paint-bench/Cargo.toml -- --json >"$RESULT_DIR/map-paint.json"
 fi
 
 echo

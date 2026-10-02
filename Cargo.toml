@@ -1,22 +1,22 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/k10s-atlas",
-    "crates/k10s-core",
-    "crates/k10s-clustergen",
-    "crates/k10s-world",
-    "crates/k10s-theme",
-    "crates/k10s-map",
-    "crates/k10s-shell",
-    "crates/k10s-app",
-    "crates/k10s-data",
-    "crates/k10s-bench",
-    "crates/k10s-edit",
-    "crates/k10s-assets",
+    "crates/atlas",
+    "crates/core",
+    "crates/clustergen",
+    "crates/world",
+    "crates/theme",
+    "crates/map",
+    "crates/shell",
+    "crates/app",
+    "crates/data",
+    "crates/bench",
+    "crates/edit",
+    "crates/assets",
 ]
 exclude = [
     "third-party/stacksafe-macro",
-    "tools/k10s-paint-bench",
+    "tools/paint-bench",
 ]
 
 [workspace.package]
@@ -29,18 +29,18 @@ authors = ["Miloš Nikolić <milosnikolic@milosnikolic.de>"]
 repository = "https://github.com/nikolic-milos/k10s"
 
 [workspace.dependencies]
-k10s-atlas = { path = "crates/k10s-atlas" }
-k10s-core = { path = "crates/k10s-core" }
-k10s-clustergen = { path = "crates/k10s-clustergen" }
-k10s-world = { path = "crates/k10s-world" }
-k10s-theme = { path = "crates/k10s-theme" }
-k10s-map = { path = "crates/k10s-map" }
-k10s-shell = { path = "crates/k10s-shell" }
-k10s-app = { path = "crates/k10s-app" }
-k10s-data = { path = "crates/k10s-data" }
-k10s-bench = { path = "crates/k10s-bench" }
-k10s-edit = { path = "crates/k10s-edit" }
-k10s-assets = { path = "crates/k10s-assets" }
+k10s-atlas = { path = "crates/atlas" }
+k10s-core = { path = "crates/core" }
+k10s-clustergen = { path = "crates/clustergen" }
+k10s-world = { path = "crates/world" }
+k10s-theme = { path = "crates/theme" }
+k10s-map = { path = "crates/map" }
+k10s-shell = { path = "crates/shell" }
+k10s-app = { path = "crates/app" }
+k10s-data = { path = "crates/data" }
+k10s-bench = { path = "crates/bench" }
+k10s-edit = { path = "crates/edit" }
+k10s-assets = { path = "crates/assets" }
 
 gpui = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
 gpui_platform = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }

@@ -60,7 +60,7 @@ they predate schema v4 provenance and were not collected under `--churn 0`.
   tests zero paints at idle, and none of these runs passed it. Damage-driven repaint has still never
   been verified off Wayland.
 - **Nothing comparable from the macOS run's counters (as recorded).** The viewport differs, and the
-  hex backdrop snaps its radius to powers of two (`crates/k10s-map/src/hex.rs`), so `bg_cells` can
+  hex backdrop snaps its radius to powers of two (`crates/map/src/hex.rs`), so `bg_cells` can
   move by ~4x on a small change in fit zoom. `hex 198` at Z0 against the Windows pair's `504` is
   that snapping, and the coincidence with the 198-region count is exactly a coincidence. Re-run on
   current k10s to get letterboxed counters.
@@ -74,7 +74,7 @@ they predate schema v4 provenance and were not collected under `--churn 0`.
 ## Defects these runs exposed (fixed on current `dev`)
 
 - `proc_cpu_ms` returned `0.0` on every non-Linux target; it is now `Option` / `n/a` when unmeasurable
-  (`crates/k10s-atlas/src/flight.rs`).
+  (`crates/atlas/src/flight.rs`).
 - `--machine` accepted a placeholder, and neither the machine nor the churn setting was stamped into
   the output; `--bench` now requires a usable `--machine`, the report stamps both (from schema v4
   onward), and the idle line names the churn it ran under.

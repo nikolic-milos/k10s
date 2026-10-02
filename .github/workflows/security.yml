@@ -34,7 +34,7 @@ jobs:
       - name: Capture paint-tool metadata
         run: >-
           cargo metadata
-          --manifest-path tools/k10s-paint-bench/Cargo.toml
+          --manifest-path tools/paint-bench/Cargo.toml
           --locked
           --format-version 1
           > target/paint-metadata.json
@@ -43,7 +43,7 @@ jobs:
         run: >-
           cargo run --quiet --locked -p k10s-bench
           --bin dependency-budget --
-          tools/k10s-paint-bench/dependency-budget.json
+          tools/paint-bench/dependency-budget.json
           target/paint-metadata.json
 
       - name: Check workspace advisories, bans, licenses and sources
@@ -57,7 +57,7 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
           rust-version: "1.97.1"
-          manifest-path: tools/k10s-paint-bench/Cargo.toml
+          manifest-path: tools/paint-bench/Cargo.toml
           arguments: --locked --config deny.toml
           command: check
 
@@ -82,7 +82,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: tools/k10s-paint-bench
+          working-directory: tools/paint-bench
 
   sbom:
     name: CycloneDX SBOM
@@ -101,7 +101,7 @@ jobs:
       - name: Generate application SBOM
         run: >-
           cargo cyclonedx
-          --manifest-path crates/k10s-app/Cargo.toml
+          --manifest-path crates/app/Cargo.toml
           --format json
           --all-features
           --target all

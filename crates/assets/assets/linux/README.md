@@ -24,7 +24,7 @@ exactly that reason.
 
 One command, from the repository root:
 
-    crates/k10s-assets/assets/linux/install-desktop-entry.sh
+    crates/assets/assets/linux/install-desktop-entry.sh
 
 It writes `k10s.desktop` into `$XDG_DATA_HOME/applications` (default
 `~/.local/share/applications`) and the eight PNGs into the matching
@@ -37,11 +37,11 @@ that makes the launcher entry start nothing (see the `Exec=` note below).
 
 By hand, if you would rather see it done:
 
-    install -Dm644 crates/k10s-assets/assets/linux/k10s.desktop \
+    install -Dm644 crates/assets/assets/linux/k10s.desktop \
       ~/.local/share/applications/k10s.desktop
 
     for size in 16 24 32 48 64 128 256 512; do
-      install -Dm644 crates/k10s-assets/assets/linux/icons/k10s-$size.png \
+      install -Dm644 crates/assets/assets/linux/icons/k10s-$size.png \
         ~/.local/share/icons/hicolor/${size}x${size}/apps/k10s.png
     done
 

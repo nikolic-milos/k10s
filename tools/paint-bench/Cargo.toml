@@ -10,11 +10,11 @@ publish = false
 resolver = "3"
 
 [dependencies]
-k10s-atlas = { path = "../../crates/k10s-atlas", features = ["testing"] }
-k10s-clustergen = { path = "../../crates/k10s-clustergen" }
-k10s-core = { path = "../../crates/k10s-core" }
-k10s-map = { path = "../../crates/k10s-map", features = ["testing", "bench-alloc"] }
-k10s-world = { path = "../../crates/k10s-world" }
+k10s-atlas = { path = "../../crates/atlas", features = ["testing"] }
+k10s-clustergen = { path = "../../crates/clustergen" }
+k10s-core = { path = "../../crates/core" }
+k10s-map = { path = "../../crates/map", features = ["testing", "bench-alloc"] }
+k10s-world = { path = "../../crates/world" }
 
 gpui = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306", features = ["test-support"] }
 crossbeam-channel = "0.5"

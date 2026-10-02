@@ -108,7 +108,7 @@ jobs:
           RUST_MIN_STACK: 67108864
         run: >-
           taskset --cpu-list "$PERF_CPU" cargo run --release --locked
-          --manifest-path tools/k10s-paint-bench/Cargo.toml
+          --manifest-path tools/paint-bench/Cargo.toml
           -- --json > "$RESULT_DIR/map-paint.json"
 
       - name: Compare hardware-labelled baseline

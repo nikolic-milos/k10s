@@ -6,7 +6,7 @@
 # widgets.k10s.test, or any object without k10s.dev/hplane-fixture.
 #
 #   KUBECONFIG=/home/Losmi/.rancher/k3s/k3s.yaml \
-#     ./crates/k10s-data/tests/fixtures/hplane/revert.sh
+#     ./crates/data/tests/fixtures/hplane/revert.sh
 set -euo pipefail
 
 KUBECTL="${K10S_LAB_KUBECTL:-/home/Losmi/.rancher/k3s/data/current/bin/kubectl}"
