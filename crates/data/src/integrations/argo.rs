@@ -117,7 +117,7 @@ pub struct ApplicationSet {
 pub struct Inventory {
     pub applications: Vec<Application>,
     pub application_sets: Vec<ApplicationSet>,
-    /// The listing stopped at [`MAX_APPS`] on either kind.
+    /// The listing stopped at `MAX_APPS` on either kind.
     pub truncated: bool,
     /// False when discovery has no argoproj kinds, or every list 404s. The UI
     /// stays invisible. An empty served inventory is a cluster that has the

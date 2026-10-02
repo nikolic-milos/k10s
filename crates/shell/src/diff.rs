@@ -19,12 +19,12 @@
 //! An apply needs a server dry run and two deliberate presses. After an
 //! ownership conflict, the first force press asks for a forced dry run. Its
 //! answer arms nothing; two more force presses confirm and take the fields
-//! the server named. [`ApplyGate`] arms under the name of the question, so a
+//! the server named. `ApplyGate` arms under the name of the question, so a
 //! different press re-asks instead of firing. Any recompute disarms because
 //! the thing being confirmed is no longer what is on screen.
 //!
 //! Every precondition a *press* has to clear is in one pure function,
-//! [`prepare`], and none of them is anywhere else. That is not tidiness: the two
+//! `prepare`, and none of them is anywhere else. That is not tidiness: the two
 //! that were not there were the two that failed. The force precondition lived
 //! inside a key handler, so it guarded one of the ways in; the diff's own
 //! refusal to compare was read by nobody, so an object too large to review
@@ -34,8 +34,8 @@
 //! another request already holds -- are enforced where the bytes leave, in
 //! `send`, because a dry run reaches that point without a press at all.
 //!
-//! Everything that decides is pure -- [`DiffState`], [`ApplyGate`], [`Flight`]
-//! and [`prepare`] -- so the destructive rules are tested without a window. The
+//! Everything that decides is pure -- [`DiffState`], `ApplyGate`, `Flight`
+//! and `prepare` -- so the destructive rules are tested without a window. The
 //! rows are built once per comparison and only the visible ones are ever turned
 //! into text, so a diff of a megabyte costs a vector rather than a second copy
 //! of the document.

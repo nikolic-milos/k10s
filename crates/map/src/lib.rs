@@ -64,6 +64,7 @@ pub fn keybindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("-", ZoomOut, map),
     ]
 }
+
 #[cfg(feature = "testing")]
 pub mod testing {
     pub use crate::frame::{FramePaths, FrameSink, IconJob, LabelFace, LabelJob, PaintSink, walk};

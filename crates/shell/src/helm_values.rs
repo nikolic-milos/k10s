@@ -5,7 +5,7 @@
 //! one. What keeps it contained: the lines are one owned `String` an
 //! action already produced (never a table page, a saved view, or a log
 //! line), and the tab retires with its cluster like every other
-//! [`crate::tag::ItemTag::HelmReport`]. Whole revealed documents leave
+//! `crate::tag::ItemTag::HelmReport`. Whole revealed documents leave
 //! through [`crate::editor::EditorView::scratch`] instead and are dropped
 //! with the [`k10s_provider::HelmReveal`].
 

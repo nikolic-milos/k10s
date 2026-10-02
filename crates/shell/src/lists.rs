@@ -9,7 +9,7 @@
 //! rather than leave an empty broken one. A 403 stays a labelled status.
 //!
 //! A Helm stored-manifest apply is armed by the first `u` and sent by the
-//! second, once: the [`Latch`] refuses every press while it is out, for as
+//! second, once: the `Latch` refuses every press while it is out, for as
 //! long as this view lives, and the workspace keeps the write's record so a
 //! Releases tab reopened meanwhile refuses too and shows the answer.
 

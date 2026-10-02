@@ -2,7 +2,7 @@
 //!
 //! A dock is layout policy, not rendering: which panels it holds, which one is
 //! active, whether it is open, and how wide or tall a drag asked it to be. The
-//! tab arithmetic underneath is [`Pane`], shared with the centre row; what a
+//! tab arithmetic underneath is `Pane`, shared with the centre row; what a
 //! dock adds is the open flag and the two rules that depend on it -- being
 //! handed work shows the dock, and running out of panels shuts it. Generic over
 //! the panel type so every rule here is a unit test: the workspace instantiates

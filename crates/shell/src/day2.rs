@@ -2,7 +2,7 @@
 //!
 //! The first enter asks what the press would do and never writes (a drain's
 //! ask reads the node's pods). The second enter, on the same row, is the
-//! confirmation, and it sends one write: [`Latch`] spends the confirmation
+//! confirmation, and it sends one write: `Latch` spends the confirmation
 //! when it is taken and refuses every press until the answer lands, for as
 //! long as this view lives. Caps still gate the far side. Rollout undo is not
 //! offered: that would be a fake of kubectl and of Helm.

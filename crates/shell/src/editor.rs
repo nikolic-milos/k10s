@@ -15,7 +15,7 @@
 //! because a schema describes the server it came from and nothing else.
 //! Typing reaches the buffer through `key_char` exactly like the terminal;
 //! named keys and chords arrive as `Editor`-context actions.
-//! [`DirtyState`] owns the three moments that can throw work away -- closing,
+//! `DirtyState` owns the three moments that can throw work away -- closing,
 //! reloading, and overwriting a file this buffer did not read -- and each
 //! costs a second press that any edit in between disarms. Each arms under its
 //! own name, so a press that answers a different question re-asks instead of
@@ -25,10 +25,10 @@
 //! cannot tell a document from its replacement.
 //!
 //! Three invariants the view is responsible for, each of which was once a bug:
-//! every mutation ends in [`EditorView::committed`], whatever produced it, so
+//! every mutation ends in `EditorView::committed`, whatever produced it, so
 //! an undo cannot leave the metadata, the diagnostics, an armed confirmation or
 //! the tab's dirty marker describing the previous text. Saves go through
-//! [`SaveQueue`], one write in flight and only the newest text queued behind
+//! `SaveQueue`, one write in flight and only the newest text queued behind
 //! it, because a write per keypress leaves the order to the executor and an
 //! older write can land last on a buffer already marked clean. And nothing
 //! blocking touches this thread: reads, writes, and even the conflict stamp run

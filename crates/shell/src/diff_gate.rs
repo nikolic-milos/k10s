@@ -7,7 +7,7 @@
 //! other, and any recompute disarms. A confirmation whose prompt is scrolled
 //! away first reveals it and keeps the question armed.
 //!
-//! [`prepare`] is one pure function and none of these checks is anywhere else.
+//! `prepare` is one pure function and none of these checks is anywhere else.
 //! That is not tidiness. The two preconditions that ever failed were the two
 //! that lived somewhere else: the force check sat inside a key handler, so it
 //! guarded one way in while the palette went round it. A precondition reachable
@@ -142,7 +142,7 @@ impl Flight {
 }
 
 /// Everything a press has to be true about before a write leaves this view,
-/// gathered so that [`prepare`] can be a pure function over it.
+/// gathered so that `prepare` can be a pure function over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Ready<'a> {
     /// Discovery says the server takes a patch for this kind at all.
@@ -253,7 +253,7 @@ pub(crate) struct Keepable {
 
 /// Why this hunk cannot be taken into the buffer, or None when it can.
 ///
-/// Kept apart from [`prepare`] because nothing here reaches the cluster and none
+/// Kept apart from `prepare` because nothing here reaches the cluster and none
 /// of that function's rules apply: an unpatchable kind, a blocked payload and a
 /// missing dry run all say nothing about whether a person may edit their own
 /// text. What is shared is the rule that a review is of one buffer -- ranges

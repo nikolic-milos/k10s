@@ -2,7 +2,7 @@
 //!
 //! Zed's shape at k10s scale: views hold `Arc<dyn Fs>` and never touch
 //! `std::fs`, so every open, save, and directory listing is testable against
-//! [`FakeFs`] with no disk and no clocks. The implementation blocks, which is
+//! `fake::FakeFs` with no disk and no clocks. The implementation blocks, which is
 //! why every caller reaches it from `background_executor().spawn` -- a listing
 //! on a network mount is not something a frame can wait for -- and the pure
 //! state machines in `files`, `finder` and `editor` are split so the disk work

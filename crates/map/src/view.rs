@@ -3,15 +3,13 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::px;
-
 use crossbeam_channel::Sender;
 use futures::StreamExt as _;
 use futures::channel::mpsc::Receiver;
 use gpui::{
     Context, FocusHandle, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, Window, canvas, div,
-    prelude::*,
+    prelude::*, px,
 };
 use k10s_atlas::{Camera, FlyTo, FramePacer, FrameStats, Motion, StageBlend, StageMachine};
 use k10s_core::{SceneSnapshot, SharedScene, WorldCtrl};

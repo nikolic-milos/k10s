@@ -172,7 +172,7 @@ struct WireSecretMeta {
 /// Decode one already-fetched release payload into scratch buffers.
 ///
 /// The caller has already decided to reveal this revision. Inventory still
-/// goes through [`helm::decode`], which cannot carry these fields.
+/// goes through `helm::decode`, which cannot carry these fields.
 pub fn reveal_payload(encoded: &str) -> Result<RevealedRevision, &'static str> {
     let wire: WireReveal = {
         let json = helm::decode_scratch(encoded)?;

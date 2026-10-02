@@ -23,14 +23,14 @@
 //!
 //! Bounded end to end: a workload polls at most [`MAX_POLLED_PODS`] pods
 //! (which also bounds the kubelets consulted), the kubelet's answer is capped
-//! at [`MAX_KUBELET_BODY_BYTES`] before parsing and each line at
-//! [`MAX_METRIC_LINE_BYTES`], and dropping the returned [`UsageStop`] ends
+//! at `MAX_KUBELET_BODY_BYTES` before parsing and each line at
+//! `MAX_METRIC_LINE_BYTES`, and dropping the returned [`UsageStop`] ends
 //! the poll at the next await point. Time is bounded too, because a live
 //! aggregated API with a dead backend was observed holding a request open
 //! forever where `kubectl` gets an instant 503: a source that has not
-//! answered within [`CONSULT_DEADLINE`] is treated as not answering -- the
+//! answered within `CONSULT_DEADLINE` is treated as not answering -- the
 //! same class as 503, which is what the fallback exists for -- and a whole
-//! tick is cut off at [`TICK_DEADLINE`] as a labelled failure rather than a
+//! tick is cut off at `TICK_DEADLINE` as a labelled failure rather than a
 //! panel that never updates. This module refuses to stream, to discover
 //! Prometheus, and to speak PromQL: it polls two bounded endpoints while a
 //! panel is open, nothing more.
