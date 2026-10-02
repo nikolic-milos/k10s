@@ -14,7 +14,7 @@ use k10s_core::SceneSnapshot;
 use k10s_theme::scale_alpha;
 
 use crate::frame::{self, FrameOpts, IconJob, LabelFace, LabelJob, PaintSink};
-use crate::lod::{self, lod};
+use crate::lod::lod;
 use crate::text::{self, Grouped, TextCache};
 use crate::{OverlayFrame, PickPath, hex, mark_primitive, overlay};
 
@@ -244,7 +244,7 @@ pub(super) fn paint_map(
         let vw = f32::from(bounds.size.width);
         let vh = f32::from(bounds.size.height);
         debug_assert_eq!(
-            lod::cull(scene, &camera, blend, vw, vh, opts),
+            crate::lod::cull(scene, &camera, blend, vw, vh, opts),
             counts,
             "cull oracle diverged from painter"
         );
