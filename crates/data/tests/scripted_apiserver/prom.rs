@@ -3,7 +3,7 @@
 
 use crate::*;
 
-use k10s_data::prom::{query, query_range};
+use k10s_data::integrations::prom::{query, query_range};
 use k10s_data::reach::{Bound, FoundService, ToolAuth, ToolKind, Transport};
 use k10s_data::read::Fetched;
 

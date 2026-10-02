@@ -44,8 +44,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::browse::{TableColumn, TablePage, TableRow};
-use crate::mesh::{ObservedReach, TelemetryExporter, TelemetryReason};
-use crate::prom::QueryResult;
+use crate::integrations::mesh::{ObservedReach, TelemetryExporter, TelemetryReason};
+use crate::integrations::prom::QueryResult;
 use crate::read::Fetched;
 use crate::served::{GroupAnswer, ListErr, after_group, after_list};
 

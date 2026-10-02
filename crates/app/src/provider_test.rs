@@ -34,11 +34,11 @@ fn a_describe_maps_its_document_and_keeps_denial_and_failure_labels() {
 
 #[test]
 fn a_release_inventory_crosses_as_a_table() {
-    let releases = k10s_data::helm::Releases {
-        releases: vec![k10s_data::helm::Release {
+    let releases = k10s_data::integrations::helm::Releases {
+        releases: vec![k10s_data::integrations::helm::Release {
             name: "ingress".to_string(),
             namespace: "infra".to_string(),
-            revisions: vec![k10s_data::helm::Revision {
+            revisions: vec![k10s_data::integrations::helm::Revision {
                 revision: 3,
                 status: "deployed".to_string(),
                 updated: "2026-08-01T10:00:00Z".to_string(),
@@ -71,11 +71,15 @@ fn a_release_inventory_crosses_as_a_table() {
 #[test]
 fn gitops_absence_is_invisible_and_a_denial_stays_labelled() {
     assert!(matches!(
-        argo_outcome(Fetched::Ok(k10s_data::argo::Inventory::default())),
+        argo_outcome(Fetched::Ok(
+            k10s_data::integrations::argo::Inventory::default()
+        )),
         k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
-        flux_outcome(Fetched::Ok(k10s_data::flux::Inventory::default())),
+        flux_outcome(Fetched::Ok(
+            k10s_data::integrations::flux::Inventory::default()
+        )),
         k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
@@ -84,9 +88,9 @@ fn gitops_absence_is_invisible_and_a_denial_stays_labelled() {
         }),
         k10s_provider::TableOutcome::Denied("argo applications")
     ));
-    let denied_flux = k10s_data::flux::Inventory {
-        git_repositories: k10s_data::flux::KindSet::Denied,
-        ..k10s_data::flux::Inventory::default()
+    let denied_flux = k10s_data::integrations::flux::Inventory {
+        git_repositories: k10s_data::integrations::flux::KindSet::Denied,
+        ..k10s_data::integrations::flux::Inventory::default()
     };
     match flux_outcome(Fetched::Ok(denied_flux)) {
         k10s_provider::TableOutcome::Table(page) => {
@@ -527,15 +531,19 @@ fn a_usage_sample_crosses_typed_and_every_label_survives() {
 #[test]
 fn policy_harbor_and_mesh_absence_hide_the_pane() {
     assert!(matches!(
-        policy_outcome(Fetched::Ok(k10s_data::policy::Inventory::default())),
+        policy_outcome(Fetched::Ok(
+            k10s_data::integrations::policy::Inventory::default()
+        )),
         k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
-        harbor_outcome(Fetched::Ok(k10s_data::harbor::Inventory::default())),
+        harbor_outcome(Fetched::Ok(
+            k10s_data::integrations::harbor::Inventory::default()
+        )),
         k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
-        mesh_outcome(k10s_data::mesh::MeshInventory::default()),
+        mesh_outcome(k10s_data::integrations::mesh::MeshInventory::default()),
         k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
@@ -564,14 +572,20 @@ fn policy_harbor_and_mesh_absence_hide_the_pane() {
 
 #[test]
 fn a_helm_rollback_report_keeps_the_not_helm_rollback_note() {
-    let report = k10s_data::helm_reveal::RollbackReport {
-        note: k10s_data::helm_reveal::NOT_HELM_ROLLBACK,
+    let report = k10s_data::integrations::helm_reveal::RollbackReport {
+        note: k10s_data::integrations::helm_reveal::NOT_HELM_ROLLBACK,
         documents: Vec::new(),
     };
     match helm_rollback_outcome(Fetched::Ok(report)) {
         k10s_provider::HelmRollbackOutcome::Report { note, lines } => {
-            assert_eq!(note, k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
-            assert_eq!(lines[0], k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
+            assert_eq!(
+                note,
+                k10s_data::integrations::helm_reveal::NOT_HELM_ROLLBACK
+            );
+            assert_eq!(
+                lines[0],
+                k10s_data::integrations::helm_reveal::NOT_HELM_ROLLBACK
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -579,9 +593,9 @@ fn a_helm_rollback_report_keeps_the_not_helm_rollback_note() {
 
 #[test]
 fn a_rollback_names_the_document_that_may_have_landed_and_the_ones_not_sent() {
-    use k10s_data::helm_reveal::DocumentRollback;
-    let report = k10s_data::helm_reveal::RollbackReport {
-        note: k10s_data::helm_reveal::NOT_HELM_ROLLBACK,
+    use k10s_data::integrations::helm_reveal::DocumentRollback;
+    let report = k10s_data::integrations::helm_reveal::RollbackReport {
+        note: k10s_data::integrations::helm_reveal::NOT_HELM_ROLLBACK,
         documents: vec![
             DocumentRollback::Applied {
                 name: "web".to_string(),
@@ -612,17 +626,17 @@ fn a_rollback_names_the_document_that_may_have_landed_and_the_ones_not_sent() {
 #[test]
 fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
     let catalog = k10s_data::read::GrafanaCatalog {
-        dashboards: vec![k10s_data::grafana::Dashboard {
+        dashboards: vec![k10s_data::integrations::grafana::Dashboard {
             uid: "node".to_string(),
             title: "Node".to_string(),
-            panels: vec![k10s_data::grafana::Panel {
+            panels: vec![k10s_data::integrations::grafana::Panel {
                 id: 2,
                 title: "CPU".to_string(),
-                kind: k10s_data::grafana::PanelKind::Timeseries,
-                queries: vec![k10s_data::grafana::PanelQuery {
+                kind: k10s_data::integrations::grafana::PanelKind::Timeseries,
+                queries: vec![k10s_data::integrations::grafana::PanelQuery {
                     ref_id: "A".to_string(),
                     expr: "rate(cpu[1m])".to_string(),
-                    dialect: k10s_data::grafana::QueryDialect::PromQL,
+                    dialect: k10s_data::integrations::grafana::QueryDialect::PromQL,
                     datasource: None,
                 }],
                 transformed: false,
@@ -670,7 +684,7 @@ fn inspect_details_become_event_rows_with_their_counts() {
 
 #[test]
 fn policy_findings_sharing_a_resource_get_distinct_row_uids() {
-    let finding = |policy: &str, uid: &str| k10s_data::policy::Finding {
+    let finding = |policy: &str, uid: &str| k10s_data::integrations::policy::Finding {
         policy: policy.to_string(),
         result: "fail".to_string(),
         severity: k10s_core::Severity::Warn,
@@ -678,9 +692,9 @@ fn policy_findings_sharing_a_resource_get_distinct_row_uids() {
         resource_kind: "Deployment".to_string(),
         resource_uid: uid.to_string(),
     };
-    let inventory = k10s_data::policy::Inventory {
+    let inventory = k10s_data::integrations::policy::Inventory {
         served: true,
-        reports: vec![k10s_data::policy::Report {
+        reports: vec![k10s_data::integrations::policy::Report {
             namespace: "prod".to_string(),
             name: "polr-api".to_string(),
             results: vec![
@@ -707,9 +721,9 @@ fn policy_findings_sharing_a_resource_get_distinct_row_uids() {
 
 #[test]
 fn a_harbor_project_without_fetched_repos_counts_them_under_repository_not_artifacts() {
-    let inventory = k10s_data::harbor::Inventory {
+    let inventory = k10s_data::integrations::harbor::Inventory {
         served: true,
-        projects: vec![k10s_data::harbor::Project {
+        projects: vec![k10s_data::integrations::harbor::Project {
             name: "library".to_string(),
             public: true,
             repo_count: 7,
@@ -731,10 +745,10 @@ fn a_harbor_project_without_fetched_repos_counts_them_under_repository_not_artif
 #[test]
 fn a_harbor_repo_scan_cell_reports_the_worst_artifact_not_the_first() {
     let scan = |severity: &str, mapped: k10s_core::Severity, critical: u32, total: u32| {
-        k10s_data::harbor::ArtifactScan {
+        k10s_data::integrations::harbor::ArtifactScan {
             digest: format!("sha256:{severity}"),
             tags: Vec::new(),
-            scan: Some(k10s_data::harbor::ScanOverview {
+            scan: Some(k10s_data::integrations::harbor::ScanOverview {
                 status: "Success".to_string(),
                 severity: severity.to_string(),
                 mapped,
@@ -747,13 +761,13 @@ fn a_harbor_repo_scan_cell_reports_the_worst_artifact_not_the_first() {
             }),
         }
     };
-    let inventory = k10s_data::harbor::Inventory {
+    let inventory = k10s_data::integrations::harbor::Inventory {
         served: true,
-        projects: vec![k10s_data::harbor::Project {
+        projects: vec![k10s_data::integrations::harbor::Project {
             name: "library".to_string(),
             public: false,
             repo_count: 1,
-            repositories: vec![k10s_data::harbor::Repository {
+            repositories: vec![k10s_data::integrations::harbor::Repository {
                 name: "api".to_string(),
                 artifact_count: 2,
                 pull_count: 0,
@@ -776,9 +790,9 @@ fn a_harbor_repo_scan_cell_reports_the_worst_artifact_not_the_first() {
 
 #[test]
 fn unreadable_harbor_rows_mark_the_listing_as_partial() {
-    let inventory = k10s_data::harbor::Inventory {
+    let inventory = k10s_data::integrations::harbor::Inventory {
         served: true,
-        projects: vec![k10s_data::harbor::Project {
+        projects: vec![k10s_data::integrations::harbor::Project {
             name: "library".to_string(),
             public: true,
             repo_count: 1,
@@ -795,7 +809,7 @@ fn unreadable_harbor_rows_mark_the_listing_as_partial() {
 
 #[test]
 fn a_denied_mesh_group_stays_visible_next_to_the_one_that_answered() {
-    use k10s_data::mesh::{GroupState, MeshInventory, MeshKind, MeshObject};
+    use k10s_data::integrations::mesh::{GroupState, MeshInventory, MeshKind, MeshObject};
 
     let object = MeshObject {
         kind: MeshKind::VirtualService,
@@ -853,7 +867,7 @@ fn a_denied_mesh_group_stays_visible_next_to_the_one_that_answered() {
 
 #[test]
 fn an_alert_join_uses_the_chosen_fingerprint_and_keeps_both_labels() {
-    let alerts = k10s_data::alertmanager::parse_alerts(
+    let alerts = k10s_data::integrations::alertmanager::parse_alerts(
         br#"[
         {"fingerprint":"other", "labels":{"namespace":"wrong", "pod":"same-name"}},
         {"fingerprint":"chosen", "labels":{"namespace":"prod", "pod":"same-name"}}
@@ -895,7 +909,7 @@ fn an_alert_join_uses_the_chosen_fingerprint_and_keeps_both_labels() {
         serde_json::json!({"pod":"same-name"}),
         serde_json::json!({}),
     ] {
-        let alerts = k10s_data::alertmanager::parse_alerts(
+        let alerts = k10s_data::integrations::alertmanager::parse_alerts(
             serde_json::json!([{"fingerprint":"chosen", "labels":labels}])
                 .to_string()
                 .as_bytes(),
@@ -912,13 +926,13 @@ fn an_alert_join_uses_the_chosen_fingerprint_and_keeps_both_labels() {
 
 #[test]
 fn the_omitted_alerts_row_names_no_pod() {
-    let mut alerts = k10s_data::alertmanager::parse_alerts(
+    let mut alerts = k10s_data::integrations::alertmanager::parse_alerts(
         br#"[{"fingerprint":"fdfff9b4ee24368c", "labels":{"namespace":"prod", "pod":"api-0"}}]"#,
     )
     .expect("alert");
     alerts.dropped = 2;
     let k10s_provider::TableOutcome::Table(page) = optional_table_outcome(Fetched::Ok(
-        k10s_data::alertmanager::table_page(Some(&alerts)),
+        k10s_data::integrations::alertmanager::table_page(Some(&alerts)),
     )) else {
         panic!("Alertmanager answered");
     };
@@ -963,13 +977,13 @@ fn the_silence_adapter_preserves_matchers_interval_and_destination() {
     assert_eq!(
         spec.matchers,
         vec![
-            k10s_data::alertmanager::Matcher {
+            k10s_data::integrations::alertmanager::Matcher {
                 name: "namespace".into(),
                 value: "prod".into(),
                 is_regex: false,
                 is_equal: true
             },
-            k10s_data::alertmanager::Matcher {
+            k10s_data::integrations::alertmanager::Matcher {
                 name: "pod".into(),
                 value: "api.v2-7d4f".into(),
                 is_regex: false,

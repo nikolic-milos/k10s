@@ -75,7 +75,7 @@ pub struct Inventory {
     pub classes: Vec<Class>,
     pub ingresses: Vec<Ingress>,
     /// The cluster-scoped IngressClass list answered 403 while Ingress did
-    /// not — a common RBAC shape. The readable side is still shown.
+    /// not -- a common RBAC shape. The readable side is still shown.
     pub classes_denied: bool,
     /// The Ingress list answered 403 while IngressClass did not.
     pub ingresses_denied: bool,

@@ -20,7 +20,7 @@
 //! parse keeps a clipped match-kind list and drops the rest. Findings are
 //! not computed here. Kyverno writes those to `wgpolicyk8s.io` PolicyReport
 //! CRs or, when enabled, `openreports.io` Report CRs; callers read them
-//! through [`crate::policy`].
+//! through [`crate::integrations::policy`].
 
 use kube::Client;
 use kube::api::{ListParams, Request};

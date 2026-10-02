@@ -182,7 +182,7 @@ fn a_collector_bind_prefers_the_ports_health_can_actually_answer_on() {
         auth: ToolAuth::Anonymous,
     };
     assert!(
-        crate::otel::health_path(&bound).is_ok(),
+        crate::integrations::otel::health_path(&bound).is_ok(),
         "the discovered bind must be a port health_path accepts"
     );
 
@@ -221,7 +221,8 @@ fn a_collector_without_the_extensions_still_binds_and_health_says_why() {
         },
         auth: ToolAuth::Anonymous,
     };
-    let why = crate::otel::health_path(&bound).expect_err("OTLP is not a health signal");
+    let why =
+        crate::integrations::otel::health_path(&bound).expect_err("OTLP is not a health signal");
     assert!(why.contains("OTLP"), "{why}");
 }
 

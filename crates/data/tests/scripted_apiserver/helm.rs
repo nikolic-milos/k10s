@@ -193,7 +193,7 @@ fn helm_releases_are_listed_as_release_secrets_only_and_grouped_newest_first() {
     // Nothing the payload carried beyond the inventory reaches a caller.
     let rendered = format!(
         "{releases:?}\n{}",
-        k10s_data::helm::render(&releases).join("\n")
+        k10s_data::integrations::helm::render(&releases).join("\n")
     );
     assert!(
         !rendered.contains("SECRET"),
@@ -219,7 +219,7 @@ const ROLLBACK_MANIFEST: &str = "---\n# Source: rollback-probe/templates/secret.
 #[test]
 fn a_stored_manifest_apply_patches_each_document_and_skips_the_secret() {
     use k10s_data::apply::ApplyOutcome;
-    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::integrations::helm_reveal::DocumentRollback;
     use k10s_data::read::Fetched;
 
     let script = Script::default();
@@ -341,7 +341,7 @@ const TWO_CONFIGMAPS: &str = "---\n# Source: rollback-probe/templates/first.yaml
 #[test]
 fn a_refused_document_does_not_stop_a_rollback() {
     use k10s_data::apply::ApplyOutcome;
-    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::integrations::helm_reveal::DocumentRollback;
     use k10s_data::read::Fetched;
 
     for (code, reason) in [
@@ -427,7 +427,7 @@ fn a_refused_document_does_not_stop_a_rollback() {
 #[test]
 fn a_rollback_stops_at_the_first_document_that_could_not_be_sent() {
     use k10s_data::apply::ApplyOutcome;
-    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::integrations::helm_reveal::DocumentRollback;
     use k10s_data::read::Fetched;
 
     let script = Script::default();
@@ -499,7 +499,7 @@ fn a_rollback_stops_at_the_first_document_that_could_not_be_sent() {
 #[test]
 fn a_rollback_stops_at_the_first_document_that_may_have_landed() {
     use k10s_data::apply::ApplyOutcome;
-    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::integrations::helm_reveal::DocumentRollback;
     use k10s_data::read::Fetched;
 
     for (code, message, reason) in [
@@ -614,7 +614,7 @@ fn a_rollback_stops_at_the_first_document_that_may_have_landed() {
 #[test]
 fn a_rollback_stops_at_a_document_whose_connection_is_lost() {
     use k10s_data::apply::ApplyOutcome;
-    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::integrations::helm_reveal::DocumentRollback;
     use k10s_data::read::Fetched;
 
     let script = Script::default();

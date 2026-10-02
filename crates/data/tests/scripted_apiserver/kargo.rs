@@ -2,7 +2,7 @@
 //! merge-patch of `kargo.akuity.io/refresh`.
 
 use crate::*;
-use k10s_data::kargo::{self, Confirm, KindSet};
+use k10s_data::integrations::kargo::{self, Confirm, KindSet};
 use k10s_data::read::Fetched;
 
 fn status(code: u16, reason: &str) -> String {

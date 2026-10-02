@@ -24,8 +24,8 @@ use kube::api::{Api, ListParams, Request};
 use serde::Deserialize;
 
 use crate::browse::{TableColumn, TablePage, TableRow};
+use crate::integrations::talos;
 use crate::read::{Fetched, classify};
-use crate::talos;
 
 const NODE_LIMIT: u32 = 500;
 const PODS_PER_NODE_LIMIT: u32 = 1_500;

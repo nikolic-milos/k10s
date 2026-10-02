@@ -2,7 +2,9 @@
 //! invisible; a 403 is Denied. Hubble Relay is never dialed.
 
 use crate::*;
-use k10s_data::cilium::{self, Completeness, Decision, EndpointRef, KindSet, Protocol, Traffic};
+use k10s_data::integrations::cilium::{
+    self, Completeness, Decision, EndpointRef, KindSet, Protocol, Traffic,
+};
 use k10s_data::read::Fetched;
 
 fn status(code: u16, reason: &str) -> String {

@@ -45,11 +45,11 @@ use std::time::Duration;
 
 use k10s_core::KindId;
 use k10s_data::apply::{ApplyOutcome, ApplyRequest};
-use k10s_data::argo;
 use k10s_data::day2::{Blast, Caps, Day2Call, Day2Outcome, DeleteRequest, ScaleRequest};
 use k10s_data::describe::DescribeRequest;
-use k10s_data::flux;
-use k10s_data::helm;
+use k10s_data::integrations::argo;
+use k10s_data::integrations::flux;
+use k10s_data::integrations::helm;
 use k10s_data::overlay;
 use k10s_data::reach::ReachSettings;
 use k10s_data::read::{Fetched, KindRow, Reader};
@@ -446,7 +446,7 @@ fn current_rollback_revision(sync: &Sync) -> u32 {
         .expect("live_fixtures.sh installs the rollback-probe release")
 }
 
-fn roll_back(sync: &Sync, revision: u32) -> k10s_data::helm_reveal::RollbackReport {
+fn roll_back(sync: &Sync, revision: u32) -> k10s_data::integrations::helm_reveal::RollbackReport {
     let (tx, rx) = std::sync::mpsc::channel();
     sync.reader.rollback_helm_revision(
         Some(namespace()),
@@ -464,8 +464,8 @@ fn roll_back(sync: &Sync, revision: u32) -> k10s_data::helm_reveal::RollbackRepo
     }
 }
 
-fn assert_secret_skipped(report: &k10s_data::helm_reveal::RollbackReport) {
-    use k10s_data::helm_reveal::DocumentRollback;
+fn assert_secret_skipped(report: &k10s_data::integrations::helm_reveal::RollbackReport) {
+    use k10s_data::integrations::helm_reveal::DocumentRollback;
     assert!(
         report.documents.iter().any(|document| matches!(
             document,
@@ -484,7 +484,7 @@ fn assert_secret_skipped(report: &k10s_data::helm_reveal::RollbackReport) {
 #[test]
 #[ignore = "needs a live cluster; see the module comment"]
 fn a_stored_manifest_apply_recreates_the_configmap_and_leaves_the_secret() {
-    use k10s_data::helm_reveal::{DocumentRollback, NOT_HELM_ROLLBACK};
+    use k10s_data::integrations::helm_reveal::{DocumentRollback, NOT_HELM_ROLLBACK};
     let _restore = RestoreRelease::armed();
     let (_plane, sync) = connect(None);
     let revision = current_rollback_revision(&sync);
@@ -521,7 +521,7 @@ fn a_stored_manifest_apply_recreates_the_configmap_and_leaves_the_secret() {
 #[test]
 #[ignore = "needs a live cluster; see the module comment"]
 fn a_reader_cannot_apply_a_stored_manifest_and_nothing_is_created() {
-    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::integrations::helm_reveal::DocumentRollback;
     let _restore = RestoreRelease::armed();
     let (_admin_plane, admin) = connect(None);
     let revision = current_rollback_revision(&admin);
@@ -561,7 +561,7 @@ fn a_reader_cannot_apply_a_stored_manifest_and_nothing_is_created() {
 #[ignore = "needs a live cluster; see the module comment"]
 fn a_stored_manifest_apply_of_an_older_revision_conflicts_with_helm() {
     use k10s_data::apply::Conflicted;
-    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::integrations::helm_reveal::DocumentRollback;
     let _restore = RestoreRelease::armed();
     let (_plane, sync) = connect(None);
     let revision = current_rollback_revision(&sync);
@@ -599,7 +599,7 @@ fn a_stored_manifest_apply_of_an_older_revision_conflicts_with_helm() {
 #[test]
 #[ignore = "needs the live lab's permissive CNPG fixture CRD; see the module comment"]
 fn an_unreadable_live_resource_survives_into_the_ecosystem_table() {
-    use k10s_data::cnpg;
+    use k10s_data::integrations::cnpg;
     use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 
     let (_plane, sync) = connect(None);
@@ -1060,7 +1060,7 @@ fn a_reader_cannot_scale_and_a_configmap_is_not_a_scale_target() {
 #[test]
 #[ignore = "needs live_fixtures.sh --with observability"]
 fn prometheus_reads_the_lab_namespace_and_grafana_serves_its_dashboards() {
-    use k10s_data::grafana::QueryDialect;
+    use k10s_data::integrations::grafana::QueryDialect;
     use k10s_data::reach::{ToolKind, ToolReach, Transport};
 
     let (_plane, sync) = connect(None);
@@ -1273,7 +1273,7 @@ fn loki_returns_the_producers_log_with_its_namespace_pod_and_trace_id() {
             .as_nanos() as u64;
         let (tx, rx) = std::sync::mpsc::channel();
         sync.reader.query_loki(
-            k10s_data::loki::RangeQuery {
+            k10s_data::integrations::loki::RangeQuery {
                 query: format!("{{namespace=\"observability\",pod=\"{pod}\"}} |= \"{trace_id}\""),
                 start_ns,
                 end_ns,
@@ -1348,8 +1348,8 @@ fn await_live_alert(
     reader: &Reader,
     name: &str,
     what: &str,
-    accept: impl Fn(&k10s_data::alertmanager::Alert) -> bool,
-) -> k10s_data::alertmanager::Alert {
+    accept: impl Fn(&k10s_data::integrations::alertmanager::Alert) -> bool,
+) -> k10s_data::integrations::alertmanager::Alert {
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
     loop {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1376,7 +1376,7 @@ fn await_live_alert(
 #[test]
 #[ignore = "needs live_fixtures.sh --with observability; fires and silences a real Prometheus rule"]
 fn a_firing_live_alert_keeps_its_pod_join_and_is_silenced_by_exact_matchers() {
-    use k10s_data::alertmanager::{self, Matcher, SilenceOutcome, SilenceSpec};
+    use k10s_data::integrations::alertmanager::{self, Matcher, SilenceOutcome, SilenceSpec};
     use kube::api::{
         ApiResource, DeleteParams, DynamicObject, GroupVersionKind, PostParams, Preconditions,
     };
@@ -1585,7 +1585,7 @@ fn a_firing_live_alert_keeps_its_pod_join_and_is_silenced_by_exact_matchers() {
 #[test]
 #[ignore = "needs the observability fixture and reader@k10s-lab"]
 fn a_read_only_account_cannot_create_a_live_alertmanager_silence() {
-    use k10s_data::alertmanager::{self, Matcher, SilenceOutcome, SilenceSpec};
+    use k10s_data::integrations::alertmanager::{self, Matcher, SilenceOutcome, SilenceSpec};
     let (_admin_plane, admin) = connect(None);
     let (pod, _) = telemetry_probe_trace();
     let admin_bound = live_alertmanager(&admin.reader);

@@ -90,7 +90,7 @@ impl ToolKind {
 
 /// How this process is allowed to authenticate *to the tool*.
 ///
-/// A Secret is not a variant. Reading one is [`crate::helm`]'s exception and
+/// A Secret is not a variant. Reading one is [`crate::integrations::helm`]'s exception and
 /// an explicit reveal; this enum has nowhere to put a cluster Secret name
 /// that was never shown to a person.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

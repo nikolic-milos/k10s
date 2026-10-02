@@ -1,6 +1,6 @@
 use super::*;
-use crate::mesh::{ObservedReach, TelemetryExporter, TelemetryReason};
-use crate::prom::{QueryResult, ResultType, Series};
+use crate::integrations::mesh::{ObservedReach, TelemetryExporter, TelemetryReason};
+use crate::integrations::prom::{QueryResult, ResultType, Series};
 use serde_json::json;
 
 fn cnp_json() -> Value {

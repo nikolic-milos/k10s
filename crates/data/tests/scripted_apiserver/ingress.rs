@@ -1,7 +1,7 @@
 //! Ingress and IngressClass listed as core networking.k8s.io/v1 kinds.
 
 use crate::*;
-use k10s_data::ingress;
+use k10s_data::integrations::ingress;
 use k10s_data::read::Fetched;
 
 fn status(code: u16, reason: &str) -> String {

@@ -2,7 +2,7 @@
 //! parser fixtures, a planted token in a rules ConfigMap, and caps.
 
 use crate::*;
-use k10s_data::falco::{
+use k10s_data::integrations::falco::{
     self, CrKind, EventSet, GroupState, MAX_EVENTS, OUTPUTS_UNBOUND, Outputs, RuleMaps, Workloads,
     parse_log_chunk,
 };

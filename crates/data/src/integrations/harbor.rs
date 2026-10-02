@@ -9,14 +9,14 @@
 //! stays invisible. 401 and 403 stay [`crate::read::Fetched::Denied`].
 //!
 //! Scan overview rides the artifact list when Harbor includes it. Cosign and
-//! SBOM live in [`crate::oci`]: this module joins a scan to the pods that
+//! SBOM live in [`crate::integrations::oci`]: this module joins a scan to the pods that
 //! run that digest, and does not verify a signature.
 
 use k10s_core::Severity;
 use kube::Client;
 use serde_json::Value;
 
-use crate::oci::{DigestIndex, clipped, encode_segment, why_is_not_found};
+use crate::integrations::oci::{DigestIndex, clipped, encode_segment, why_is_not_found};
 use crate::reach::{Bound, ToolKind, ToolReach, Unbound};
 use crate::read::Fetched;
 
@@ -569,7 +569,7 @@ pub fn render(inventory: &Inventory) -> Vec<String> {
         for repo in &project.repositories {
             let mut line = format!("  {}", repo.name);
             // The worst scan across the repo's artifacts, not whichever
-            // Harbor listed first — same rule as the table cell.
+            // Harbor listed first -- same rule as the table cell.
             let worst = repo
                 .artifacts
                 .iter()

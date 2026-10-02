@@ -1,10 +1,10 @@
 //! Helm values and revision manifests after the secret-reveal policy.
 //!
-//! [`crate::helm`] lists releases by reading Helm's own Secrets, then throws
+//! [`crate::integrations::helm`] lists releases by reading Helm's own Secrets, then throws
 //! the payload away at that boundary so an inventory has nowhere to put a
 //! password. This module is the one later step that boundary exists to force:
 //! an explicit reveal of one revision, into [`crate::reach::Scratch`] buffers
-//! that zeroize on drop and never sit on [`crate::helm::Revision`].
+//! that zeroize on drop and never sit on [`crate::integrations::helm::Revision`].
 //!
 //! Three fields come out, and only those three. `config` is the user values
 //! Helm stored. `chart.values` is the chart's defaults. `manifest` is the
@@ -32,7 +32,7 @@ use k10s_core::KindId;
 use crate::apply::{self, ApplyOutcome, ApplyRequest};
 use crate::describe::is_secret;
 use crate::discover::KindTarget;
-use crate::helm;
+use crate::integrations::helm;
 use crate::reach::Scratch;
 use crate::read::{Fetched, collection_path};
 

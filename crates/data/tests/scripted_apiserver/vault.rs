@@ -2,8 +2,8 @@
 //! 403, the wire path, a planted token, table presence, and paging.
 
 use crate::*;
+use k10s_data::integrations::vault::{self, HASHICORP_GROUP, KindSet};
 use k10s_data::read::Fetched;
-use k10s_data::vault::{self, HASHICORP_GROUP, KindSet};
 
 const PLANTED: &str = "PLANTED-TOKEN-9f3a";
 

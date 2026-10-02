@@ -47,8 +47,9 @@ fn status(code: u16, reason: &str) -> String {
 fn a_cluster_without_argoproj_kinds_is_unserved_and_does_not_list() {
     let script = Script::default();
     let runtime = runtime();
-    let fetched = runtime
-        .block_on(async { k10s_data::argo::fetch_inventory(&script.client(), &[], None).await });
+    let fetched = runtime.block_on(async {
+        k10s_data::integrations::argo::fetch_inventory(&script.client(), &[], None).await
+    });
     let Fetched::Ok(inventory) = fetched else {
         panic!("absence is Ok with served false: {fetched:?}");
     };
@@ -75,7 +76,12 @@ fn a_404_list_is_unserved_and_a_403_list_is_denied() {
         status(404, "NotFound"),
     );
     let fetched = runtime.block_on(async {
-        k10s_data::argo::fetch_inventory(&missing.client(), std::slice::from_ref(&apps), None).await
+        k10s_data::integrations::argo::fetch_inventory(
+            &missing.client(),
+            std::slice::from_ref(&apps),
+            None,
+        )
+        .await
     });
     let Fetched::Ok(inventory) = fetched else {
         panic!("a 404 is unserved, not an error: {fetched:?}");
@@ -90,7 +96,7 @@ fn a_404_list_is_unserved_and_a_403_list_is_denied() {
         status(403, "Forbidden"),
     );
     let fetched = runtime.block_on(async {
-        k10s_data::argo::fetch_inventory(&denied.client(), &[apps], None).await
+        k10s_data::integrations::argo::fetch_inventory(&denied.client(), &[apps], None).await
     });
     assert_eq!(
         fetched,
@@ -143,7 +149,7 @@ fn applications_are_listed_cluster_wide_and_refresh_patches_the_annotation() {
         ),
     ];
     let fetched = runtime.block_on(async {
-        k10s_data::argo::fetch_inventory(&script.client(), &targets, None).await
+        k10s_data::integrations::argo::fetch_inventory(&script.client(), &targets, None).await
     });
     let Fetched::Ok(inventory) = fetched else {
         panic!("the listing must resolve: {fetched:?}");
@@ -164,12 +170,12 @@ fn applications_are_listed_cluster_wide_and_refresh_patches_the_annotation() {
     );
 
     let refreshed = runtime.block_on(async {
-        k10s_data::argo::refresh(
+        k10s_data::integrations::argo::refresh(
             &script.client(),
             &targets,
             "argocd",
             "guestbook",
-            k10s_data::argo::Refresh::Hard,
+            k10s_data::integrations::argo::Refresh::Hard,
         )
         .await
     });
@@ -217,7 +223,7 @@ fn a_sync_sends_operation_sync_and_a_403_on_the_patch_is_denied() {
         &["get", "list", "patch"],
     )];
     let synced = runtime.block_on(async {
-        k10s_data::argo::sync(&script.client(), &targets, "argocd", "guestbook").await
+        k10s_data::integrations::argo::sync(&script.client(), &targets, "argocd", "guestbook").await
     });
     assert_eq!(synced, Fetched::Ok(()));
     let body: serde_json::Value = serde_json::from_str(&script.seen()[0].body).expect("patch JSON");
@@ -232,12 +238,12 @@ fn a_sync_sends_operation_sync_and_a_403_on_the_patch_is_denied() {
         status(403, "Forbidden"),
     );
     let fetched = runtime.block_on(async {
-        k10s_data::argo::refresh(
+        k10s_data::integrations::argo::refresh(
             &denied.client(),
             &targets,
             "argocd",
             "guestbook",
-            k10s_data::argo::Refresh::Normal,
+            k10s_data::integrations::argo::Refresh::Normal,
         )
         .await
     });

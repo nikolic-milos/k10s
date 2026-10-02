@@ -290,7 +290,7 @@ pub enum KindSet {
     NotServed,
     Denied,
     /// This controller could not be asked (a 5xx or a transport error).
-    /// Not absence and not denial — and never a reason to hide the other
+    /// Not absence and not denial -- and never a reason to hide the other
     /// five controllers' answers.
     Failed {
         why: String,
@@ -835,7 +835,7 @@ async fn fetch_controller(
 /// Probe each controller's groups and list the CRs they already serve.
 /// Controllers are independent in failure as well as in absence: one 5xx
 /// or denial stays on its own row and never hides the other five. Only
-/// when every controller failed — the API server itself is unreachable —
+/// when every controller failed -- the API server itself is unreachable --
 /// does the whole fetch fail.
 pub async fn fetch(client: &Client, namespace: Option<&str>) -> Fetched<Inventory> {
     let (contour, envoy_gateway, haproxy, kong, nginx, ambassador) = tokio::join!(

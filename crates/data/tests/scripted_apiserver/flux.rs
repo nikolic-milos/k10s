@@ -2,7 +2,7 @@
 //! as the merge-patch bodies Flux already honours.
 
 use crate::*;
-use k10s_data::flux::{self, KindSet};
+use k10s_data::integrations::flux::{self, KindSet};
 use k10s_data::read::Fetched;
 
 fn status(code: u16, reason: &str) -> String {

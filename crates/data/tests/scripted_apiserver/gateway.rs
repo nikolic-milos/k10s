@@ -2,7 +2,7 @@
 //! objects is a table, not absence. Paths stay on gateway.networking.k8s.io.
 
 use crate::*;
-use k10s_data::gateway::{self, KindSet};
+use k10s_data::integrations::gateway::{self, KindSet};
 use k10s_data::read::Fetched;
 
 fn status(code: u16, reason: &str) -> String {

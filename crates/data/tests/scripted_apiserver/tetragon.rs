@@ -2,10 +2,10 @@
 //! A planted kprobe arg filter must not appear in Debug.
 
 use crate::*;
-use k10s_data::read::Fetched;
-use k10s_data::tetragon::{
+use k10s_data::integrations::tetragon::{
     self, CILIUM_GROUP, GROUPS, GroupState, KindSet, TETRAGON_GROUP, WorkloadKind, WorkloadSet,
 };
+use k10s_data::read::Fetched;
 
 const PLANTED: &str = "planted-kprobe-arg-secret-7f3a";
 

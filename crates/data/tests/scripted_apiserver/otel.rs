@@ -2,7 +2,7 @@
 //! only when the bound port is the extension.
 
 use crate::*;
-use k10s_data::otel::{self, KindSet, health};
+use k10s_data::integrations::otel::{self, KindSet, health};
 use k10s_data::reach::{Bound, FoundService, ToolAuth, ToolKind, Transport};
 use k10s_data::read::Fetched;
 

@@ -2,7 +2,9 @@
 //! catalog failures that must survive a successful health probe.
 
 use crate::*;
-use k10s_data::grafana::{fetch_dashboard, fetch_provisioned_from_configmaps, fetch_search};
+use k10s_data::integrations::grafana::{
+    fetch_dashboard, fetch_provisioned_from_configmaps, fetch_search,
+};
 use k10s_data::reach::{Bound, ToolAuth, ToolKind, Transport};
 use k10s_data::read::Fetched;
 
@@ -79,7 +81,10 @@ fn a_dashboard_is_fetched_by_uid_through_the_same_proxy() {
     let query = &dash.panels[0].queries[0];
     assert_eq!(query.expr, "kube_pod_info");
     assert_eq!(query.datasource.as_deref(), Some("$datasource"));
-    assert_eq!(query.dialect, k10s_data::grafana::QueryDialect::PromQL);
+    assert_eq!(
+        query.dialect,
+        k10s_data::integrations::grafana::QueryDialect::PromQL
+    );
     let seen = script.requests_for("/proxy/api/dashboards/uid/k8s");
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].method, "GET");

@@ -2,7 +2,7 @@
 //! NotServed, not Failed.
 
 use crate::*;
-use k10s_data::proxies::{self, CONTOUR_GROUP, HAPROXY_LEGACY_GROUP, KindSet};
+use k10s_data::integrations::proxies::{self, CONTOUR_GROUP, HAPROXY_LEGACY_GROUP, KindSet};
 use k10s_data::read::Fetched;
 
 fn status(code: u16, reason: &str) -> String {

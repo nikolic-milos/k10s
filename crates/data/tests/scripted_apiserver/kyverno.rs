@@ -2,7 +2,7 @@
 //! wire path, a planted rule-body token, table presence, and paging.
 
 use crate::*;
-use k10s_data::kyverno::{self, CEL_GROUP, GROUP, KindSet};
+use k10s_data::integrations::kyverno::{self, CEL_GROUP, GROUP, KindSet};
 use k10s_data::read::Fetched;
 
 const PLANTED: &str = "PLANTED-TOKEN-9f3a";

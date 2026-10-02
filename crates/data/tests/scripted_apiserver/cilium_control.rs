@@ -2,7 +2,7 @@
 //! and the listing cap are proven on the wire. Declared CNP policy is not.
 
 use crate::*;
-use k10s_data::cilium_control::{self, GroupState, Kind, KindSet};
+use k10s_data::integrations::cilium_control::{self, GroupState, Kind, KindSet};
 use k10s_data::read::Fetched;
 
 const PLANTED: &str = "PLANTED_SECRET_do_not_leak";

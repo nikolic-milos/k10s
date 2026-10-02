@@ -26,21 +26,21 @@
 //! adapter that kept raw metadata or fetched the Secret would fail this suite,
 //! not pass it vacuously.
 
-use k10s_data::cilium;
-use k10s_data::cnpg;
-use k10s_data::eso;
-use k10s_data::falco;
-use k10s_data::gateway;
-use k10s_data::ingress;
-use k10s_data::kargo;
-use k10s_data::kyverno;
-use k10s_data::otel;
-use k10s_data::proxies;
+use k10s_data::integrations::cilium;
+use k10s_data::integrations::cnpg;
+use k10s_data::integrations::eso;
+use k10s_data::integrations::falco;
+use k10s_data::integrations::gateway;
+use k10s_data::integrations::ingress;
+use k10s_data::integrations::kargo;
+use k10s_data::integrations::kyverno;
+use k10s_data::integrations::otel;
+use k10s_data::integrations::proxies;
+use k10s_data::integrations::tetragon;
+use k10s_data::integrations::traefik;
+use k10s_data::integrations::vault;
+use k10s_data::integrations::velero;
 use k10s_data::read::Fetched;
-use k10s_data::tetragon;
-use k10s_data::traefik;
-use k10s_data::vault;
-use k10s_data::velero;
 use kube::Client;
 use kube::api::{ListParams, Request};
 use serde_json::Value;
@@ -404,7 +404,7 @@ fn gateway_lists_the_lab_chain_and_never_a_planted_canary() {
             gateway.served,
             "k3s Traefik serves gateway.networking.k8s.io"
         );
-        let of = |set: &k10s_data::gateway::KindSet| -> Vec<(String, String)> {
+        let of = |set: &k10s_data::integrations::gateway::KindSet| -> Vec<(String, String)> {
             set.items()
                 .iter()
                 .map(|item| (item.namespace.clone(), item.name.clone()))

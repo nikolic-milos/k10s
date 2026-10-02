@@ -3,8 +3,10 @@
 //! and a planted middleware secret that must not leak.
 
 use crate::*;
+use k10s_data::integrations::traefik::{
+    self, GROUP, INGRESS_CONTROLLER, Kind, KindSet, parse_item, table_page,
+};
 use k10s_data::read::Fetched;
-use k10s_data::traefik::{self, GROUP, INGRESS_CONTROLLER, Kind, KindSet, parse_item, table_page};
 
 fn status(code: u16, reason: &str) -> String {
     format!(

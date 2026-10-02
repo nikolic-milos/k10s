@@ -1,7 +1,7 @@
 //! A failed decode is a visible inventory result, including beside readable rows.
 
 use k10s_data::browse::TablePage;
-use k10s_data::{
+use k10s_data::integrations::{
     alertmanager, cilium, cilium_control, cnpg, eso, flux, gateway, helm, kargo, kyverno, tetragon,
     traefik, vault, velero,
 };

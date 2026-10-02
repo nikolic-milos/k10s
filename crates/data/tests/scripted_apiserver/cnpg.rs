@@ -2,7 +2,7 @@
 //! fixture Cluster must not appear in the inventory.
 
 use crate::*;
-use k10s_data::cnpg::{self, KindSet};
+use k10s_data::integrations::cnpg::{self, KindSet};
 use k10s_data::read::Fetched;
 
 const PLANTED_PASSWORD: &str = "planted-s3cret-must-not-leak";

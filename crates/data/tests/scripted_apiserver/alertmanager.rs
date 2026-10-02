@@ -4,7 +4,7 @@
 
 use crate::*;
 
-use k10s_data::alertmanager::{
+use k10s_data::integrations::alertmanager::{
     SilenceOutcome, SilenceSpec, create_silence, expire_silence, fetch_alerts, fetch_silences,
 };
 use k10s_data::reach::{Bound, FoundService, ToolAuth, ToolKind, Transport};
@@ -63,7 +63,7 @@ fn proxy() -> Transport {
 
 fn spec() -> SilenceSpec {
     SilenceSpec {
-        matchers: vec![k10s_data::alertmanager::Matcher {
+        matchers: vec![k10s_data::integrations::alertmanager::Matcher {
             name: "alertname".into(),
             value: "Watchdog".into(),
             is_regex: false,
@@ -395,7 +395,7 @@ fn a_named_token_never_rides_the_service_proxy() {
 
 #[test]
 fn the_reader_posts_the_reviewed_pod_matchers_to_the_reviewed_endpoint() {
-    use k10s_data::alertmanager::Matcher;
+    use k10s_data::integrations::alertmanager::Matcher;
     let script = Script::default();
     script_discovery(&script);
     script_rules_review(&script);

@@ -2,7 +2,7 @@
 //! hole, and a scan joins to pods by digest without claiming a Cosign verify.
 
 use super::*;
-use crate::oci::{digest_index, parse_image_id};
+use crate::integrations::oci::{digest_index, parse_image_id};
 use crate::reach::{Bound, ToolAuth, ToolKind, ToolReach, Transport, Unbound};
 use crate::read::Fetched;
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodStatus};

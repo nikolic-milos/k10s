@@ -8,12 +8,12 @@ use k10s_core::Severity;
 
 pub use k10s_core::OverlayKind as Kind;
 
-use crate::argo;
-use crate::flux;
-use crate::mesh;
+use crate::integrations::argo;
+use crate::integrations::flux;
+use crate::integrations::mesh;
+use crate::integrations::policy;
+use crate::integrations::prom;
 use crate::netpol;
-use crate::policy;
-use crate::prom;
 
 /// One card's overlay. `uid` joins to a published scene object when present;
 /// `namespace` plus `name` is the fallback a snapshot can still resolve.
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn cadvisor_cpu_is_not_an_observed_mesh_edge() {
-        let labels = [crate::mesh::SeriesLabels {
+        let labels = [crate::integrations::mesh::SeriesLabels {
             name: "container_cpu_usage_seconds_total".into(),
             labels: vec![
                 ("namespace".into(), "prod".into()),
@@ -532,7 +532,7 @@ mod tests {
                 ("destination".into(), "db".into()),
             ],
         }];
-        let frame = from_mesh_observed(&crate::mesh::observed_from_series(&labels));
+        let frame = from_mesh_observed(&crate::integrations::mesh::observed_from_series(&labels));
         assert!(frame.stamps.is_empty());
         assert!(
             frame

@@ -8,7 +8,7 @@ use base64::Engine;
 use k10s_core::{Catalog, KindId};
 use kube::discovery::{ApiCapabilities, ApiResource, Scope};
 
-use crate::helm::decode;
+use crate::integrations::helm::decode;
 
 fn release_json(name: &str, revision: u32, config: &str, defaults: &str, manifest: &str) -> String {
     format!(

@@ -2,7 +2,7 @@
 //! path, a planted token, table presence, and paging.
 
 use crate::*;
-use k10s_data::eso::{self, KindSet};
+use k10s_data::integrations::eso::{self, KindSet};
 use k10s_data::read::Fetched;
 
 const PLANTED: &str = "PLANTED-TOKEN-9f3a";

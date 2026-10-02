@@ -2,8 +2,8 @@
 //! proven as the SSA body of a velero.io Backup CR.
 
 use crate::*;
+use k10s_data::integrations::velero::{self, BackupDocument, Confirm, KindSet};
 use k10s_data::read::Fetched;
-use k10s_data::velero::{self, BackupDocument, Confirm, KindSet};
 
 fn status(code: u16, reason: &str) -> String {
     format!(

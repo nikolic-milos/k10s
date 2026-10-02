@@ -6,7 +6,7 @@
 //! API, not a leftover). The OpenBao Secrets Operator (archived) was a VSO
 //! fork that served the same kinds on the same `secrets.hashicorp.com`
 //! group, so one group probe covers both vendors; current OpenBao docs point
-//! at External Secrets Operator instead ([`crate::eso`]). OpenBao labels and
+//! at External Secrets Operator instead ([`crate::integrations::eso`]). OpenBao labels and
 //! annotations on the HashiCorp kinds keep a leftover install attributed.
 //!
 //! Parse keeps the connection address, the auth method type, the secret path,
