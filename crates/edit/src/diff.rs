@@ -620,21 +620,19 @@ impl Line {
 pub(crate) fn split_lines(text: &str) -> Option<Vec<Line>> {
     let mut lines = Vec::new();
     let mut start = 0usize;
-    for (at, byte) in text.bytes().enumerate() {
-        if byte == b'\n' {
-            if lines.len() == MAX_SIDE_LINES {
-                return None;
-            }
-            // CRLF is one line terminator. Keeping its CR in the row makes an
-            // LF/CRLF comparison paint an invisible one-character change on
-            // every line and contradicts Row::bytes' terminator-free contract.
-            let end = at - usize::from(at > start && text.as_bytes()[at - 1] == b'\r');
-            lines.push(Line {
-                start: start as u32,
-                end: end as u32,
-            });
-            start = at + 1;
+    for (at, _) in text.match_indices('\n') {
+        if lines.len() == MAX_SIDE_LINES {
+            return None;
         }
+        // CRLF is one line terminator. Keeping its CR in the row makes an
+        // LF/CRLF comparison paint an invisible one-character change on
+        // every line and contradicts Row::bytes' terminator-free contract.
+        let end = at - usize::from(at > start && text.as_bytes()[at - 1] == b'\r');
+        lines.push(Line {
+            start: start as u32,
+            end: end as u32,
+        });
+        start = at + 1;
     }
     if start < text.len() {
         if lines.len() == MAX_SIDE_LINES {

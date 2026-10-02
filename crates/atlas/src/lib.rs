@@ -28,6 +28,8 @@ pub mod lod;
 pub mod motion;
 pub mod pacing;
 pub mod scene;
+#[cfg(test)]
+mod scene_test;
 pub mod stats;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
