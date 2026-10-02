@@ -34,16 +34,11 @@ impl Rect {
     }
 
     pub fn intersects(&self, o: &Rect) -> bool {
-        // Independent axis tests let the compiler combine comparisons without
-        // a branch for every side of every candidate rectangle.
-        (self.x < o.max_x()) & (o.x < self.max_x()) & (self.y < o.max_y()) & (o.y < self.max_y())
+        self.x < o.max_x() && o.x < self.max_x() && self.y < o.max_y() && o.y < self.max_y()
     }
 
     pub fn contains(&self, o: &Rect) -> bool {
-        (self.x <= o.x)
-            & (self.y <= o.y)
-            & (o.max_x() <= self.max_x())
-            & (o.max_y() <= self.max_y())
+        self.x <= o.x && self.y <= o.y && o.max_x() <= self.max_x() && o.max_y() <= self.max_y()
     }
 
     pub fn intersection_fraction(&self, other: &Rect) -> f32 {

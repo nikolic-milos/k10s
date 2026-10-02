@@ -370,11 +370,7 @@ fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
                     }
                 });
             } else {
-                for cell in cells {
-                    if cell.rect.intersects(visible) {
-                        cull_cell(cell, zoom, stage, policy, &mut st);
-                    }
-                }
+                cull_visible_cell_slice(cells, visible, zoom, stage, policy, &mut st);
             }
         };
         if scene.region_block_index_is_selective(region_index, visible) {
@@ -542,6 +538,32 @@ fn cull_block<const INDEXED: bool, R, B, C, S>(
             }
         });
     }
+}
+
+#[inline]
+fn cull_visible_cell_slice<C>(
+    cells: &[crate::scene::CellNode<C>],
+    visible: &Rect,
+    zoom: f32,
+    stage: u8,
+    policy: &LodPolicy,
+    st: &mut CullStats,
+) {
+    // Keep the scan read-only so viewport and policy loads can leave the loop.
+    // Label admission is independent of cell order; apply its cap once.
+    let mut drawn = 0;
+    let mut labels = 0;
+    for cell in cells {
+        if cell.rect.intersects(visible) {
+            drawn += 1;
+            labels += usize::from(stage >= 3 && policy.cell_label_shown(cell.rect.w, zoom));
+        }
+    }
+    st.drawn_cells += drawn;
+    st.quads += drawn;
+    let accepted = labels.min(policy.max_labels.saturating_sub(st.labels));
+    st.labels += accepted;
+    st.labels_dropped += labels - accepted;
 }
 
 #[inline]

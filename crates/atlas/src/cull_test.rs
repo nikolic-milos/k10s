@@ -54,6 +54,49 @@ fn settled(pol: &LodPolicy, cam: &Camera) -> StageBlend {
     StageBlend::settled(pol.stage_for_zoom(cam.zoom))
 }
 
+#[test]
+fn partial_cell_scan_counts_only_visible_labels_against_the_remaining_budget() {
+    let mut scene = tiny_scene();
+    scene.blocks[0].rect = Rect::new(0.0, 0.0, 80.0, 60.0);
+    scene.blocks[0].inner = scene.blocks[0].rect;
+    scene.cells = [
+        Rect::new(4.0, 4.0, 12.0, 12.0),
+        Rect::new(9.0, 4.0, 12.0, 12.0),
+        Rect::new(3.0, 10.0, 2.0, 2.0),
+        Rect::new(12.0, 4.0, 12.0, 12.0),
+    ]
+    .into_iter()
+    .map(|rect| CellNode {
+        rect,
+        label: "pod".into(),
+        ext: (),
+    })
+    .collect();
+    scene.blocks[0].children = 0..scene.cells.len() as u32;
+    let camera = Camera {
+        cx: 5.0,
+        cy: 5.0,
+        zoom: 4.0,
+    };
+    for limit in [0, 1, 3, 10] {
+        let mut policy = policy();
+        policy.max_labels = limit;
+        let stats = cull(
+            &scene,
+            &camera,
+            &policy,
+            settled(&policy, &camera),
+            40.0,
+            40.0,
+            false,
+            false,
+        );
+        assert_eq!(stats.drawn_cells, 3);
+        assert_eq!(stats.labels, limit.min(4));
+        assert_eq!(stats.labels_dropped, 4usize.saturating_sub(limit));
+    }
+}
+
 fn tiny_scene() -> Scene {
     let block_rect = Rect::new(10.0, 20.0, 80.0, 60.0);
     Scene {
