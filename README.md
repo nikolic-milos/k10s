@@ -15,7 +15,48 @@ cargo bench -p k10s-atlas --features testing --bench cull  # headless cull bench
 cargo bench -p k10s-world --bench publish                  # headless layout and publish bench
 ```
 
-## Notes
+## Architecture
+
+Directory names describe responsibilities. Cargo package names keep the `k10s-`
+prefix so commands and dependency names remain unambiguous.
+
+| Directory | Responsibility |
+| --- | --- |
+| `crates/core` | Dense resource identities, bounded ingestion and immutable scene contracts. |
+| `crates/atlas` | Domain-independent geometry, culling, camera motion and frame accounting. |
+| `crates/world` | Bevy ECS scheduling over flat topology arrays and pooled snapshot publication. |
+| `crates/provider` | UI-independent service requests, labelled outcomes and connection selection. |
+| `crates/data` | Discovery, transport, watches and bounded upstream API clients. |
+| `crates/app` | Runtime composition and conversion from data answers to provider outcomes. |
+| `crates/map`, `crates/shell` | Starmap painting and operator-facing views. |
+| `crates/theme`, `crates/assets` | Presentation values, indexed glyphs, fonts and artwork. |
+| `crates/edit` | Text, syntax and document state without a window dependency. |
+| `crates/clustergen`, `crates/bench`, `tools/paint-bench` | Deterministic fixtures and measurement. |
+
+The provider depends only on the core model; the data plane does not depend on
+views. The dependency gate enforces these boundaries. Rendering consumes shared
+snapshots and prepared outcomes, and never waits for network I/O. The world uses
+stable slots and contiguous arrays inside ECS resources; an entity abstraction
+does not sit between the painter and each visible object.
+
+An upstream integration belongs in `crates/data/src/integrations`. Keep discovery,
+bounded decoding and request construction there, scheduling in `data::read`,
+operator-facing requests and outcomes in `provider`, and conversions in
+`app::provider`. Absence, denied access, partial results and server failures must
+remain distinguishable. Every request shape needs a scripted API-server test;
+writes, proxies, upgrades and controller behavior also need live lab proof.
+Confirmed writes use the interactive transport, which does not resend a request
+after transmission. Existing adapters expose specific supported operations;
+their presence does not imply complete coverage of an upstream API.
+
+For presentation changes, `map::frame` owns the shared traversal, `map::paint`
+draws its prepared output, and `map::view` owns input and frame scheduling.
+Selection identity and presentation milestones have separate modules. Glyph
+artwork and its dense-ID lookup live in `assets`, so replacing an icon does not
+require changing traversal or input handling. Keep the independently written
+cull oracle and the allocation, idle, startup and timing gates intact.
+
+## Build and assets
 
 gpui is pinned to [my Zed fork](https://github.com/nikolic-milos/zed)
 (`k10s/batched-paint-quads`, rev `1997311daedbd90333b6710634d2cfbd81b33306`) for

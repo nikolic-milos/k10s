@@ -11,7 +11,8 @@ use k10s_core::{BUILTIN_KINDS, SceneSnapshot, Severity, Totals};
 use k10s_theme::{Theme, sparkline};
 
 use crate::overlay::{OverlayFrame, OverlayKind, uid_at};
-use crate::{Grouped, PickPath, path_rect};
+use crate::text::Grouped;
+use crate::{PickPath, path_rect};
 const HOVER_WIDTH: f32 = 252.0;
 const HOVER_HEIGHT: f32 = 74.0;
 const HOVER_OVERLAY_LINE: f32 = 16.0;

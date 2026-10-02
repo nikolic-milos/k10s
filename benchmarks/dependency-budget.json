@@ -47,6 +47,24 @@
       "tree-sitter-json",
       "tree-sitter-yaml",
       "unicode-segmentation"
+    ],
+    "k10s-data": [
+      "base64",
+      "crossbeam-channel",
+      "flate2",
+      "futures",
+      "http",
+      "http-body-util",
+      "hyper-timeout",
+      "hyper-util",
+      "k10s-core",
+      "k8s-openapi",
+      "kube",
+      "serde",
+      "serde_json",
+      "tokio",
+      "tower",
+      "tower-http"
     ]
   }
 }

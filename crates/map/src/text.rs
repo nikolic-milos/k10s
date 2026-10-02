@@ -175,6 +175,22 @@ pub(crate) fn content_hash(text: &str) -> u64 {
     })
 }
 
+pub(super) struct Grouped(pub(super) u32);
+
+impl std::fmt::Display for Grouped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn write_grouped(value: u32, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if value < 1000 {
+                write!(f, "{value}")
+            } else {
+                write_grouped(value / 1000, f)?;
+                write!(f, ",{:03}", value % 1000)
+            }
+        }
+        write_grouped(self.0, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
