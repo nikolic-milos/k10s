@@ -152,11 +152,12 @@ fn probe_replicas() -> Option<i32> {
 }
 
 fn apply(reader: &Reader, request: ApplyRequest) -> ApplyOutcome {
+    let requests = if request.dry_run { 2 } else { 1 };
     let (tx, rx) = std::sync::mpsc::channel();
     reader.apply(request, move |outcome| {
         let _ = tx.send(outcome);
     });
-    wait_interactive(&rx, 1)
+    wait_interactive(&rx, requests)
 }
 
 fn day2(reader: &Reader, kind: KindId, call: Day2Call) -> Day2Outcome {
@@ -455,7 +456,9 @@ fn roll_back(sync: &Sync, revision: u32) -> k10s_data::helm_reveal::RollbackRepo
             let _ = tx.send(fetched);
         },
     );
-    match wait(&rx) {
+    // This fixture has one applyable ConfigMap and one skipped Secret:
+    // a list, an optional fallback GET and one apply.
+    match wait_interactive(&rx, 3) {
         Fetched::Ok(report) => report,
         other => panic!("the stored-manifest apply resolves to a report: {other:?}"),
     }
@@ -495,8 +498,8 @@ fn a_stored_manifest_apply_recreates_the_configmap_and_leaves_the_secret() {
     assert!(
         report.documents.iter().any(|document| matches!(
             document,
-            DocumentRollback::Applied { kind, name, outcome: ApplyOutcome::Applied(applied) }
-                if kind == "ConfigMap" && name == ROLLBACK_RELEASE && !applied.dry_run
+            DocumentRollback::Applied { kind, name, outcome: ApplyOutcome::Applied(_) }
+                if kind == "ConfigMap" && name == ROLLBACK_RELEASE
         )),
         "the ConfigMap is applied: {report:?}"
     );

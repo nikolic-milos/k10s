@@ -1,20 +1,20 @@
 //! The read seam: one handle the UI pulls detail through.
 //!
-//! A [`Reader`] carries both clients, the runtime handle, what discovery
-//! found, and the probe's capability verdicts. The four writes a person
-//! confirms (an apply, a day-2 call, a stored-manifest apply and a silence)
-//! go through the interactive client, with every read inside them that decides
-//! the write; any write added later belongs there too. Everything else, the
-//! long-lived streams included, uses the sync client.
+//! A [`Reader`] carries both clients, the runtime handle, what discovery found,
+//! and the probe's capability verdicts. The four writes a person confirms (an
+//! apply, a day-2 call, a stored-manifest apply and a silence) go through the
+//! interactive client, with every read inside them that decides the write, a
+//! dry run's read of the object included, and each is judged by its answer in
+//! `connect::send_write`; any write added later belongs there too. Everything
+//! else, the long-lived streams included, uses the sync client.
 //!
 //! Every method is fire-and-forget onto the data plane's runtime with the
 //! answer handed to a caller-supplied callback -- the render thread never
-//! blocks on the cluster -- and every
-//! outcome is a labelled [`Fetched`]: an account the cluster refuses -- 401 or
-//! 403, the same pair a watch calls forbidden -- arrives as `Denied`, never as
-//! an empty panel or an error string a person has to diagnose. Errors that
-//! reach text pass through the same redaction filter as everything else in
-//! this crate.
+//! blocks on the cluster -- and every outcome is a labelled [`Fetched`]: an
+//! account the cluster refuses -- 401 or 403, the same pair a watch calls
+//! forbidden -- arrives as `Denied`, never as an empty panel or an error string
+//! a person has to diagnose. Errors that reach text pass through the same
+//! redaction filter as everything else in this crate.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -274,8 +274,10 @@ impl Reader {
 
     // Server-side apply. Dry run and apply are the same request with one query
     // parameter between them, which is why they are one method: a caller cannot
-    // reach the apply without having been able to reach the dry run. Day-2
-    // clicks are a different method; they are not documents.
+    // reach the apply without having been able to reach the dry run. A dry run
+    // reads the object first, so it is two requests and waits at most two
+    // interactive deadlines. Day-2 clicks are a different method; they are not
+    // documents.
     pub fn apply(&self, request: ApplyRequest, reply: impl FnOnce(ApplyOutcome) + Send + 'static) {
         let client = self.interactive.clone();
         let targets = self.targets.clone();
@@ -877,7 +879,10 @@ impl Reader {
     /// [`helm_reveal::NOT_HELM_ROLLBACK`]. Each request waits at most the
     /// interactive deadline: the list of the revision's release Secret
     /// (selected by name and version), a read of it by its conventional name
-    /// when the list finds none, and one apply per document.
+    /// when the list finds none, and one apply per document. It stops at the
+    /// first document that goes unconfirmed or cannot be sent, so a server that
+    /// stopped answering holds it for at most three deadlines: each request's
+    /// deadline includes connecting to it.
     pub fn rollback_helm_revision(
         &self,
         namespace: Option<String>,

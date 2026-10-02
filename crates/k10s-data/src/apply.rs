@@ -2,10 +2,11 @@
 //!
 //! One request shape covers both halves of §5.2's last row: `?dryRun=All` asks
 //! the API server what it *would* store and changes nothing, and the same
-//! request without it stores it. The dry-run answer is the whole point of doing
-//! it this way -- it is the authoritative right-hand side of a diff, computed by
-//! the machine that owns the merge, admission webhooks and defaulting
-//! included, rather than by a client guessing at strategic-merge semantics.
+//! request without it stores it; a dry run reads the object first, so it is two
+//! requests. The dry-run answer is the whole point of doing it this way -- it
+//! is the authoritative right-hand side of a diff, computed by the machine that
+//! owns the merge, admission webhooks and defaulting included, rather than by a
+//! client guessing at strategic-merge semantics.
 //!
 //! The body is the buffer's own bytes under `application/apply-patch+yaml`,
 //! whose entire purpose is that the bytes may be YAML: nothing in this process
@@ -14,17 +15,18 @@
 //! only the body is ours.
 //!
 //! One thing a server-side apply does that is worth stating rather than
-//! discovering: it **creates** the object when it is absent. That is
-//! `kubectl apply`'s behaviour too, and it means an apply of a document whose
-//! object was deleted between the fetch and the press recreates it rather than
-//! failing -- which is not what the person pressing the key is thinking about.
-//! It is detectable with no second round trip, because the answer to the apply
-//! carries the object's `uid`: [`Applied::uid`] is that field, and a caller that
-//! holds the uid the document was *read* at can compare the two. This layer
-//! reports the identity and draws no conclusion from it; the conclusion needs
-//! the read's uid, which lives with the review rather than with the request.
-//! Secret responses are negotiated as metadata, including on a dry run: the
-//! merged data fields must not enter the process to be discarded later.
+//! discovering: it **creates** the object when it is absent. That is `kubectl
+//! apply`'s behaviour too, and it means an apply of a document whose object was
+//! deleted between the fetch and the press recreates it rather than failing --
+//! which is not what the person pressing the key is thinking about. It is
+//! detectable because the answer to the apply carries the object's `uid`:
+//! [`Applied::uid`] and [`DryRun::uid`] are that field, and a caller that holds
+//! the uid the document was *read* at can compare the two; a dry run's own read
+//! carries one too. This layer reports the identity and draws no conclusion
+//! from it; the conclusion needs the editor's uid, which lives with the review
+//! rather than with the request. Secret responses are negotiated as metadata,
+//! including on a dry run: the merged data fields must not enter the process to
+//! be discarded later.
 //!
 //! `fieldManager=k10s` names us in `managedFields`, which is what makes a
 //! conflict possible in the first place -- and a conflict is a labelled state
@@ -46,15 +48,27 @@
 //!   and answers **500** with `field not declared in schema`. So the text a
 //!   person reads comes from the server's own `message` for every status code,
 //!   never from a flattened error chain -- the server writes that sentence to
-//!   be read, and it names the field.
+//!   be read, and it names the field. The dry run shows it as a failure; a real
+//!   apply shows it as the reason the write is unconfirmed, since the same
+//!   server answers its own 500 after storing a write too.
 //!
 //! And one outcome exists because a write is not the same event as a picture of
-//! a write. The response body is rendered by the editor's own emitter, which
+//! a write. A dry run's answer is rendered by the editor's own emitter, which
 //! caps a document at 2 MiB and 64 levels of nesting, and a merged object can
-//! exceed either -- so a request the server answered 2xx to can still fail to
-//! render. That is [`ApplyOutcome::Unrendered`] and not [`ApplyOutcome::Failed`]
-//! because on a real apply the object is already stored: calling it a failure
-//! tells someone the cluster is unchanged while it holds their write.
+//! exceed either -- so a dry run the server answered 2xx to can still fail to
+//! render. That is [`ApplyOutcome::Unrendered`] and not [`ApplyOutcome::Failed`].
+//! A real apply's answer is not rendered at all: only its uid is read, since
+//! the editor that sent it reads the object again. A real apply that was sent
+//! and got no verdict (a lost connection, the interactive deadline, or a 5xx,
+//! which `connect::send_write` sorts out) is [`ApplyOutcome::Unconfirmed`]: it
+//! may have landed, and nobody here can tell.
+//!
+//! So a review is never of a copy read earlier: every dry run reads the object
+//! with it, on the same client, and [`DryRun::live`] is that read. A write that
+//! landed before the read, this editor's or anyone's, is on the left side of
+//! the review instead of hidden inside it. One that lands after it, between the
+//! read and the dry run or later, is not; the caller compares the read's uid
+//! with the answer's so a replacement in between is at least named.
 
 use kube::Client;
 use kube::api::{Patch, PatchParams, Request, ValidationDirective};
@@ -62,6 +76,7 @@ use kube::core::Status;
 
 use k10s_core::KindId;
 
+use crate::describe;
 use crate::discover::KindTarget;
 use crate::manifest;
 use crate::read::collection_path;
@@ -85,10 +100,6 @@ pub struct ApplyRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
-    // What the server would store, or did, rendered by the same emitter the
-    // editor opened the object with.
-    pub yaml: String,
-    pub dry_run: bool,
     // Which object the server answered about. Compared against the uid the
     // document was read at, this is the difference between an update and a
     // recreation -- an apply creates what is absent, so the object a press lands
@@ -98,14 +109,32 @@ pub struct Applied {
     pub uid: Option<String>,
 }
 
-// A request the server answered 2xx to, whose answer the editor's own emitter
-// will not render -- it caps a document at 2 MiB and 64 levels of nesting, and
-// the merged object the server echoes can exceed either. Separate from
-// `Failed` because on a real apply the write *landed*: reporting it as a
-// failure tells someone the cluster is unchanged when it is not.
+// A dry run's answer and the read made with it: what the server would store,
+// and the object as the server held it a moment before it answered, which is
+// the review's left side. One value, so an answer without its read cannot be
+// built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DryRun {
+    pub yaml: String,
+    pub uid: Option<String>,
+    pub live: Live,
+}
+
+// What a dry run's read found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Live {
+    // Rendered by the same emitter as the answer, with the uid it carried.
+    Read { yaml: String, uid: Option<String> },
+    // It does not exist, so the apply would create it.
+    Absent,
+}
+
+// A dry run the server answered 2xx to, whose answer cannot be shown: it is
+// not JSON, or the editor's own emitter will not render it (it caps a document
+// at 2 MiB and 64 levels of nesting, and the merged object the server echoes
+// can exceed either). Separate from `Failed` because the server did answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unrendered {
-    pub dry_run: bool,
     pub why: String,
 }
 
@@ -120,8 +149,9 @@ pub struct Conflicted {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyOutcome {
     Applied(Applied),
-    // The server took it and answered; only the rendering of that answer
-    // failed. On a real apply this is a write that happened.
+    DryRun(DryRun),
+    // A dry run the server answered 2xx whose answer cannot be rendered here,
+    // so there is nothing to review. A real apply's answer is never rendered.
     Unrendered(Unrendered),
     // 409 with causes: fields this apply sets are owned by someone else.
     // Forcing takes them; the causes say what and from whom.
@@ -152,8 +182,24 @@ pub enum ApplyOutcome {
         what: &'static str,
         why: String,
     },
-    // Nothing was written, as far as anything here can tell. Everything that
-    // *was* written and could not be shown is `Unrendered` instead.
+    // A real apply that was sent and that nothing confirmed or refused: the
+    // connection broke after it was made, the interactive deadline passed, or
+    // the answer was a redirect or a 5xx (`connect::NoVerdict`). The write may have
+    // landed. `why` is the reason alone; what it means for the person who
+    // pressed the key is the caller's sentence.
+    Unconfirmed {
+        why: String,
+    },
+    // A real apply that provably never left this process: its credential
+    // failed, or no connection was made. Nothing was written. `why` is the
+    // reason alone. Separate from `Failed` so a caller running several applies
+    // can stop, since every one after it would fail the same way.
+    NotSent {
+        why: String,
+    },
+    // Nothing was written: the server refused it, or it was never built, or it
+    // was a dry run. Everything that may have been written is `Unconfirmed`, and
+    // a real apply that provably never left is `NotSent`.
     Failed {
         why: String,
     },
@@ -204,52 +250,109 @@ pub(crate) async fn apply(
         }
     };
     *built.body_mut() = request.yaml.clone().into_bytes();
-    match client.request::<serde_json::Value>(built).await {
-        Ok(mut value) => {
-            // Read before rendering: the emitter is handed the value by mutable
-            // reference, and the identity of what came back is not something a
-            // later reader of the text should have to parse back out of it.
-            let uid = manifest::uid_of(&value);
-            match manifest::document(target, &mut value) {
-                Ok((yaml, _)) => ApplyOutcome::Applied(Applied {
-                    yaml,
-                    dry_run: request.dry_run,
-                    uid,
-                }),
-                // The server answered, so on a real apply the object is already
-                // stored. Only the emitter refused it -- it caps a document at
-                // 2 MiB and 64 levels, and a merged object can exceed either.
-                // Calling that a failure would tell someone their write did not
-                // happen while the cluster holds it.
-                Err(why) => ApplyOutcome::Unrendered(Unrendered {
-                    dry_run: request.dry_run,
-                    why: why.to_string(),
-                }),
-            }
+    let live = if request.dry_run {
+        match read_live(client, target, request).await {
+            Ok(live) => Some(live),
+            Err(outcome) => return outcome,
         }
-        Err(error) => classify(&error, request.dry_run),
+    } else {
+        None
+    };
+    let text = match crate::connect::send_write(client, built).await {
+        Ok(text) => text,
+        Err(error) => return classify(&error, request.dry_run),
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text);
+    // `live` is there exactly when this was a dry run: it was read above for
+    // that and nothing else.
+    let Some(live) = live else {
+        // The write landed whatever the answer holds; an answer that is not
+        // JSON only leaves its uid unknown.
+        let uid = value.ok().and_then(|value| manifest::uid_of(&value));
+        return ApplyOutcome::Applied(Applied { uid });
+    };
+    let mut value = match value {
+        Ok(value) => value,
+        Err(why) => {
+            return ApplyOutcome::Unrendered(Unrendered {
+                why: format!("the answer is not JSON: {why}"),
+            });
+        }
+    };
+    // Read before rendering: the emitter is handed the value by mutable
+    // reference, and the identity of what came back is not something a later
+    // reader of the text should have to parse back out of it.
+    let uid = manifest::uid_of(&value);
+    match manifest::document(target, &mut value) {
+        Ok((yaml, _)) => ApplyOutcome::DryRun(DryRun { yaml, uid, live }),
+        Err(why) => ApplyOutcome::Unrendered(Unrendered {
+            why: why.to_string(),
+        }),
     }
 }
 
-// `dry_run` is here for one case: an error that never reached a server, on a
-// request that may already have been served. A 4xx or 5xx is the server
-// speaking and says for itself that nothing was stored; a transport failure
-// says nothing at all, and on a real apply the honest answer names that
-// instead of implying the cluster is untouched.
+// The object as it is now, read through the manifest path's own GET and
+// rendering, so the two sides of a review differ only where the server's
+// objects do. A read that cannot be made leaves the dry run nothing to be
+// compared with, so its PATCH is not sent.
+async fn read_live(
+    client: &Client,
+    target: &KindTarget,
+    request: &ApplyRequest,
+) -> Result<Live, ApplyOutcome> {
+    let unread = |why: String| ApplyOutcome::Failed {
+        why: format!("the object could not be read, so the dry run was not sent: {why}"),
+    };
+    match describe::fetch_object(client, target, request.namespace.as_deref(), &request.name).await
+    {
+        Ok(mut value) => {
+            let uid = manifest::uid_of(&value);
+            manifest::document(target, &mut value)
+                .map(|(yaml, _)| Live::Read { yaml, uid })
+                .map_err(|why| ApplyOutcome::Failed {
+                    why: format!(
+                        "the object as it is now cannot be shown here, so the dry run was not \
+                         sent: {why}"
+                    ),
+                })
+        }
+        Err(kube::Error::Api(status)) if status.code == 404 => Ok(Live::Absent),
+        Err(kube::Error::Api(status)) if matches!(status.code, 401 | 403) => {
+            Err(ApplyOutcome::Denied {
+                what: "read",
+                why: format!(
+                    "the dry run was not sent: {}",
+                    crate::connect::status_sentence(&status)
+                ),
+            })
+        }
+        Err(kube::Error::Api(status)) => Err(unread(crate::connect::status_sentence(&status))),
+        Err(error) => Err(unread(crate::connect::describe(
+            &error as &(dyn std::error::Error + 'static),
+        ))),
+    }
+}
+
+// `dry_run` decides one thing: whether a request that got no verdict can have
+// stored anything. A redirect, a 5xx or a connection lost after it was made is
+// `Unconfirmed` on a real apply; a request whose credential or connection
+// failed before sending is `NotSent`. A dry run stores nothing whatever
+// happened, so there they are `Failed`. Every Api error carries the server's
+// own sentence.
 fn classify(error: &kube::Error, dry_run: bool) -> ApplyOutcome {
     if let kube::Error::Api(status) = error {
         match status.code {
             401 | 403 => {
                 return ApplyOutcome::Denied {
                     what: "apply",
-                    why: message_of(status),
+                    why: crate::connect::status_sentence(status),
                 };
             }
             409 => {
                 let (causes, truncated) = conflicts(status);
                 return if !causes.is_empty() {
                     ApplyOutcome::Conflict {
-                        message: message_of(status),
+                        message: crate::connect::status_sentence(status),
                         causes,
                         truncated,
                     }
@@ -262,53 +365,39 @@ fn classify(error: &kube::Error, dry_run: bool) -> ApplyOutcome {
                     // Force only has defined meaning for FieldManagerConflict;
                     // every other structured refusal stays non-forceable.
                     ApplyOutcome::Rejected {
-                        message: message_of(status),
+                        message: crate::connect::status_sentence(status),
                         causes: rejections(status),
                     }
                 } else {
                     ApplyOutcome::Stale {
-                        message: message_of(status),
+                        message: crate::connect::status_sentence(status),
                     }
                 };
             }
             400 | 422 => {
                 return ApplyOutcome::Rejected {
-                    message: message_of(status),
+                    message: crate::connect::status_sentence(status),
                     causes: rejections(status),
                 };
             }
-            // Anything else the server answered, it answered in a sentence it
-            // wrote for a person; the chain-walking fallback below is for the
-            // errors that never reached a server at all.
+            // Any other refusal, in the sentence it came with; the fallback
+            // below is for a 5xx and for errors with no answer at all.
             _ => {
                 return ApplyOutcome::Failed {
-                    why: message_of(status),
+                    why: crate::connect::status_sentence(status),
                 };
             }
         }
     }
-    let why = crate::connect::describe(error as &(dyn std::error::Error + 'static));
+    let error = error as &(dyn std::error::Error + 'static);
+    let why = crate::connect::describe(error);
     if dry_run {
-        return ApplyOutcome::Failed { why };
+        ApplyOutcome::Failed { why }
+    } else if crate::connect::never_sent(error) {
+        ApplyOutcome::NotSent { why }
+    } else {
+        ApplyOutcome::Unconfirmed { why }
     }
-    ApplyOutcome::Failed {
-        why: format!(
-            "{why}; the apply may or may not have reached the cluster, so read the object again \
-             before sending it a second time"
-        ),
-    }
-}
-
-// The API server's own `message`, which it writes to be read. A status that
-// somehow carries none names its code rather than printing an empty line.
-fn message_of(status: &Status) -> String {
-    if status.message.is_empty() {
-        return format!(
-            "the API server refused the apply with status {}",
-            status.code
-        );
-    }
-    status.message.clone()
 }
 
 fn conflicts(status: &Status) -> (Vec<Conflicted>, bool) {
@@ -469,66 +558,120 @@ mod tests {
         );
     }
 
-    // What a real server answers for a misspelled field in an apply: the typed
-    // patch cannot be built, so it is a 500 whose message names the field. It
-    // has to reach a person as that sentence, not as a flattened error chain.
+    // What the lab's server answers a misspelled field in an apply, recorded: the
+    // typed patch cannot be built, a 500 with no reason whose message names the
+    // field. A 5xx is no verdict, since the same server answers its own 500 after
+    // storing a write too, so the sentence reaches a person as it is: the failure
+    // of a dry run, and the reason a real apply is unconfirmed.
     #[test]
-    fn an_unexpected_status_still_carries_the_servers_own_sentence() {
-        let error = kube::Error::Api(
-            Status::failure(
-                "failed to create typed patch object (g2/settings; /v1, Kind=ConfigMap): .dataz: field not declared in schema",
-                "InternalError",
-            )
-            .with_code(500)
-            .boxed(),
-        );
-        let ApplyOutcome::Failed { why } = classify(&error, true) else {
-            panic!("a 500 is a labelled failure");
-        };
+    fn a_misspelled_field_reaches_a_person_as_the_servers_own_sentence() {
+        let message = "failed to create typed patch object (g2/settings; /v1, Kind=ConfigMap): \
+                       .dataz: field not declared in schema";
+        let answer =
+            || kube::Error::Service(Box::new(crate::connect::NoVerdict(message.to_string())));
         assert_eq!(
-            why,
-            "failed to create typed patch object (g2/settings; /v1, Kind=ConfigMap): .dataz: field not declared in schema",
-            "the field is named and nothing is wrapped around it"
+            classify(&answer(), true),
+            ApplyOutcome::Failed {
+                why: message.to_string()
+            }
+        );
+        assert_eq!(
+            classify(&answer(), false),
+            ApplyOutcome::Unconfirmed {
+                why: message.to_string()
+            }
         );
     }
 
-    // A status code is the server speaking: it says for itself that nothing was
-    // stored. A transport failure says nothing at all, and on a real apply the
-    // request may already have been served -- so the sentence must not imply
-    // the cluster is untouched.
+    // A transport failure says nothing at all, and a real apply may already
+    // have been served, so it is `Unconfirmed` rather than a failure that implies
+    // the cluster is untouched. A dry run stores nothing either way.
     #[test]
-    fn an_error_that_never_reached_a_server_does_not_claim_the_write_did_not_happen() {
+    fn a_real_apply_that_lost_its_connection_is_unconfirmed_and_a_dry_run_failed() {
         let broken = || {
             kube::Error::ReadEvents(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 "connection reset by peer",
             ))
         };
-        let ApplyOutcome::Failed { why } = classify(&broken(), false) else {
-            panic!("a transport failure is a labelled failure");
+        let ApplyOutcome::Unconfirmed { why } = classify(&broken(), false) else {
+            panic!("a real apply with no answer may have landed");
         };
         assert!(why.contains("connection reset by peer"), "{why}");
         assert!(
-            why.contains("may or may not have reached the cluster"),
-            "and it says what it cannot know: {why}"
+            !why.contains("landed"),
+            "the reason alone; the caller words what it means: {why}"
         );
 
         let ApplyOutcome::Failed { why } = classify(&broken(), true) else {
-            panic!("a transport failure is a labelled failure");
+            panic!("a dry run with no answer stored nothing");
         };
-        assert!(
-            !why.contains("may or may not"),
-            "a dry run had nothing to store either way: {why}"
+        assert!(why.contains("connection reset by peer"), "{why}");
+    }
+
+    // An answer that is no verdict (a redirect or a 5xx, whoever wrote it) says
+    // nothing of the request behind it. On a real apply
+    // that is the same uncertainty as a lost connection, and its sentence is
+    // the reason.
+    #[test]
+    fn an_answer_with_no_verdict_is_unconfirmed_on_a_real_apply_and_a_failure_on_a_dry_run() {
+        let message = "Timeout: request did not complete within requested timeout";
+        let timeout =
+            || kube::Error::Service(Box::new(crate::connect::NoVerdict(message.to_string())));
+        assert_eq!(
+            classify(&timeout(), false),
+            ApplyOutcome::Unconfirmed {
+                why: message.to_string()
+            }
+        );
+        assert_eq!(
+            classify(&timeout(), true),
+            ApplyOutcome::Failed {
+                why: message.to_string()
+            }
+        );
+    }
+
+    // The interactive client's deadline travels inside kube's `Error::Service`;
+    // it reaches the person as its own sentence, not as "ServiceError: ...".
+    #[test]
+    fn a_real_apply_past_the_deadline_is_unconfirmed_in_the_deadlines_words() {
+        let late = kube::Error::Service(Box::new(crate::deadline::NoAnswer(
+            std::time::Duration::from_secs(35),
+        )));
+        assert_eq!(
+            classify(&late, false),
+            ApplyOutcome::Unconfirmed {
+                why: "no answer within 35 s".to_string()
+            }
+        );
+    }
+
+    // A body that was not a Status (a gateway's text, API Priority and
+    // Fairness's "Too many requests, please try again later.\n", recorded on the
+    // lab) arrives as its raw text; the sentence carries no trailing newline.
+    #[test]
+    fn a_plain_text_answer_is_its_sentence_without_the_newline() {
+        let error = kube::Error::Api(
+            Status::failure("Too many requests, please try again later.\n", "")
+                .with_code(429)
+                .boxed(),
+        );
+        assert_eq!(
+            classify(&error, false),
+            ApplyOutcome::Failed {
+                why: "Too many requests, please try again later.".to_string()
+            }
         );
     }
 
     #[test]
     fn a_status_with_no_message_names_its_code_rather_than_printing_nothing() {
-        let error = kube::Error::Api(Status::failure("", "").with_code(507).boxed());
+        let error = kube::Error::Api(Status::failure("", "").with_code(405).boxed());
         let ApplyOutcome::Failed { why } = classify(&error, true) else {
-            panic!("a 507 is a labelled failure");
+            panic!("a 405 is a labelled failure");
         };
-        assert_eq!(why, "the API server refused the apply with status 507");
+        assert_eq!(why, "answered with status 405 and no message");
     }
 
     #[test]
@@ -585,15 +728,22 @@ mod tests {
         assert_eq!(what, "apply");
         assert_eq!(why, "the token has expired");
 
-        let broken = kube::Error::Api(
-            Status::failure("etcdserver: request timed out", "ServiceUnavailable")
-                .with_code(503)
-                .boxed(),
+        // The lab's answer to a write over the body limit, recorded.
+        let too_large = kube::Error::Api(
+            Status::failure(
+                "Request entity too large: limit is 3145728",
+                "RequestEntityTooLarge",
+            )
+            .with_code(413)
+            .boxed(),
         );
-        let ApplyOutcome::Failed { why } = classify(&broken, true) else {
-            panic!("a 503 is a labelled failure");
-        };
-        assert_eq!(why, "etcdserver: request timed out");
+        assert_eq!(
+            classify(&too_large, false),
+            ApplyOutcome::Failed {
+                why: "Request entity too large: limit is 3145728".to_string()
+            },
+            "any other refusal is a failure in the server's words"
+        );
     }
 
     // A pathological server could answer with thousands of causes; the panel

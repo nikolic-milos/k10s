@@ -253,6 +253,20 @@ impl Script {
         self
     }
 
+    // How many routes for this method and path were scripted, and how many of
+    // them were answered.
+    fn answered(&self, method: &'static str, matches: &str) -> (usize, usize) {
+        let state = self.state.lock().expect("script lock");
+        let routes = state
+            .routes
+            .iter()
+            .filter(|route| route.method == method && route.matches == matches);
+        let (scripted, used) = routes.fold((0, 0), |(scripted, used), route| {
+            (scripted + 1, used + usize::from(route.used))
+        });
+        (scripted, used)
+    }
+
     fn seen(&self) -> Vec<Seen> {
         self.state.lock().expect("script lock").seen.clone()
     }

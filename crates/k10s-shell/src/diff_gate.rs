@@ -20,6 +20,7 @@ use k10s_edit::diff::{self, Origin, Verdict};
 
 use crate::diff::Mode;
 use crate::editor::BufferStamp;
+use crate::provider::{ApplyOutcome, LiveCopy};
 
 /// Which destructive question is armed. One bit could not tell an apply from a
 /// force, and a press meant for one would answer the other.
@@ -159,6 +160,8 @@ pub(crate) struct Ready<'a> {
     pub(crate) conflicts: usize,
     /// What holds the wire, if anything.
     pub(crate) in_flight: Option<&'static str>,
+    /// The last dry run's read and answer were about different objects.
+    pub(crate) raced: bool,
 }
 
 /// Whether this press may confirm a write or must preview a force first. Every rule
@@ -218,6 +221,11 @@ pub(crate) fn prepare(wanted: Armed, at: Ready<'_>) -> Result<Preparation, Strin
     // live alone reaches a write whose payload the server never saw, defaulting
     // and admission included, which is a review of a guess.
     if !at.dry_run.is_some_and(|review| review.stamp == at.reviewed) {
+        // The server was asked; its answer compared two objects. The race's
+        // own sentence stands on the line, so this says what the press did.
+        if at.raced {
+            return Err("this comparison mixes two objects, so nothing was sent".to_string());
+        }
         return Err(
             "the server has not been asked what this would store; ctrl-alt-r asks it".to_string(),
         );
@@ -362,25 +370,41 @@ impl Sent {
     }
 }
 
-/// Whether an answer from the server is about the object the review was made of.
+/// Whether two uids name the same object.
 ///
 /// A server-side apply *creates* what is absent, so applying a document whose
 /// object was deleted between the read and the press brings it back instead of
 /// failing -- `kubectl apply`'s behaviour, and not what the person pressing the
-/// key is thinking about. The uid is what distinguishes the two, and it costs no
-/// second round trip: the answer to the apply carries it.
+/// key is thinking about. The uid is what distinguishes the two; an apply's
+/// answer and a dry run's read both carry one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Identity {
     /// Both uids are known and equal, so whatever else changed, this is the same
     /// object.
     Same,
-    /// Both are known and differ: the object the server answered about is not the
-    /// one this document was read from.
+    /// Both are known and differ: they are two objects.
     Different,
     /// One side carried no uid. Silence, not a guess: an unfounded claim that an
     /// object was replaced sends someone looking for a deletion nobody made, and
     /// the missing-field case is exactly where that claim would come from.
     Unknown,
+}
+
+/// What a dry run's read says about the object this document was opened from.
+/// Exactly one holds for a comparison, and `status_line` derives its sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Seen {
+    /// The read is the object that was opened.
+    Same,
+    /// The read is a different object: the one opened was replaced.
+    Replaced,
+    /// One side carried no uid, so nothing is claimed.
+    Unknown,
+    /// The read found no object at all, so the apply would create it.
+    Gone,
+    /// The read and the dry run's answer are about different objects: it was
+    /// replaced in the round trip between them, so the comparison mixes two.
+    Raced,
 }
 
 pub(crate) fn identity(read: Option<&str>, answered: Option<&str>) -> Identity {
@@ -408,27 +432,106 @@ pub(crate) fn recreated_note() -> &'static str {
      on a new object with a different uid"
 }
 
-/// And what a *dry run* about a different object says. Nothing has been written,
-/// so the point is not what happened but that the left-hand side of the
-/// comparison describes an object that no longer exists.
+/// And what a *dry run* says when its read found a different object than the
+/// one this document was opened from. Nothing has been written; the comparison
+/// is already against the object the server holds now, and the point is that
+/// the buffer was written against one that is gone.
 pub(crate) fn stale_object_note() -> &'static str {
-    "the server answered about a different object than this was opened from -- that one is gone, \
-     so the live side of this comparison is out of date; open the object again"
+    "the object this was opened from was replaced; this compares with the one the server holds now, \
+     and applying lands on it"
 }
 
-/// What a dry-run answer means once the comparison against it has been made:
-/// the line to show, or -- when there is no comparison -- the line to show
-/// *and* the fact that nothing was reviewed. Not two branches on a boolean,
-/// because a comparison nobody could make is not a comparison that found
-/// nothing, and reading it as one told the user that applying a document the
-/// diff had refused to review would change nothing.
-pub(crate) fn reviewed(verdict: Verdict, force: bool) -> Result<&'static str, String> {
-    match verdict {
-        Verdict::Differs | Verdict::Agreed if force => {
-            Ok("forced dry run only; ctrl-shift-s asks to take the conflicting fields")
+/// What a dry run says when its read found nothing.
+pub(crate) fn gone_note() -> &'static str {
+    "the object this was opened from is gone; applying creates it"
+}
+
+/// What a dry run says when its read and its answer are about different
+/// objects. No review is recorded from it.
+pub(crate) fn raced_note() -> &'static str {
+    "the object was replaced between this review's read and its dry run; ctrl-alt-r compares again"
+}
+
+/// The left side of a dry-run review, and what it says about the object:
+/// `opened` is the uid the editor loaded, `answered` the dry-run answer's. The
+/// left side is the object as the server held it when the dry run read it,
+/// never a copy read earlier, so a write that landed before that read, from
+/// this editor or anyone, is on this side instead of hidden in the review. An
+/// absent object is an empty document, so the review reads as a creation.
+pub(crate) fn dry_run_left(
+    opened: Option<&str>,
+    live: LiveCopy,
+    answered: Option<&str>,
+) -> (String, Seen) {
+    match live {
+        LiveCopy::Absent => (String::new(), Seen::Gone),
+        LiveCopy::Read { yaml, uid } => {
+            let seen = match (
+                identity(uid.as_deref(), answered),
+                identity(opened, uid.as_deref()),
+            ) {
+                (Identity::Different, _) => Seen::Raced,
+                (_, Identity::Same) => Seen::Same,
+                (_, Identity::Different) => Seen::Replaced,
+                (_, Identity::Unknown) => Seen::Unknown,
+            };
+            (yaml, seen)
         }
-        Verdict::Differs => Ok("ctrl-s applies this"),
-        Verdict::Agreed => Ok("the cluster already holds this; applying changes nothing"),
-        Verdict::Refused(reason) => Err(format!("the server answered, but {reason}")),
+    }
+}
+
+/// What a dry-run answer means once the comparison against it has been made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Reviewed {
+    /// The comparison is a review: it is recorded, and this line says what the
+    /// next press does.
+    Recorded(&'static str),
+    /// No comparison could be made, and this says why. A comparison nobody could
+    /// make is not one that found nothing: reading it as one told the user that
+    /// applying a document the diff had refused to review would change nothing.
+    Refused(String),
+    /// The comparison mixes two objects, so it authorises nothing; the line
+    /// derives why from [`Seen::Raced`] for as long as it stands.
+    Raced,
+}
+
+pub(crate) fn reviewed(verdict: Verdict, force: bool, seen: Seen) -> Reviewed {
+    if seen == Seen::Raced {
+        return Reviewed::Raced;
+    }
+    match verdict {
+        Verdict::Differs | Verdict::Agreed if force => Reviewed::Recorded(
+            "forced dry run only; ctrl-shift-s asks to take the conflicting fields",
+        ),
+        Verdict::Differs => Reviewed::Recorded("ctrl-s applies this"),
+        Verdict::Agreed => {
+            Reviewed::Recorded("the cluster already holds this; applying changes nothing")
+        }
+        Verdict::Refused(reason) => Reviewed::Refused(format!("the server answered, but {reason}")),
+    }
+}
+
+/// Whether the line keeps saying an apply from this view may still land: from
+/// the first real apply that went unconfirmed (so answered, or its reply dropped)
+/// for as long as the view lives. No answer that comes later, a refusal or a
+/// landed apply included, says anything about a write the server may still be
+/// holding.
+pub(crate) fn may_still_land(before: bool, dry_run: bool, answer: Option<&ApplyOutcome>) -> bool {
+    before || (!dry_run && matches!(answer, None | Some(ApplyOutcome::Unconfirmed(_))))
+}
+
+/// What the seen note says after an answer (`None` a dropped reply). A real
+/// apply that landed, or may have, can have created or replaced the object the
+/// note describes, so the note says nothing any more; a dry run or a refusal
+/// changed nothing.
+pub(crate) fn seen_after(seen: Seen, dry_run: bool, answer: Option<&ApplyOutcome>) -> Seen {
+    let may_have_written = matches!(
+        answer,
+        None | Some(ApplyOutcome::Applied { .. } | ApplyOutcome::Unconfirmed(_))
+    );
+    if !dry_run && may_have_written {
+        Seen::Unknown
+    } else {
+        seen
     }
 }

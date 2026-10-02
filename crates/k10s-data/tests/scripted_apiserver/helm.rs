@@ -1,7 +1,8 @@
 //! Helm releases read as release Secrets only, grouped newest first -- the one
 //! place the Secret rule bends, held by what the list asks the server for --
 //! and a stored revision applied back as the documents it holds, its Secret
-//! documents skipped, with that write's whole request set pinned.
+//! documents skipped, with that write's whole request set pinned, stopping at
+//! the first document that goes unconfirmed or cannot be sent.
 
 use crate::*;
 
@@ -319,10 +320,368 @@ fn a_stored_manifest_apply_patches_each_document_and_skips_the_secret() {
         (kind.as_str(), name.as_str()),
         ("ConfigMap", "rollback-probe")
     );
-    assert!(matches!(outcome, ApplyOutcome::Applied(applied) if !applied.dry_run));
+    assert!(matches!(outcome, ApplyOutcome::Applied(_)), "{outcome:?}");
     assert!(
         !format!("{report:?}").contains("PLANTED-rollback-canary"),
         "a skipped Secret's values never reach the report"
+    );
+
+    drop(runtime);
+}
+
+// Two documents, so a stop after the first shows as the second not being sent.
+const TWO_CONFIGMAPS: &str = "---\n# Source: rollback-probe/templates/first.yaml\n\
+    apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: first\ndata:\n  proof: stored\n---\n\
+    # Source: rollback-probe/templates/second.yaml\napiVersion: v1\nkind: ConfigMap\n\
+    metadata:\n  name: second\ndata:\n  proof: stored\n";
+
+// A document the server refused was not applied: the rollback goes on to the
+// next one, which may not depend on it. Only a document that may have landed,
+// or could not be sent, stops it.
+#[test]
+fn a_refused_document_does_not_stop_a_rollback() {
+    use k10s_data::apply::ApplyOutcome;
+    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::read::Fetched;
+
+    for (code, reason) in [
+        (409, "Conflict"),
+        (422, "Invalid"),
+        (413, "RequestEntityTooLarge"),
+    ] {
+        let script = Script::default();
+        script_discovery(&script);
+        script_rules_review(&script);
+        script_access_reviews(&script, true, 32);
+        script_lists(&script);
+        script.route(
+            "GET",
+            "/api/v1/namespaces/prod/secrets?",
+            200,
+            format!(
+                r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
+                release_secret(
+                    "sh.helm.release.v1.rollback-probe.v1",
+                    "rollback-probe",
+                    1,
+                    "deployed",
+                    TWO_CONFIGMAPS
+                ),
+            ),
+        );
+        script.route(
+            "PATCH",
+            "/api/v1/namespaces/prod/configmaps/first?",
+            code,
+            format!(
+                r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"refused with {code}","reason":"{reason}","code":{code}}}"#
+            ),
+        );
+        script.route(
+            "PATCH",
+            "/api/v1/namespaces/prod/configmaps/second?",
+            200,
+            r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"second","namespace":"prod","uid":"uid-second"}}"#,
+        );
+
+        let runtime = runtime();
+        let (sync, _live) = sync_on(&runtime, &script);
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader.rollback_helm_revision(
+            Some("prod".to_string()),
+            "rollback-probe".to_string(),
+            1,
+            move |fetched| {
+                let _ = tx.send(fetched);
+            },
+        );
+        let outcome = wait(&rx);
+        let Fetched::Ok(report) = outcome else {
+            panic!("{code}: the rollback must resolve: {outcome:?}");
+        };
+        assert_eq!(report.documents.len(), 2, "{code}: {:?}", report.documents);
+        assert!(
+            matches!(&report.documents[0], DocumentRollback::Applied { name, outcome, .. }
+                if name == "first" && !matches!(outcome, ApplyOutcome::Applied(_) | ApplyOutcome::Unconfirmed { .. })),
+            "{code}: the first is refused: {:?}",
+            report.documents[0]
+        );
+        assert!(
+            matches!(&report.documents[1], DocumentRollback::Applied { name, outcome: ApplyOutcome::Applied(_), .. }
+                if name == "second"),
+            "{code}: the second is still sent: {:?}",
+            report.documents[1]
+        );
+        assert_eq!(
+            script.requests_for("/configmaps/second?").len(),
+            1,
+            "{code}: the second document is sent once"
+        );
+        drop(runtime);
+    }
+}
+
+// A document that could not be sent (its credential failed, or no connection
+// was made) means every document after it would fail the same way, so the
+// rollback stops there too, and names why it did not send the rest.
+#[test]
+fn a_rollback_stops_at_the_first_document_that_could_not_be_sent() {
+    use k10s_data::apply::ApplyOutcome;
+    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/secrets?",
+        200,
+        format!(
+            r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
+            release_secret(
+                "sh.helm.release.v1.rollback-probe.v1",
+                "rollback-probe",
+                1,
+                "deployed",
+                TWO_CONFIGMAPS
+            ),
+        ),
+    );
+    script.route_unsent("PATCH", "/api/v1/namespaces/prod/configmaps/first?");
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.rollback_helm_revision(
+        Some("prod".to_string()),
+        "rollback-probe".to_string(),
+        1,
+        move |fetched| {
+            let _ = tx.send(fetched);
+        },
+    );
+    let outcome = wait(&rx);
+    let Fetched::Ok(report) = outcome else {
+        panic!("the rollback must resolve: {outcome:?}");
+    };
+    assert_eq!(report.documents.len(), 2, "{:?}", report.documents);
+    assert!(
+        matches!(&report.documents[0], DocumentRollback::Applied { name, outcome: ApplyOutcome::NotSent { .. }, .. }
+            if name == "first"),
+        "{:?}",
+        report.documents[0]
+    );
+    assert_eq!(
+        report.documents[1],
+        DocumentRollback::Skipped {
+            name: "second".to_string(),
+            kind: "ConfigMap".to_string(),
+            why: "not sent after an earlier document could not be sent".to_string(),
+        }
+    );
+    assert!(
+        script
+            .requests_for("/api/v1/namespaces/prod/configmaps/second")
+            .is_empty(),
+        "the second is never asked for"
+    );
+    drop(runtime);
+}
+
+// A document answered with a 5xx may have landed, so the rollback stops there:
+// the documents after it would go on top of a write nobody can see, and a
+// server that stopped answering would be asked once per document. The 500 is
+// the lab's answer for a write it stored (C1/lab/after-storage). The second
+// ConfigMap has no route, so sending it would show as a third request.
+#[test]
+fn a_rollback_stops_at_the_first_document_that_may_have_landed() {
+    use k10s_data::apply::ApplyOutcome;
+    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::read::Fetched;
+
+    for (code, message, reason) in [
+        (
+            504,
+            "Timeout: request did not complete within requested timeout",
+            r#","reason":"Timeout""#,
+        ),
+        (
+            500,
+            "conversion webhook for closeout.k10s.test/v1, Kind=Widget failed: this webhook refuses every conversion to v2",
+            "",
+        ),
+        (302, "answered with status 302 and no Location", ""),
+        (303, "answered with status 303 and no Location", ""),
+        (307, "answered with status 307 and no Location", ""),
+    ] {
+        let script = Script::default();
+        script_discovery(&script);
+        script_rules_review(&script);
+        script_access_reviews(&script, true, 32);
+        script_lists(&script);
+        script.route(
+            "GET",
+            "/api/v1/namespaces/prod/secrets?",
+            200,
+            format!(
+                r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
+                release_secret(
+                    "sh.helm.release.v1.rollback-probe.v1",
+                    "rollback-probe",
+                    1,
+                    "deployed",
+                    TWO_CONFIGMAPS
+                ),
+            ),
+        );
+        script.route(
+            "PATCH",
+            "/api/v1/namespaces/prod/configmaps/first?",
+            code,
+            if (300..400).contains(&code) {
+                String::new()
+            } else {
+                format!(
+                    r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"{message}"{reason},"code":{code}}}"#
+                )
+            },
+        );
+
+        let runtime = runtime();
+        let (sync, _live) = sync_on(&runtime, &script);
+        let before = script.seen().len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader.rollback_helm_revision(
+            Some("prod".to_string()),
+            "rollback-probe".to_string(),
+            1,
+            move |fetched| {
+                let _ = tx.send(fetched);
+            },
+        );
+        let outcome = wait(&rx);
+        let Fetched::Ok(report) = outcome else {
+            panic!("the rollback must resolve: {outcome:?}");
+        };
+
+        let sent: Vec<_> = script.seen()[before..]
+            .iter()
+            .filter(|seen| !seen.path.contains("watch=true"))
+            .cloned()
+            .collect();
+        assert_eq!(sent.len(), 2, "one list and one apply: {sent:?}");
+        assert_eq!(sent[0].method, "GET");
+        assert!(sent[0].path.starts_with("/api/v1/namespaces/prod/secrets?"));
+        assert_eq!(sent[1].method, "PATCH");
+        assert_eq!(
+            sent[1].path,
+            "/api/v1/namespaces/prod/configmaps/first?&fieldManager=k10s&fieldValidation=Strict"
+        );
+        assert_eq!(sent[1].accept, "application/json");
+        assert_eq!(sent[1].content_type, "application/apply-patch+yaml");
+        assert_eq!(
+            sent[1].body,
+            "# Source: rollback-probe/templates/first.yaml\napiVersion: v1\nkind: ConfigMap\n\
+         metadata:\n  name: first\ndata:\n  proof: stored\n"
+        );
+        assert_eq!(
+            report.documents,
+            vec![
+                DocumentRollback::Applied {
+                    name: "first".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    outcome: ApplyOutcome::Unconfirmed {
+                        why: message.to_string()
+                    },
+                },
+                DocumentRollback::Skipped {
+                    name: "second".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    why: "not sent after an earlier document went unconfirmed".to_string(),
+                },
+            ]
+        );
+
+        drop(runtime);
+    }
+}
+
+// The other arm of the apply's classification: a connection lost after the
+// first document was sent stops the rollback the same way a 5xx does.
+#[test]
+fn a_rollback_stops_at_a_document_whose_connection_is_lost() {
+    use k10s_data::apply::ApplyOutcome;
+    use k10s_data::helm_reveal::DocumentRollback;
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    script_discovery(&script);
+    script_rules_review(&script);
+    script_access_reviews(&script, true, 32);
+    script_lists(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/prod/secrets?",
+        200,
+        format!(
+            r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
+            release_secret(
+                "sh.helm.release.v1.rollback-probe.v1",
+                "rollback-probe",
+                1,
+                "deployed",
+                TWO_CONFIGMAPS
+            ),
+        ),
+    );
+    script.route_lost("PATCH", "/api/v1/namespaces/prod/configmaps/first?");
+
+    let runtime = runtime();
+    let (sync, _live) = sync_on(&runtime, &script);
+    let before = script.seen().len();
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.rollback_helm_revision(
+        Some("prod".to_string()),
+        "rollback-probe".to_string(),
+        1,
+        move |fetched| {
+            let _ = tx.send(fetched);
+        },
+    );
+    let outcome = wait(&rx);
+    let Fetched::Ok(report) = outcome else {
+        panic!("the rollback must resolve: {outcome:?}");
+    };
+    let patches: Vec<_> = script.seen()[before..]
+        .iter()
+        .filter(|seen| seen.method == "PATCH")
+        .cloned()
+        .collect();
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    let [
+        DocumentRollback::Applied {
+            name,
+            outcome: ApplyOutcome::Unconfirmed { why },
+            ..
+        },
+        DocumentRollback::Skipped {
+            name: skipped,
+            why: not_sent,
+            ..
+        },
+    ] = report.documents.as_slice()
+    else {
+        panic!("the first document is unconfirmed and the second not sent: {report:?}");
+    };
+    assert_eq!(name, "first");
+    assert!(why.contains("the scripted connection was lost"), "{why}");
+    assert_eq!(skipped, "second");
+    assert_eq!(
+        not_sent,
+        "not sent after an earlier document went unconfirmed"
     );
 
     drop(runtime);

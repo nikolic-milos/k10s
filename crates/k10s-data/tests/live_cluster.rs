@@ -267,11 +267,12 @@ fn table(reader: &Reader, kind: KindId) -> k10s_data::browse::TablePage {
 }
 
 fn apply(reader: &Reader, request: ApplyRequest) -> ApplyOutcome {
+    let requests = if request.dry_run { 2 } else { 1 };
     let (tx, rx) = std::sync::mpsc::channel();
     reader.apply(request, move |outcome| {
         let _ = tx.send(outcome);
     });
-    wait_interactive(&rx, 1)
+    wait_interactive(&rx, requests)
 }
 
 fn request(kind: KindId, name: &str, yaml: String, dry_run: bool, force: bool) -> ApplyRequest {
@@ -405,10 +406,9 @@ fn a_client_side_applied_object_yields_a_three_way_base_and_a_sendable_payload()
             false,
         ),
     );
-    let ApplyOutcome::Applied(applied) = outcome else {
+    let ApplyOutcome::DryRun(applied) = outcome else {
         panic!("a real server accepts the pruned payload as a dry run: {outcome:?}");
     };
-    assert!(applied.dry_run);
     assert!(
         applied.yaml.contains("greeting: hello"),
         "the server echoes what it would store:\n{}",
@@ -467,7 +467,7 @@ fn a_stale_resource_version_in_the_body_is_a_precondition_the_prune_exists_to_av
         ),
     );
     assert!(
-        matches!(outcome, ApplyOutcome::Applied(_)),
+        matches!(outcome, ApplyOutcome::DryRun(_)),
         "the pruned payload is accepted: {outcome:?}"
     );
 }
@@ -479,6 +479,22 @@ fn resource_version(yaml: &str) -> String {
         .expect("the document carries a resourceVersion")
 }
 
+// The document with its `retries` value set, whatever it was.
+fn with_retries(yaml: &str, value: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    for line in yaml.lines() {
+        match line.trim_start().strip_prefix("retries:") {
+            Some(_) => {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push_str(&format!("{indent}retries: \"{value}\""));
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 // A real field-manager conflict, produced by a second manager taking a field,
 // and the message shape `manager_of` reads the manager out of.
 #[test]
@@ -487,9 +503,11 @@ fn a_field_manager_conflict_is_previewed_before_force_takes_the_field() {
     let (plane, sync) = connect(None);
     let configmaps = kind(&sync.reader, "configmaps");
 
-    // k10s takes ownership of the field first, by applying it as it stands.
+    // k10s takes ownership of the field first, at a known value: forced, so
+    // whatever an earlier run left and whoever holds the field now, it starts
+    // from the same place.
     let live = manifest(&sync.reader, configmaps.id, "settings");
-    let built = payload(&live.yaml, live.status_subresource);
+    let built = payload(&with_retries(&live.yaml, "3"), live.status_subresource);
     let outcome = apply(
         &sync.reader,
         request(
@@ -497,24 +515,33 @@ fn a_field_manager_conflict_is_previewed_before_force_takes_the_field() {
             "settings",
             sent(&built).to_string(),
             false,
-            false,
+            true,
         ),
     );
     assert!(
         matches!(outcome, ApplyOutcome::Applied(_)),
-        "the first apply establishes k10s as a manager: {outcome:?}"
+        "the first apply establishes k10s as the field's manager: {outcome:?}"
+    );
+
+    // The editor's copy is read now, before the rival's apply: the buffer is
+    // made from a copy the cluster then moves past, which is the case the dry
+    // run's own read exists for.
+    let copy = manifest(&sync.reader, configmaps.id, "settings");
+    assert!(
+        copy.yaml.contains("retries: \"3\""),
+        "the copy holds k10s's value, not the rival's:\n{}",
+        copy.yaml
     );
 
     // A rival manager takes the same field, forcing it away from k10s.
     rival_apply(&plane, &namespace(), "9");
 
-    let live = manifest(&sync.reader, configmaps.id, "settings");
-    let contested = live.yaml.replace("retries: \"9\"", "retries: \"5\"");
+    let contested = with_retries(&copy.yaml, "5");
     assert_ne!(
-        contested, live.yaml,
+        contested, copy.yaml,
         "the buffer changes the contested field"
     );
-    let built = payload(&contested, live.status_subresource);
+    let built = payload(&contested, copy.status_subresource);
     let outcome = apply(
         &sync.reader,
         request(
@@ -553,11 +580,16 @@ fn a_field_manager_conflict_is_previewed_before_force_takes_the_field() {
             true,
         ),
     );
-    let ApplyOutcome::Applied(preview) = preview else {
+    let ApplyOutcome::DryRun(preview) = preview else {
         panic!("the forced dry run provides a review: {preview:?}");
     };
-    assert!(preview.dry_run);
     assert!(preview.yaml.contains("retries: \"5\""), "{}", preview.yaml);
+    // The review's left side is the object as the server holds it, read with
+    // the dry run: the rival's value, which the buffer's copy never had.
+    let k10s_data::apply::Live::Read { yaml: before, .. } = &preview.live else {
+        panic!("a dry run carries its read: {:?}", preview.live);
+    };
+    assert!(before.contains("retries: \"9\""), "{before}");
     let unchanged = manifest(&sync.reader, configmaps.id, "settings");
     assert!(
         unchanged.yaml.contains("retries: \"9\""),
@@ -663,6 +695,30 @@ fn an_unknown_field_is_refused_by_name_rather_than_dropped() {
         !labelled.starts_with("ApiError"),
         "and it is the server's own sentence, not a flattened error chain: {labelled}"
     );
+
+    // A real apply of it gets the same 500 with no reason, the answer the same
+    // server gives a write it has stored, so it is unconfirmed in those words:
+    // a 5xx is no verdict. The object is untouched.
+    let before = manifest(&sync.reader, configmaps.id, "settings");
+    let outcome = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            format!("{}dataz:\n  oops: yes\n", sent(&built)),
+            false,
+            false,
+        ),
+    );
+    let ApplyOutcome::Unconfirmed { why } = &outcome else {
+        panic!("a real apply answered 500 is unconfirmed, not {outcome:?}");
+    };
+    assert!(why.contains("field not declared in schema"), "{why}");
+    assert_eq!(
+        manifest(&sync.reader, configmaps.id, "settings").yaml,
+        before.yaml,
+        "nothing was written"
+    );
 }
 
 // The hard rule, against real data rather than a fixture. A Secret written by
@@ -719,7 +775,7 @@ fn a_secrets_values_never_reach_a_document_by_any_of_the_three_routes() {
                 false,
             ),
         );
-        let ApplyOutcome::Applied(applied) = &outcome else {
+        let ApplyOutcome::DryRun(applied) = &outcome else {
             panic!("the dry run resolves: {outcome:?}");
         };
         assert!(
@@ -731,6 +787,17 @@ fn a_secrets_values_never_reach_a_document_by_any_of_the_three_routes() {
             applied.yaml.starts_with("# values withheld"),
             "the note that says so leads it:\n{}",
             applied.yaml
+        );
+        // And the read the dry run makes with it, the review's left side, is
+        // the same metadata-only document.
+        let k10s_data::apply::Live::Read { yaml: read, .. } = &applied.live else {
+            panic!("a dry run carries its read: {:?}", applied.live);
+        };
+        assert!(
+            !read.contains("plaintext-in-the-annotation")
+                && !read.contains("super-secret-value")
+                && read.starts_with("# values withheld"),
+            "no value in the dry run's read either:\n{read}"
         );
     }
 }
@@ -812,18 +879,20 @@ fn secret_apply_reviews_metadata_and_preserves_the_stored_value() {
             &sync.reader,
             request(secrets.id, &probe.name, yaml.clone(), dry_run, false),
         );
-        let ApplyOutcome::Applied(applied) = outcome else {
-            panic!("the metadata apply succeeds: {outcome:?}");
-        };
-        assert_eq!(applied.dry_run, dry_run);
-        assert_eq!(applied.uid, original.metadata.uid);
-        assert!(applied.yaml.contains("values withheld"), "{}", applied.yaml);
-        assert!(applied.yaml.contains("kind: Secret"), "{}", applied.yaml);
-        assert!(
-            !applied.yaml.contains(SECRET_PROBE_VALUE),
-            "{}",
-            applied.yaml
-        );
+        // A real apply's answer is not rendered, only its uid read; the dry
+        // run's is what a person reviews.
+        match outcome {
+            ApplyOutcome::DryRun(dry) if dry_run => {
+                assert_eq!(dry.uid, original.metadata.uid);
+                assert!(dry.yaml.contains("values withheld"), "{}", dry.yaml);
+                assert!(dry.yaml.contains("kind: Secret"), "{}", dry.yaml);
+                assert!(!dry.yaml.contains(SECRET_PROBE_VALUE), "{}", dry.yaml);
+            }
+            ApplyOutcome::Applied(applied) if !dry_run => {
+                assert_eq!(applied.uid, original.metadata.uid);
+            }
+            other => panic!("the metadata apply succeeds: {other:?}"),
+        }
         let stored = probe.read().expect("the fixture still exists");
         assert_eq!(
             stored.data, original.data,
@@ -966,10 +1035,9 @@ fn a_kind_with_a_status_subresource_applies_without_its_status() {
         &sync.reader,
         request(deployments.id, "web", sent(&built).to_string(), true, false),
     );
-    let ApplyOutcome::Applied(applied) = outcome else {
+    let ApplyOutcome::DryRun(applied) = outcome else {
         panic!("the server accepts a Deployment applied without status: {outcome:?}");
     };
-    assert!(applied.dry_run);
     let returned = payload(&applied.yaml, live.status_subresource);
     assert_eq!(
         sent(&returned),
@@ -1102,10 +1170,9 @@ fn a_custom_resource_is_discovered_listed_and_applied_like_any_other_kind() {
             false,
         ),
     );
-    let ApplyOutcome::Applied(applied) = &outcome else {
+    let ApplyOutcome::DryRun(applied) = &outcome else {
         panic!("a dry run against a custom resource resolves: {outcome:?}");
     };
-    assert!(applied.dry_run, "nothing was stored");
     assert!(
         applied.yaml.contains("flavour: vanilla"),
         "and the server's answer is the object it would keep:\n{}",

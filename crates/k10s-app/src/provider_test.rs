@@ -167,29 +167,57 @@ fn a_manifest_crosses_field_for_field_including_an_absent_uid() {
 fn every_apply_arm_keeps_what_the_review_reads() {
     use k10s_data::apply::ApplyOutcome as Plane;
 
+    // A dry run's own read of the object is the review's left side, so it has
+    // to cross whole, the absent case included.
+    for (read, crossed) in [
+        (
+            k10s_data::apply::Live::Read {
+                yaml: "l".to_string(),
+                uid: Some("abc".to_string()),
+            },
+            k10s_shell::LiveCopy::Read {
+                yaml: "l".to_string(),
+                uid: Some("abc".to_string()),
+            },
+        ),
+        (k10s_data::apply::Live::Absent, k10s_shell::LiveCopy::Absent),
+    ] {
+        match apply_outcome(Plane::DryRun(k10s_data::apply::DryRun {
+            yaml: "y".to_string(),
+            uid: Some("abc".to_string()),
+            live: read,
+        })) {
+            k10s_shell::ApplyOutcome::DryRun { yaml, uid, live } => {
+                assert_eq!(
+                    (yaml.as_str(), uid.as_deref(), live),
+                    ("y", Some("abc"), crossed)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // A real apply crosses as a real apply, with the uid that says which object
+    // it landed on.
     match apply_outcome(Plane::Applied(k10s_data::apply::Applied {
-        yaml: "y".to_string(),
-        dry_run: true,
         uid: Some("abc".to_string()),
     })) {
-        k10s_shell::ApplyOutcome::Applied { yaml, dry_run, uid } => {
-            assert_eq!(
-                (yaml.as_str(), dry_run, uid.as_deref()),
-                ("y", true, Some("abc"))
-            );
-        }
+        k10s_shell::ApplyOutcome::Applied { uid } => assert_eq!(uid.as_deref(), Some("abc")),
         other => panic!("{other:?}"),
     }
 
-    // A real apply whose answer would not render is still a write that
-    // happened; dry_run is what lets the review say which.
     match apply_outcome(Plane::Unrendered(k10s_data::apply::Unrendered {
-        dry_run: false,
         why: "too deep".to_string(),
     })) {
-        k10s_shell::ApplyOutcome::Unrendered { dry_run, why } => {
-            assert!(!dry_run);
-            assert_eq!(why, "too deep");
+        k10s_shell::ApplyOutcome::Unrendered { why } => assert_eq!(why, "too deep"),
+        other => panic!("{other:?}"),
+    }
+
+    // A real apply that never left crosses as the failure it is, saying so.
+    match apply_outcome(Plane::NotSent {
+        why: "exec credential plugin failed".to_string(),
+    }) {
+        k10s_shell::ApplyOutcome::Failed(why) => {
+            assert_eq!(why, "nothing was sent: exec credential plugin failed")
         }
         other => panic!("{other:?}"),
     }
@@ -239,6 +267,14 @@ fn every_apply_arm_keeps_what_the_review_reads() {
         k10s_shell::ApplyOutcome::Denied { what, why } => {
             assert_eq!((what, why.as_str()), ("apply", "forbidden"));
         }
+        other => panic!("{other:?}"),
+    }
+    // A write that may have landed must not cross as a failure, whose contract
+    // is that nothing was written: its words and the standing note differ.
+    match apply_outcome(Plane::Unconfirmed {
+        why: "no answer within 35 s".to_string(),
+    }) {
+        k10s_shell::ApplyOutcome::Unconfirmed(why) => assert_eq!(why, "no answer within 35 s"),
         other => panic!("{other:?}"),
     }
     match apply_outcome(Plane::Failed {
@@ -534,6 +570,38 @@ fn a_helm_rollback_report_keeps_the_not_helm_rollback_note() {
             assert_eq!(note, k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
             assert_eq!(lines[0], k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
         }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_rollback_names_the_document_that_may_have_landed_and_the_ones_not_sent() {
+    use k10s_data::helm_reveal::DocumentRollback;
+    let report = k10s_data::helm_reveal::RollbackReport {
+        note: k10s_data::helm_reveal::NOT_HELM_ROLLBACK,
+        documents: vec![
+            DocumentRollback::Applied {
+                name: "web".to_string(),
+                kind: "Deployment".to_string(),
+                outcome: k10s_data::apply::ApplyOutcome::Unconfirmed {
+                    why: "no answer within 35 s".to_string(),
+                },
+            },
+            DocumentRollback::Skipped {
+                name: "settings".to_string(),
+                kind: "ConfigMap".to_string(),
+                why: "not sent after an earlier document went unconfirmed".to_string(),
+            },
+        ],
+    };
+    match helm_rollback_outcome(Fetched::Ok(report)) {
+        k10s_shell::HelmRollbackOutcome::Report { lines, .. } => assert_eq!(
+            lines[2..],
+            [
+                "Deployment web: it may have landed: no answer within 35 s",
+                "ConfigMap settings: skipped (not sent after an earlier document went unconfirmed)",
+            ]
+        ),
         other => panic!("{other:?}"),
     }
 }

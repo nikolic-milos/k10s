@@ -883,13 +883,18 @@ fn manifest_outcome(
 fn apply_outcome(outcome: k10s_data::apply::ApplyOutcome) -> k10s_shell::ApplyOutcome {
     use k10s_data::apply::ApplyOutcome;
     match outcome {
-        ApplyOutcome::Applied(applied) => k10s_shell::ApplyOutcome::Applied {
-            yaml: applied.yaml,
-            dry_run: applied.dry_run,
-            uid: applied.uid,
+        ApplyOutcome::Applied(applied) => k10s_shell::ApplyOutcome::Applied { uid: applied.uid },
+        ApplyOutcome::DryRun(dry) => k10s_shell::ApplyOutcome::DryRun {
+            yaml: dry.yaml,
+            uid: dry.uid,
+            live: match dry.live {
+                k10s_data::apply::Live::Read { yaml, uid } => {
+                    k10s_shell::LiveCopy::Read { yaml, uid }
+                }
+                k10s_data::apply::Live::Absent => k10s_shell::LiveCopy::Absent,
+            },
         },
         ApplyOutcome::Unrendered(unrendered) => k10s_shell::ApplyOutcome::Unrendered {
-            dry_run: unrendered.dry_run,
             why: unrendered.why,
         },
         ApplyOutcome::Conflict {
@@ -912,6 +917,10 @@ fn apply_outcome(outcome: k10s_data::apply::ApplyOutcome) -> k10s_shell::ApplyOu
             k10s_shell::ApplyOutcome::Rejected { message, causes }
         }
         ApplyOutcome::Denied { what, why } => k10s_shell::ApplyOutcome::Denied { what, why },
+        ApplyOutcome::Unconfirmed { why } => k10s_shell::ApplyOutcome::Unconfirmed(why),
+        ApplyOutcome::NotSent { why } => {
+            k10s_shell::ApplyOutcome::Failed(format!("nothing was sent: {why}"))
+        }
         ApplyOutcome::Failed { why } => k10s_shell::ApplyOutcome::Failed(why),
     }
 }
@@ -1550,18 +1559,20 @@ fn helm_diff_outcome(fetched: Fetched<String>) -> k10s_shell::DocOutcome {
 fn apply_line(outcome: &k10s_data::apply::ApplyOutcome) -> String {
     use k10s_data::apply::ApplyOutcome;
     match outcome {
-        ApplyOutcome::Applied(applied) => {
-            if applied.dry_run {
-                "dry-run applied".to_string()
-            } else {
-                "applied".to_string()
-            }
+        ApplyOutcome::Applied(_) => "applied".to_string(),
+        ApplyOutcome::DryRun(_) => "dry-run applied".to_string(),
+        ApplyOutcome::Unrendered(unrendered) => {
+            format!(
+                "accepted, but its answer cannot be shown ({})",
+                unrendered.why
+            )
         }
-        ApplyOutcome::Unrendered(unrendered) => format!("applied ({})", unrendered.why),
         ApplyOutcome::Conflict { message, .. } => format!("conflict: {message}"),
         ApplyOutcome::Stale { message } => format!("stale: {message}"),
         ApplyOutcome::Rejected { message, .. } => format!("rejected: {message}"),
         ApplyOutcome::Denied { what, why } => format!("{what}: {why}"),
+        ApplyOutcome::Unconfirmed { why } => format!("it may have landed: {why}"),
+        ApplyOutcome::NotSent { why } => format!("nothing was sent: {why}"),
         ApplyOutcome::Failed { why } => why.clone(),
     }
 }

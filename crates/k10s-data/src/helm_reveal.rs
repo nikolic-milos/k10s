@@ -14,10 +14,11 @@
 //! Diffing two revisions compares those scratch buffers and returns the diff
 //! text as an owned `String`. That string is the action's result, not an
 //! inventory field. Rollback is server-side apply of the stored manifest
-//! documents with `fieldManager=k10s`. It is not `helm rollback`: hooks do
-//! not run, and the outcome says so. Chart rendering still needs Go templates
-//! and Sprig; if a `helm` binary is on PATH this module will name its path,
-//! and if it is not the absence is labelled rather than approximated.
+//! documents with `fieldManager=k10s`, stopping at the first document that
+//! goes unconfirmed or cannot be sent. It is not `helm rollback`: hooks do not
+//! run, and the outcome says so. Chart rendering still needs Go templates and Sprig; if a
+//! `helm` binary is on PATH this module will name its path, and if it is not
+//! the absence is labelled rather than approximated.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -291,8 +292,9 @@ pub fn diff_values(from: &RevealedRevision, to: &RevealedRevision) -> String {
     )
 }
 
-/// Server-side apply of the stored manifest. Not Helm rollback: hooks will
-/// not run.
+/// Server-side apply of the stored manifest, one document at a time, stopping
+/// at the first that goes unconfirmed or cannot be sent. Not Helm rollback:
+/// hooks will not run.
 pub async fn rollback(
     client: &Client,
     targets: &[KindTarget],
@@ -314,21 +316,43 @@ pub async fn rollback(
         }]);
     }
     let mut documents = Vec::new();
+    // A document whose apply went unconfirmed may have landed. Later documents
+    // can depend on it (a namespace before its objects, a CRD before its resources, a
+    // ConfigMap before the Deployment that mounts it), so going on can turn one
+    // unknown into a run of confusing failures; a server that stopped answering
+    // would cost a deadline per document; and a rollback can be pressed again
+    // once someone has looked. So it stops there, and at a document that could
+    // not be sent, since every one after it would fail the same way. A drain
+    // goes on after an answer that is no verdict because each eviction is
+    // checked against its own pod's budget.
+    let mut stopped = None;
     for item in planned {
         match item {
             Planned::Skip { name, kind, why } => {
                 documents.push(DocumentRollback::Skipped { name, kind, why });
             }
-            Planned::Apply(request) => {
-                let name = request.name.clone();
-                let kind = kind_name(targets, request.kind);
-                let outcome = apply::apply(client, targets, &request).await;
-                documents.push(DocumentRollback::Applied {
-                    name,
-                    kind,
-                    outcome,
-                });
-            }
+            Planned::Apply(request) => match stopped {
+                Some(after) => documents.push(DocumentRollback::Skipped {
+                    kind: kind_name(targets, request.kind),
+                    name: request.name,
+                    why: format!("not sent after an earlier document {after}"),
+                }),
+                None => {
+                    let name = request.name.clone();
+                    let kind = kind_name(targets, request.kind);
+                    let outcome = apply::apply(client, targets, &request).await;
+                    stopped = match outcome {
+                        ApplyOutcome::Unconfirmed { .. } => Some("went unconfirmed"),
+                        ApplyOutcome::NotSent { .. } => Some("could not be sent"),
+                        _ => None,
+                    };
+                    documents.push(DocumentRollback::Applied {
+                        name,
+                        kind,
+                        outcome,
+                    });
+                }
+            },
         }
     }
     RollbackReport::wrap(documents)

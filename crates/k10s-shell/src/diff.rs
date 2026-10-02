@@ -9,6 +9,11 @@
 //! is handed the payload with `?dryRun=All`, and what comes back is what it
 //! *would* store, defaulting and admission webhooks included, so the diff is
 //! against the real outcome rather than a client's guess at merge semantics.
+//! Its left side is the object as the server holds it, read with the dry run,
+//! never the copy the editor loaded: a write that landed since, an apply of
+//! this view's that went unconfirmed included, shows there instead of hiding
+//! in the review. The local comparison is against the loaded copy and
+//! authorises nothing.
 //!
 //! An apply needs a server dry run and two deliberate presses. After an
 //! ownership conflict, the first force press asks for a forced dry run. Its
@@ -46,8 +51,9 @@ use k10s_edit::diff::{self, Origin, Side, Verdict};
 use k10s_theme::Theme;
 
 use crate::diff_gate::{
-    ApplyGate, Armed, Flight, Identity, Keepable, Preparation, Ready, Review, Sent, Step, identity,
-    kept_note, landed_note, prepare, refuse_keep, reviewed, stale_object_note,
+    ApplyGate, Armed, Flight, Keepable, Preparation, Ready, Review, Reviewed, Seen, Sent, Step,
+    dry_run_left, gone_note, kept_note, landed_note, may_still_land, prepare, raced_note,
+    refuse_keep, reviewed, seen_after, stale_object_note,
 };
 use crate::editor::{BufferStamp, DiffSources, EditorView};
 use crate::provider::{
@@ -69,7 +75,8 @@ pub(crate) const MAX_SHOWN_CAUSES: usize = 12;
 pub enum Mode {
     /// Live, last-applied and the buffer, from the editor alone.
     Local,
-    /// Live against what the server answered it would store.
+    /// The object as the dry run read it against what the server answered it
+    /// would store.
     DryRun,
 }
 
@@ -493,13 +500,15 @@ pub struct DiffView {
     // could not tell a document from its replacement, because a reload restarts
     // the count.
     stamp: BufferStamp,
-    // Which object the live document was read from, and which object the server
-    // last answered a dry run about. They differ when the object was deleted or
-    // replaced since the read, which is the difference between an apply that
-    // updates and one that creates. Both come from a server response; neither is
-    // the uid of whatever was selected to open the editor.
+    // The object this editor read when the comparison opened, and what the
+    // latest dry run's read said about it: the same one, a replacement, or none
+    // at all. Both identities come from a server response.
     uid: Option<String>,
-    answered: Option<String>,
+    seen: Seen,
+    // A real apply from this view went unconfirmed and may still land. Shown on
+    // the status line for as long as the view lives ([`may_still_land`]), so no
+    // one-shot message, and no later answer, can erase it.
+    unknown_write: bool,
     patchable: bool,
     status: Option<String>,
     gate: ApplyGate,
@@ -533,7 +542,8 @@ impl DiffView {
             payload: k10s_edit::Payload::default(),
             stamp: sources.stamp,
             uid: None,
-            answered: None,
+            seen: Seen::Unknown,
+            unknown_write: false,
             patchable: false,
             status: None,
             gate: ApplyGate::default(),
@@ -592,7 +602,7 @@ impl DiffView {
         self.stamp = stamp;
         self.flight.forget_review();
         self.uid = uid;
-        self.answered = None;
+        self.seen = Seen::Unknown;
         self.patchable = patchable;
         self.state.set(Mode::Local, live, base, buffer);
         self.status = None;
@@ -630,6 +640,7 @@ impl DiffView {
             dry_run: self.flight.reviewed(),
             conflicts: self.conflict.len(),
             in_flight: self.flight.busy().then(|| self.flight.holder()),
+            raced: self.seen == Seen::Raced,
         }
     }
 
@@ -768,25 +779,56 @@ impl DiffView {
             let _ = tx.send(outcome);
         });
         self.provider.apply(&request, reply);
+        let sender = self.editor.clone();
         cx.spawn(async move |this, cx| {
             let answer = rx.await;
+            // What landed is re-read by the editor that sent it, whether or not
+            // this view is still open, and never by whichever editor a reused
+            // tab points at now: its buffer is someone else's work.
+            let reload = match &answer {
+                Ok(ApplyOutcome::Applied { .. }) => Some(
+                    sender
+                        .update(cx, |editor, cx| {
+                            if editor.reload_if_applied(sent.stamp, cx) {
+                                Reload::Done
+                            } else {
+                                Reload::Moved
+                            }
+                        })
+                        .unwrap_or(Reload::Gone),
+                ),
+                _ => None,
+            };
+            let unconfirmed = matches!(answer, Err(_) | Ok(ApplyOutcome::Unconfirmed(_)));
             let _ = this.update(cx, |this, cx| {
                 // The wire is released by whichever request holds it, on every
                 // path out of the await: a reply that is dropped rather than
                 // sent would otherwise strand the ticket, which is the exact
                 // failure the ticket replaced a flag to fix.
                 let owed = this.flight.release(ticket);
-                let speaks = sent.still_speaks(this.generation);
-                match answer {
-                    Ok(outcome) if speaks => this.settle(outcome, &sent, cx),
-                    Ok(_) => {}
-                    Err(_) if speaks => {
-                        this.status = Some(dropped_note(sent.dry_run).to_string());
+                if sent.still_speaks(this.generation) {
+                    // One rule for an answer and for a reply dropped unsent,
+                    // which is `None`: what it leaves standing about this
+                    // view's writes and about the object.
+                    let answered = answer.as_ref().ok();
+                    this.unknown_write = may_still_land(this.unknown_write, sent.dry_run, answered);
+                    this.seen = seen_after(this.seen, sent.dry_run, answered);
+                    match answer {
+                        Ok(outcome) => this.settle(outcome, &sent, reload),
+                        Err(_) => this.status = Some(dropped_note(sent.dry_run).to_string()),
                     }
-                    Err(_) => {}
                 }
-                if owed {
+                // A comparison asked for while a real apply was out is not sent
+                // after it: that apply's answer is the one sentence the person
+                // must read, and the comparison would replace it a round trip
+                // later. After a dry run, the owed one simply goes.
+                if owed && sent.dry_run {
                     this.send(true, false, cx);
+                } else if owed {
+                    this.status = this
+                        .status
+                        .take()
+                        .map(|status| owed_not_sent(status, unconfirmed));
                 }
                 cx.notify();
             });
@@ -794,7 +836,8 @@ impl DiffView {
         .detach();
     }
 
-    fn settle(&mut self, outcome: ApplyOutcome, sent: &Sent, cx: &mut Context<Self>) {
+    // `reload` is what the sending editor did with a real apply that landed.
+    fn settle(&mut self, outcome: ApplyOutcome, sent: &Sent, reload: Option<Reload>) {
         // A forced preview takes no fields. Keep the named owners for the
         // confirmation that follows it, including when the preview must retry.
         if !sent.dry_run || !sent.force {
@@ -804,52 +847,47 @@ impl DiffView {
             self.flight.forget_review();
         }
         match outcome {
-            ApplyOutcome::Applied { yaml, dry_run, uid } if dry_run => {
-                // Whose object the server answered about, before anything is said
-                // about what it holds: `status_line` derives the warning from it
-                // for as long as it stands, rather than printing it once into a
-                // message the next action overwrites.
-                self.answered = uid;
-                let live = std::mem::take(&mut self.state.live);
-                self.state.set(Mode::DryRun, live, None, yaml);
-                self.status = Some(match reviewed(self.state.diff().verdict(), sent.force) {
-                    Ok(note) => {
+            ApplyOutcome::DryRun { yaml, uid, live } => {
+                // The left side is the object as the server holds it now, read
+                // with the dry run, and what that read says about the object this
+                // was opened from stands in `status_line` for as long as the
+                // comparison does.
+                let (left, seen) = dry_run_left(self.uid.as_deref(), live, uid.as_deref());
+                self.seen = seen;
+                self.state.set(Mode::DryRun, left, None, yaml);
+                // Only a recorded review authorises a press; otherwise the stamp
+                // stays unreviewed and `prepare` says why on the next one.
+                self.status = match reviewed(self.state.diff().verdict(), sent.force, seen) {
+                    Reviewed::Recorded(note) => {
                         self.flight.record_review(Review {
                             stamp: sent.stamp,
                             force: sent.force,
                         });
-                        note.to_string()
+                        Some(note.to_string())
                     }
-                    // No review was made, so none authorises a press: the stamp
-                    // stays unreviewed and `prepare` says why on the next one.
-                    Err(note) => note,
-                });
+                    Reviewed::Refused(note) => Some(note),
+                    // The line derives why from `seen`.
+                    Reviewed::Raced => None,
+                };
             }
-            ApplyOutcome::Applied { uid, .. } => {
+            ApplyOutcome::Applied { uid } => {
                 // A write that landed on a different object than the one this
                 // document was opened from. An apply creates what is absent, so
                 // this is not an error -- it is `kubectl apply`'s behaviour -- but
                 // it is the one outcome nobody presses ctrl-s expecting.
                 let landed = landed_note(sent.uid.as_deref(), uid.as_deref());
                 // The object the cluster now holds is not necessarily the bytes
-                // that were sent: defaulting and admission both ran. Re-reading
-                // is the only honest way to show what landed -- and it only
-                // happens while the buffer is still the one that was applied, so
-                // an edit made while the apply was in flight survives it.
-                let reloaded = self
-                    .editor
-                    .upgrade()
-                    .map(|editor| {
-                        editor.update(cx, |editor, cx| editor.reload_if_applied(sent.stamp, cx))
-                    })
-                    .unwrap_or(false);
-                self.status = Some(applied_note(&sent.note, &landed, reloaded));
+                // that were sent: defaulting and admission both ran. The sending
+                // editor re-read it, but only while its buffer was still the one
+                // applied, so an edit made while the apply was in flight survives.
+                self.status = Some(applied_note(
+                    &sent.note,
+                    &landed,
+                    reload.unwrap_or(Reload::Gone),
+                ));
             }
-            // The server took it and answered; only rendering that answer
-            // failed. On a real apply the object is already stored, so the one
-            // thing this must not read as is a write that did not happen.
-            ApplyOutcome::Unrendered { dry_run, why } => {
-                self.status = Some(unrendered_note(dry_run, &sent.note, &why));
+            ApplyOutcome::Unrendered { why } => {
+                self.status = Some(unrendered_note(&why));
             }
             ApplyOutcome::Conflict {
                 message,
@@ -872,6 +910,9 @@ impl DiffView {
             }
             ApplyOutcome::Denied { what, why } => {
                 self.status = Some(format!("{what} denied: {why}"));
+            }
+            ApplyOutcome::Unconfirmed(why) => {
+                self.status = Some(unconfirmed_note(&why));
             }
             ApplyOutcome::Failed(why) => {
                 self.status = Some(why);
@@ -910,7 +951,8 @@ impl DiffView {
             armed: self.gate.armed(),
             conflict: &self.conflict,
             conflict_truncated: self.conflict_truncated,
-            identity: identity(self.uid.as_deref(), self.answered.as_deref()),
+            seen: self.seen,
+            unknown_write: self.unknown_write,
             status: self.status.as_deref(),
             context: self.context.as_deref(),
         })
@@ -927,7 +969,9 @@ pub(crate) struct Line<'a> {
     pub(crate) armed: Option<Armed>,
     pub(crate) conflict: &'a [Conflicted],
     pub(crate) conflict_truncated: bool,
-    pub(crate) identity: Identity,
+    pub(crate) seen: Seen,
+    /// A real apply from this view went unconfirmed and may still land.
+    pub(crate) unknown_write: bool,
     pub(crate) status: Option<&'a str>,
     /// The kubeconfig context this write would land in. `None` is an
     /// in-cluster account, which has no context name to print.
@@ -999,13 +1043,38 @@ pub(crate) fn status_line(at: Line<'_>) -> String {
     // Derived rather than remembered, for the same reason the armed prompt is:
     // it stands for as long as the comparison does, and a one-shot message
     // would be overwritten by the next thing that happened.
-    if at.identity == Identity::Different {
-        pieces.push(stale_object_note().to_string());
+    match at.seen {
+        Seen::Replaced => pieces.push(stale_object_note().to_string()),
+        Seen::Gone => pieces.push(gone_note().to_string()),
+        Seen::Raced => pieces.push(raced_note().to_string()),
+        Seen::Same | Seen::Unknown => {}
+    }
+    if at.unknown_write {
+        pieces.push(standing_note().to_string());
     }
     if let Some(status) = at.status {
         pieces.push(status.to_string());
     }
     pieces.join("  ·  ")
+}
+
+// Stands on the line from the first real apply of this view that went
+// unconfirmed, for as long as the view lives: nothing read later can say that
+// the write will not land.
+pub(crate) fn standing_note() -> &'static str {
+    "an apply from this view went unconfirmed and may still land"
+}
+
+// A real apply's answer, with the comparison asked for while it was out, which
+// was not sent after it. An apply that went unconfirmed already offers
+// ctrl-alt-r, and one sentence does not offer it twice.
+pub(crate) fn owed_not_sent(status: String, unconfirmed: bool) -> String {
+    let skipped = if unconfirmed {
+        "the comparison asked for while it was out was not sent"
+    } else {
+        "the comparison asked for while it was out was not sent; ctrl-alt-r asks for it"
+    };
+    format!("{status}; {skipped}")
 }
 
 // The sentence a request whose answer never arrived shows. A dry run writes
@@ -1015,41 +1084,58 @@ pub(crate) fn dropped_note(dry_run: bool) -> &'static str {
     if dry_run {
         "the dry run ended without an answer"
     } else {
-        "the apply ended without an answer; it may have landed, so reload the object before \
-         sending it again"
+        "the apply ended without an answer; it may have landed; ctrl-alt-r compares the buffer \
+         with the object as it is now"
     }
 }
 
-// The sentence a landed apply shows. `reloaded` is the editor's answer, not a
-// request: re-reading only happens while the buffer is still the one that was
-// applied, so an edit made while the apply was in flight survives it -- and
-// the sentence has to say which of the two happened.
-pub(crate) fn applied_note(sent_note: &str, landed: &str, reloaded: bool) -> String {
-    if reloaded {
-        format!("applied as fieldManager k10s{sent_note}{landed}")
-    } else {
-        format!(
-            "applied as fieldManager k10s{sent_note}{landed}; the buffer moved meanwhile, so \
-             it was left as it is"
-        )
+// The sentence a real apply that went unconfirmed shows: that it may have
+// landed and how to see what the server holds, then the reason, which for a
+// lost connection is the client's whole error chain.
+pub(crate) fn unconfirmed_note(why: &str) -> String {
+    format!(
+        "the apply may have landed; ctrl-alt-r compares the buffer with the object as it is now; \
+         {why}"
+    )
+}
+
+/// What the editor that sent a landed apply did with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reload {
+    /// It started a re-read of the object, so the buffer will show what landed.
+    Done,
+    /// Its buffer is not the one that was applied any more, an edit or a
+    /// save to a file since, so it was left as it is.
+    Moved,
+    /// It is closed, so nothing was re-read.
+    Gone,
+}
+
+// The sentence a landed apply shows. `reload` is the sending editor's answer,
+// not a request: re-reading only happens while the buffer is still the one that
+// was applied, so an edit made while the apply was in flight survives it, and
+// the sentence has to say which of the three happened.
+pub(crate) fn applied_note(sent_note: &str, landed: &str, reload: Reload) -> String {
+    match reload {
+        Reload::Done => format!("applied as fieldManager k10s{sent_note}{landed}"),
+        Reload::Moved => format!(
+            "applied as fieldManager k10s{sent_note}{landed}; the buffer is not the one that \
+             was applied any more, so it was left as it is"
+        ),
+        Reload::Gone => format!(
+            "applied as fieldManager k10s{sent_note}{landed}; the editor it came from is closed, \
+             so nothing was reloaded"
+        ),
     }
 }
 
-// The server took it and answered; only rendering that answer failed. On a
-// real apply the object is already stored, so the one thing this must not
-// read as is a write that did not happen.
-pub(crate) fn unrendered_note(dry_run: bool, sent_note: &str, why: &str) -> String {
-    if dry_run {
-        format!(
-            "the server accepted this, but its answer cannot be shown here, so there is \
-             nothing to review: {why}"
-        )
-    } else {
-        format!(
-            "applied as fieldManager k10s{sent_note}; the object the cluster now holds cannot be \
-             shown here, so the buffer was left as it is: {why}"
-        )
-    }
+// The server took the dry run and answered; only rendering that answer failed,
+// so there is nothing to review, and nothing was written.
+pub(crate) fn unrendered_note(why: &str) -> String {
+    format!(
+        "the server accepted this dry run, but its answer cannot be shown here, so there is \
+         nothing to review: {why}"
+    )
 }
 
 // A rejection names its causes when the server gave any, bounded, and falls

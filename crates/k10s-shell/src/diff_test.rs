@@ -10,11 +10,12 @@ use k10s_edit::diff::{self, Origin, Verdict};
 
 use crate::diff::*;
 use crate::diff_gate::{
-    ApplyGate, Armed, Flight, Identity, Keepable, Preparation, Ready, Review, Sent, Step, identity,
-    kept_note, landed_note, prepare, recreated_note, refuse_keep, reviewed, stale_object_note,
+    ApplyGate, Armed, Flight, Identity, Keepable, Preparation, Ready, Review, Reviewed, Seen, Sent,
+    Step, dry_run_left, gone_note, identity, kept_note, landed_note, may_still_land, prepare,
+    raced_note, recreated_note, refuse_keep, reviewed, seen_after, stale_object_note,
 };
 use crate::editor::BufferStamp;
-use crate::provider::Conflicted;
+use crate::provider::{ApplyOutcome, Conflicted, LiveCopy};
 
 const LIVE: &str = concat!(
     "apiVersion: v1\n",
@@ -398,6 +399,7 @@ fn ready<'a>(blocked: &'a [&'static str], verdict: Verdict) -> Ready<'a> {
         dry_run: Some(Review { stamp, force: true }),
         conflicts: 1,
         in_flight: None,
+        raced: false,
     }
 }
 
@@ -591,11 +593,103 @@ fn a_forced_preview_still_checks_the_buffer_payload_conflict_and_wire() {
 fn a_forced_preview_names_the_transfer_even_when_the_documents_agree() {
     for verdict in [Verdict::Differs, Verdict::Agreed] {
         assert_eq!(
-            reviewed(verdict, true),
-            Ok("forced dry run only; ctrl-shift-s asks to take the conflicting fields")
+            reviewed(verdict, true, Seen::Same),
+            Reviewed::Recorded(
+                "forced dry run only; ctrl-shift-s asks to take the conflicting fields"
+            )
         );
     }
-    assert!(reviewed(Verdict::Refused("too many lines"), true).is_err());
+    assert!(matches!(
+        reviewed(Verdict::Refused("too many lines"), true, Seen::Same),
+        Reviewed::Refused(_)
+    ));
+}
+
+// A comparison of two objects authorises nothing, whatever it concluded, and
+// the next press says why in the race's own words rather than claiming the
+// server was never asked.
+#[test]
+fn a_raced_dry_run_records_no_review_and_the_press_names_the_race() {
+    for verdict in [Verdict::Differs, Verdict::Agreed] {
+        for force in [false, true] {
+            assert_eq!(reviewed(verdict, force, Seen::Raced), Reviewed::Raced);
+        }
+    }
+    for seen in [Seen::Same, Seen::Replaced, Seen::Unknown, Seen::Gone] {
+        assert!(
+            matches!(
+                reviewed(Verdict::Differs, false, seen),
+                Reviewed::Recorded(_)
+            ),
+            "{seen:?} records"
+        );
+    }
+    let mut at = ready(&[], Verdict::Differs);
+    at.dry_run = None;
+    at.raced = true;
+    assert_eq!(
+        prepare(Armed::Apply, at),
+        Err("this comparison mixes two objects, so nothing was sent".to_string())
+    );
+    let mut at = ready(&[], Verdict::Differs);
+    at.dry_run = None;
+    assert_eq!(
+        prepare(Armed::Apply, at),
+        Err("the server has not been asked what this would store; ctrl-alt-r asks it".to_string())
+    );
+}
+
+// After a creation lands, "the object this was opened from is gone; applying
+// creates it" would still stand beside the answer. A real apply that landed, or
+// may have, leaves the note nothing to say; a dry run or a refusal leaves it.
+#[test]
+fn a_real_apply_that_may_have_written_leaves_the_seen_note_nothing_to_say() {
+    let landed = ApplyOutcome::Applied { uid: None };
+    let unconfirmed = ApplyOutcome::Unconfirmed("no answer within 35 s".to_string());
+    let refused = ApplyOutcome::Failed("Request entity too large: limit is 3145728".to_string());
+    assert_eq!(seen_after(Seen::Gone, false, Some(&landed)), Seen::Unknown);
+    assert_eq!(
+        seen_after(Seen::Gone, false, Some(&unconfirmed)),
+        Seen::Unknown
+    );
+    assert_eq!(
+        seen_after(Seen::Replaced, false, None),
+        Seen::Unknown,
+        "a dropped reply"
+    );
+    assert_eq!(seen_after(Seen::Gone, false, Some(&refused)), Seen::Gone);
+    assert_eq!(
+        seen_after(Seen::Replaced, true, Some(&landed)),
+        Seen::Replaced,
+        "a dry run writes nothing"
+    );
+}
+
+// Once a real apply went unconfirmed, the line says it may still land for the
+// life of the view: no later answer says anything about that write.
+#[test]
+fn an_unconfirmed_apply_stands_for_the_life_of_the_view() {
+    let unconfirmed = ApplyOutcome::Unconfirmed("no answer within 35 s".to_string());
+    let landed = ApplyOutcome::Applied { uid: None };
+    let refused = ApplyOutcome::Failed("Request entity too large: limit is 3145728".to_string());
+    assert!(may_still_land(false, false, Some(&unconfirmed)));
+    assert!(may_still_land(false, false, None), "a dropped reply");
+    assert!(
+        !may_still_land(false, true, None),
+        "a dry run writes nothing"
+    );
+    assert!(!may_still_land(false, true, Some(&unconfirmed)));
+    assert!(!may_still_land(false, false, Some(&landed)));
+    assert!(
+        may_still_land(true, true, None),
+        "a later dry run, the commonest later answer, clears nothing"
+    );
+    for later in [&landed, &refused] {
+        assert!(
+            may_still_land(true, false, Some(later)),
+            "{later:?} clears nothing"
+        );
+    }
 }
 
 #[test]
@@ -641,16 +735,21 @@ fn a_recompute_discards_a_dry_run_and_never_a_write() {
 
 #[test]
 fn a_dry_run_the_diff_could_not_compare_authorises_nothing() {
-    assert_eq!(reviewed(Verdict::Differs, false), Ok("ctrl-s applies this"));
     assert_eq!(
-        reviewed(Verdict::Agreed, false),
-        Ok("the cluster already holds this; applying changes nothing")
+        reviewed(Verdict::Differs, false, Seen::Same),
+        Reviewed::Recorded("ctrl-s applies this")
     );
-    let note = reviewed(
+    assert_eq!(
+        reviewed(Verdict::Agreed, false, Seen::Same),
+        Reviewed::Recorded("the cluster already holds this; applying changes nothing")
+    );
+    let Reviewed::Refused(note) = reviewed(
         Verdict::Refused("one side of this comparison has more than 65,536 lines"),
         false,
-    )
-    .expect_err("a refusal is not a review");
+        Seen::Same,
+    ) else {
+        panic!("a refusal is not a review");
+    };
     assert!(note.contains("65,536 lines"), "{note}");
     assert!(
         !note.contains("applying changes nothing"),
@@ -894,9 +993,72 @@ fn an_answer_about_a_different_object_is_only_claimed_when_both_uids_are_known()
     assert_eq!(landed_note(Some("a"), Some("a")), "");
     assert_eq!(landed_note(None, Some("b")), "");
     assert_eq!(landed_note(Some("a"), None), "");
-    assert!(
-        stale_object_note().contains("open the object again"),
-        "a dry run about another object leaves the comparison's left side stale"
+    assert_eq!(
+        stale_object_note(),
+        "the object this was opened from was replaced; this compares with the one the server holds \
+         now, and applying lands on it"
+    );
+    assert_eq!(
+        gone_note(),
+        "the object this was opened from is gone; applying creates it"
+    );
+}
+
+// The left side of a dry-run review is the dry run's own read of the object,
+// never the copy the editor loaded, and that read is what says whether the
+// object is the one the buffer was opened from.
+#[test]
+fn a_dry_run_is_compared_with_its_own_read_of_the_object() {
+    let read = |uid: &str| LiveCopy::Read {
+        yaml: "kind: ConfigMap\ndata:\n  a: landed\n".to_string(),
+        uid: Some(uid.to_string()),
+    };
+    assert_eq!(
+        dry_run_left(Some("uid-1"), read("uid-1"), Some("uid-1")),
+        (
+            "kind: ConfigMap\ndata:\n  a: landed\n".to_string(),
+            Seen::Same
+        )
+    );
+    // Replaced since the editor read it: the comparison is against the one
+    // there now, and says so.
+    assert_eq!(
+        dry_run_left(Some("uid-1"), read("uid-2"), Some("uid-2")).1,
+        Seen::Replaced
+    );
+    // Replaced between the dry run's read and its answer: two objects.
+    assert_eq!(
+        dry_run_left(Some("uid-1"), read("uid-1"), Some("uid-3")).1,
+        Seen::Raced
+    );
+    // A read or an answer without a uid claims nothing: never a race and never
+    // a replacement on a missing field.
+    let unnamed = LiveCopy::Read {
+        yaml: String::new(),
+        uid: None,
+    };
+    assert_eq!(
+        dry_run_left(Some("uid-1"), unnamed, Some("uid-1")).1,
+        Seen::Unknown
+    );
+    assert_eq!(
+        dry_run_left(Some("uid-1"), read("uid-1"), None).1,
+        Seen::Same
+    );
+    assert_eq!(
+        dry_run_left(None, read("uid-1"), Some("uid-1")).1,
+        Seen::Unknown
+    );
+    // Gone: an empty left side, so the review reads as a creation, whatever
+    // uid the answer would give the new object.
+    assert_eq!(
+        dry_run_left(Some("uid-1"), LiveCopy::Absent, Some("uid-new")),
+        (String::new(), Seen::Gone)
+    );
+    assert_eq!(
+        raced_note(),
+        "the object was replaced between this review's read and its dry run; ctrl-alt-r compares \
+         again"
     );
 }
 
@@ -926,15 +1088,22 @@ fn the_gate_arms_under_its_own_name_and_a_different_press_re_asks() {
 #[test]
 fn an_applied_note_says_whether_the_buffer_followed_the_write() {
     assert_eq!(
-        applied_note(" (forced)", "", true),
+        applied_note(" (forced)", "", Reload::Done),
         "applied as fieldManager k10s (forced)"
     );
-    let moved = applied_note("", "; landed on another object", false);
+    let moved = applied_note("", "; landed on another object", Reload::Moved);
     assert!(
-        moved.ends_with("the buffer moved meanwhile, so it was left as it is"),
+        moved.ends_with(
+            "the buffer is not the one that was applied any more, so it was left as it is"
+        ),
         "an edit made during the flight must be said to have survived: {moved}"
     );
     assert!(moved.contains("; landed on another object"));
+    assert!(
+        applied_note("", "", Reload::Gone)
+            .ends_with("the editor it came from is closed, so nothing was reloaded"),
+        "a closed editor did not have its buffer move"
+    );
 }
 
 // A reply that never arrived used to read "the request ended without an
@@ -945,26 +1114,30 @@ fn a_real_apply_without_an_answer_says_it_may_have_landed() {
     assert_eq!(dropped_note(true), "the dry run ended without an answer");
     assert_eq!(
         dropped_note(false),
-        "the apply ended without an answer; it may have landed, so reload the object before \
-         sending it again"
+        "the apply ended without an answer; it may have landed; ctrl-alt-r compares the buffer \
+         with the object as it is now"
+    );
+}
+
+// The reason comes last: a lost connection's is kube's whole error chain, and
+// at the lab's window width a line that led with it was cut before "may have
+// landed", reading as a failure.
+#[test]
+fn an_unconfirmed_apply_gives_its_reason_and_the_key_that_shows_what_is_there() {
+    assert_eq!(
+        unconfirmed_note("no answer within 35 s"),
+        "the apply may have landed; ctrl-alt-r compares the buffer with the object as it is now; \
+         no answer within 35 s"
     );
 }
 
 #[test]
-fn an_unrendered_real_apply_never_reads_as_a_write_that_did_not_happen() {
-    let dry = unrendered_note(true, "", "answer too deep");
-    assert!(
-        dry.contains("nothing to review"),
-        "a dry run that cannot render has nothing to confirm: {dry}"
+fn a_dry_run_whose_answer_cannot_be_shown_has_nothing_to_review() {
+    assert_eq!(
+        unrendered_note("answer too deep"),
+        "the server accepted this dry run, but its answer cannot be shown here, so there is \
+         nothing to review: answer too deep"
     );
-    assert!(!dry.contains("applied as"), "{dry}");
-
-    let real = unrendered_note(false, "", "answer too deep");
-    assert!(
-        real.starts_with("applied as fieldManager k10s"),
-        "the object is already stored, and the sentence must say so first: {real}"
-    );
-    assert!(real.contains("answer too deep"));
 }
 
 #[test]
@@ -997,7 +1170,8 @@ fn line_at<'a>(conflict: &'a [Conflicted], armed: Option<Armed>) -> Line<'a> {
         armed,
         conflict,
         conflict_truncated: false,
-        identity: Identity::Same,
+        seen: Seen::Same,
+        unknown_write: false,
         status: None,
         context: Some("prod-eu"),
     }
@@ -1048,12 +1222,66 @@ fn the_conflict_list_counts_its_overflow_and_names_the_servers_remainder() {
 }
 
 #[test]
-fn a_write_that_answered_about_another_object_marks_the_line_stale() {
+fn a_dry_run_that_read_another_object_or_none_says_so_on_the_line() {
     let stale = status_line(Line {
-        identity: identity(Some("uid-read"), Some("uid-answered")),
+        seen: Seen::Replaced,
         ..line_at(&[], None)
     });
     assert!(stale.contains(stale_object_note()), "{stale}");
+    let gone = status_line(Line {
+        seen: Seen::Gone,
+        ..line_at(&[], None)
+    });
+    assert!(gone.contains(gone_note()), "{gone}");
+    let raced = status_line(Line {
+        seen: Seen::Raced,
+        ..line_at(&[], None)
+    });
+    assert!(raced.contains(raced_note()), "{raced}");
+    for quiet in [Seen::Same, Seen::Unknown] {
+        let line = status_line(Line {
+            seen: quiet,
+            ..line_at(&[], None)
+        });
+        assert!(
+            !line.contains("replaced") && !line.contains("gone"),
+            "{quiet:?}: {line}"
+        );
+    }
+}
+
+// Derived, like the armed prompt, so the message a dry run or an owed
+// comparison writes cannot erase it.
+#[test]
+fn an_apply_that_may_still_land_stays_on_the_line_whatever_the_status_says() {
+    let line = status_line(Line {
+        unknown_write: true,
+        status: Some("ctrl-s applies this"),
+        ..line_at(&[], None)
+    });
+    assert!(line.contains(standing_note()), "{line}");
+    assert_eq!(
+        standing_note(),
+        "an apply from this view went unconfirmed and may still land"
+    );
+    assert!(line.contains("ctrl-s applies this"), "{line}");
+    assert!(!status_line(line_at(&[], None)).contains("may still land"));
+}
+
+// A comparison asked for while a real apply was out is not sent after it, and
+// the apply's answer says so rather than being replaced a round trip later.
+#[test]
+fn an_owed_comparison_skipped_after_an_apply_is_named_after_its_answer() {
+    assert_eq!(
+        owed_not_sent("applied as fieldManager k10s".to_string(), false),
+        "applied as fieldManager k10s; the comparison asked for while it was out was not sent; \
+         ctrl-alt-r asks for it"
+    );
+    assert_eq!(
+        owed_not_sent(unconfirmed_note("no answer within 35 s"), true),
+        "the apply may have landed; ctrl-alt-r compares the buffer with the object as it is now; \
+         no answer within 35 s; the comparison asked for while it was out was not sent"
+    );
 }
 
 #[test]

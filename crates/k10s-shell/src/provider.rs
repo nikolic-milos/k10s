@@ -440,6 +440,14 @@ pub struct ApplyRequest {
     pub force: bool,
 }
 
+// What a dry run's read found: the object, rendered like the editor's
+// document, or nothing, so the apply would create it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveCopy {
+    Read { yaml: String, uid: Option<String> },
+    Absent,
+}
+
 // One field another field manager owns, and who owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conflicted {
@@ -449,22 +457,28 @@ pub struct Conflicted {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyOutcome {
-    // What the server would store, or did, rendered like the document the
-    // editor opened so the two can be diffed line for line.
+    // A real apply the server stored. `uid` is which object it answered about,
+    // so the view can say whether the press updated the object it was opened
+    // from or landed on a different one. None is "the answer carried no
+    // identity", never "the same".
     Applied {
-        yaml: String,
-        dry_run: bool,
-        // Which object the server answered about, so a review can say whether the
-        // press updated the object it was opened from or landed on a different
-        // one. None is "the answer carried no identity", never "the same".
         uid: Option<String>,
     },
-    // The server took the request and answered; only rendering that answer
-    // failed, because the emitter caps a document at 2 MiB and 64 levels. On a
-    // real apply the object is already stored, so this is not a failure and
-    // must never be shown as one: the cluster changed and the buffer did not.
+    // A dry run's answer, what the server would store, rendered like the
+    // document the editor opened so the two can be diffed line for line, with
+    // the object as the server held it a moment before it answered, read with
+    // it: the review's left side. One variant, so an answer cannot arrive
+    // without its read.
+    DryRun {
+        yaml: String,
+        uid: Option<String>,
+        live: LiveCopy,
+    },
+    // A dry run the server answered, whose answer cannot be shown: it is not
+    // JSON, or the emitter will not render it (it caps a document at 2 MiB and
+    // 64 levels). There is nothing to review. A real apply's answer is never
+    // rendered, so it cannot end here.
     Unrendered {
-        dry_run: bool,
         why: String,
     },
     Conflict {
@@ -490,6 +504,11 @@ pub enum ApplyOutcome {
         what: &'static str,
         why: String,
     },
+    // A real apply that was sent and that nothing confirmed or refused: a lost
+    // connection, the deadline, or a 5xx. It may have landed, which is why it is
+    // not `Failed`; the next dry run reads the object with it and shows what is
+    // there.
+    Unconfirmed(String),
     Failed(String),
 }
 

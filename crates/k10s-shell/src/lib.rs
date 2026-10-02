@@ -103,13 +103,13 @@ pub use provider::{
     Detail, DocOutcome, EcosystemEntry, EventRow, ExecEvent, ExecRequest, ExecSession,
     ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, GrafanaOutcome, GrafanaPanelKind,
     GrafanaPanelRow, HelmReveal, HelmRevealOutcome, HelmRollbackOutcome, KindRow, LaunchProvider,
-    LogChunk, LogRequest, LogStop, LokiOutcome, ManifestOutcome, Millicores, NullExecSession,
-    NullLaunchProvider, NullProvider, ObserveReach, OverlayOutcome, OverlayStamp, PodPostureView,
-    PostureOutcome, PromOutcome, PromSeriesView, ProviderFactory, ProviderSlot, QueryDialect,
-    ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome, SchemaSource,
-    SchemaTextOutcome, SilenceOutcome, SilenceRequest, SpanView, TableColumn, TableOutcome,
-    TablePage, TableRow, ToolPresence, TraceOutcome, UsageOutcome, UsageRequest, UsageSample,
-    UsageSource, UsageTarget, WorkloadLogRequest,
+    LiveCopy, LogChunk, LogRequest, LogStop, LokiOutcome, ManifestOutcome, Millicores,
+    NullExecSession, NullLaunchProvider, NullProvider, ObserveReach, OverlayOutcome, OverlayStamp,
+    PodPostureView, PostureOutcome, PromOutcome, PromSeriesView, ProviderFactory, ProviderSlot,
+    QueryDialect, ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome,
+    SchemaSource, SchemaTextOutcome, SilenceOutcome, SilenceRequest, SpanView, TableColumn,
+    TableOutcome, TablePage, TableRow, ToolPresence, TraceOutcome, UsageOutcome, UsageRequest,
+    UsageSample, UsageSource, UsageTarget, WorkloadLogRequest,
 };
 pub use selection::{LogTarget, Selection};
 pub use workspace::{ConfigPaths, Workspace};
