@@ -2096,6 +2096,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "k10s-assets"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "k10s-core",
+]
+
+[[package]]
 name = "k10s-atlas"
 version = "0.1.0"
 dependencies = [
@@ -2127,6 +2135,7 @@ dependencies = [
  "crossbeam-channel",
  "futures",
  "gpui",
+ "k10s-assets",
  "k10s-atlas",
  "k10s-core",
  "k10s-theme",

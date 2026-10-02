@@ -14,7 +14,7 @@ root=$(CDPATH= cd -- "$here/../.." && pwd)
 bin=$root/target/release/k10s
 desktop=$root/crates/assets/assets/linux/k10s.desktop
 icons=$root/crates/assets/assets/linux/icons
-notice=$root/crates/map/assets/icons/ATTRIBUTION.md
+notice=$root/crates/assets/assets/icons/ATTRIBUTION.md
 license=$root/LICENSE
 out_dir=$root/target/dist
 sizes="16 24 32 48 64 128 256 512"

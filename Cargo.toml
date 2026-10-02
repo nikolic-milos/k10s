@@ -42,7 +42,7 @@ k10s-app = { path = "crates/app" }
 k10s-data = { path = "crates/data" }
 k10s-bench = { path = "crates/bench" }
 k10s-edit = { path = "crates/edit" }
-k10s-assets = { path = "crates/assets" }
+k10s-assets = { path = "crates/assets", default-features = false }
 
 gpui = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
 gpui_platform = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }

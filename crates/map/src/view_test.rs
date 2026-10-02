@@ -6,10 +6,7 @@ use std::sync::Arc;
 
 use k10s_core::{NsExt, NsNode, SceneIds, SceneSnapshot, Severity};
 
-use super::{
-    Grouped, KIND_GLYPHS, LabelCounts, MapView, Mark, PickPath, TOOL_GLYPHS, UNKNOWN_GLYPH,
-    glyph_of,
-};
+use super::{Grouped, LabelCounts, MapView, Mark, PickPath};
 
 const POD_LABELS: [&str; 3] = [
     "checkout-api-7f9c8d6b5-tzq4x",
@@ -69,21 +66,6 @@ fn an_empty_scene_does_not_spend_the_one_automatic_fit() {
         !MapView::should_fit_scene(197, true, true, true),
         "and never one they have"
     );
-}
-
-// The two lookups the HUD and the frame lean on, reachable because this module
-// is a child of the crate root rather than a module of its own.
-#[test]
-fn an_id_past_either_glyph_table_falls_back_to_the_unknown_glyph() {
-    let (unknown_key, _) = UNKNOWN_GLYPH;
-    assert_eq!(glyph_of(KIND_GLYPHS, usize::MAX).0.as_ref(), unknown_key);
-    assert_eq!(glyph_of(TOOL_GLYPHS, 9_001).0.as_ref(), unknown_key);
-    assert_eq!(
-        glyph_of(TOOL_GLYPHS, 0).0.as_ref(),
-        unknown_key,
-        "tool zero is the catalog's own unknown"
-    );
-    assert_ne!(glyph_of(KIND_GLYPHS, 0).0.as_ref(), unknown_key);
 }
 
 #[test]

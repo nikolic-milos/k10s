@@ -3593,6 +3593,7 @@ dependencies = [
  "assets",
  "gpui",
  "image",
+ "k10s-core",
  "k10s-theme",
 ]
 
@@ -3677,6 +3678,7 @@ dependencies = [
  "crossbeam-channel",
  "futures",
  "gpui",
+ "k10s-assets",
  "k10s-atlas",
  "k10s-bench",
  "k10s-core",
@@ -3700,6 +3702,7 @@ dependencies = [
  "alacritty_terminal",
  "futures",
  "gpui",
+ "k10s-assets",
  "k10s-atlas",
  "k10s-bench",
  "k10s-core",

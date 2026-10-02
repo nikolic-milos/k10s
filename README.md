@@ -27,7 +27,7 @@ is kept current.
 
 Icons: workload kind glyphs derive from the Kubernetes icon set (CC BY 4.0),
 tool logos come from [simple-icons](https://github.com/simple-icons/simple-icons)
-(CC0). Details in `crates/map/assets/icons/ATTRIBUTION.md`.
+(CC0). Details in `crates/assets/assets/icons/ATTRIBUTION.md`.
 
 Typography: Inter, Lilex and League Spartan are embedded from
 `crates/assets/assets/fonts` under the SIL Open Font License; each family's

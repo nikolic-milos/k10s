@@ -16,6 +16,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+k10s-assets.workspace = true
 k10s-atlas.workspace = true
 k10s-core.workspace = true
 k10s-provider.workspace = true

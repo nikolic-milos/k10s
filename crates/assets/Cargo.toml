@@ -9,13 +9,20 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["application"]
+# The painter only needs indexed glyphs. Keep fonts, window artwork and the
+# upstream fallback out of its isolated allocation harness.
+application = ["dep:k10s-theme", "dep:zed_assets", "dep:image"]
+
 [dependencies]
-k10s-theme.workspace = true
+k10s-core.workspace = true
+k10s-theme = { workspace = true, optional = true }
 gpui.workspace = true
 # The eight window-control and panel SVGs this build still uses are Zed's, so
 # the asset source chains rather than forks. Keeping the fork revision pinned
 # in the workspace manifest is what makes that safe.
-zed_assets.workspace = true
+zed_assets = { workspace = true, optional = true }
 # Already in the lock via gpui, and only the PNG decoder is asked for: the
 # X11 window icon wants an RgbaImage and nothing else here decodes anything.
-image = { workspace = true }
+image = { workspace = true, optional = true }
