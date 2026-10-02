@@ -56,6 +56,74 @@ fn fixture(linked: bool) -> PublishBench {
 }
 
 #[test]
+fn an_empty_namespace_gets_an_empty_edge_range() {
+    let mut bench = fixture(true);
+    bench.apply_events(&[replay::scope("ns-canary", "canary", Op::Added)]);
+    bench.run_publish();
+    let after = bench.snapshot();
+    assert_eq!(after.region_edges.len(), after.regions.len());
+    topology::verify_derived_state(&mut bench.world);
+    assert_published_matches_full(&bench.world, &after);
+}
+
+#[test]
+fn attachment_changes_preserve_dependencies_until_their_targets_change() {
+    let mut bench = fixture(true);
+    let mut api = replay::owner("wl-api", "prod", "api", KindId::DEPLOYMENT, Op::Modified);
+    if let IngestEvent::Resource(resource) = &mut api
+        && let Payload::Owner { depends_on, .. } = &mut resource.payload
+    {
+        depends_on.extend([Arc::from("wl-side"), Arc::from("wl-future")]);
+    }
+    let batches = [
+        vec![api, replay::scope("ns-canary", "canary", Op::Added)],
+        vec![replay::owner(
+            "wl-future",
+            "canary",
+            "future",
+            KindId::DEPLOYMENT,
+            Op::Added,
+        )],
+        vec![replay::instance(
+            "extra",
+            "prod",
+            "wl-api",
+            State::OK,
+            Op::Added,
+        )],
+        vec![replay::instance(
+            "extra",
+            "prod",
+            "wl-api",
+            State::OK,
+            Op::Deleted,
+        )],
+        vec![replay::owner(
+            "wl-future",
+            "canary",
+            "future",
+            KindId::DEPLOYMENT,
+            Op::Deleted,
+        )],
+        vec![replay::owner(
+            "wl-replacement",
+            "canary",
+            "replacement",
+            KindId::DEPLOYMENT,
+            Op::Added,
+        )],
+    ];
+    for (batch, cross_edges) in batches.into_iter().zip([0, 1, 1, 1, 0, 0]) {
+        bench.apply_events(&batch);
+        bench.run_publish();
+        topology::verify_derived_state(&mut bench.world);
+        let after = bench.snapshot();
+        assert_published_matches_full(&bench.world, &after);
+        assert_eq!(after.cross_edges.len(), cross_edges);
+    }
+}
+
+#[test]
 fn a_pod_leaving_a_linked_parent_drops_its_old_service_edge() {
     let mut bench = fixture(true);
     let held = bench.snapshot();

@@ -466,6 +466,7 @@ struct BatchDirt {
     wl_pod: bool,
     wl_sat: bool,
     edges: bool,
+    dependency_edges: bool,
     counts_full: bool,
     aggregates_full: bool,
     nss: Vec<u32>,
@@ -540,7 +541,11 @@ fn rebuild_selective(topology: &mut Topology, dirt: &BatchDirt) {
         }
     }
     if dirt.edges {
-        rebuild_edges(topology);
+        if dirt.ns_wl || dirt.dependency_edges {
+            rebuild_edges(topology);
+        } else {
+            rebuild_attachment_edges(topology);
+        }
     }
 }
 
@@ -654,6 +659,7 @@ fn upsert_namespace(
     }
     dirt.identity = true;
     dirt.ns_wl = true;
+    dirt.edges = true;
     ensure_namespace_aggregates(aggregates, index + 1);
     aggregates.ns_sev_counts[index] = [0; 4];
     aggregates.ns_unhealthy_count[index] = 0;
@@ -724,6 +730,7 @@ fn upsert_workload(
     }
     if !inserted && !moved && topology.wl_depends_on[index].as_slice() != depends_on {
         dirt.edges = true;
+        dirt.dependency_edges = true;
     }
     topology.wl_labels[index] = resource.name.clone();
     topology.wl_kinds[index] = kind;
@@ -1041,8 +1048,33 @@ pub(super) fn rebuild_edges(topology: &mut Topology) {
             }
         }
     }
-    push_extra_edges(topology, &mut local);
+    finish_edges(topology, local, cross);
+}
 
+fn rebuild_attachment_edges(topology: &mut Topology) {
+    // Each namespace stores workload dependencies before attachment edges.
+    // Pods and satellites cannot change those resolved workload slots, and
+    // namespace/workload membership or dependency changes take the full path.
+    let local = topology
+        .ns_edge_range
+        .iter()
+        .map(|range| {
+            let edges = &topology.edges[range.start as usize..range.end as usize];
+            let end = edges
+                .iter()
+                .position(|edge| !edge.is_block_pair())
+                .unwrap_or(edges.len());
+            edges[..end].to_vec()
+        })
+        .collect();
+    let cross = topology.edges
+        [topology.cross_edge_range.start as usize..topology.cross_edge_range.end as usize]
+        .to_vec();
+    finish_edges(topology, local, cross);
+}
+
+fn finish_edges(topology: &mut Topology, mut local: Vec<Vec<EdgeInst>>, cross: Vec<EdgeInst>) {
+    push_extra_edges(topology, &mut local);
     topology.edges.clear();
     topology.ns_edge_range.clear();
     for edges in local {
