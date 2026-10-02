@@ -100,6 +100,7 @@ pub fn cull(
     vh: f32,
     opts: FrameOpts<'_>,
 ) -> CullStats {
+    // The independent endpoint walk below supplies the edge count.
     let mut st = k10s_atlas::cull(
         scene,
         camera,
@@ -107,7 +108,7 @@ pub fn cull(
         blend,
         vw,
         vh,
-        opts.edges_on,
+        false,
         opts.skip_blocks,
     );
     let visible = camera.visible_world(vw, vh);

@@ -52,18 +52,6 @@ pub fn cull<R, B, C, S>(
     let contiguous = scene.child_ranges_are_direct();
     let single_region_inside = scene.regions.len() == 1 && visible.contains(&scene.regions[0].rect);
     if contiguous && stage != 1 {
-        if stage >= 2 && scene.visible_region_has_selective_block_index(&visible) {
-            return cull_inner::<true, _, _, _, _>(
-                scene,
-                camera,
-                policy,
-                blend,
-                vw,
-                vh,
-                edges_on,
-                skip_blocks,
-            );
-        }
         if scene.region_index_is_selective(&visible) {
             return cull_contiguous::<true, _, _, _, _>(
                 scene,
