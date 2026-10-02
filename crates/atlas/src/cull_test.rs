@@ -1360,6 +1360,8 @@ fn sats_counted_with_curve_budget() {
     assert_eq!(st.labels, 1 + 1 + 6);
 
     let mut tight = policy();
+    tight.max_labels = 3;
+    tight.max_icons = 2;
     tight.max_curves = 2;
     let st = cull(
         &snap,
@@ -1371,6 +1373,8 @@ fn sats_counted_with_curve_budget() {
         true,
         false,
     );
+    assert_eq!((st.labels, st.labels_dropped), (3, 5));
+    assert_eq!((st.icons, st.icons_dropped), (2, 2));
     assert_eq!((st.curves, st.curves_dropped), (2, 1));
 
     let mut off = policy();

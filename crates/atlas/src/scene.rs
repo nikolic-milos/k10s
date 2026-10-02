@@ -646,6 +646,21 @@ impl<R, B, C, S> Scene<R, B, C, S> {
         self.spatial_index.cells.is_selective(block, visible)
     }
 
+    pub(crate) fn visible_region_has_selective_block_index(&self, visible: &Rect) -> bool {
+        if self.spatial_index.blocks.nodes.is_empty() {
+            return false;
+        }
+        let mut selective = false;
+        self.for_each_region_candidate(visible, |region_index, region| {
+            selective |= region.rect.intersects(visible)
+                && self
+                    .spatial_index
+                    .blocks
+                    .is_selective(region_index, visible);
+        });
+        selective
+    }
+
     pub fn rebuild_spatial_index(&mut self) {
         let mut regions = SpatialForest::with_roots(1);
         regions.build_root(

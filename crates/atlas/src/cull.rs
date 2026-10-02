@@ -52,6 +52,18 @@ pub fn cull<R, B, C, S>(
     let contiguous = scene.child_ranges_are_direct();
     let single_region_inside = scene.regions.len() == 1 && visible.contains(&scene.regions[0].rect);
     if contiguous && stage != 1 {
+        if stage >= 2 && scene.visible_region_has_selective_block_index(&visible) {
+            return cull_inner::<true, _, _, _, _>(
+                scene,
+                camera,
+                policy,
+                blend,
+                vw,
+                vh,
+                edges_on,
+                skip_blocks,
+            );
+        }
         if scene.region_index_is_selective(&visible) {
             return cull_contiguous::<true, _, _, _, _>(
                 scene,
@@ -192,10 +204,10 @@ fn count_workload_mark(
         WorkloadPresentation::Medallion | WorkloadPresentation::Detailed
     ) && policy.block_icon_shown(inner_w, zoom)
     {
-        push_icon(st, policy);
+        st.icons += 1;
     }
     if presentation.card_shown() && policy.block_label_shown(inner_w, zoom) {
-        push_label(st, policy);
+        st.labels += 1;
     }
     presentation
 }
@@ -219,7 +231,7 @@ fn cull_stage_one_indexed<R, B, C, S>(
         st.drawn_regions += 1;
         st.quads += 1;
         if policy.region_label_shown(region.rect.w, zoom) {
-            push_label(&mut st, policy);
+            st.labels += 1;
         }
 
         let region_inside = visible.contains(&region.rect);
@@ -230,7 +242,7 @@ fn cull_stage_one_indexed<R, B, C, S>(
             count_workload_mark(&mut st, policy, block.inner.w, zoom, 1, skip_blocks);
         });
     });
-    st
+    finish_counts(st, policy)
 }
 
 fn cull_stage_one_contiguous<R, B, C, S>(
@@ -274,13 +286,7 @@ fn cull_stage_one_contiguous<R, B, C, S>(
             }
         }
     }
-    // At this stage the counts do not affect traversal. Charge the budgets
-    // once so a wide namespace does not test the same caps per workload.
-    st.labels_dropped = st.labels.saturating_sub(policy.max_labels);
-    st.labels = st.labels.min(policy.max_labels);
-    st.icons_dropped = st.icons.saturating_sub(policy.max_icons);
-    st.icons = st.icons.min(policy.max_icons);
-    st
+    finish_counts(st, policy)
 }
 
 fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
@@ -306,7 +312,7 @@ fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
         st.quads += 1;
 
         if policy.region_label_shown(region.rect.w, zoom) {
-            push_label(&mut st, policy);
+            st.labels += 1;
         }
         if stage == 0 {
             return;
@@ -334,18 +340,13 @@ fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
                     }
                     st.drawn_sats += 1;
                     if policy.sat_icon_shown() {
-                        push_icon(&mut st, policy);
+                        st.icons += 1;
                     }
                     if policy.sat_label_shown(satellite.rect.w, zoom) {
-                        push_label(&mut st, policy);
-                        push_label(&mut st, policy);
+                        st.labels += 2;
                     }
                     if policy.sat_curves {
-                        if st.curves >= policy.curve_budget() {
-                            st.curves_dropped += 1;
-                        } else {
-                            st.curves += 1;
-                        }
+                        st.curves += 1;
                     }
                 }
             }
@@ -401,7 +402,7 @@ fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
     if edges_on && stage >= 2 && !policy.stress && !policy.stress_curves {
         st.edges = walk_edges(scene, visible, policy.max_edges, |_, _| {});
     }
-    st
+    finish_counts(st, policy)
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -434,7 +435,7 @@ fn cull_inner<const INDEXED: bool, R, B, C, S>(
         st.quads += 1;
 
         if policy.region_label_shown(region.rect.w, zoom) {
-            push_label(&mut st, policy);
+            st.labels += 1;
         }
 
         if stage == 0 {
@@ -466,7 +467,7 @@ fn cull_inner<const INDEXED: bool, R, B, C, S>(
         st.edges = walk_edges(scene, &visible, policy.max_edges, |_, _| {});
     }
 
-    st
+    finish_counts(st, policy)
 }
 
 #[inline]
@@ -502,18 +503,13 @@ fn cull_block<const INDEXED: bool, R, B, C, S>(
             }
             st.drawn_sats += 1;
             if policy.sat_icon_shown() {
-                push_icon(st, policy);
+                st.icons += 1;
             }
             if policy.sat_label_shown(sat.rect.w, zoom) {
-                push_label(st, policy);
-                push_label(st, policy);
+                st.labels += 2;
             }
             if policy.sat_curves {
-                if st.curves >= policy.curve_budget() {
-                    st.curves_dropped += 1;
-                } else {
-                    st.curves += 1;
-                }
+                st.curves += 1;
             }
         });
     }
@@ -555,7 +551,6 @@ fn cull_visible_cell_slice<C>(
     st: &mut CullStats,
 ) {
     // Keep the scan read-only so viewport and policy loads can leave the loop.
-    // Label admission is independent of cell order; apply its cap once.
     let mut drawn = 0;
     let mut labels = 0;
     for cell in cells {
@@ -566,9 +561,7 @@ fn cull_visible_cell_slice<C>(
     }
     st.drawn_cells += drawn;
     st.quads += drawn;
-    let accepted = labels.min(policy.max_labels.saturating_sub(st.labels));
-    st.labels += accepted;
-    st.labels_dropped += labels - accepted;
+    st.labels += labels;
 }
 
 #[inline]
@@ -589,9 +582,7 @@ fn cull_cell_slice<C>(
         .iter()
         .filter(|cell| policy.cell_label_shown(cell.rect.w, zoom))
         .count();
-    let accepted = labels.min(policy.max_labels.saturating_sub(st.labels));
-    st.labels += accepted;
-    st.labels_dropped += labels - accepted;
+    st.labels += labels;
 }
 
 #[inline(always)]
@@ -605,7 +596,7 @@ fn cull_cell<C>(
     st.drawn_cells += 1;
     st.quads += 1;
     if stage >= 3 && policy.cell_label_shown(cell.rect.w, zoom) {
-        push_label(st, policy);
+        st.labels += 1;
     }
 }
 
@@ -751,18 +742,15 @@ fn scan_indexed_edges<R, B, C, S>(
     true
 }
 
-fn push_label(st: &mut CullStats, policy: &LodPolicy) {
-    if st.labels >= policy.max_labels {
-        st.labels_dropped += 1;
-    } else {
-        st.labels += 1;
-    }
-}
-
-fn push_icon(st: &mut CullStats, policy: &LodPolicy) {
-    if st.icons >= policy.max_icons {
-        st.icons_dropped += 1;
-    } else {
-        st.icons += 1;
-    }
+#[inline]
+fn finish_counts(mut st: CullStats, policy: &LodPolicy) -> CullStats {
+    // These caps do not affect traversal. Applying them once keeps admission
+    // checks out of every node visit while preserving the dropped counts.
+    st.labels_dropped = st.labels.saturating_sub(policy.max_labels);
+    st.labels = st.labels.min(policy.max_labels);
+    st.icons_dropped = st.icons.saturating_sub(policy.max_icons);
+    st.icons = st.icons.min(policy.max_icons);
+    st.curves_dropped = st.curves.saturating_sub(policy.curve_budget());
+    st.curves = st.curves.min(policy.curve_budget());
+    st
 }
