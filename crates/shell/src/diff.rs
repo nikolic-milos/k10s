@@ -60,10 +60,10 @@ use crate::diff_gate::{
     refuse_keep, reviewed, seen_after, stale_object_note,
 };
 use crate::editor::{BufferStamp, DiffSources, EditorView};
-use crate::provider::{
-    ApplyOutcome, ApplyRequest, Conflicted, DescribeRequest, ReadProvider, Reply,
-};
 use crate::ui::{CONTENT_PADDING, STATUS_BAR_HEIGHT, Viewport};
+use k10s_provider::{
+    ApplyOutcome, ApplyRequest, ClusterProvider, Conflicted, DescribeRequest, Reply,
+};
 
 // How much unchanged text stays visible around a change when the folded view is
 // on. Three lines is git's default and is enough to place a hunk in a manifest.
@@ -633,7 +633,7 @@ impl Element for StatusBar {
 
 pub struct DiffView {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     // The kubeconfig context this view's apply would write to, captured when the
     // review opened. It is in the armed sentence because "the cluster" reads the
     // same in every window somebody has open.
@@ -677,7 +677,7 @@ pub struct DiffView {
 
 impl DiffView {
     pub fn new(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         editor: WeakEntity<EditorView>,
         sources: DiffSources,
         dry_run: bool,

@@ -22,7 +22,6 @@ use gpui::{
 };
 
 use crate::confirm::{Latch, Press, Slot, StatusText, nothing_listed};
-use crate::provider::{ReadProvider, TableOutcome, TablePage};
 use crate::table::TableState;
 use crate::tag::ItemTag;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header, status_slot};
@@ -30,6 +29,7 @@ use crate::{
     CancelInput, CommitInput, DeleteInputChar, EnterFilter, HelmDiff, HelmRollback, OpenRow,
     Refresh, RevealHelm, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
 };
+use k10s_provider::{ClusterProvider, TableOutcome, TablePage};
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
 
@@ -119,7 +119,7 @@ pub enum InventoryEvent {
 
 pub struct InventoryView {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     kind: InventoryKind,
     table: TableState,
     loading: bool,
@@ -137,33 +137,33 @@ pub struct InventoryView {
 impl EventEmitter<InventoryEvent> for InventoryView {}
 
 impl InventoryView {
-    pub fn helm(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> InventoryView {
+    pub fn helm(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> InventoryView {
         InventoryView::open(InventoryKind::Helm, provider, cx)
     }
 
-    pub fn argo(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> InventoryView {
+    pub fn argo(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> InventoryView {
         InventoryView::open(InventoryKind::Argo, provider, cx)
     }
 
-    pub fn flux(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> InventoryView {
+    pub fn flux(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> InventoryView {
         InventoryView::open(InventoryKind::Flux, provider, cx)
     }
 
-    pub fn policy(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> InventoryView {
+    pub fn policy(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> InventoryView {
         InventoryView::open(InventoryKind::Policy, provider, cx)
     }
 
-    pub fn harbor(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> InventoryView {
+    pub fn harbor(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> InventoryView {
         InventoryView::open(InventoryKind::Harbor, provider, cx)
     }
 
-    pub fn mesh(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> InventoryView {
+    pub fn mesh(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> InventoryView {
         InventoryView::open(InventoryKind::Mesh, provider, cx)
     }
 
     fn open(
         kind: InventoryKind,
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         cx: &mut Context<Self>,
     ) -> InventoryView {
         let mut view = InventoryView {

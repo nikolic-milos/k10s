@@ -22,7 +22,6 @@ use gpui::{
 };
 
 use crate::lists::InventoryEvent;
-use crate::provider::{AlertPodOutcome, EcosystemEntry, ReadProvider, TableOutcome, TablePage};
 use crate::table::TableState;
 use crate::tag::ItemTag;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
@@ -30,6 +29,7 @@ use crate::{
     CancelInput, CommitInput, DeleteInputChar, EnterFilter, NextFamily, OpenRow, PrevFamily,
     Refresh, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
 };
+use k10s_provider::{AlertPodOutcome, ClusterProvider, EcosystemEntry, TableOutcome, TablePage};
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
 const FAMILY_COLUMN_WIDTH: f32 = 196.0;
@@ -145,7 +145,7 @@ impl FamilyEntry {
 
 pub struct EcosystemView {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     families: Vec<FamilyEntry>,
     selected: usize,
     table: TableState,
@@ -160,7 +160,7 @@ pub struct EcosystemView {
 impl EventEmitter<InventoryEvent> for EcosystemView {}
 
 impl EcosystemView {
-    pub fn new(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> EcosystemView {
+    pub fn new(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> EcosystemView {
         let mut view = EcosystemView {
             focus: cx.focus_handle(),
             provider,

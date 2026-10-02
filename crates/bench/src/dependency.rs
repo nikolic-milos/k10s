@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 
 use serde::Deserialize;
@@ -13,6 +13,10 @@ pub struct Policy {
     pub maximum_git_packages: usize,
     pub allowed_git_sources: BTreeSet<String>,
     pub forbidden_packages: BTreeSet<String>,
+    /// Normal and build dependencies allowed across a protected crate boundary.
+    /// Development dependencies may exercise higher layers in tests.
+    #[serde(default)]
+    pub restricted_dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,6 +100,26 @@ pub fn audit(policy: &Policy, metadata: &Value) -> Result<Audit, Box<dyn Error>>
     for package in policy.forbidden_packages.intersection(&present_packages) {
         violations.push(format!("forbidden package is present: {package}"));
     }
+    for (name, allowed) in &policy.restricted_dependencies {
+        let package = packages
+            .iter()
+            .find(|package| package["name"].as_str() == Some(name) && package["source"].is_null())
+            .ok_or_else(|| format!("protected local package is missing: {name}"))?;
+        let dependencies = package["dependencies"]
+            .as_array()
+            .ok_or_else(|| format!("cargo metadata package {name} has no dependencies array"))?;
+        for dependency in dependencies {
+            if dependency["kind"].as_str() == Some("dev") {
+                continue;
+            }
+            let target = dependency["name"]
+                .as_str()
+                .ok_or("cargo metadata dependency has no name")?;
+            if !allowed.contains(target) {
+                violations.push(format!("{name} cannot depend on {target} outside tests"));
+            }
+        }
+    }
 
     Ok(Audit { counts, violations })
 }
@@ -120,6 +144,7 @@ mod tests {
             maximum_git_packages: 1,
             allowed_git_sources: BTreeSet::from(["git+https://example/repo?rev=a#a".to_owned()]),
             forbidden_packages: BTreeSet::from(["obsolete".to_owned()]),
+            restricted_dependencies: BTreeMap::new(),
         }
     }
 
@@ -150,5 +175,46 @@ mod tests {
         ]});
         let audit = audit(&policy(), &metadata).unwrap();
         assert_eq!(audit.violations.len(), 4);
+    }
+
+    #[test]
+    fn protected_boundary_allows_test_consumers_but_rejects_runtime_and_build_edges() {
+        let mut policy = policy();
+        policy
+            .restricted_dependencies
+            .insert("local".into(), BTreeSet::from(["model".into()]));
+        for kind in [Value::Null, json!("build")] {
+            let metadata = json!({"packages": [{
+                "name": "local", "source": null, "dependencies": [
+                    {"name": "model", "kind": null},
+                    {"name": "renderer", "kind": "dev"}
+                ]
+            }]});
+            assert!(audit(&policy, &metadata).unwrap().passed());
+
+            let mut leaked = metadata;
+            leaked["packages"][0]["dependencies"][1]["kind"] = kind;
+            leaked["packages"][0]["dependencies"][1]["rename"] = json!("model");
+            assert_eq!(
+                audit(&policy, &leaked).unwrap().violations,
+                ["local cannot depend on renderer outside tests"]
+            );
+        }
+    }
+
+    #[test]
+    fn protected_boundary_requires_its_local_package_and_dependency_metadata() {
+        let mut policy = policy();
+        policy
+            .restricted_dependencies
+            .insert("local".into(), BTreeSet::new());
+        for packages in [
+            json!([]),
+            json!([{"name": "local", "source": "registry+https://example/index"}]),
+            json!([{"name": "local", "source": null}]),
+            json!([{"name": "local", "source": null, "dependencies": [{}]}]),
+        ] {
+            assert!(audit(&policy, &json!({"packages": packages})).is_err());
+        }
     }
 }

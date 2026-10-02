@@ -35,13 +35,13 @@ use crate::modal::ModalSlot;
 use crate::overlay::{self, next_overlay};
 use crate::palette::{PaletteEvent, PaletteView};
 use crate::pane::Pane;
-use crate::provider::{
-    Detail, LaunchProvider, LogStop, NullLaunchProvider, OverlayOutcome, PostureOutcome,
-    ProviderSlot, ReadProvider, UsageOutcome,
-};
 use crate::selection::Selection;
 use crate::tag::ItemTag;
 use crate::ui::Viewport;
+use k10s_provider::{
+    ClusterProvider, Detail, LaunchProvider, LogStop, NullLaunchProvider, OverlayOutcome,
+    PostureOutcome, ProviderSlot, UsageOutcome,
+};
 
 /// Where the user's config files live; the app resolves the platform paths and
 /// the workspace only opens what it is handed.
@@ -123,7 +123,7 @@ impl Workspace {
         map: Entity<MapView>,
         bench: bool,
         scene_chosen: bool,
-        provider: Option<Rc<dyn ReadProvider>>,
+        provider: Option<Rc<dyn ClusterProvider>>,
         launch_provider: Option<Rc<dyn LaunchProvider>>,
         config: Option<ConfigPaths>,
         cx: &mut Context<Self>,
@@ -198,7 +198,7 @@ impl Workspace {
     /// names was one name too many: this is the slot itself, handed out
     /// type-erased, so a view built before a connect and one built after are
     /// pointed at the same place.
-    pub(crate) fn provider(&self) -> Rc<dyn ReadProvider> {
+    pub(crate) fn provider(&self) -> Rc<dyn ClusterProvider> {
         self.slot.clone()
     }
 

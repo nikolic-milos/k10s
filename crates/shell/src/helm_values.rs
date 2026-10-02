@@ -7,7 +7,7 @@
 //! line), and the tab retires with its cluster like every other
 //! [`crate::tag::ItemTag::HelmReport`]. Whole revealed documents leave
 //! through [`crate::editor::EditorView::scratch`] instead and are dropped
-//! with the [`crate::provider::HelmReveal`].
+//! with the [`k10s_provider::HelmReveal`].
 
 use gpui::{
     Context, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, Role, ScrollWheelEvent,

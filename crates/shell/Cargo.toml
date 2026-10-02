@@ -18,6 +18,7 @@ test-support = []
 [dependencies]
 k10s-atlas.workspace = true
 k10s-core.workspace = true
+k10s-provider.workspace = true
 k10s-edit.workspace = true
 k10s-map.workspace = true
 k10s-theme.workspace = true

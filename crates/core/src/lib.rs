@@ -12,6 +12,7 @@
 pub mod ingest;
 pub mod layout;
 pub mod model;
+pub mod overlay;
 mod prepared;
 pub mod replay;
 
@@ -33,6 +34,7 @@ pub use model::{
     BUILTIN_TOOLS, Catalog, KindEntry, KindId, KindInfo, ReasonId, ReasonInfo, Role, Severity,
     State, ToolId, ToolInfo, kind_role, kind_short, reason_severity,
 };
+pub use overlay::OverlayKind;
 pub use prepared::{PreparedNamespace, PreparedPod, PreparedSat, PreparedScene, PreparedWorkload};
 pub use replay::RecordedStream;
 

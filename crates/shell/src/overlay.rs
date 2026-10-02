@@ -10,7 +10,7 @@ use k10s_core::SceneSnapshot;
 use k10s_map::{OverlayFrame, OverlayKind, OverlayMark};
 use k10s_theme::{Sample, Series, downsample_samples};
 
-use crate::provider::OverlayStamp;
+use k10s_provider::OverlayStamp;
 
 /// Join fetched stamps to the snapshot. A uid the scene does not carry, or a
 /// name that matches nothing, is skipped: missing overlay, not a default colour.

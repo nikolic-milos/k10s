@@ -30,10 +30,10 @@ use gpui::{
 };
 use k10s_theme::ShellTheme;
 
-use crate::provider::{ExecEvent, ExecRequest, ExecSession, ReadProvider};
 use crate::ui::{
     CONTENT_PADDING, PANEL_FOOTER_HEIGHT, PANEL_HEADER_HEIGHT, Viewport, panel_header,
 };
+use k10s_provider::{ClusterProvider, ExecEvent, ExecRequest, ExecSession};
 
 /// How many lines of history the grid keeps above the visible screen. The
 /// bound is the memory ceiling: a session that prints forever still occupies
@@ -422,7 +422,7 @@ pub struct TerminalView {
 
 impl TerminalView {
     pub fn exec(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         request: ExecRequest,
         cx: &mut Context<Self>,
     ) -> TerminalView {
@@ -438,7 +438,7 @@ impl TerminalView {
     /// only, no TTY command. The flag rides on [`ExecRequest`] so the
     /// transport trait stays as it is.
     pub fn attach(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         request: ExecRequest,
         cx: &mut Context<Self>,
     ) -> TerminalView {
@@ -484,7 +484,7 @@ impl TerminalView {
                      platform yet"
                         .to_string(),
                 ));
-                Box::new(crate::provider::NullExecSession)
+                Box::new(k10s_provider::NullExecSession)
             },
             cx,
         )
@@ -503,7 +503,7 @@ impl TerminalView {
                 on_event(ExecEvent::Failed(
                     "local machine commands are not available on this platform".to_string(),
                 ));
-                Box::new(crate::provider::NullExecSession)
+                Box::new(k10s_provider::NullExecSession)
             },
             cx,
         )

@@ -21,6 +21,7 @@ path = "src/main.rs"
 # and its first useful frame 295.4 to 225.2 ms. Two packages, budgeted.
 mimalloc = "0.1"
 k10s-core.workspace = true
+k10s-provider.workspace = true
 k10s-clustergen.workspace = true
 k10s-data.workspace = true
 k10s-world.workspace = true

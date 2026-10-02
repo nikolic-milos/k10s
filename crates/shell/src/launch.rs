@@ -21,7 +21,7 @@
 //! that is refused are all labelled states with the rows still live underneath.
 //! And a kubeconfig holds credentials -- `token`, `client-key-data`, an exec
 //! plugin's arguments -- so the only fields that reach a row are the ones
-//! [`crate::provider::ContextRow`] carries, and [`detail`] is the one place
+//! [`k10s_provider::ContextRow`] carries, and [`detail`] is the one place
 //! that decides what of those is shown.
 
 use gpui::{
@@ -30,9 +30,9 @@ use gpui::{
 };
 
 use crate::palette::fuzzy_match;
-use crate::provider::{ConfigSource, ConnectRequest, ContextRow, ScanOutcome, ScanRequest};
 use crate::ui::{LAUNCH_LOGO_SIZE, LIST_ROW_HEIGHT, MODAL_MAX_HEIGHT, MODAL_WIDTH, brand_logo};
 use crate::{CancelInput, CommitInput, DeleteInputChar, RowDown, RowUp};
+use k10s_provider::{ConfigSource, ConnectRequest, ContextRow, ScanOutcome, ScanRequest};
 
 /// What one selectable entry does when it is confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -16,7 +16,8 @@ use k10s_clustergen::GenConfig;
 use k10s_core::{PreparedScene, WorldCtrl, new_shared_scene};
 use k10s_data::DEFAULT_EVENT_SINK_CAPACITY;
 use k10s_map::{BenchMeta, MapView};
-use k10s_shell::{ConnectOutcome, ConnectRequest, LaunchProvider as _, ScanRequest, Workspace};
+use k10s_provider::{ConnectOutcome, ConnectRequest, LaunchProvider as _, ScanRequest};
+use k10s_shell::Workspace;
 
 use config::{ConfigFiles, DesktopAppearance};
 use launch::{Feed, LaunchService};

@@ -19,15 +19,15 @@ use gpui::{
     SharedString, Styled, Window, canvas, div, prelude::*, px, rgb,
 };
 
-use crate::provider::{
-    ContainersOutcome, DescribeRequest, DocOutcome, LogChunk, LogRequest, LogStop, ReadProvider,
-    Reply, WorkloadLogRequest,
-};
 use crate::ui::{CONTENT_PADDING, PANEL_HEADER_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
     CancelDoc, CancelInput, CommitInput, CycleContainer, DeleteInputChar, DocEnd, DocHome,
     DocPageDown, DocPageUp, DocScrollDown, DocScrollUp, EnterSearch, NextMatch, PrevMatch, Reload,
     ToggleFollow, TogglePrevious, ToggleTimestamps,
+};
+use k10s_provider::{
+    ClusterProvider, ContainersOutcome, DescribeRequest, DocOutcome, LogChunk, LogRequest, LogStop,
+    Reply, WorkloadLogRequest,
 };
 
 pub const MAX_LOG_LINES: usize = 10_000;
@@ -356,7 +356,7 @@ struct LogSource {
 
 pub struct TextView {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     title: SharedString,
     state: TextState,
     source: Source,
@@ -370,7 +370,7 @@ pub struct TextView {
 
 impl TextView {
     pub fn doc(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         request: DescribeRequest,
         cx: &mut Context<Self>,
     ) -> TextView {
@@ -392,7 +392,7 @@ impl TextView {
     }
 
     pub fn logs(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         request: LogRequest,
         cx: &mut Context<Self>,
     ) -> TextView {
@@ -421,7 +421,7 @@ impl TextView {
     }
 
     pub fn workload_logs(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         request: WorkloadLogRequest,
         cx: &mut Context<Self>,
     ) -> TextView {

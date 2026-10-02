@@ -3577,6 +3577,7 @@ dependencies = [
  "k10s-core",
  "k10s-data",
  "k10s-map",
+ "k10s-provider",
  "k10s-shell",
  "k10s-theme",
  "k10s-world",
@@ -3686,6 +3687,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "k10s-provider"
+version = "0.1.0"
+dependencies = [
+ "k10s-core",
+]
+
+[[package]]
 name = "k10s-shell"
 version = "0.1.0"
 dependencies = [
@@ -3697,6 +3705,7 @@ dependencies = [
  "k10s-core",
  "k10s-edit",
  "k10s-map",
+ "k10s-provider",
  "k10s-theme",
  "k10s-world",
  "regex",

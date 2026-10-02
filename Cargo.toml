@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/atlas",
     "crates/core",
+    "crates/provider",
     "crates/clustergen",
     "crates/world",
     "crates/theme",
@@ -31,6 +32,7 @@ repository = "https://github.com/nikolic-milos/k10s"
 [workspace.dependencies]
 k10s-atlas = { path = "crates/atlas" }
 k10s-core = { path = "crates/core" }
+k10s-provider = { path = "crates/provider" }
 k10s-clustergen = { path = "crates/clustergen" }
 k10s-world = { path = "crates/world" }
 k10s-theme = { path = "crates/theme" }

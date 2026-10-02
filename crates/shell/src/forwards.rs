@@ -16,20 +16,20 @@ use gpui::{
     ScrollWheelEvent, SharedString, Styled, Window, canvas, div, prelude::*, px, rgb,
 };
 
-use crate::provider::{
-    ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, ReadProvider, TableColumn, TablePage,
-    TableRow,
-};
 use crate::table::TableState;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{Refresh, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp, StopForward};
+use k10s_provider::{
+    ClusterProvider, ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, TableColumn,
+    TablePage, TableRow,
+};
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
 const NO_FORWARDS: &str = "no forwards open; F on a pod or service row in the browser starts one";
 
 pub struct ForwardsView {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     table: TableState,
     status: Option<String>,
     viewport: Viewport,
@@ -41,7 +41,7 @@ pub struct ForwardsView {
 
 impl ForwardsView {
     pub fn new(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         start: Option<ForwardRequest>,
         cx: &mut Context<Self>,
     ) -> ForwardsView {

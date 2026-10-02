@@ -10,7 +10,7 @@
 //! live log follows -- switched by tabs and keyed actions; anything hosted
 //! implements [`Item`] and the workspace holds it as a boxed [`ItemHandle`],
 //! so a new panel kind never touches workspace internals. Every read goes
-//! through the [`ReadProvider`] seam, so the shell never sees kube, and every
+//! through the [`ClusterProvider`] seam, so the shell never sees kube, and every
 //! denial arrives as a labelled state; the local terminal is the same
 //! `TerminalView` on a PTY transport instead of an exec. The chrome is
 //! Zed's: a title bar with the application menu, drag-to-move, and
@@ -57,7 +57,6 @@ pub mod launch;
 pub mod lists;
 pub mod observe;
 pub mod palette;
-pub mod provider;
 #[cfg(unix)]
 pub mod pty;
 pub mod reveal;
@@ -98,17 +97,17 @@ mod workspace;
 pub use actions::*;
 pub use bindings::{input_suppressors, keybindings};
 pub use item::{Item, ItemHandle};
-pub use provider::{
+pub use k10s_provider::{
     AlertMatcher, AlertPodOutcome, AlertmanagerEndpoint, AlertmanagerOutcome, ApplyOutcome,
-    ApplyRequest, Bytes, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest, Connection,
-    ContainersOutcome, ContextRow, Day2Op, Day2Outcome, Day2Request, DemoOutcome, DescribeRequest,
-    Detail, DocOutcome, EcosystemEntry, EventRow, ExecEvent, ExecRequest, ExecSession,
-    ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, GrafanaOutcome, GrafanaPanelKind,
-    GrafanaPanelRow, HelmReveal, HelmRevealOutcome, HelmRollbackOutcome, KindRow, LaunchProvider,
-    LiveCopy, LogChunk, LogRequest, LogStop, LokiOutcome, ManifestOutcome, Millicores,
-    NullExecSession, NullLaunchProvider, NullProvider, ObserveReach, OverlayOutcome, OverlayStamp,
-    PodPostureView, PostureOutcome, PromOutcome, PromSeriesView, ProviderFactory, ProviderSlot,
-    QueryDialect, ReadProvider, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome,
+    ApplyRequest, Bytes, ClusterProvider, ConfigSource, Conflicted, ConnectOutcome, ConnectRequest,
+    Connection, ContainersOutcome, ContextRow, Day2Op, Day2Outcome, Day2Request, DemoOutcome,
+    DescribeRequest, Detail, DocOutcome, EcosystemEntry, EventRow, ExecEvent, ExecRequest,
+    ExecSession, ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, GrafanaOutcome,
+    GrafanaPanelKind, GrafanaPanelRow, HelmReveal, HelmRevealOutcome, HelmRollbackOutcome, KindRow,
+    LaunchProvider, LiveCopy, LogChunk, LogRequest, LogStop, LokiOutcome, ManifestOutcome,
+    Millicores, NullExecSession, NullLaunchProvider, NullProvider, ObserveReach, OverlayOutcome,
+    OverlayStamp, PodPostureView, PostureOutcome, PromOutcome, PromSeriesView, ProviderFactory,
+    ProviderSlot, QueryDialect, Reply, ScanOutcome, ScanRequest, SchemaCatalogOutcome,
     SchemaSource, SchemaTextOutcome, SilenceOutcome, SilenceRequest, SpanView, TableColumn,
     TableOutcome, TablePage, TableRow, ToolPresence, TraceOutcome, UsageOutcome, UsageRequest,
     UsageSample, UsageSource, UsageTarget, WorkloadLogRequest,

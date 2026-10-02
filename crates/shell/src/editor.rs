@@ -58,9 +58,9 @@ use k10s_theme::Typography;
 
 use crate::dirty::DirtyState;
 use crate::fs::Fs;
-use crate::provider::{DescribeRequest, ReadProvider, SchemaSource};
 use crate::saves::SaveQueue;
 use crate::ui::{CONTENT_PADDING, STATUS_BAR_HEIGHT, Viewport};
+use k10s_provider::{ClusterProvider, DescribeRequest, SchemaSource};
 
 pub use crate::spans::{LineLayers, SpanFlags, compose_line, viewport_layers};
 
@@ -291,7 +291,7 @@ pub struct EditorView {
     // strong handle; the sources it is built from have to carry the identity or
     // a reused diff tab keeps pointing at the editor it was first opened from.
     pub(crate) handle: WeakEntity<EditorView>,
-    pub(crate) provider: Rc<dyn ReadProvider>,
+    pub(crate) provider: Rc<dyn ClusterProvider>,
     pub(crate) fs: Arc<dyn Fs>,
     pub(crate) source: EditorSource,
     pub(crate) title: SharedString,
@@ -339,7 +339,7 @@ pub struct EditorView {
 
 impl EditorView {
     fn build(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         fs: Arc<dyn Fs>,
         schema: Rc<RefCell<SchemaStore>>,
         source: EditorSource,
@@ -385,7 +385,7 @@ impl EditorView {
     }
 
     pub fn cluster(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         fs: Arc<dyn Fs>,
         schema: Rc<RefCell<SchemaStore>>,
         request: DescribeRequest,
@@ -406,7 +406,7 @@ impl EditorView {
     }
 
     pub fn file(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         fs: Arc<dyn Fs>,
         schema: Rc<RefCell<SchemaStore>>,
         path: PathBuf,
@@ -428,7 +428,7 @@ impl EditorView {
     }
 
     pub fn scratch(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         fs: Arc<dyn Fs>,
         schema: Rc<RefCell<SchemaStore>>,
         title: String,
@@ -461,7 +461,7 @@ impl EditorView {
     // when it does not: how the settings and keymap files open before their
     // first save.
     pub fn file_or_template(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         fs: Arc<dyn Fs>,
         schema: Rc<RefCell<SchemaStore>>,
         path: PathBuf,

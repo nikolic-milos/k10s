@@ -15,7 +15,7 @@ use crate::diff_gate::{
     raced_note, recreated_note, refuse_keep, reviewed, seen_after, stale_object_note,
 };
 use crate::editor::BufferStamp;
-use crate::provider::{ApplyOutcome, Conflicted, LiveCopy};
+use k10s_provider::{ApplyOutcome, Conflicted, LiveCopy};
 
 const LIVE: &str = concat!(
     "apiVersion: v1\n",

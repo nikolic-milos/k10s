@@ -206,7 +206,7 @@ fn a_workload_says_how_much_of_it_the_numbers_cover() {
 
 #[test]
 fn posture_lines_report_isolation_and_named_ports_not_a_traffic_verdict() {
-    let view = crate::provider::PodPostureView {
+    let view = k10s_provider::PodPostureView {
         ingress_isolated: true,
         ingress_policies: 2,
         ingress_names: vec!["prod/ingress-a".into()],

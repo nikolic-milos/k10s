@@ -30,15 +30,15 @@ use crate::helm_values::HelmReportView;
 use crate::item::{Item, ItemHandle};
 use crate::lists::{InventoryEvent, InventoryView};
 use crate::observe::ObserveView;
-use crate::provider::{
-    DescribeRequest, DocOutcome, ExecRequest, ForwardRequest, HelmReveal, HelmRevealOutcome,
-    HelmRollbackOutcome, LogRequest, WorkloadLogRequest,
-};
 use crate::tag::ItemTag;
 use crate::term::TerminalView;
 use crate::text::TextView;
 use crate::traces::TracesView;
 use crate::workspace::{PickerPurpose, Workspace};
+use k10s_provider::{
+    DescribeRequest, DocOutcome, ExecRequest, ForwardRequest, HelmReveal, HelmRevealOutcome,
+    HelmRollbackOutcome, LogRequest, WorkloadLogRequest,
+};
 
 // The map is an item like any other hosted view: erasing it behind the same
 // handle is what lets the center row treat "the starmap" and "a describe
@@ -592,7 +592,7 @@ impl Workspace {
         let tag = ItemTag::Silence(selection.uid.to_string());
         // Pin the provider as well as the endpoint. A context swap must never
         // redirect a reviewed write through the shared slot.
-        let provider = self.slot.get();
+        let provider = self.slot.current();
         let context = self.context.clone();
         let (tx, rx) = futures::channel::oneshot::channel();
         provider.bind_alertmanager(Box::new(move |outcome| {
@@ -604,16 +604,16 @@ impl Workspace {
         window
             .spawn(cx, async move |cx| {
                 let outcome = rx.await.unwrap_or_else(|_| {
-                    crate::provider::AlertmanagerOutcome::Failed(
+                    k10s_provider::AlertmanagerOutcome::Failed(
                         "the Alertmanager lookup was dropped".to_string(),
                     )
                 });
                 let _ = this.update_in(cx, |this, window, cx| {
-                    if !std::rc::Rc::ptr_eq(&provider, &this.slot.get()) {
+                    if !std::rc::Rc::ptr_eq(&provider, &this.slot.current()) {
                         return;
                     }
                     match outcome {
-                        crate::provider::AlertmanagerOutcome::Ready(endpoint) => {
+                        k10s_provider::AlertmanagerOutcome::Ready(endpoint) => {
                             this.status_note = None;
                             this.open_item(tag, Place::Center, window, cx, |_, _, cx| {
                                 (
@@ -626,11 +626,11 @@ impl Workspace {
                                 )
                             });
                         }
-                        crate::provider::AlertmanagerOutcome::Absent => {
+                        k10s_provider::AlertmanagerOutcome::Absent => {
                             this.status_note =
                                 Some("Alertmanager is not served by this cluster".to_string())
                         }
-                        crate::provider::AlertmanagerOutcome::Failed(why) => {
+                        k10s_provider::AlertmanagerOutcome::Failed(why) => {
                             this.status_note = Some(why)
                         }
                     }

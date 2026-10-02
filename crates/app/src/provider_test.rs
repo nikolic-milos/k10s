@@ -13,7 +13,7 @@ fn a_describe_maps_its_document_and_keeps_denial_and_failure_labels() {
         lines: vec!["line".to_string()],
     }));
     match doc {
-        k10s_shell::DocOutcome::Doc { title, lines } => {
+        k10s_provider::DocOutcome::Doc { title, lines } => {
             assert_eq!(title, "pod api-1");
             assert_eq!(lines, vec!["line".to_string()]);
         }
@@ -21,13 +21,13 @@ fn a_describe_maps_its_document_and_keeps_denial_and_failure_labels() {
     }
     assert!(matches!(
         describe_outcome(Fetched::Denied { what: "events" }),
-        k10s_shell::DocOutcome::Denied("events")
+        k10s_provider::DocOutcome::Denied("events")
     ));
     match describe_outcome(Fetched::Failed {
         what: "describe",
         why: "timed out".to_string(),
     }) {
-        k10s_shell::DocOutcome::Failed(why) => assert_eq!(why, "timed out"),
+        k10s_provider::DocOutcome::Failed(why) => assert_eq!(why, "timed out"),
         other => panic!("{other:?}"),
     }
 }
@@ -52,7 +52,7 @@ fn a_release_inventory_crosses_as_a_table() {
         unreadable: 0,
     };
     match releases_outcome(Fetched::Ok(releases)) {
-        k10s_shell::TableOutcome::Table(page) => {
+        k10s_provider::TableOutcome::Table(page) => {
             assert_eq!(
                 page.rows[0].cells,
                 ["ingress", "infra", "3", "deployed", "ingress-nginx-4.11.0"]
@@ -64,7 +64,7 @@ fn a_release_inventory_crosses_as_a_table() {
         releases_outcome(Fetched::Denied {
             what: "helm releases"
         }),
-        k10s_shell::TableOutcome::Denied("helm releases")
+        k10s_provider::TableOutcome::Denied("helm releases")
     ));
 }
 
@@ -72,24 +72,24 @@ fn a_release_inventory_crosses_as_a_table() {
 fn gitops_absence_is_invisible_and_a_denial_stays_labelled() {
     assert!(matches!(
         argo_outcome(Fetched::Ok(k10s_data::argo::Inventory::default())),
-        k10s_shell::TableOutcome::Absent
+        k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
         flux_outcome(Fetched::Ok(k10s_data::flux::Inventory::default())),
-        k10s_shell::TableOutcome::Absent
+        k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
         argo_outcome(Fetched::Denied {
             what: "argo applications"
         }),
-        k10s_shell::TableOutcome::Denied("argo applications")
+        k10s_provider::TableOutcome::Denied("argo applications")
     ));
     let denied_flux = k10s_data::flux::Inventory {
         git_repositories: k10s_data::flux::KindSet::Denied,
         ..k10s_data::flux::Inventory::default()
     };
     match flux_outcome(Fetched::Ok(denied_flux)) {
-        k10s_shell::TableOutcome::Table(page) => {
+        k10s_provider::TableOutcome::Table(page) => {
             let text = page
                 .rows
                 .iter()
@@ -111,7 +111,7 @@ fn a_day2_needs_confirm_crosses_the_summary_and_not_a_write() {
         blast: k10s_data::day2::Blast::Replicas { from: 3, to: 0 },
         summary: "scale api from 3 to 0 replicas".to_string(),
     }) {
-        k10s_shell::Day2Outcome::NeedsConfirm { summary } => {
+        k10s_provider::Day2Outcome::NeedsConfirm { summary } => {
             assert_eq!(summary, "scale api from 3 to 0 replicas");
         }
         other => panic!("{other:?}"),
@@ -120,7 +120,7 @@ fn a_day2_needs_confirm_crosses_the_summary_and_not_a_write() {
         what: "scale",
         why: "this account cannot patch".to_string(),
     }) {
-        k10s_shell::Day2Outcome::Denied { what, why } => {
+        k10s_provider::Day2Outcome::Denied { what, why } => {
             assert_eq!((what, why.as_str()), ("scale", "this account cannot patch"));
         }
         other => panic!("{other:?}"),
@@ -140,7 +140,7 @@ fn a_manifest_crosses_field_for_field_including_an_absent_uid() {
         uid: None,
     });
     match manifest_outcome(fetched) {
-        k10s_shell::ManifestOutcome::Manifest {
+        k10s_provider::ManifestOutcome::Manifest {
             title,
             yaml,
             api_version,
@@ -175,19 +175,22 @@ fn every_apply_arm_keeps_what_the_review_reads() {
                 yaml: "l".to_string(),
                 uid: Some("abc".to_string()),
             },
-            k10s_shell::LiveCopy::Read {
+            k10s_provider::LiveCopy::Read {
                 yaml: "l".to_string(),
                 uid: Some("abc".to_string()),
             },
         ),
-        (k10s_data::apply::Live::Absent, k10s_shell::LiveCopy::Absent),
+        (
+            k10s_data::apply::Live::Absent,
+            k10s_provider::LiveCopy::Absent,
+        ),
     ] {
         match apply_outcome(Plane::DryRun(k10s_data::apply::DryRun {
             yaml: "y".to_string(),
             uid: Some("abc".to_string()),
             live: read,
         })) {
-            k10s_shell::ApplyOutcome::DryRun { yaml, uid, live } => {
+            k10s_provider::ApplyOutcome::DryRun { yaml, uid, live } => {
                 assert_eq!(
                     (yaml.as_str(), uid.as_deref(), live),
                     ("y", Some("abc"), crossed)
@@ -201,14 +204,14 @@ fn every_apply_arm_keeps_what_the_review_reads() {
     match apply_outcome(Plane::Applied(k10s_data::apply::Applied {
         uid: Some("abc".to_string()),
     })) {
-        k10s_shell::ApplyOutcome::Applied { uid } => assert_eq!(uid.as_deref(), Some("abc")),
+        k10s_provider::ApplyOutcome::Applied { uid } => assert_eq!(uid.as_deref(), Some("abc")),
         other => panic!("{other:?}"),
     }
 
     match apply_outcome(Plane::Unrendered(k10s_data::apply::Unrendered {
         why: "too deep".to_string(),
     })) {
-        k10s_shell::ApplyOutcome::Unrendered { why } => assert_eq!(why, "too deep"),
+        k10s_provider::ApplyOutcome::Unrendered { why } => assert_eq!(why, "too deep"),
         other => panic!("{other:?}"),
     }
 
@@ -216,7 +219,7 @@ fn every_apply_arm_keeps_what_the_review_reads() {
     match apply_outcome(Plane::NotSent {
         why: "exec credential plugin failed".to_string(),
     }) {
-        k10s_shell::ApplyOutcome::Failed(why) => {
+        k10s_provider::ApplyOutcome::Failed(why) => {
             assert_eq!(why, "nothing was sent: exec credential plugin failed")
         }
         other => panic!("{other:?}"),
@@ -230,7 +233,7 @@ fn every_apply_arm_keeps_what_the_review_reads() {
         }],
         truncated: true,
     }) {
-        k10s_shell::ApplyOutcome::Conflict {
+        k10s_provider::ApplyOutcome::Conflict {
             causes, truncated, ..
         } => {
             assert_eq!(causes[0].field, ".spec.replicas");
@@ -245,7 +248,7 @@ fn every_apply_arm_keeps_what_the_review_reads() {
         message: "invalid".to_string(),
         causes: vec!["spec.bogus: unknown field".to_string()],
     }) {
-        k10s_shell::ApplyOutcome::Rejected { message, causes } => {
+        k10s_provider::ApplyOutcome::Rejected { message, causes } => {
             assert_eq!(message, "invalid");
             assert_eq!(causes.len(), 1);
         }
@@ -257,14 +260,14 @@ fn every_apply_arm_keeps_what_the_review_reads() {
     match apply_outcome(Plane::Stale {
         message: "newer".to_string(),
     }) {
-        k10s_shell::ApplyOutcome::Stale { message } => assert_eq!(message, "newer"),
+        k10s_provider::ApplyOutcome::Stale { message } => assert_eq!(message, "newer"),
         other => panic!("{other:?}"),
     }
     match apply_outcome(Plane::Denied {
         what: "apply",
         why: "forbidden".to_string(),
     }) {
-        k10s_shell::ApplyOutcome::Denied { what, why } => {
+        k10s_provider::ApplyOutcome::Denied { what, why } => {
             assert_eq!((what, why.as_str()), ("apply", "forbidden"));
         }
         other => panic!("{other:?}"),
@@ -274,13 +277,13 @@ fn every_apply_arm_keeps_what_the_review_reads() {
     match apply_outcome(Plane::Unconfirmed {
         why: "no answer within 35 s".to_string(),
     }) {
-        k10s_shell::ApplyOutcome::Unconfirmed(why) => assert_eq!(why, "no answer within 35 s"),
+        k10s_provider::ApplyOutcome::Unconfirmed(why) => assert_eq!(why, "no answer within 35 s"),
         other => panic!("{other:?}"),
     }
     match apply_outcome(Plane::Failed {
         why: "io".to_string(),
     }) {
-        k10s_shell::ApplyOutcome::Failed(why) => assert_eq!(why, "io"),
+        k10s_provider::ApplyOutcome::Failed(why) => assert_eq!(why, "io"),
         other => panic!("{other:?}"),
     }
 }
@@ -291,14 +294,14 @@ fn the_arms_that_only_carry_a_label_still_carry_it() {
     // These are the ones a seam loses silently: nothing fails to compile when
     // a reason stops crossing, it just stops being on screen.
     match adapt_chunk(k10s_data::logs::LogChunk::Lines(vec!["one".to_string()])) {
-        k10s_shell::LogChunk::Lines(lines) => assert_eq!(lines, vec!["one".to_string()]),
+        k10s_provider::LogChunk::Lines(lines) => assert_eq!(lines, vec!["one".to_string()]),
         other => panic!("{other:?}"),
     }
     match adapt_chunk(k10s_data::logs::LogChunk::Failed {
         what: "logs",
         why: "connection reset".to_string(),
     }) {
-        k10s_shell::LogChunk::Failed(why) => assert_eq!(why, "connection reset"),
+        k10s_provider::LogChunk::Failed(why) => assert_eq!(why, "connection reset"),
         other => panic!("{other:?}"),
     }
 
@@ -318,36 +321,36 @@ fn the_arms_that_only_carry_a_label_still_carry_it() {
     };
     assert!(matches!(
         adapt_forward(opening).state,
-        k10s_shell::ForwardState::Opening
+        k10s_provider::ForwardState::Opening
     ));
     assert!(matches!(
         adapt_forward(active).state,
-        k10s_shell::ForwardState::Active
+        k10s_provider::ForwardState::Active
     ));
 
     match table_outcome(Fetched::<k10s_data::browse::TablePage>::Failed {
         what: "table",
         why: "the list timed out".to_string(),
     }) {
-        k10s_shell::TableOutcome::Failed(why) => assert_eq!(why, "the list timed out"),
+        k10s_provider::TableOutcome::Failed(why) => assert_eq!(why, "the list timed out"),
         other => panic!("{other:?}"),
     }
     assert!(matches!(
         table_outcome(Fetched::<k10s_data::browse::TablePage>::Denied { what: "pods" }),
-        k10s_shell::TableOutcome::Denied("pods")
+        k10s_provider::TableOutcome::Denied("pods")
     ));
     match schema_text_outcome(Fetched::Failed {
         what: "schema",
         why: "not served".to_string(),
     }) {
-        k10s_shell::SchemaTextOutcome::Failed(why) => assert_eq!(why, "not served"),
+        k10s_provider::SchemaTextOutcome::Failed(why) => assert_eq!(why, "not served"),
         other => panic!("{other:?}"),
     }
     match containers_outcome(Fetched::Failed {
         what: "containers",
         why: "gone".to_string(),
     }) {
-        k10s_shell::ContainersOutcome::Failed(why) => assert_eq!(why, "gone"),
+        k10s_provider::ContainersOutcome::Failed(why) => assert_eq!(why, "gone"),
         other => panic!("{other:?}"),
     }
 }
@@ -358,7 +361,7 @@ fn schema_answers_keep_their_sources_and_their_labels() {
         group_version: "apps/v1".to_string(),
         url: "/openapi/v3/apis/apps/v1".to_string(),
     }])) {
-        k10s_shell::SchemaCatalogOutcome::Catalog(sources) => {
+        k10s_provider::SchemaCatalogOutcome::Catalog(sources) => {
             assert_eq!(sources[0].group_version, "apps/v1");
             assert_eq!(sources[0].url, "/openapi/v3/apis/apps/v1");
         }
@@ -366,10 +369,10 @@ fn schema_answers_keep_their_sources_and_their_labels() {
     }
     assert!(matches!(
         schema_text_outcome(Fetched::Denied { what: "schemas" }),
-        k10s_shell::SchemaTextOutcome::Denied("schemas")
+        k10s_provider::SchemaTextOutcome::Denied("schemas")
     ));
     match schema_text_outcome(Fetched::Ok("{}".to_string())) {
-        k10s_shell::SchemaTextOutcome::Text(text) => assert_eq!(text, "{}"),
+        k10s_provider::SchemaTextOutcome::Text(text) => assert_eq!(text, "{}"),
         other => panic!("{other:?}"),
     }
 }
@@ -391,7 +394,7 @@ fn a_table_page_keeps_its_pagination_facts() {
         continue_token: Some("page-2".to_string()),
     };
     match table_outcome(Fetched::Ok(page)) {
-        k10s_shell::TableOutcome::Table(table) => {
+        k10s_provider::TableOutcome::Table(table) => {
             assert_eq!(table.columns[0].name, "Name");
             assert_eq!(table.rows[0].uid, "uid-1");
             assert!(table.truncated);
@@ -405,27 +408,27 @@ fn a_table_page_keeps_its_pagination_facts() {
 fn containers_and_exec_events_and_log_chunks_translate_arm_for_arm() {
     assert!(matches!(
         containers_outcome(Fetched::Ok(vec!["app".to_string()])),
-        k10s_shell::ContainersOutcome::Containers(c) if c == ["app".to_string()]
+        k10s_provider::ContainersOutcome::Containers(c) if c == ["app".to_string()]
     ));
 
     assert!(matches!(
         exec_event(k10s_data::exec::ExecEvent::Output(b"hi".to_vec())),
-        k10s_shell::ExecEvent::Output(bytes) if bytes == b"hi"
+        k10s_provider::ExecEvent::Output(bytes) if bytes == b"hi"
     ));
     match exec_event(k10s_data::exec::ExecEvent::Ended {
         why: "process exited".to_string(),
     }) {
-        k10s_shell::ExecEvent::Ended(why) => assert_eq!(why, "process exited"),
+        k10s_provider::ExecEvent::Ended(why) => assert_eq!(why, "process exited"),
         other => panic!("{other:?}"),
     }
 
     match adapt_chunk(k10s_data::logs::LogChunk::Ended { why: "rotated" }) {
-        k10s_shell::LogChunk::Ended(why) => assert_eq!(why, "rotated"),
+        k10s_provider::LogChunk::Ended(why) => assert_eq!(why, "rotated"),
         other => panic!("{other:?}"),
     }
     assert!(matches!(
         adapt_chunk(k10s_data::logs::LogChunk::Denied { what: "logs" }),
-        k10s_shell::LogChunk::Denied("logs")
+        k10s_provider::LogChunk::Denied("logs")
     ));
 }
 
@@ -444,11 +447,11 @@ fn a_dead_forward_keeps_the_reason_it_died() {
         },
     };
     match forward_outcome(Fetched::Ok(row)) {
-        k10s_shell::ForwardOutcome::Opened(row) => {
+        k10s_provider::ForwardOutcome::Opened(row) => {
             assert_eq!(row.id, 7);
             assert_eq!((row.local_port, row.remote_port), (8080, 80));
             match row.state {
-                k10s_shell::ForwardState::Dead(why) => assert_eq!(why, "pod is gone"),
+                k10s_provider::ForwardState::Dead(why) => assert_eq!(why, "pod is gone"),
                 other => panic!("{other:?}"),
             }
         }
@@ -473,21 +476,21 @@ fn a_usage_sample_crosses_typed_and_every_label_survives() {
         truncated: true,
     };
     match usage_outcome(plane::UsageOutcome::Usage(sample)) {
-        k10s_shell::UsageOutcome::Usage(sample) => {
-            assert_eq!(sample.cpu, Some(k10s_shell::Millicores(250)));
-            assert_eq!(sample.memory, Some(k10s_shell::Bytes(32 * 1024 * 1024)));
-            assert_eq!(sample.cpu_request, Some(k10s_shell::Millicores(500)));
+        k10s_provider::UsageOutcome::Usage(sample) => {
+            assert_eq!(sample.cpu, Some(k10s_provider::Millicores(250)));
+            assert_eq!(sample.memory, Some(k10s_provider::Bytes(32 * 1024 * 1024)));
+            assert_eq!(sample.cpu_request, Some(k10s_provider::Millicores(500)));
             // "No limit" must survive the seam as an absence, never as zero.
             assert_eq!(sample.cpu_limit, None);
             assert_eq!(
                 sample.memory_request,
-                Some(k10s_shell::Bytes(64 * 1024 * 1024))
+                Some(k10s_provider::Bytes(64 * 1024 * 1024))
             );
             assert_eq!(
                 sample.memory_limit,
-                Some(k10s_shell::Bytes(128 * 1024 * 1024))
+                Some(k10s_provider::Bytes(128 * 1024 * 1024))
             );
-            assert_eq!(sample.source, k10s_shell::UsageSource::Kubelet);
+            assert_eq!(sample.source, k10s_provider::UsageSource::Kubelet);
             assert_eq!(
                 (sample.pods_measured, sample.pods_total),
                 (2, 3),
@@ -502,19 +505,19 @@ fn a_usage_sample_crosses_typed_and_every_label_survives() {
         usage_outcome(plane::UsageOutcome::Denied {
             what: "pod metrics"
         }),
-        k10s_shell::UsageOutcome::Denied("pod metrics")
+        k10s_provider::UsageOutcome::Denied("pod metrics")
     ));
     match usage_outcome(plane::UsageOutcome::Failed {
         what: "node metrics",
         why: "did not parse".to_string(),
     }) {
-        k10s_shell::UsageOutcome::Failed(why) => assert_eq!(why, "did not parse"),
+        k10s_provider::UsageOutcome::Failed(why) => assert_eq!(why, "did not parse"),
         other => panic!("{other:?}"),
     }
     match usage_outcome(plane::UsageOutcome::Absent {
         why: "metrics-server is not installed".to_string(),
     }) {
-        k10s_shell::UsageOutcome::Absent(why) => {
+        k10s_provider::UsageOutcome::Absent(why) => {
             assert_eq!(why, "metrics-server is not installed");
         }
         other => panic!("{other:?}"),
@@ -525,15 +528,15 @@ fn a_usage_sample_crosses_typed_and_every_label_survives() {
 fn policy_harbor_and_mesh_absence_hide_the_pane() {
     assert!(matches!(
         policy_outcome(Fetched::Ok(k10s_data::policy::Inventory::default())),
-        k10s_shell::TableOutcome::Absent
+        k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
         harbor_outcome(Fetched::Ok(k10s_data::harbor::Inventory::default())),
-        k10s_shell::TableOutcome::Absent
+        k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
         mesh_outcome(k10s_data::mesh::MeshInventory::default()),
-        k10s_shell::TableOutcome::Absent
+        k10s_provider::TableOutcome::Absent
     ));
     assert!(matches!(
         grafana_outcome(Fetched::Ok(k10s_data::read::GrafanaCatalog {
@@ -543,19 +546,19 @@ fn policy_harbor_and_mesh_absence_hide_the_pane() {
             browser_base: None,
             served: false,
         })),
-        k10s_shell::GrafanaOutcome::Absent
+        k10s_provider::GrafanaOutcome::Absent
     ));
     assert!(matches!(
         prom_outcome(Fetched::Ok(None)),
-        k10s_shell::PromOutcome::Absent
+        k10s_provider::PromOutcome::Absent
     ));
     assert!(matches!(
         loki_outcome(Fetched::Ok(None)),
-        k10s_shell::LokiOutcome::Absent
+        k10s_provider::LokiOutcome::Absent
     ));
     assert!(matches!(
         trace_outcome(Fetched::Ok(None)),
-        k10s_shell::TraceOutcome::Absent
+        k10s_provider::TraceOutcome::Absent
     ));
 }
 
@@ -566,7 +569,7 @@ fn a_helm_rollback_report_keeps_the_not_helm_rollback_note() {
         documents: Vec::new(),
     };
     match helm_rollback_outcome(Fetched::Ok(report)) {
-        k10s_shell::HelmRollbackOutcome::Report { note, lines } => {
+        k10s_provider::HelmRollbackOutcome::Report { note, lines } => {
             assert_eq!(note, k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
             assert_eq!(lines[0], k10s_data::helm_reveal::NOT_HELM_ROLLBACK);
         }
@@ -595,7 +598,7 @@ fn a_rollback_names_the_document_that_may_have_landed_and_the_ones_not_sent() {
         ],
     };
     match helm_rollback_outcome(Fetched::Ok(report)) {
-        k10s_shell::HelmRollbackOutcome::Report { lines, .. } => assert_eq!(
+        k10s_provider::HelmRollbackOutcome::Report { lines, .. } => assert_eq!(
             lines[2..],
             [
                 "Deployment web: it may have landed: no answer within 35 s",
@@ -632,7 +635,7 @@ fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
         served: true,
     };
     match grafana_outcome(Fetched::Ok(catalog)) {
-        k10s_shell::GrafanaOutcome::Catalog { panels, .. } => {
+        k10s_provider::GrafanaOutcome::Catalog { panels, .. } => {
             assert_eq!(panels[0].expr, "rate(cpu[1m])");
             assert_eq!(
                 panels[0].browser_url.as_deref(),
@@ -655,7 +658,7 @@ fn inspect_details_become_event_rows_with_their_counts() {
         },
     ]));
     match detail {
-        k10s_shell::Detail::Events(rows) => {
+        k10s_provider::Detail::Events(rows) => {
             assert_eq!(rows[0].when, "2m");
             assert_eq!(rows[0].kind, "Warning");
             assert_eq!(rows[0].reason, "BackOff");
@@ -691,7 +694,7 @@ fn policy_findings_sharing_a_resource_get_distinct_row_uids() {
         partly_denied: false,
     };
     match policy_outcome(Fetched::Ok(inventory)) {
-        k10s_shell::TableOutcome::Table(page) => {
+        k10s_provider::TableOutcome::Table(page) => {
             let mut uids: Vec<&str> = page.rows.iter().map(|row| row.uid.as_str()).collect();
             uids.sort_unstable();
             let before = uids.len();
@@ -716,7 +719,7 @@ fn a_harbor_project_without_fetched_repos_counts_them_under_repository_not_artif
         unreadable: 0,
     };
     match harbor_outcome(Fetched::Ok(inventory)) {
-        k10s_shell::TableOutcome::Table(page) => {
+        k10s_provider::TableOutcome::Table(page) => {
             // Columns are Project, Visibility, Repository, Artifacts, Scan.
             assert_eq!(page.rows[0].cells[2], "(7 repositories)");
             assert_eq!(page.rows[0].cells[3], "");
@@ -764,7 +767,7 @@ fn a_harbor_repo_scan_cell_reports_the_worst_artifact_not_the_first() {
         unreadable: 0,
     };
     match harbor_outcome(Fetched::Ok(inventory)) {
-        k10s_shell::TableOutcome::Table(page) => {
+        k10s_provider::TableOutcome::Table(page) => {
             assert_eq!(page.rows[0].cells[4], "Critical (9)");
         }
         other => panic!("{other:?}"),
@@ -785,7 +788,7 @@ fn unreadable_harbor_rows_mark_the_listing_as_partial() {
         unreadable: 2,
     };
     match harbor_outcome(Fetched::Ok(inventory)) {
-        k10s_shell::TableOutcome::Table(page) => assert!(page.truncated),
+        k10s_provider::TableOutcome::Table(page) => assert!(page.truncated),
         other => panic!("{other:?}"),
     }
 }
@@ -810,7 +813,7 @@ fn a_denied_mesh_group_stays_visible_next_to_the_one_that_answered() {
         objects: vec![object],
         truncated: false,
     }) {
-        k10s_shell::TableOutcome::Table(page) => assert!(page.truncated),
+        k10s_provider::TableOutcome::Table(page) => assert!(page.truncated),
         other => panic!("{other:?}"),
     }
 
@@ -822,7 +825,7 @@ fn a_denied_mesh_group_stays_visible_next_to_the_one_that_answered() {
             objects: Vec::new(),
             truncated: false,
         }),
-        k10s_shell::TableOutcome::Denied("mesh")
+        k10s_provider::TableOutcome::Denied("mesh")
     ));
     match mesh_outcome(MeshInventory {
         istio: GroupState::Served,
@@ -832,7 +835,7 @@ fn a_denied_mesh_group_stays_visible_next_to_the_one_that_answered() {
         objects: Vec::new(),
         truncated: false,
     }) {
-        k10s_shell::TableOutcome::Failed(why) => assert_eq!(why, "timed out"),
+        k10s_provider::TableOutcome::Failed(why) => assert_eq!(why, "timed out"),
         other => panic!("{other:?}"),
     }
 
@@ -843,7 +846,7 @@ fn a_denied_mesh_group_stays_visible_next_to_the_one_that_answered() {
         objects: Vec::new(),
         truncated: false,
     }) {
-        k10s_shell::TableOutcome::Table(page) => assert!(!page.truncated),
+        k10s_provider::TableOutcome::Table(page) => assert!(!page.truncated),
         other => panic!("{other:?}"),
     }
 }
@@ -859,14 +862,14 @@ fn an_alert_join_uses_the_chosen_fingerprint_and_keeps_both_labels() {
     .expect("alerts");
     assert_eq!(
         alert_pod_outcome("chosen", Fetched::Ok(Some(alerts))),
-        k10s_shell::AlertPodOutcome::Pod {
+        k10s_provider::AlertPodOutcome::Pod {
             namespace: "prod".into(),
             pod: "same-name".into()
         }
     );
     assert_eq!(
         alert_pod_outcome("chosen", Fetched::Ok(None)),
-        k10s_shell::AlertPodOutcome::Absent
+        k10s_provider::AlertPodOutcome::Absent
     );
     assert_eq!(
         alert_pod_outcome(
@@ -875,7 +878,7 @@ fn an_alert_join_uses_the_chosen_fingerprint_and_keeps_both_labels() {
                 what: "alertmanager"
             }
         ),
-        k10s_shell::AlertPodOutcome::Denied("alertmanager")
+        k10s_provider::AlertPodOutcome::Denied("alertmanager")
     );
     assert_eq!(
         alert_pod_outcome(
@@ -885,7 +888,7 @@ fn an_alert_join_uses_the_chosen_fingerprint_and_keeps_both_labels() {
                 why: "backend unavailable".into()
             }
         ),
-        k10s_shell::AlertPodOutcome::Failed("backend unavailable".into())
+        k10s_provider::AlertPodOutcome::Failed("backend unavailable".into())
     );
     for labels in [
         serde_json::json!({"namespace":"prod"}),
@@ -899,11 +902,11 @@ fn an_alert_join_uses_the_chosen_fingerprint_and_keeps_both_labels() {
         )
         .expect("alert");
         assert!(
-            matches!(alert_pod_outcome("chosen", Fetched::Ok(Some(alerts))), k10s_shell::AlertPodOutcome::Failed(why) if why.contains("both namespace and pod"))
+            matches!(alert_pod_outcome("chosen", Fetched::Ok(Some(alerts))), k10s_provider::AlertPodOutcome::Failed(why) if why.contains("both namespace and pod"))
         );
     }
     assert!(
-        matches!(alert_pod_outcome("gone", Fetched::Ok(Some(Default::default()))), k10s_shell::AlertPodOutcome::Failed(why) if why.contains("no longer"))
+        matches!(alert_pod_outcome("gone", Fetched::Ok(Some(Default::default()))), k10s_provider::AlertPodOutcome::Failed(why) if why.contains("no longer"))
     );
 }
 
@@ -914,14 +917,14 @@ fn the_omitted_alerts_row_names_no_pod() {
     )
     .expect("alert");
     alerts.dropped = 2;
-    let k10s_shell::TableOutcome::Table(page) = optional_table_outcome(Fetched::Ok(
+    let k10s_provider::TableOutcome::Table(page) = optional_table_outcome(Fetched::Ok(
         k10s_data::alertmanager::table_page(Some(&alerts)),
     )) else {
         panic!("Alertmanager answered");
     };
     assert_eq!(
         omitted_notice_answer(&page.rows[0].uid),
-        Some(k10s_shell::AlertPodOutcome::Failed(
+        Some(k10s_provider::AlertPodOutcome::Failed(
             "this row counts alerts that are not shown; it names no pod".into()
         ))
     );
@@ -930,7 +933,7 @@ fn the_omitted_alerts_row_names_no_pod() {
 
 #[test]
 fn the_silence_adapter_preserves_matchers_interval_and_destination() {
-    use k10s_shell::{AlertMatcher, AlertmanagerEndpoint, SilenceRequest};
+    use k10s_provider::{AlertMatcher, AlertmanagerEndpoint, SilenceRequest};
     let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_789_182_000);
     let request = SilenceRequest {
         endpoint: AlertmanagerEndpoint {

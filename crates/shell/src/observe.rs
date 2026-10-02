@@ -13,10 +13,6 @@ use gpui::{
 };
 
 use crate::lists::InventoryEvent;
-use crate::provider::{
-    GrafanaOutcome, GrafanaPanelKind, GrafanaPanelRow, LokiOutcome, PromOutcome, QueryDialect,
-    ReadProvider, TableColumn, TablePage, TableRow, ToolPresence,
-};
 use crate::table::TableState;
 use crate::tag::ItemTag;
 use crate::text::TextState;
@@ -24,6 +20,10 @@ use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
     CancelInput, CommitInput, DeleteInputChar, EnterFilter, OpenRow, Refresh, RowDown, RowEnd,
     RowHome, RowPageDown, RowPageUp, RowUp,
+};
+use k10s_provider::{
+    ClusterProvider, GrafanaOutcome, GrafanaPanelKind, GrafanaPanelRow, LokiOutcome, PromOutcome,
+    QueryDialect, TableColumn, TablePage, TableRow, ToolPresence,
 };
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
@@ -37,7 +37,7 @@ enum QueryKind {
 
 pub struct ObserveView {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     table: TableState,
     panels: Vec<GrafanaPanelRow>,
     grafana: ToolPresence,
@@ -87,7 +87,7 @@ fn scoped_query(selection: Option<&crate::selection::Selection>) -> String {
 
 impl ObserveView {
     pub fn new(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         selection: Option<&crate::selection::Selection>,
         cx: &mut Context<Self>,
     ) -> ObserveView {
@@ -823,7 +823,7 @@ fn dialect_word(dialect: QueryDialect) -> &'static str {
     }
 }
 
-fn render_series(series: &[crate::provider::PromSeriesView]) -> Vec<String> {
+fn render_series(series: &[k10s_provider::PromSeriesView]) -> Vec<String> {
     if series.is_empty() {
         return vec!["this PromQL returned no series".to_string()];
     }

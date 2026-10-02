@@ -16,15 +16,15 @@ use gpui::{
     prelude::*, px, rgb,
 };
 
-use crate::provider::{
-    DescribeRequest, ForwardRequest, KindRow, ReadProvider, TableColumn, TableOutcome, TablePage,
-    TableRow,
-};
 use crate::table::TableState;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
     Back, CancelInput, CommitInput, DeleteInputChar, EnterFilter, ExecRow, LoadMore, LogsRow,
     OpenRow, Refresh, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp, StartForward,
+};
+use k10s_provider::{
+    ClusterProvider, DescribeRequest, ForwardRequest, KindRow, TableColumn, TableOutcome,
+    TablePage, TableRow,
 };
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
@@ -116,7 +116,7 @@ pub(crate) fn row_actions(kind: &str) -> RowActions {
 
 pub struct BrowseView {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     kinds: Vec<KindRow>,
     table: TableState,
     phase: Phase,
@@ -128,7 +128,7 @@ pub struct BrowseView {
 impl EventEmitter<BrowseEvent> for BrowseView {}
 
 impl BrowseView {
-    pub fn kinds(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> BrowseView {
+    pub fn kinds(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> BrowseView {
         let mut view = BrowseView {
             focus: cx.focus_handle(),
             kinds: provider.kinds(),
@@ -143,7 +143,7 @@ impl BrowseView {
         view
     }
 
-    pub fn nodes(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> BrowseView {
+    pub fn nodes(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> BrowseView {
         let mut view = BrowseView {
             focus: cx.focus_handle(),
             kinds: provider.kinds(),

@@ -1,6 +1,6 @@
 //! Trace-id lookup as a span table.
 //!
-//! Tempo and Jaeger answer through [`ReadProvider::lookup_trace`]. Absence
+//! Tempo and Jaeger answer through [`ClusterProvider::lookup_trace`]. Absence
 //! takes the pane down. Nothing here is a web trace UI.
 
 use std::rc::Rc;
@@ -12,9 +12,6 @@ use gpui::{
 };
 
 use crate::lists::InventoryEvent;
-use crate::provider::{
-    ReadProvider, SpanView, TableColumn, TablePage, TableRow, ToolPresence, TraceOutcome,
-};
 use crate::table::TableState;
 use crate::tag::ItemTag;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
@@ -22,13 +19,16 @@ use crate::{
     CancelInput, CommitInput, DeleteInputChar, EnterFilter, OpenRow, Refresh, RowDown, RowEnd,
     RowHome, RowPageDown, RowPageUp, RowUp,
 };
+use k10s_provider::{
+    ClusterProvider, SpanView, TableColumn, TablePage, TableRow, ToolPresence, TraceOutcome,
+};
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
 const QUERY_HEIGHT: f32 = 28.0;
 
 pub struct TracesView {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     table: TableState,
     query: String,
     typing: bool,
@@ -42,7 +42,7 @@ pub struct TracesView {
 impl EventEmitter<InventoryEvent> for TracesView {}
 
 impl TracesView {
-    pub fn new(provider: Rc<dyn ReadProvider>, cx: &mut Context<Self>) -> TracesView {
+    pub fn new(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> TracesView {
         let mut view = TracesView {
             focus: cx.focus_handle(),
             provider,

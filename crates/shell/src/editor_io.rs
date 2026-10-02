@@ -26,10 +26,10 @@ use k10s_edit::{Buffer, DocMeta, LanguageKind, Syntax};
 use crate::dirty::{CloseStep, SaveStep};
 use crate::editor::{EditorEvent, EditorSource, EditorView, SchemaStore, file_title};
 use crate::fs::Stamp;
-use crate::provider::{
+use crate::saves::PendingSave;
+use k10s_provider::{
     DescribeRequest, ManifestOutcome, Reply, SchemaCatalogOutcome, SchemaTextOutcome,
 };
-use crate::saves::PendingSave;
 
 impl EditorView {
     // Fetch the source into the buffer. A buffer that has never been loaded is

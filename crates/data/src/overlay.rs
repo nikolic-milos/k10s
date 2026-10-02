@@ -6,6 +6,8 @@
 
 use k10s_core::Severity;
 
+pub use k10s_core::OverlayKind as Kind;
+
 use crate::argo;
 use crate::flux;
 use crate::mesh;
@@ -30,16 +32,6 @@ pub struct Frame {
     pub stamps: Vec<Stamp>,
     pub truncated: bool,
     pub note: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Sync,
-    Metrics,
-    Policy,
-    Netpol,
-    MeshDeclared,
-    MeshObserved,
 }
 
 impl Frame {

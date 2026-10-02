@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "maximum_packages": 832,
+  "maximum_packages": 833,
   "maximum_external_packages": 819,
   "maximum_git_packages": 29,
   "allowed_git_sources": [
@@ -13,5 +13,40 @@
   "forbidden_packages": [
     "proc-macro-error-attr2",
     "proc-macro-error2"
-  ]
+  ],
+  "restricted_dependencies": {
+    "k10s-atlas": [
+      "rustix",
+      "serde"
+    ],
+    "k10s-core": [
+      "arc-swap",
+      "k10s-atlas"
+    ],
+    "k10s-provider": [
+      "k10s-core"
+    ],
+    "k10s-clustergen": [
+      "k10s-core",
+      "rand",
+      "rand_chacha"
+    ],
+    "k10s-world": [
+      "bevy_ecs",
+      "crossbeam-channel",
+      "k10s-core",
+      "rand",
+      "rand_chacha",
+      "rustc-hash"
+    ],
+    "k10s-edit": [
+      "regex",
+      "serde_json",
+      "streaming-iterator",
+      "tree-sitter",
+      "tree-sitter-json",
+      "tree-sitter-yaml",
+      "unicode-segmentation"
+    ]
+  }
 }

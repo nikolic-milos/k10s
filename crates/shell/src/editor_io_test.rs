@@ -8,7 +8,7 @@
 
 use crate::editor::SchemaStore;
 use crate::editor_io::{SchemaDoc, absorb_catalog, absorb_schema_text, next_document_url};
-use crate::provider::{SchemaCatalogOutcome, SchemaSource, SchemaTextOutcome};
+use k10s_provider::{SchemaCatalogOutcome, SchemaSource, SchemaTextOutcome};
 
 fn catalog() -> SchemaCatalogOutcome {
     SchemaCatalogOutcome::Catalog(vec![

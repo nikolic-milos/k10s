@@ -26,9 +26,9 @@ use crossbeam_channel::{Receiver, Sender};
 use k10s_core::{IngestEvent, WorldCtrl};
 use k10s_data::connect::{Env, Listing, Source};
 use k10s_data::{DEFAULT_EVENT_SINK_CAPACITY, DataPlane};
-use k10s_shell::{
-    ConfigSource, ConnectOutcome, ConnectRequest, Connection, ContextRow, DemoOutcome,
-    LaunchProvider, ReadProvider, Reply, ScanOutcome, ScanRequest,
+use k10s_provider::{
+    ClusterProvider, ConfigSource, ConnectOutcome, ConnectRequest, Connection, ContextRow,
+    DemoOutcome, LaunchProvider, Reply, ScanOutcome, ScanRequest,
 };
 
 use crate::cli;
@@ -243,7 +243,7 @@ impl Service {
             // the way the rest of this can.
             provider: Box::new(move || {
                 Rc::new(crate::provider::PlaneProvider::new(inspector, reader))
-                    as Rc<dyn ReadProvider>
+                    as Rc<dyn ClusterProvider>
             }),
         })
     }

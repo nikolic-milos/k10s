@@ -21,7 +21,7 @@ use k10s_edit::diff::{self, Origin, Verdict};
 
 use crate::diff::Mode;
 use crate::editor::BufferStamp;
-use crate::provider::{ApplyOutcome, LiveCopy};
+use k10s_provider::{ApplyOutcome, LiveCopy};
 
 /// Which destructive question is armed. One bit could not tell an apply from a
 /// force, and a press meant for one would answer the other.

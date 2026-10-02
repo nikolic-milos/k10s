@@ -15,16 +15,16 @@ use gpui::{
 };
 
 use crate::confirm::{Latch, Press, Slot, StatusText, nothing_listed, write_target};
-use crate::provider::{
-    Day2Op, Day2Outcome, Day2Request, KindRow, ReadProvider, TableColumn, TableOutcome, TablePage,
-    TableRow,
-};
 use crate::selection::Selection;
 use crate::table::TableState;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header, status_slot};
 use crate::{
     Back, CancelInput, CommitInput, DeleteInputChar, EnterFilter, OpenRow, Refresh, RowDown,
     RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
+};
+use k10s_provider::{
+    ClusterProvider, Day2Op, Day2Outcome, Day2Request, KindRow, TableColumn, TableOutcome,
+    TablePage, TableRow,
 };
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
@@ -59,7 +59,7 @@ enum Phase {
 
 pub struct Day2View {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     // Which kubeconfig context these writes land in, for the confirm sentence.
     context: Option<String>,
     kinds: Vec<KindRow>,
@@ -80,7 +80,7 @@ pub struct Day2View {
 
 impl Day2View {
     pub fn new(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         selection: Option<&Selection>,
         context: Option<String>,
         cx: &mut Context<Self>,

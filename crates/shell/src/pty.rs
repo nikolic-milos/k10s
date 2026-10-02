@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty::{self, Options, Pty, Shell};
 
-use crate::provider::{ExecEvent, ExecSession, NullExecSession};
+use k10s_provider::{ExecEvent, ExecSession, NullExecSession};
 
 // The kernel tracks a pixel size alongside rows and columns; nothing reads
 // it here, but zero would be a lie some programs trip over.

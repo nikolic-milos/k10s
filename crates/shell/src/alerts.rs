@@ -15,11 +15,11 @@ use gpui::{
 };
 use k10s_core::{Level, SceneSnapshot};
 
-use crate::provider::{
-    AlertMatcher, AlertmanagerEndpoint, ReadProvider, SilenceOutcome, SilenceRequest,
-};
 use crate::selection::Selection;
 use crate::{CancelInput, CommitInput, DeleteInputChar};
+use k10s_provider::{
+    AlertMatcher, AlertmanagerEndpoint, ClusterProvider, SilenceOutcome, SilenceRequest,
+};
 
 pub(crate) fn pod_uid(snapshot: &SceneSnapshot, namespace: &str, pod: &str) -> Option<Arc<str>> {
     if namespace.is_empty() || pod.is_empty() {
@@ -218,14 +218,14 @@ impl SilenceState {
 
 pub(crate) struct SilenceView {
     focus: FocusHandle,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
     context: String,
     state: SilenceState,
 }
 
 impl SilenceView {
     pub(crate) fn new(
-        provider: Rc<dyn ReadProvider>,
+        provider: Rc<dyn ClusterProvider>,
         context: Option<String>,
         endpoint: AlertmanagerEndpoint,
         matchers: Vec<AlertMatcher>,

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use k10s_core::{KindId, Level, SceneSnapshot, SlotIds, kind_short};
 use k10s_map::PickPath;
 
-use crate::provider::{DescribeRequest, UsageRequest, UsageTarget, WorkloadLogRequest};
+use k10s_provider::{DescribeRequest, UsageRequest, UsageTarget, WorkloadLogRequest};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Selection {

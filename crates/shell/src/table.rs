@@ -8,7 +8,7 @@
 //! pages append behind the rows already held, up to a hard cap of
 //! [`MAX_ROWS`]; past it the machine refuses more and says so.
 
-use crate::provider::{TablePage, TableRow};
+use k10s_provider::{TablePage, TableRow};
 
 const MIN_COL: usize = 2;
 const MAX_COL: usize = 48;
@@ -289,7 +289,7 @@ fn format_cells(cells: &[String], widths: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::TableColumn;
+    use k10s_provider::TableColumn;
 
     fn page(rows: &[(&str, &[&str])]) -> TablePage {
         let columns = ["Name", "Ready"]

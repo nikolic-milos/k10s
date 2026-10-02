@@ -24,11 +24,11 @@ use gpui::{AppContext as _, Context, Entity, Window};
 use crate::editor::SchemaStore;
 use crate::finder::PickerMode;
 use crate::launch::{self, LaunchEvent, LaunchView};
-use crate::provider::{
-    ConnectOutcome, ConnectRequest, Connection, DemoOutcome, NullProvider, ProviderSlot,
-    ReadProvider, ScanRequest,
-};
 use crate::workspace::{PickerPurpose, Workspace};
+use k10s_provider::{
+    ClusterProvider, ConnectOutcome, ConnectRequest, Connection, DemoOutcome, NullProvider,
+    ProviderSlot, ScanRequest,
+};
 
 impl Workspace {
     /// Land the connection explicitly requested by the command line.
@@ -389,7 +389,7 @@ impl Workspace {
 pub(crate) fn swap_connection(
     slot: &ProviderSlot,
     schema: &RefCell<SchemaStore>,
-    provider: Rc<dyn ReadProvider>,
+    provider: Rc<dyn ClusterProvider>,
 ) {
     slot.set(provider);
     schema.borrow_mut().retire();
@@ -452,7 +452,7 @@ mod tests {
 
     use super::{adopt_note, kubeconfig_dir, swap_connection};
     use crate::editor::SchemaStore;
-    use crate::provider::{NullProvider, ProviderSlot};
+    use k10s_provider::{NullProvider, ProviderSlot};
 
     #[test]
     fn a_connection_swap_retires_the_schemas_of_the_cluster_that_left() {

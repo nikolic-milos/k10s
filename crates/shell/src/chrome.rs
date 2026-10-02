@@ -19,9 +19,6 @@ use k10s_theme::{Theme, Typography};
 
 use crate::dock::{self, Dock};
 use crate::hosting::Tab;
-use crate::provider::{
-    Bytes, Detail, Millicores, PostureOutcome, UsageOutcome, UsageSample, UsageSource,
-};
 use crate::selection::Selection;
 use crate::settings;
 use crate::ui::{
@@ -34,6 +31,9 @@ use crate::{
     OpenFlux, OpenForwards, OpenHarbor, OpenMesh, OpenNodes, OpenObserve, OpenPalette, OpenPolicy,
     OpenReleases, OpenSettings, OpenTraces, Quit, ToggleBottomDock, ToggleInspector,
     ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+};
+use k10s_provider::{
+    Bytes, Detail, Millicores, PostureOutcome, UsageOutcome, UsageSample, UsageSource,
 };
 
 pub(crate) use crate::dock::DockEdge;
@@ -1113,7 +1113,7 @@ pub(crate) fn usage_lines(sample: &UsageSample) -> Vec<String> {
     lines
 }
 
-pub(crate) fn posture_lines(view: &crate::provider::PodPostureView) -> Vec<String> {
+pub(crate) fn posture_lines(view: &k10s_provider::PodPostureView) -> Vec<String> {
     let mut lines = vec![
         direction_line(
             "Ingress",
