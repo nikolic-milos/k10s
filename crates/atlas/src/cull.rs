@@ -52,6 +52,17 @@ pub fn cull<R, B, C, S>(
     let contiguous = scene.child_ranges_are_direct();
     let single_region_inside = scene.regions.len() == 1 && visible.contains(&scene.regions[0].rect);
     if contiguous && stage != 1 {
+        if scene.spatial_index.is_empty() {
+            return cull_contiguous::<false, _, _, _, _>(
+                scene,
+                camera.zoom,
+                &visible,
+                policy,
+                stage,
+                edges_on,
+                skip_blocks,
+            );
+        }
         if stage >= 2 && scene.visible_region_has_selective_block_index(&visible) {
             return cull_inner::<true, _, _, _, _>(
                 scene,
@@ -64,18 +75,7 @@ pub fn cull<R, B, C, S>(
                 skip_blocks,
             );
         }
-        if scene.region_index_is_selective(&visible) {
-            return cull_contiguous::<true, _, _, _, _>(
-                scene,
-                camera.zoom,
-                &visible,
-                policy,
-                stage,
-                edges_on,
-                skip_blocks,
-            );
-        }
-        return cull_contiguous::<false, _, _, _, _>(
+        return cull_contiguous::<true, _, _, _, _>(
             scene,
             camera.zoom,
             &visible,
@@ -289,7 +289,7 @@ fn cull_stage_one_contiguous<R, B, C, S>(
     finish_counts(st, policy)
 }
 
-fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
+fn cull_contiguous<const INDEXED: bool, R, B, C, S>(
     scene: &Scene<R, B, C, S>,
     zoom: f32,
     visible: &Rect,
@@ -369,7 +369,7 @@ fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
                 || (block.inner.w > 0.0 && block.inner.h > 0.0 && visible.contains(&block.inner))
             {
                 cull_cell_slice(cells, zoom, stage, policy, &mut st);
-            } else if scene.block_cell_index_is_selective(block_index, visible) {
+            } else if INDEXED && scene.block_cell_index_is_selective(block_index, visible) {
                 scene.for_each_block_cell_candidate(block_index, visible, |_, cell| {
                     if cell.rect.intersects(visible) {
                         cull_cell(cell, zoom, stage, policy, &mut st);
@@ -379,7 +379,7 @@ fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
                 cull_visible_cell_slice(cells, visible, zoom, stage, policy, &mut st);
             }
         };
-        if scene.region_block_index_is_selective(region_index, visible) {
+        if INDEXED && scene.region_block_index_is_selective(region_index, visible) {
             scene.for_each_region_block_candidate(region_index, visible, &mut visit_block);
         } else {
             let start = region.children.start as usize;
@@ -391,7 +391,7 @@ fn cull_contiguous<const INDEX_REGIONS: bool, R, B, C, S>(
             }
         }
     };
-    if INDEX_REGIONS {
+    if INDEXED && scene.region_index_is_selective(visible) {
         scene.for_each_region_candidate(visible, &mut visit_region);
     } else {
         for (index, region) in scene.regions.iter().enumerate() {
