@@ -809,7 +809,8 @@ read_provider! {
     fn fetch_flux(&self, reply: Reply<TableOutcome>);
     /// Scale, rollout, delete, evict, cordon, drain, debug. Caps are applied
     /// on the far side of the seam so a caller cannot skip the gate. The first
-    /// call with confirm=false never touches the wire.
+    /// call with confirm=false never writes (a drain's ask reads the node's
+    /// pods).
     fn run_day2(&self, request: &Day2Request, reply: Reply<Day2Outcome>);
     fn fetch_manifest(&self, request: &DescribeRequest, reply: Reply<ManifestOutcome>);
     /// Server-side apply. Dry run and apply differ by one field of the

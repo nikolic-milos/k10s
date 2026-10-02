@@ -53,6 +53,7 @@ use gpui::{
 use k10s_edit::diff::{self, Origin, Side, Verdict};
 use k10s_theme::Theme;
 
+use crate::confirm::write_target;
 use crate::diff_gate::{
     ApplyGate, Armed, Flight, Keepable, Preparation, Ready, Review, Reviewed, Seen, Sent, Step,
     dry_run_left, gone_note, kept_note, landed_note, may_still_land, prepare, raced_note,
@@ -1148,15 +1149,6 @@ pub(crate) struct Line<'a> {
     pub(crate) folded: bool,
 }
 
-/// How a write names where it lands. An unnamed context is the in-cluster
-/// account, which is a real answer rather than a missing one.
-fn target(context: Option<&str>) -> String {
-    match context {
-        Some(context) if !context.is_empty() => format!("context {context}"),
-        _ => "this cluster's in-cluster account".to_string(),
-    }
-}
-
 // The pieces go in the order a person acts on them: what the next press does,
 // what the comparison is, the payload's standing refusals of that press, the
 // last answer, what stands about the object and this view's writes, who owns
@@ -1176,11 +1168,11 @@ pub(crate) fn status_line(at: Line<'_>) -> String {
             // A confirm that says "the cluster" is the same sentence in every
             // context a person has open, and that is how the wrong one gets
             // written to.
-            Armed::Apply => format!("ctrl-s again to apply this to {}", target(at.context)),
+            Armed::Apply => format!("ctrl-s again to apply this to {}", write_target(at.context)),
             Armed::Force => format!(
                 "ctrl-shift-s again to take {} from their managers in {}",
                 taken(at.conflict.len(), at.conflict_truncated),
-                target(at.context)
+                write_target(at.context)
             ),
         }));
     }

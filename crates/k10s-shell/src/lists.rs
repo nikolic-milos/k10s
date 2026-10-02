@@ -7,6 +7,11 @@
 //! Helm row starts a reveal. Adapters that are not served emit
 //! [`InventoryEvent::NotServed`] so the workspace can take the pane down
 //! rather than leave an empty broken one. A 403 stays a labelled status.
+//!
+//! A Helm stored-manifest apply is armed by the first `u` and sent by the
+//! second, once: the [`Latch`] refuses every press while it is out, for as
+//! long as this view lives, and the workspace keeps the write's record so a
+//! Releases tab reopened meanwhile refuses too and shows the answer.
 
 use std::rc::Rc;
 
@@ -16,10 +21,11 @@ use gpui::{
     prelude::*, px, rgb,
 };
 
+use crate::confirm::{Latch, Press, Slot, StatusText, nothing_listed};
 use crate::provider::{ReadProvider, TableOutcome, TablePage};
 use crate::table::TableState;
 use crate::tag::ItemTag;
-use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
+use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header, status_slot};
 use crate::{
     CancelInput, CommitInput, DeleteInputChar, EnterFilter, HelmDiff, HelmRollback, OpenRow,
     Refresh, RevealHelm, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
@@ -117,9 +123,13 @@ pub struct InventoryView {
     kind: InventoryKind,
     table: TableState,
     loading: bool,
-    status: Option<String>,
+    status: Option<SharedString>,
+    // A listing that was denied or failed. Its own line, never hidden behind
+    // a write's line and never beside "nothing here".
+    fetch_label: Option<SharedString>,
     filtering: bool,
-    armed: Option<String>,
+    latch: Latch<(Option<String>, String, u32)>,
+    status_text: StatusText,
     generation: u64,
     viewport: Viewport,
 }
@@ -163,8 +173,10 @@ impl InventoryView {
             table: TableState::new(),
             loading: true,
             status: None,
+            fetch_label: None,
             filtering: false,
-            armed: None,
+            latch: Latch::Idle,
+            status_text: StatusText::default(),
             generation: 0,
             viewport: Viewport::default(),
         };
@@ -185,7 +197,8 @@ impl InventoryView {
         let generation = self.generation;
         self.loading = true;
         self.status = None;
-        self.armed = None;
+        self.fetch_label = None;
+        self.latch.disarm();
         let (tx, rx) = futures::channel::oneshot::channel();
         let reply = Box::new(move |outcome| {
             let _ = tx.send(outcome);
@@ -216,11 +229,12 @@ impl InventoryView {
                         }
                         TableOutcome::Denied(what) => {
                             this.table.set_page(TablePage::default());
-                            this.status = Some(format!("{what}: access denied for this account"));
+                            this.fetch_label =
+                                Some(format!("{what}: access denied for this account").into());
                         }
                         TableOutcome::Failed(why) => {
                             this.table.set_page(TablePage::default());
-                            this.status = Some(why);
+                            this.fetch_label = Some(why.into());
                         }
                     }
                     cx.notify();
@@ -259,7 +273,7 @@ impl InventoryView {
         let Some((namespace, name, revision)) = self.selected_release() else {
             return;
         };
-        self.armed = None;
+        self.latch.disarm();
         cx.emit(InventoryEvent::RevealRelease {
             namespace,
             name,
@@ -271,11 +285,10 @@ impl InventoryView {
         let Some((namespace, name, revision)) = self.selected_release() else {
             return;
         };
-        self.armed = None;
+        self.latch.disarm();
         if revision <= 1 {
-            self.status = Some(format!(
-                "{name} revision {revision} has no previous revision to diff"
-            ));
+            self.status =
+                Some(format!("{name} revision {revision} has no previous revision to diff").into());
             cx.notify();
             return;
         }
@@ -287,31 +300,51 @@ impl InventoryView {
         });
     }
 
+    // Nothing to ask the server first, so the first `u` arms and forms both
+    // lines, and the second sends the stored triple once.
     fn emit_rollback(&mut self, cx: &mut Context<Self>) {
         let Some((namespace, name, revision)) = self.selected_release() else {
             return;
         };
-        let key = format!("{}/{name}/{revision}", namespace.as_deref().unwrap_or(""));
-        if self.armed.as_deref() == Some(key.as_str()) {
-            self.armed = None;
-            cx.emit(InventoryEvent::RollbackRelease {
-                namespace,
-                name,
-                revision,
-            });
-            return;
+        let subject = rollback_subject(namespace.as_deref(), &name, revision);
+        match self.latch.press(&subject) {
+            Press::Ask => {
+                let (armed, sent) = rollback_lines(&name, revision);
+                self.status = None;
+                self.latch
+                    .arm(subject, (namespace, name, revision), armed, sent);
+            }
+            Press::Go((namespace, name, revision)) => {
+                self.status = None;
+                cx.emit(InventoryEvent::RollbackRelease {
+                    namespace,
+                    name,
+                    revision,
+                });
+            }
+            Press::Refused => {}
         }
-        self.armed = Some(key);
-        self.status = Some(format!(
-            "press u again to apply {name} revision {revision}: not helm rollback (hooks will not run)"
-        ));
         cx.notify();
     }
 
-    fn disarm(&mut self) {
-        if self.armed.take().is_some() {
-            self.status = None;
-        }
+    fn selected_subject(&self) -> Option<String> {
+        let (namespace, name, revision) = self.selected_release()?;
+        Some(rollback_subject(namespace.as_deref(), &name, revision))
+    }
+
+    /// The stored-manifest apply this view sent or resumed has its answer.
+    pub(crate) fn rollback_answered(&mut self, answer: SharedString, cx: &mut Context<Self>) {
+        self.latch.settle(self.selected_subject().as_deref());
+        self.status = Some(answer);
+        cx.notify();
+    }
+
+    /// Opened while a stored-manifest apply is out: refuse presses and show
+    /// its line until its answer lands.
+    pub(crate) fn resume_rollback(&mut self, namespace: Option<&str>, name: &str, revision: u32) {
+        let (_, sent) = rollback_lines(name, revision);
+        self.latch
+            .resume(rollback_subject(namespace, name, revision), sent);
     }
 
     fn hint(&self) -> &'static str {
@@ -331,6 +364,22 @@ impl InventoryView {
     }
 }
 
+/// Which stored-manifest apply a press is about, in the latch's terms.
+fn rollback_subject(namespace: Option<&str>, name: &str, revision: u32) -> String {
+    format!("{}/{name}/{revision}", namespace.unwrap_or(""))
+}
+
+/// The armed and sent lines of a stored-manifest apply, formed once.
+fn rollback_lines(name: &str, revision: u32) -> (SharedString, SharedString) {
+    (
+        format!(
+            "u again applies {name} revision {revision}: not helm rollback (hooks will not run)"
+        )
+        .into(),
+        format!("applying {name} revision {revision}: sent, waiting for the server").into(),
+    )
+}
+
 impl crate::item::Item for InventoryView {
     fn title(&self) -> SharedString {
         InventoryView::title(self)
@@ -346,7 +395,21 @@ impl Render for InventoryView {
         let theme = k10s_theme::active(cx).clone();
         let fonts = k10s_theme::typography(cx).clone();
         let view = cx.entity();
-        let empty = self.table.total_rows() == 0 && self.status.is_none() && !self.loading;
+        let empty = !self.loading
+            && nothing_listed(
+                self.table.total_rows(),
+                self.status.as_ref(),
+                self.fetch_label.as_ref(),
+            );
+        let slot = status_slot(
+            &theme,
+            &fonts,
+            self.status_text.text(Slot::of(
+                &self.latch,
+                self.status.as_ref(),
+                self.fetch_label.as_ref(),
+            )),
+        );
 
         div()
             .id("inventory-view")
@@ -368,32 +431,32 @@ impl Render for InventoryView {
             .font_family(fonts.ui_family.clone())
             .text_color(rgb(theme.shell.text))
             .on_action(cx.listener(|this, _: &RowUp, _, cx| {
-                this.disarm();
+                this.latch.disarm();
                 this.table.move_selection(-1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowDown, _, cx| {
-                this.disarm();
+                this.latch.disarm();
                 this.table.move_selection(1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowPageUp, _, cx| {
-                this.disarm();
+                this.latch.disarm();
                 this.table.page_by(-1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowPageDown, _, cx| {
-                this.disarm();
+                this.latch.disarm();
                 this.table.page_by(1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowHome, _, cx| {
-                this.disarm();
+                this.latch.disarm();
                 this.table.select_first();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowEnd, _, cx| {
-                this.disarm();
+                this.latch.disarm();
                 this.table.select_last();
                 cx.notify();
             }))
@@ -414,14 +477,17 @@ impl Render for InventoryView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &EnterFilter, _, cx| {
+                this.latch.disarm();
                 this.filtering = true;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CommitInput, _, cx| {
+                this.latch.disarm();
                 this.filtering = false;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CancelInput, _, cx| {
+                this.latch.disarm();
                 this.filtering = false;
                 this.table.clear_filter();
                 cx.notify();
@@ -444,11 +510,15 @@ impl Render for InventoryView {
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                this.disarm();
                 let delta = f32::from(event.delta.pixel_delta(px(LIST_ROW_HEIGHT)).y);
-                this.table
-                    .move_selection(-(delta / LIST_ROW_HEIGHT).round() as i64);
-                cx.notify();
+                // A touch that rounds to no row moves nothing and disarms
+                // nothing.
+                let step = -(delta / LIST_ROW_HEIGHT).round() as i64;
+                if step != 0 {
+                    this.latch.disarm();
+                    this.table.move_selection(step);
+                    cx.notify();
+                }
             }))
             .child(panel_header(&theme, &fonts, self.breadcrumb()))
             .child(
@@ -524,7 +594,7 @@ impl Render for InventoryView {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                                this.disarm();
+                                                this.latch.disarm();
                                                 this.table.select_visible_offset(offset);
                                                 cx.notify();
                                             }),
@@ -543,14 +613,7 @@ impl Render for InventoryView {
                                     .child(self.kind.empty_hint())
                             })),
                     )
-                    .children(self.status.clone().map(|status| {
-                        div()
-                            .flex_none()
-                            .p(px(12.0))
-                            .text_size(px(fonts.ui_size))
-                            .text_color(rgb(theme.shell.text))
-                            .child(status)
-                    })),
+                    .children(slot),
             )
             .child(
                 div()
@@ -568,5 +631,25 @@ impl Render for InventoryView {
                     .overflow_hidden()
                     .child(self.hint()),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stored_manifest_apply_is_asked_and_sent_in_these_words() {
+        assert_eq!(rollback_subject(Some("prod"), "web", 3), "prod/web/3");
+        assert_eq!(rollback_subject(None, "web", 3), "/web/3");
+        let (armed, sent) = rollback_lines("web", 3);
+        assert_eq!(
+            armed.as_ref(),
+            "u again applies web revision 3: not helm rollback (hooks will not run)"
+        );
+        assert_eq!(
+            sent.as_ref(),
+            "applying web revision 3: sent, waiting for the server"
+        );
     }
 }

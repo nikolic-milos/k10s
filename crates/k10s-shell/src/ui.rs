@@ -308,6 +308,23 @@ pub fn panel_header(
         .child(title)
 }
 
+/// A view's status slot under its rows, drawn only when something is in it:
+/// the view's cached text preserves its label, line, hint and note in order.
+pub(crate) fn status_slot(
+    theme: &Theme,
+    fonts: &Typography,
+    text: Option<SharedString>,
+) -> Option<Div> {
+    text.map(|text| {
+        div()
+            .flex_none()
+            .p(px(12.0))
+            .text_size(px(fonts.ui_size))
+            .text_color(rgb(theme.shell.text))
+            .child(text)
+    })
+}
+
 pub fn toolbar(theme: &Theme) -> Stateful<Div> {
     div()
         .id("toolbar")

@@ -1,9 +1,11 @@
 //! Day-2 operations as a native table: scale, rollout, cordon, drain, delete.
 //!
-//! The first enter asks what the press would do and never touches the wire.
-//! The second enter, on the same row, is the confirmation. Caps still gate
-//! the far side. Rollout undo is not offered: that would be a fake of
-//! kubectl and of Helm.
+//! The first enter asks what the press would do and never writes (a drain's
+//! ask reads the node's pods). The second enter, on the same row, is the
+//! confirmation, and it sends one write: [`Latch`] spends the confirmation
+//! when it is taken and refuses every press until the answer lands, for as
+//! long as this view lives. Caps still gate the far side. Rollout undo is not
+//! offered: that would be a fake of kubectl and of Helm.
 
 use std::rc::Rc;
 
@@ -12,13 +14,14 @@ use gpui::{
     Render, Role, ScrollWheelEvent, SharedString, Styled, Window, canvas, div, prelude::*, px, rgb,
 };
 
+use crate::confirm::{Latch, Press, Slot, StatusText, nothing_listed, write_target};
 use crate::provider::{
     Day2Op, Day2Outcome, Day2Request, KindRow, ReadProvider, TableColumn, TableOutcome, TablePage,
     TableRow,
 };
 use crate::selection::Selection;
 use crate::table::TableState;
-use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
+use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header, status_slot};
 use crate::{
     Back, CancelInput, CommitInput, DeleteInputChar, EnterFilter, OpenRow, Refresh, RowDown,
     RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
@@ -33,6 +36,15 @@ pub struct Day2Target {
     pub namespace: Option<String>,
     pub name: String,
     pub current_replicas: Option<i32>,
+}
+
+// What a confirmation sends: the reviewed request, the prefix its answer is
+// named by, and the ask's own summary, which an Applied answer that only
+// repeats it is compared with.
+struct Confirmed {
+    request: Day2Request,
+    prefix: SharedString,
+    asked: String,
 }
 
 enum Phase {
@@ -53,8 +65,12 @@ pub struct Day2View {
     kinds: Vec<KindRow>,
     table: TableState,
     phase: Phase,
-    status: Option<String>,
-    armed: Option<String>,
+    status: Option<SharedString>,
+    // A target kind that could not be listed. Its own line, so a write's
+    // answer landing after Esc cannot erase the fact that the list is partial.
+    targets_label: Option<SharedString>,
+    latch: Latch<Confirmed>,
+    status_text: StatusText,
     filtering: bool,
     generation: u64,
     pending: u32,
@@ -63,15 +79,6 @@ pub struct Day2View {
 }
 
 impl Day2View {
-    /// How a day-2 confirm names where the write lands. Shares its wording with
-    /// the editor's apply prompt on purpose: one sentence for one question.
-    pub(crate) fn write_target(&self) -> String {
-        match self.context.as_deref() {
-            Some(context) if !context.is_empty() => format!("context {context}"),
-            _ => "this cluster's in-cluster account".to_string(),
-        }
-    }
-
     pub fn new(
         provider: Rc<dyn ReadProvider>,
         selection: Option<&Selection>,
@@ -87,7 +94,9 @@ impl Day2View {
             table: TableState::new(),
             phase: Phase::Targets { loading: true },
             status: None,
-            armed: None,
+            targets_label: None,
+            latch: Latch::Idle,
+            status_text: StatusText::default(),
             filtering: false,
             generation: 0,
             pending: 0,
@@ -115,16 +124,20 @@ impl Day2View {
         self.table = TableState::new();
         self.table.set_page(ops_page(&target, &ops));
         self.phase = Phase::Ops { target, ops };
-        self.armed = None;
-        self.status = Some("enter asks; enter again confirms. nothing is sent until then".into());
+        self.latch.disarm();
+        // While a write is out every press is refused, so the way to ask would
+        // be a false instruction; the latch's own line says what is happening.
+        self.status = (!matches!(self.latch, Latch::Sent { .. }))
+            .then(|| "enter asks; enter again confirms. nothing is written until then".into());
     }
 
     fn fetch_targets(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
         self.collected.clear();
-        self.armed = None;
+        self.latch.disarm();
         self.status = None;
+        self.targets_label = None;
         self.phase = Phase::Targets { loading: true };
         self.table = TableState::new();
 
@@ -204,12 +217,12 @@ impl Day2View {
                     .extend(targets_from_page(kind_name, kind_id, &page));
             }
             TableOutcome::Denied(what) => {
-                self.status = Some(format!("{what}: access denied for this account"));
+                let line = format!("{what}: access denied for this account");
+                self.targets_label = Some(unlisted(self.targets_label.take(), line));
             }
             TableOutcome::Failed(why) => {
-                if self.status.is_none() {
-                    self.status = Some(why);
-                }
+                let line = format!("{kind_name}: {why}");
+                self.targets_label = Some(unlisted(self.targets_label.take(), line));
             }
             TableOutcome::Absent => {}
         }
@@ -247,22 +260,54 @@ impl Day2View {
                 let Some((_, op)) = ops.iter().find(|(name, _)| name == &row.uid) else {
                     return;
                 };
-                let confirm = self.armed.as_deref() == Some(row.uid.as_str());
                 let request = Day2Request {
                     kind: target.kind_id,
                     namespace: target.namespace.clone(),
                     name: target.name.clone(),
                     op: op.clone(),
-                    confirm,
+                    confirm: false,
                 };
-                self.run(request, row.uid.clone(), cx);
+                let subject = subject_of(target, &row.uid);
+                match self.latch.press(&subject) {
+                    Press::Ask => {
+                        self.status = None;
+                        self.run(request, subject, None, cx);
+                    }
+                    Press::Go(Confirmed {
+                        request,
+                        prefix,
+                        asked,
+                    }) => {
+                        self.status = None;
+                        self.run(request, subject, Some((prefix, asked)), cx);
+                    }
+                    Press::Refused => {}
+                }
             }
         }
     }
 
-    fn run(&mut self, request: Day2Request, op_uid: String, cx: &mut Context<Self>) {
+    // Which subject the selection is on, in the latch's terms: the target and
+    // the op, so an arm cannot survive a change of either.
+    fn selected_subject(&self) -> Option<String> {
+        let Phase::Ops { target, .. } = &self.phase else {
+            return None;
+        };
+        let row = self.table.selected_row()?;
+        Some(subject_of(target, &row.uid))
+    }
+
+    // `confirmed` is a write's prefix and its ask's summary, and is what makes
+    // this a write; an ask carries none. Where the reply goes is [`landing`]'s.
+    fn run(
+        &mut self,
+        request: Day2Request,
+        subject: String,
+        confirmed: Option<(SharedString, String)>,
+        cx: &mut Context<Self>,
+    ) {
         self.generation += 1;
-        let generation = self.generation;
+        let asked = self.generation;
         let (tx, rx) = futures::channel::oneshot::channel();
         self.provider.run_day2(
             &request,
@@ -271,46 +316,41 @@ impl Day2View {
             }),
         );
         cx.spawn(async move |this, cx| {
-            if let Ok(outcome) = rx.await {
-                let _ = this.update(cx, |this, cx| {
-                    if this.generation != generation {
-                        return;
+            let answer = rx.await.ok();
+            let _ = this.update(cx, |this, cx| {
+                let selected = this.selected_subject();
+                let write = confirmed
+                    .as_ref()
+                    .map(|(prefix, asked)| (prefix.as_ref(), asked.as_str()));
+                match landing(
+                    write,
+                    asked == this.generation,
+                    selected.as_deref() == Some(subject.as_str()),
+                    answer,
+                    &write_target(this.context.as_deref()),
+                ) {
+                    Landing::Dropped => return,
+                    Landing::Settled(line) => {
+                        this.latch.settle(selected.as_deref());
+                        this.status = Some(line.into());
                     }
-                    this.status = Some(match outcome {
-                        Day2Outcome::NeedsConfirm { summary } => {
-                            this.armed = Some(op_uid);
-                            // The confirm names the cluster as well as the
-                            // object: the blast radius of a day-2 write is the
-                            // operation *and* where it lands.
-                            format!(
-                                "{summary} in {}  (enter again to confirm)",
-                                this.write_target()
-                            )
-                        }
-                        Day2Outcome::Applied { summary, truncated } => {
-                            this.armed = None;
-                            if truncated {
-                                format!("{summary}  (truncated)")
-                            } else {
-                                summary
-                            }
-                        }
-                        Day2Outcome::Denied { what, why } => {
-                            this.armed = None;
-                            format!("{what}: {why}")
-                        }
-                        Day2Outcome::Rejected { message } => {
-                            this.armed = None;
-                            message
-                        }
-                        Day2Outcome::Failed { why } => {
-                            this.armed = None;
-                            why
-                        }
-                    });
-                    cx.notify();
-                });
-            }
+                    Landing::Arm { prefix, asked } => {
+                        let (armed, sent) = (armed_line(&prefix), sent_line(&prefix));
+                        let confirmed = Confirmed {
+                            request: Day2Request {
+                                confirm: true,
+                                ..request
+                            },
+                            prefix: prefix.into(),
+                            asked,
+                        };
+                        this.latch
+                            .arm(subject, confirmed, armed.into(), sent.into());
+                    }
+                    Landing::Said(line) => this.status = Some(line.into()),
+                }
+                cx.notify();
+            });
         })
         .detach();
         cx.notify();
@@ -320,7 +360,7 @@ impl Day2View {
         match &self.phase {
             Phase::Ops { .. } => {
                 self.generation += 1;
-                self.armed = None;
+                self.latch.disarm();
                 self.phase = Phase::Targets { loading: false };
                 self.table = TableState::new();
                 self.table.set_page(targets_page(&self.collected));
@@ -454,6 +494,119 @@ pub fn ops_for(kind: &str, current: Option<i32>) -> Vec<(String, Day2Op)> {
     ops
 }
 
+// The latch's subject: the target and the op together, so an arm cannot survive
+// a change of either.
+fn subject_of(target: &Day2Target, op: &str) -> String {
+    format!("{}/{op}", target_uid(target))
+}
+
+/// Where a day-2 reply goes, decided from data alone. `write` is a confirmed
+/// write's prefix and its ask's summary, None for an ask; `current` is whether
+/// nothing newer was asked since; `still_selected` whether the row that pressed
+/// is still the one selected; `answer` is None for a reply dropped unsent.
+/// A write's answer always lands, whatever the view moved to, because the
+/// write happened or may have. An ask's answer lands only while it is the
+/// newest ask and its row is still selected, so nothing is armed, or said, for
+/// a row the person left.
+#[derive(Debug, PartialEq, Eq)]
+enum Landing {
+    Dropped,
+    /// Settle the latch with the selection and show this.
+    Settled(String),
+    /// Arm the row, the confirmation named by `prefix`.
+    Arm {
+        prefix: String,
+        asked: String,
+    },
+    Said(String),
+}
+
+fn landing(
+    write: Option<(&str, &str)>,
+    current: bool,
+    still_selected: bool,
+    answer: Option<Day2Outcome>,
+    target: &str,
+) -> Landing {
+    if let Some((prefix, asked)) = write {
+        return Landing::Settled(match answer {
+            Some(outcome) => answered_line(prefix, asked, outcome),
+            None => dropped_write_line(prefix),
+        });
+    }
+    if !current || !still_selected {
+        return Landing::Dropped;
+    }
+    match answer {
+        // The confirm names the cluster as well as the object: the blast
+        // radius of a day-2 write is the operation and where it lands.
+        Some(Day2Outcome::NeedsConfirm { summary }) => Landing::Arm {
+            prefix: format!("{summary} in {target}"),
+            asked: summary,
+        },
+        Some(outcome) => Landing::Said(outcome_text(outcome)),
+        None => Landing::Said("the ask ended without an answer; nothing was written".to_string()),
+    }
+}
+
+// Every kind that could not be listed is named: a list missing one kind
+// silently would read as complete.
+fn unlisted(label: Option<SharedString>, line: String) -> SharedString {
+    match label {
+        Some(before) => format!("{before}; {line}").into(),
+        None => line.into(),
+    }
+}
+
+fn armed_line(prefix: &str) -> String {
+    format!("{prefix}  (enter again to confirm)")
+}
+
+fn sent_line(prefix: &str) -> String {
+    format!("{prefix}: sent, waiting for the server")
+}
+
+fn dropped_write_line(prefix: &str) -> String {
+    format!(
+        "{prefix}: no answer arrived; the write may have landed; read the object before retrying"
+    )
+}
+
+// What an outcome says, in the server's words.
+fn outcome_text(outcome: Day2Outcome) -> String {
+    match outcome {
+        Day2Outcome::NeedsConfirm { summary } => summary,
+        Day2Outcome::Applied { summary, truncated } => {
+            if truncated {
+                format!("{summary}  (truncated)")
+            } else {
+                summary
+            }
+        }
+        Day2Outcome::Denied { what, why } => format!("{what}: {why}"),
+        Day2Outcome::Rejected { message } => message,
+        Day2Outcome::Failed { why } => why,
+    }
+}
+
+/// A confirmed write's answer, named by what was confirmed, so an answer
+/// landing after the person moved on still says what it is about. An Applied
+/// summary that only repeats the ask says nothing more, so the line says it
+/// was applied; one that differs (a drain's count) is shown.
+fn answered_line(prefix: &str, asked: &str, outcome: Day2Outcome) -> String {
+    match outcome {
+        Day2Outcome::Applied { summary, truncated } => {
+            let truncated = if truncated { "  (truncated)" } else { "" };
+            if summary == asked {
+                format!("{prefix}: applied{truncated}")
+            } else {
+                format!("{prefix}: {summary}{truncated}")
+            }
+        }
+        other => format!("{prefix}: {}", outcome_text(other)),
+    }
+}
+
 fn target_uid(target: &Day2Target) -> String {
     match &target.namespace {
         Some(namespace) => format!("{}/{}/{}", target.kind, namespace, target.name),
@@ -556,7 +709,17 @@ impl Render for Day2View {
         let theme = k10s_theme::active(cx).clone();
         let fonts = k10s_theme::typography(cx).clone();
         let view = cx.entity();
-        let empty = self.table.total_rows() == 0 && self.status.is_none();
+        let label = match self.phase {
+            Phase::Targets { .. } => self.targets_label.as_ref(),
+            Phase::Ops { .. } => None,
+        };
+        let empty = nothing_listed(self.table.total_rows(), self.status.as_ref(), label);
+        let slot = status_slot(
+            &theme,
+            &fonts,
+            self.status_text
+                .text(Slot::of(&self.latch, self.status.as_ref(), label)),
+        );
         let loading = matches!(self.phase, Phase::Targets { loading: true });
 
         div()
@@ -571,32 +734,32 @@ impl Render for Day2View {
             .font_family(fonts.ui_family.clone())
             .text_color(rgb(theme.shell.text))
             .on_action(cx.listener(|this, _: &RowUp, _, cx| {
-                this.armed = None;
+                this.latch.disarm();
                 this.table.move_selection(-1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowDown, _, cx| {
-                this.armed = None;
+                this.latch.disarm();
                 this.table.move_selection(1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowPageUp, _, cx| {
-                this.armed = None;
+                this.latch.disarm();
                 this.table.page_by(-1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowPageDown, _, cx| {
-                this.armed = None;
+                this.latch.disarm();
                 this.table.page_by(1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowHome, _, cx| {
-                this.armed = None;
+                this.latch.disarm();
                 this.table.select_first();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowEnd, _, cx| {
-                this.armed = None;
+                this.latch.disarm();
                 this.table.select_last();
                 cx.notify();
             }))
@@ -614,14 +777,17 @@ impl Render for Day2View {
                 this.back(cx);
             }))
             .on_action(cx.listener(|this, _: &EnterFilter, _, cx| {
+                this.latch.disarm();
                 this.filtering = true;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CommitInput, _, cx| {
+                this.latch.disarm();
                 this.filtering = false;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CancelInput, _, cx| {
+                this.latch.disarm();
                 this.filtering = false;
                 this.table.clear_filter();
                 cx.notify();
@@ -645,9 +811,14 @@ impl Render for Day2View {
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                 let delta = f32::from(event.delta.pixel_delta(px(LIST_ROW_HEIGHT)).y);
-                this.table
-                    .move_selection(-(delta / LIST_ROW_HEIGHT).round() as i64);
-                cx.notify();
+                // A touch that rounds to no row moves nothing and disarms
+                // nothing.
+                let step = -(delta / LIST_ROW_HEIGHT).round() as i64;
+                if step != 0 {
+                    this.latch.disarm();
+                    this.table.move_selection(step);
+                    cx.notify();
+                }
             }))
             .child(panel_header(&theme, &fonts, self.breadcrumb()))
             .child(
@@ -723,7 +894,7 @@ impl Render for Day2View {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                                this.armed = None;
+                                                this.latch.disarm();
                                                 this.table.select_visible_offset(offset);
                                                 cx.notify();
                                             }),
@@ -742,14 +913,7 @@ impl Render for Day2View {
                                     .child("select a workload or node, or wait for the target list")
                             })),
                     )
-                    .children(self.status.clone().map(|status| {
-                        div()
-                            .flex_none()
-                            .p(px(12.0))
-                            .text_size(px(fonts.ui_size))
-                            .text_color(rgb(theme.shell.text))
-                            .child(status)
-                    })),
+                    .children(slot),
             )
             .child(
                 div()
@@ -819,6 +983,187 @@ mod tests {
         assert!(
             ops.iter().all(|(name, _)| !name.starts_with("scale")),
             "a guessed replica count would lie in the confirm sentence"
+        );
+    }
+
+    const TARGET: &str = "context lab";
+
+    fn needs_confirm() -> Option<Day2Outcome> {
+        Some(Day2Outcome::NeedsConfirm {
+            summary: "restart deploy prod/api".to_string(),
+        })
+    }
+
+    // A write's answer lands whether or not anything newer was asked and
+    // whether or not its row is still selected: the write happened, or may
+    // have. A reply dropped unsent says so.
+    #[test]
+    fn a_write_answer_always_lands() {
+        let write = Some((
+            "restart deploy prod/api in context lab",
+            "restart deploy prod/api",
+        ));
+        for current in [true, false] {
+            for still_selected in [true, false] {
+                assert_eq!(
+                    landing(
+                        write,
+                        current,
+                        still_selected,
+                        Some(Day2Outcome::Failed {
+                            why: "no answer within 35 s".to_string()
+                        }),
+                        TARGET
+                    ),
+                    Landing::Settled(
+                        "restart deploy prod/api in context lab: no answer within 35 s".to_string()
+                    ),
+                    "current {current}, selected {still_selected}"
+                );
+                assert_eq!(
+                    landing(write, current, still_selected, None, TARGET),
+                    Landing::Settled(
+                        "restart deploy prod/api in context lab: no answer arrived; the write may \
+                         have landed; read the object before retrying"
+                            .to_string()
+                    )
+                );
+            }
+        }
+    }
+
+    // An ask's answer lands only while it is the newest ask and its row is
+    // still selected: a stale answer, or one for a row the person left, arms
+    // nothing and says nothing.
+    #[test]
+    fn an_ask_answer_lands_only_on_the_newest_ask_still_selected() {
+        for (current, still_selected) in [(false, true), (true, false), (false, false)] {
+            assert_eq!(
+                landing(None, current, still_selected, needs_confirm(), TARGET),
+                Landing::Dropped
+            );
+            assert_eq!(
+                landing(
+                    None,
+                    current,
+                    still_selected,
+                    Some(Day2Outcome::Denied {
+                        what: "drain",
+                        why: "this account cannot create evictions".to_string()
+                    }),
+                    TARGET
+                ),
+                Landing::Dropped
+            );
+            assert_eq!(
+                landing(None, current, still_selected, None, TARGET),
+                Landing::Dropped
+            );
+        }
+        assert_eq!(
+            landing(None, true, true, needs_confirm(), TARGET),
+            Landing::Arm {
+                prefix: "restart deploy prod/api in context lab".to_string(),
+                asked: "restart deploy prod/api".to_string(),
+            }
+        );
+        assert_eq!(
+            landing(
+                None,
+                true,
+                true,
+                Some(Day2Outcome::Denied {
+                    what: "drain",
+                    why: "this account cannot create evictions".to_string()
+                }),
+                TARGET
+            ),
+            Landing::Said("drain: this account cannot create evictions".to_string())
+        );
+        assert_eq!(
+            landing(None, true, true, None, TARGET),
+            Landing::Said("the ask ended without an answer; nothing was written".to_string())
+        );
+    }
+
+    #[test]
+    fn the_confirm_and_sent_lines_name_the_write_and_where_it_lands() {
+        for target in [write_target(Some("lab")), write_target(None)] {
+            let Landing::Arm { prefix, .. } = landing(None, true, true, needs_confirm(), &target)
+            else {
+                panic!("the newest ask on its row arms");
+            };
+            assert_eq!(
+                armed_line(&prefix),
+                format!("restart deploy prod/api in {target}  (enter again to confirm)")
+            );
+            assert_eq!(
+                sent_line(&prefix),
+                format!("restart deploy prod/api in {target}: sent, waiting for the server")
+            );
+        }
+        assert_eq!(write_target(None), "this cluster's in-cluster account");
+    }
+
+    #[test]
+    fn every_kind_that_could_not_be_listed_is_named() {
+        let one = unlisted(None, "Node: access denied for this account".to_string());
+        assert_eq!(one.as_ref(), "Node: access denied for this account");
+        assert_eq!(
+            unlisted(Some(one), "StatefulSet: the list timed out".to_string()).as_ref(),
+            "Node: access denied for this account; StatefulSet: the list timed out"
+        );
+    }
+
+    #[test]
+    fn a_write_answer_names_what_was_confirmed() {
+        let prefix = "scale deploy prod/api to 0 in context lab";
+        let asked = "scale deploy prod/api to 0";
+        // An Applied summary that repeats the ask says only that it applied.
+        assert_eq!(
+            answered_line(
+                prefix,
+                asked,
+                Day2Outcome::Applied {
+                    summary: asked.to_string(),
+                    truncated: false,
+                }
+            ),
+            "scale deploy prod/api to 0 in context lab: applied"
+        );
+        // One that says more, a drain's count, is shown.
+        assert_eq!(
+            answered_line(
+                "drain node w1: cordon, then evict 2 pods in context lab",
+                "drain node w1: cordon, then evict 2 pods",
+                Day2Outcome::Applied {
+                    summary: "cordoned w1; evicted 2 pods".to_string(),
+                    truncated: true,
+                }
+            ),
+            "drain node w1: cordon, then evict 2 pods in context lab: cordoned w1; evicted 2 pods  \
+             (truncated)"
+        );
+        assert_eq!(
+            answered_line(
+                prefix,
+                asked,
+                Day2Outcome::Denied {
+                    what: "scale",
+                    why: "forbidden".to_string(),
+                }
+            ),
+            "scale deploy prod/api to 0 in context lab: scale: forbidden"
+        );
+        assert_eq!(
+            answered_line(
+                prefix,
+                asked,
+                Day2Outcome::Failed {
+                    why: "no answer within 35 s".to_string(),
+                }
+            ),
+            "scale deploy prod/api to 0 in context lab: no answer within 35 s"
         );
     }
 

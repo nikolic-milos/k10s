@@ -471,7 +471,18 @@ impl Workspace {
             cx,
             |this, window, cx| {
                 let provider = this.provider();
-                let view = cx.new(|cx| InventoryView::helm(provider, cx));
+                let flight = this.helm_in_flight.clone();
+                let view = cx.new(|cx| {
+                    let mut view = InventoryView::helm(provider, cx);
+                    if let Some(flight) = flight {
+                        view.resume_rollback(
+                            flight.namespace.as_deref(),
+                            &flight.name,
+                            flight.revision,
+                        );
+                    }
+                    view
+                });
                 let subscription = this.subscribe_inventory(&view, window, cx);
                 (view, Some(subscription))
             },
@@ -904,6 +915,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.helm_in_flight = Some(HelmInFlight {
+            namespace: namespace.clone(),
+            name: name.clone(),
+            revision,
+        });
         let provider = self.provider();
         let (tx, rx) = futures::channel::oneshot::channel();
         provider.rollback_helm(
@@ -921,29 +937,46 @@ impl Workspace {
         let this = cx.weak_entity();
         window
             .spawn(cx, async move |cx| {
-                if let Ok(outcome) = rx.await {
-                    let _ = this.update_in(cx, |this, window, cx| match outcome {
-                        HelmRollbackOutcome::Report { note, lines } => {
-                            this.status_note = Some(note);
+                let answer = rx.await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.helm_in_flight = None;
+                    let note = match answer {
+                        Ok(HelmRollbackOutcome::Report { note, lines }) => {
                             let id = format!(
                                 "{}/{name}/{revision}/rollback",
                                 namespace.as_deref().unwrap_or("")
                             );
                             this.open_helm_report(id, "helm rollback".into(), lines, window, cx);
+                            note
                         }
-                        HelmRollbackOutcome::Denied(what) => {
-                            this.status_note =
-                                Some(format!("{what}: access denied for this account"));
-                            cx.notify();
+                        Ok(HelmRollbackOutcome::Denied(what)) => {
+                            format!("{what}: access denied for this account")
                         }
-                        HelmRollbackOutcome::Failed(why) => {
-                            this.status_note = Some(why);
-                            cx.notify();
-                        }
-                    });
-                }
+                        Ok(HelmRollbackOutcome::Failed(why)) => why,
+                        Err(_) => "no answer arrived; the apply may have landed; read the \
+                                   release's objects before retrying"
+                            .to_string(),
+                    };
+                    this.rollback_answered(note.clone().into(), cx);
+                    this.status_note = Some(note);
+                    cx.notify();
+                });
             })
             .detach();
+    }
+
+    // The answer settles whichever Releases view is open now, found by its tag
+    // rather than by a handle taken at dispatch: the tab may have been closed
+    // and reopened while the write was out.
+    fn rollback_answered(&mut self, answer: SharedString, cx: &mut Context<Self>) {
+        let live = self
+            .center
+            .find(|tab| tab.tag == ItemTag::Releases)
+            .and_then(|index| self.center.get(index))
+            .and_then(|tab| tab.view.to_any().downcast::<InventoryView>().ok());
+        if let Some(view) = live {
+            view.update(cx, |view, cx| view.rollback_answered(answer, cx));
+        }
     }
 
     fn open_helm_report(
@@ -1529,6 +1562,14 @@ pub(crate) fn close_target(
         return CloseTarget::WarnDirty;
     }
     CloseTarget::Center(center_active.min(center_len.saturating_sub(2)))
+}
+
+/// The stored-manifest apply that is out, resumed by a reopened Releases view.
+#[derive(Clone)]
+pub(crate) struct HelmInFlight {
+    pub(crate) namespace: Option<String>,
+    pub(crate) name: String,
+    pub(crate) revision: u32,
 }
 
 #[cfg(test)]

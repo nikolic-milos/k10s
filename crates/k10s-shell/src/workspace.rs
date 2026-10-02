@@ -89,6 +89,10 @@ pub struct Workspace {
     pub(crate) cluster_finder: ModalSlot<ClusterFinderView>,
     pub(crate) scratch_counter: usize,
     pub(crate) status_note: Option<String>,
+    // The stored-manifest apply that is out, if one is. Kept here rather than in
+    // the Releases view, so a tab closed and reopened meanwhile refuses a second
+    // one and still shows the answer.
+    pub(crate) helm_in_flight: Option<crate::hosting::HelmInFlight>,
     pub(crate) connected: bool,
     // Which cluster, for the label the state dot describes. `None` while
     // connected is an in-cluster service account, which has no context name.
@@ -167,6 +171,7 @@ impl Workspace {
             cluster_finder: ModalSlot::default(),
             scratch_counter: 0,
             status_note: None,
+            helm_in_flight: None,
             connected,
             context: None,
             // The caller also knows about a command-line scene while its

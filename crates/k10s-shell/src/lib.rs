@@ -30,7 +30,8 @@
 //! with no gpui in them at all -- the default keymap, the pick-to-selection
 //! function, item identity, and the tab arithmetic under both the centre row and
 //! the docks -- are their own modules precisely so they can be tested without a
-//! window.
+//! window. So is the one-write latch behind the day-2 and Helm confirmations,
+//! whose only gpui item is `SharedString`.
 
 pub mod attribution;
 pub mod browse;
@@ -77,6 +78,7 @@ mod alerts;
 mod bindings;
 mod chrome;
 mod cluster;
+mod confirm;
 mod dirty;
 mod editor_element;
 mod editor_io;
