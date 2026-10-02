@@ -55,6 +55,72 @@ fn settled(pol: &LodPolicy, cam: &Camera) -> StageBlend {
 }
 
 #[test]
+fn namespace_scan_charges_label_and_icon_budgets_after_counting_visible_marks() {
+    let mut scene = tiny_scene();
+    scene.regions[0].rect = Rect::new(0.0, 0.0, 400.0, 200.0);
+    let prototype = scene.blocks[0].clone();
+    scene.blocks = [80.0, 30.0, 1.0]
+        .into_iter()
+        .enumerate()
+        .map(|(i, width)| {
+            let rect = Rect::new(i as f32 * 100.0, 20.0, width, 60.0);
+            BlockNode {
+                rect,
+                inner: rect,
+                children: 0..0,
+                ..prototype.clone()
+            }
+        })
+        .collect();
+    scene.regions[0].children = 0..3;
+    let camera = Camera {
+        cx: 200.0,
+        cy: 100.0,
+        zoom: 0.1,
+    };
+    for stress in [false, true] {
+        for skip_blocks in [false, true] {
+            for limit in [0, 1, 10] {
+                let policy = LodPolicy {
+                    block_min_px: 1.0,
+                    block_icon_min_px: 5.0,
+                    region_label_min_px: 0.0,
+                    block_label_min_px: 0.0,
+                    block_label_min_zoom: 0.0,
+                    max_labels: limit,
+                    max_icons: limit,
+                    stress,
+                    ..policy()
+                };
+                let stats = cull(
+                    &scene,
+                    &camera,
+                    &policy,
+                    StageBlend::settled(1),
+                    40.0,
+                    40.0,
+                    false,
+                    skip_blocks,
+                );
+                let (blocks, labels, icons, quads) = if skip_blocks {
+                    (0, 1usize, 0usize, 2)
+                } else if stress {
+                    (3, 4, 0, 5)
+                } else {
+                    (2, 2, 1, 3)
+                };
+                assert_eq!(stats.drawn_blocks, blocks);
+                assert_eq!(stats.quads, quads);
+                assert_eq!(stats.labels, labels.min(limit));
+                assert_eq!(stats.labels_dropped, labels.saturating_sub(limit));
+                assert_eq!(stats.icons, icons.min(limit));
+                assert_eq!(stats.icons_dropped, icons.saturating_sub(limit));
+            }
+        }
+    }
+}
+
+#[test]
 fn partial_cell_scan_counts_only_visible_labels_against_the_remaining_budget() {
     let mut scene = tiny_scene();
     scene.blocks[0].rect = Rect::new(0.0, 0.0, 80.0, 60.0);

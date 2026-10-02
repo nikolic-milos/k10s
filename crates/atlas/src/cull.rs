@@ -263,8 +263,9 @@ fn cull_stage_one_contiguous<R, B, C, S>(
         }
         st.drawn_regions += 1;
         st.quads += 1;
-        if policy.region_label_shown(region.rect.w, zoom) {
-            push_label(&mut st, policy);
+        st.labels += usize::from(policy.region_label_shown(region.rect.w, zoom));
+        if skip_blocks {
+            continue;
         }
 
         let region_inside = visible.contains(&region.rect);
@@ -272,9 +273,25 @@ fn cull_stage_one_contiguous<R, B, C, S>(
             if !(region_inside || block.rect.intersects(visible)) {
                 continue;
             }
-            count_workload_mark(&mut st, policy, block.inner.w, zoom, 1, skip_blocks);
+            let presentation = policy.workload_presentation(block.inner.w, zoom, 1);
+            if presentation == WorkloadPresentation::Hidden {
+                continue;
+            }
+            st.drawn_blocks += 1;
+            if presentation.card_shown() {
+                st.quads += 1;
+                st.labels += usize::from(policy.block_label_shown(block.inner.w, zoom));
+            } else {
+                st.icons += 1;
+            }
         }
     }
+    // At this stage the counts do not affect traversal. Charge the budgets
+    // once so a wide namespace does not test the same caps per workload.
+    st.labels_dropped = st.labels.saturating_sub(policy.max_labels);
+    st.labels = st.labels.min(policy.max_labels);
+    st.icons_dropped = st.icons.saturating_sub(policy.max_icons);
+    st.icons = st.icons.min(policy.max_icons);
     st
 }
 
