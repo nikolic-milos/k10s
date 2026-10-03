@@ -114,7 +114,7 @@ struct Route {
     matches: String,
     accept_contains: Option<&'static str>,
     status: u16,
-    body: String,
+    body: Vec<u8>,
     fate: Fate,
     delay: Option<Duration>,
     used: bool,
@@ -149,12 +149,22 @@ impl Script {
         status: u16,
         body: impl Into<String>,
     ) -> &Self {
+        self.route_bytes(method, matches, status, body.into().into_bytes())
+    }
+
+    fn route_bytes(
+        &self,
+        method: &'static str,
+        matches: &str,
+        status: u16,
+        body: Vec<u8>,
+    ) -> &Self {
         self.state.lock().expect("script lock").routes.push(Route {
             method,
             matches: matches.to_string(),
             accept_contains: None,
             status,
-            body: body.into(),
+            body,
             fate: Fate::Answer,
             delay: None,
             used: false,
@@ -175,7 +185,7 @@ impl Script {
             matches: matches.to_string(),
             accept_contains: Some(accept_contains),
             status,
-            body: body.into(),
+            body: body.into().into_bytes(),
             fate: Fate::Answer,
             delay: None,
             used: false,
@@ -192,7 +202,7 @@ impl Script {
             matches: matches.to_string(),
             accept_contains: None,
             status: 0,
-            body: String::new(),
+            body: Vec::new(),
             fate: Fate::Hang,
             delay: None,
             used: false,
@@ -207,7 +217,7 @@ impl Script {
             matches: matches.to_string(),
             accept_contains: None,
             status: 0,
-            body: String::new(),
+            body: Vec::new(),
             fate: Fate::Lose,
             delay: None,
             used: false,
@@ -221,7 +231,7 @@ impl Script {
             matches: matches.to_string(),
             accept_contains: None,
             status: 0,
-            body: String::new(),
+            body: Vec::new(),
             fate: Fate::Unsent,
             delay: None,
             used: false,
@@ -245,7 +255,7 @@ impl Script {
             matches: matches.to_string(),
             accept_contains: None,
             status,
-            body: body.into(),
+            body: body.into().into_bytes(),
             fate: Fate::Answer,
             delay: Some(delay),
             used: false,
@@ -346,7 +356,7 @@ impl Service<http::Request<Body>> for Script {
                     Fate::Answer,
                     404,
                     r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":404,"reason":"NotFound","message":"unscripted"}"#
-                        .to_string(),
+                        .as_bytes().to_vec(),
                     None,
                 )),
             };
@@ -376,7 +386,7 @@ impl Service<http::Request<Body>> for Script {
             Ok(http::Response::builder()
                 .status(status)
                 .header(http::header::CONTENT_TYPE, "application/json")
-                .body(Body::from(response.into_bytes()))
+                .body(Body::from(response))
                 .expect("a response"))
         })
     }

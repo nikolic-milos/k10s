@@ -30,7 +30,8 @@
 //!
 //! The drain proof requires `live_fixtures.sh --with kwok`: it drains a fake
 //! kwok node whose one pod sits under a PodDisruptionBudget with no disruption
-//! allowed, and deletes the node and its namespace even when a check panics.
+//! allowed, and deletes only its own node and namespace even when a check panics.
+//! Creation and readiness share one minute, and cleanup has one further minute.
 //!
 //! The observability tests require `live_fixtures.sh --with observability`.
 //! The monitoring test compares a scraped namespace creation time with
@@ -1663,138 +1664,437 @@ fn a_read_only_account_cannot_create_a_live_alertmanager_silence() {
     println!("live silence denial in {context}: {answer:?}");
 }
 
-const DRAIN_PROBE: &str = "k10s-live-drain";
+const DRAIN_FIXTURE_BUDGET: Duration = Duration::from_secs(60);
 
-// A tainted kwok node with one tolerating pod under a budget that allows no
-// disruption, deleted with its namespace however the test ends.
-struct DrainProbe;
+async fn drain_before(
+    deadline: tokio::time::Instant,
+    request: impl std::future::Future<Output = Result<serde_json::Value, kube::Error>>,
+) -> Result<serde_json::Value, kube::Error> {
+    let expired = || {
+        kube::Error::Service(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the drain fixture exceeded its 60 s deadline",
+        )))
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return Err(expired());
+    }
+    tokio::time::timeout_at(deadline, request)
+        .await
+        .map_err(|_| expired())?
+}
+
+fn drain_request(
+    request: http::Request<Vec<u8>>,
+    deadline: std::time::Instant,
+) -> Result<serde_json::Value, kube::Error> {
+    kube_runtime().block_on(drain_before(deadline.into(), async {
+        let client = kube::Client::try_default().await?;
+        client.request(request).await
+    }))
+}
+
+fn drain_get(
+    path: &str,
+    name: &str,
+    deadline: std::time::Instant,
+) -> Result<serde_json::Value, kube::Error> {
+    let request = kube::api::Request::new(path)
+        .get(name, &kube::api::GetParams::default())
+        .expect("a get request");
+    drain_request(request, deadline)
+}
+
+fn drain_delete(
+    path: &str,
+    name: &str,
+    uid: &str,
+    deadline: std::time::Instant,
+) -> Result<serde_json::Value, kube::Error> {
+    let request = kube::api::Request::new(path)
+        .delete(
+            name,
+            &kube::api::DeleteParams {
+                grace_period_seconds: Some(0),
+                preconditions: Some(kube::api::Preconditions {
+                    uid: Some(uid.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("a delete request");
+    drain_request(request, deadline)
+}
+
+fn drain_pause(deadline: std::time::Instant) {
+    std::thread::sleep(
+        deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(Duration::from_secs(1)),
+    );
+}
+
+// Only successful root creates confer ownership. Namespaced objects are removed
+// through that namespace, and every forced pod deletion pins the observed UID.
+struct DrainProbe {
+    name: String,
+    node_uid: Option<String>,
+    namespace_uid: Option<String>,
+}
 
 impl DrainProbe {
-    fn create() -> Self {
-        let probe = DrainProbe;
-        let objects = [
+    fn empty(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            node_uid: None,
+            namespace_uid: None,
+        }
+    }
+
+    fn objects(&self) -> [(String, serde_json::Value); 4] {
+        let name = &self.name;
+        [
             (
                 "/api/v1/nodes".to_string(),
                 serde_json::json!({
                     "apiVersion": "v1", "kind": "Node",
-                    "metadata": {"name": DRAIN_PROBE,
+                    "metadata": {"name": name,
                         "annotations": {"kwok.x-k8s.io/node": "fake"},
-                        "labels": {"type": "kwok", "kubernetes.io/hostname": DRAIN_PROBE}},
+                        "labels": {"type": "kwok", "kubernetes.io/hostname": name}},
                     "spec": {"taints": [{"key": "kwok.x-k8s.io/node", "value": "fake", "effect": "NoExecute"}]},
                 }),
             ),
             (
                 "/api/v1/namespaces".to_string(),
-                serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": DRAIN_PROBE}}),
+                serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}}),
             ),
             (
-                format!("/apis/apps/v1/namespaces/{DRAIN_PROBE}/deployments"),
+                format!("/apis/apps/v1/namespaces/{name}/deployments"),
                 serde_json::json!({
                     "apiVersion": "apps/v1", "kind": "Deployment",
-                    "metadata": {"name": DRAIN_PROBE},
+                    "metadata": {"name": name},
                     "spec": {"replicas": 1,
-                        "selector": {"matchLabels": {"app": DRAIN_PROBE}},
-                        "template": {"metadata": {"labels": {"app": DRAIN_PROBE}},
-                            "spec": {"nodeSelector": {"kubernetes.io/hostname": DRAIN_PROBE},
+                        "selector": {"matchLabels": {"app": name}},
+                        "template": {"metadata": {"labels": {"app": name}},
+                            "spec": {"nodeSelector": {"kubernetes.io/hostname": name},
                                 "tolerations": [{"key": "kwok.x-k8s.io/node", "operator": "Exists", "effect": "NoExecute"}],
                                 "containers": [{"name": "fake", "image": "fake-image"}]}}},
                 }),
             ),
             (
-                format!("/apis/policy/v1/namespaces/{DRAIN_PROBE}/poddisruptionbudgets"),
+                format!("/apis/policy/v1/namespaces/{name}/poddisruptionbudgets"),
                 serde_json::json!({
                     "apiVersion": "policy/v1", "kind": "PodDisruptionBudget",
-                    "metadata": {"name": DRAIN_PROBE},
-                    "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": DRAIN_PROBE}}},
+                    "metadata": {"name": name},
+                    "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": name}}},
                 }),
             ),
-        ];
-        for (path, object) in objects {
-            let request = kube::api::Request::new(&path)
-                .create(
-                    &kube::api::PostParams::default(),
-                    serde_json::to_vec(&object).expect("JSON"),
-                )
-                .expect("a create request");
-            if let Err(error) = admin_request(request) {
-                panic!("creating the drain probe at {path}: {}", said(&error));
-            }
+        ]
+    }
+
+    fn create_object(
+        &mut self,
+        path: &str,
+        object: serde_json::Value,
+        deadline: std::time::Instant,
+    ) -> Result<(), kube::Error> {
+        let request = kube::api::Request::new(path)
+            .create(
+                &kube::api::PostParams::default(),
+                serde_json::to_vec(&object).expect("JSON"),
+            )
+            .expect("a create request");
+        let created = drain_request(request, deadline)?;
+        let uid = created["metadata"]["uid"]
+            .as_str()
+            .expect("a created object's UID")
+            .to_string();
+        match path {
+            "/api/v1/nodes" => self.node_uid = Some(uid),
+            "/api/v1/namespaces" => self.namespace_uid = Some(uid),
+            _ => {}
         }
-        let budget = format!("/apis/policy/v1/namespaces/{DRAIN_PROBE}/poddisruptionbudgets");
-        for _ in 0..60 {
-            let request = kube::api::Request::new(&budget)
-                .get(DRAIN_PROBE, &kube::api::GetParams::default())
-                .expect("a get request");
-            let pdb = admin_request(request).expect("the budget");
+        Ok(())
+    }
+
+    fn create() -> Self {
+        Self::try_create(&drain_probe_name("live"))
+            .unwrap_or_else(|error| panic!("creating the drain probe: {}", said(&error)))
+    }
+
+    fn try_create(name: &str) -> Result<Self, kube::Error> {
+        let mut probe = Self::empty(name);
+        let deadline = std::time::Instant::now() + DRAIN_FIXTURE_BUDGET;
+        for (path, object) in probe.objects() {
+            probe.create_object(&path, object, deadline)?;
+        }
+        let budget = format!("/apis/policy/v1/namespaces/{name}/poddisruptionbudgets");
+        loop {
+            let pdb = drain_get(&budget, name, deadline)?;
             if pdb["status"]["currentHealthy"] == 1 && pdb["status"]["disruptionsAllowed"] == 0 {
-                return probe;
+                return Ok(probe);
             }
-            std::thread::sleep(Duration::from_secs(1));
+            drain_pause(deadline);
         }
-        panic!("the kwok pod never became healthy under its budget; is kwok installed?");
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + DRAIN_FIXTURE_BUDGET;
+        let mut namespace_uid = self.namespace_uid.take();
+        let mut node_uid = self.node_uid.take();
+        for (path, uid) in [
+            ("/api/v1/namespaces", namespace_uid.as_deref()),
+            ("/api/v1/nodes", node_uid.as_deref()),
+        ] {
+            if let Some(uid) = uid
+                && let Err(error) = drain_delete(path, &self.name, uid, deadline)
+                && !matches!(&error, kube::Error::Api(status) if status.code == 404 || status.code == 409)
+            {
+                eprintln!("deleting {path}/{}: {}", self.name, said(&error));
+            }
+        }
+        while namespace_uid.is_some() || node_uid.is_some() {
+            for (path, owned) in [
+                ("/api/v1/namespaces", &mut namespace_uid),
+                ("/api/v1/nodes", &mut node_uid),
+            ] {
+                let Some(uid) = owned.as_deref() else {
+                    continue;
+                };
+                match drain_get(path, &self.name, deadline) {
+                    Ok(object) if object["metadata"]["uid"].as_str() == Some(uid) => {}
+                    Ok(_) => {
+                        *owned = None;
+                        continue;
+                    }
+                    Err(kube::Error::Api(status)) if status.code == 404 => {
+                        *owned = None;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "waiting for {path}/{}: {}",
+                            self.name,
+                            said(&error)
+                        ));
+                    }
+                }
+                if path == "/api/v1/namespaces" {
+                    self.remove_fake_pods(uid, deadline)?;
+                }
+            }
+            if namespace_uid.is_some() || node_uid.is_some() {
+                drain_pause(deadline);
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_fake_pods(
+        &self,
+        namespace_uid: &str,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let path = format!("/api/v1/namespaces/{}/pods", self.name);
+        let request = kube::api::Request::new(&path)
+            .list(&kube::api::ListParams::default())
+            .expect("a pod list request");
+        let pods = match drain_request(request, deadline) {
+            Ok(pods) => pods,
+            Err(kube::Error::Api(status)) if status.code == 404 => return Ok(()),
+            Err(error) => return Err(format!("listing the drain probe's pods: {}", said(&error))),
+        };
+        // Check after the list: a replacement namespace must never lend us its
+        // pods. Individual UID preconditions also cover replacements after this read.
+        match drain_get("/api/v1/namespaces", &self.name, deadline) {
+            Ok(namespace) if namespace["metadata"]["uid"].as_str() == Some(namespace_uid) => {}
+            Ok(_) => return Ok(()),
+            Err(kube::Error::Api(status)) if status.code == 404 => return Ok(()),
+            Err(error) => return Err(format!("checking the drain namespace: {}", said(&error))),
+        }
+        for pod in pods["items"].as_array().expect("a pod list") {
+            let name = pod["metadata"]["name"].as_str().expect("a pod name");
+            let uid = pod["metadata"]["uid"].as_str().expect("a pod UID");
+            match drain_delete(&path, name, uid, deadline) {
+                Ok(_) => {}
+                Err(kube::Error::Api(status)) if status.code == 404 || status.code == 409 => {}
+                Err(error) => {
+                    return Err(format!(
+                        "deleting the drain probe's pod {name}: {}",
+                        said(&error)
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for DrainProbe {
     fn drop(&mut self) {
-        // A kwok node has no kubelet to finish a graceful pod deletion. Stop
-        // new pods by deleting the namespace, then remove its fake pods with
-        // no grace before deleting the node.
-        let pods = format!("/api/v1/namespaces/{DRAIN_PROBE}/pods");
-        for (what, request) in [
-            (
-                "namespace",
-                kube::api::Request::new("/api/v1/namespaces")
-                    .delete(DRAIN_PROBE, &kube::api::DeleteParams::default()),
-            ),
-            (
-                "pods",
-                kube::api::Request::new(&pods).delete_collection(
-                    &kube::api::DeleteParams {
-                        grace_period_seconds: Some(0),
-                        ..Default::default()
-                    },
-                    &kube::api::ListParams::default(),
-                ),
-            ),
-            (
-                "node",
-                kube::api::Request::new("/api/v1/nodes")
-                    .delete(DRAIN_PROBE, &kube::api::DeleteParams::default()),
-            ),
-        ] {
-            let request = request.expect("a cleanup request");
-            if let Err(error) = admin_request(request) {
-                eprintln!("deleting the drain probe's {what}: {}", said(&error));
-            }
-        }
-        // A namespace still being deleted refuses to be created again, so the
-        // probe waits, bounded, until both are gone, and the next run starts
-        // clean instead of failing on this one's leftovers.
-        for path in ["/api/v1/namespaces", "/api/v1/nodes"] {
-            let gone = (0..60).any(|_| {
-                let request = kube::api::Request::new(path)
-                    .get(DRAIN_PROBE, &kube::api::GetParams::default())
-                    .expect("a get request");
-                let gone = matches!(
-                    admin_request(request),
-                    Err(kube::Error::Api(status)) if status.code == 404
-                );
-                if !gone {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-                gone
-            });
-            if !gone {
-                let message = format!("{path}/{DRAIN_PROBE} is still there after 60 s");
-                if std::thread::panicking() {
-                    eprintln!("{message}");
-                } else {
-                    panic!("{message}");
-                }
+        if let Err(message) = self.cleanup() {
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
             }
         }
     }
+}
+
+fn drain_probe_name(case: &str) -> String {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    format!("k10s-drain-{case}-{suffix}")
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_drain_fixture_preserves_a_colliding_node() {
+    let mut existing = DrainProbe::empty(&drain_probe_name("node"));
+    let (path, object) = existing.objects().into_iter().next().expect("the node");
+    let deadline = std::time::Instant::now() + DRAIN_FIXTURE_BUDGET;
+    existing
+        .create_object(&path, object, deadline)
+        .expect("the existing node");
+    let error = DrainProbe::try_create(&existing.name)
+        .err()
+        .expect("the name collides");
+    assert!(matches!(error, kube::Error::Api(status) if status.code == 409));
+    let node = drain_get(&path, &existing.name, deadline).expect("the original node remains");
+    assert_eq!(
+        node["metadata"]["uid"].as_str(),
+        existing.node_uid.as_deref()
+    );
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_drain_fixture_removes_only_its_partial_creation() {
+    let mut existing = DrainProbe::empty(&drain_probe_name("partial"));
+    let (path, object) = existing
+        .objects()
+        .into_iter()
+        .nth(1)
+        .expect("the namespace");
+    let deadline = std::time::Instant::now() + DRAIN_FIXTURE_BUDGET;
+    existing
+        .create_object(&path, object, deadline)
+        .expect("the existing namespace");
+    let error = DrainProbe::try_create(&existing.name)
+        .err()
+        .expect("the namespace collides");
+    assert!(matches!(error, kube::Error::Api(status) if status.code == 409));
+    let namespace =
+        drain_get(&path, &existing.name, deadline).expect("the original namespace remains");
+    assert_eq!(
+        namespace["metadata"]["uid"].as_str(),
+        existing.namespace_uid.as_deref()
+    );
+    assert!(
+        matches!(drain_get("/api/v1/nodes", &existing.name, deadline),
+        Err(kube::Error::Api(status)) if status.code == 404),
+        "the partially created node was removed"
+    );
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_drain_fixture_preserves_replacement_roots() {
+    let mut original = DrainProbe::empty(&drain_probe_name("replacement"));
+    let deadline = std::time::Instant::now() + DRAIN_FIXTURE_BUDGET;
+    for (path, object) in original.objects().into_iter().take(2) {
+        original
+            .create_object(&path, object, deadline)
+            .expect("the original roots");
+    }
+    let mut remover = DrainProbe {
+        name: original.name.clone(),
+        node_uid: original.node_uid.clone(),
+        namespace_uid: original.namespace_uid.clone(),
+    };
+    remover
+        .cleanup()
+        .expect("remove the original roots before replacing them");
+    let mut replacement = DrainProbe::empty(&original.name);
+    let deadline = std::time::Instant::now() + DRAIN_FIXTURE_BUDGET;
+    for (path, object) in replacement.objects().into_iter().take(2) {
+        replacement
+            .create_object(&path, object, deadline)
+            .expect("the replacement roots");
+    }
+    let pods = format!("/api/v1/namespaces/{}/pods", replacement.name);
+    replacement
+        .create_object(
+            &pods,
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "replacement"},
+                "spec": {"nodeName": replacement.name,
+                    "tolerations": [{"key": "kwok.x-k8s.io/node", "operator": "Exists", "effect": "NoExecute"}],
+                    "containers": [{"name": "fake", "image": "fake-image"}]},
+            }),
+            deadline,
+        )
+        .expect("a pod in the replacement namespace");
+    let pod = drain_get(&pods, "replacement", deadline).expect("the replacement pod");
+    assert_ne!(original.node_uid, replacement.node_uid);
+    assert_ne!(original.namespace_uid, replacement.namespace_uid);
+    original
+        .cleanup()
+        .expect("old ownership releases replacement roots");
+    for (path, uid) in [
+        ("/api/v1/nodes", replacement.node_uid.as_deref()),
+        ("/api/v1/namespaces", replacement.namespace_uid.as_deref()),
+    ] {
+        let object = drain_get(path, &replacement.name, deadline).expect("the replacement remains");
+        assert_eq!(object["metadata"]["uid"].as_str(), uid);
+    }
+    let remaining = drain_get(&pods, "replacement", deadline).expect("the replacement pod remains");
+    assert_eq!(remaining["metadata"]["uid"], pod["metadata"]["uid"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_fixture_deadline_includes_an_unanswered_request() {
+    use kube::client::Body;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let service = tower::service_fn(move |_: http::Request<Body>| {
+        let attempt = seen.fetch_add(1, Ordering::Relaxed);
+        async move {
+            if attempt == 0 {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                Ok::<_, std::convert::Infallible>(http::Response::new(Body::from(b"{}".to_vec())))
+            } else {
+                std::future::pending().await
+            }
+        }
+    });
+    let client = kube::Client::new(service, "default");
+    let started = tokio::time::Instant::now();
+    let deadline = started + DRAIN_FIXTURE_BUDGET;
+    for attempt in 0..3 {
+        let request = kube::api::Request::new("/api/v1/nodes")
+            .get("k10s-drain-unanswered", &kube::api::GetParams::default())
+            .expect("a get request");
+        let result = drain_before(deadline, client.request(request)).await;
+        if attempt == 0 {
+            result.expect("the first request answers after 20 seconds");
+        } else {
+            assert!(matches!(result, Err(kube::Error::Service(error))
+                if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)));
+        }
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(started.elapsed(), DRAIN_FIXTURE_BUDGET);
 }
 
 // A failed admin request in the server's words and code, rather than kube's
@@ -1815,13 +2115,14 @@ fn said(error: &kube::Error) -> String {
 fn a_drain_names_the_disruption_budget_promptly() {
     use k10s_data::day2::DrainRequest;
     let (_plane, sync) = connect(None);
-    let _probe = DrainProbe::create();
+    let probe = DrainProbe::create();
+    let name = &probe.name;
     let started = std::time::Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
     sync.reader.day2(
         KindId::NODE,
         Day2Call::Drain(DrainRequest {
-            name: DRAIN_PROBE.to_string(),
+            name: name.clone(),
             force: false,
             confirm: true,
             caps: Caps::default(),
@@ -1840,8 +2141,8 @@ fn a_drain_names_the_disruption_budget_promptly() {
     assert_eq!(
         applied.summary,
         format!(
-            "cordoned {DRAIN_PROBE}; evicted 0 pods; 1 blocked by a PodDisruptionBudget (The \
-             disruption budget {DRAIN_PROBE} needs 1 healthy pods and has 1 currently)"
+            "cordoned {name}; evicted 0 pods; 1 blocked by a PodDisruptionBudget (The \
+             disruption budget {name} needs 1 healthy pods and has 1 currently)"
         )
     );
     assert!(
@@ -1849,7 +2150,7 @@ fn a_drain_names_the_disruption_budget_promptly() {
         "one eviction, answered: {took:?}"
     );
     let request = kube::api::Request::new("/api/v1/nodes")
-        .get(DRAIN_PROBE, &kube::api::GetParams::default())
+        .get(name, &kube::api::GetParams::default())
         .expect("a get request");
     let node = admin_request(request).expect("the node");
     assert_eq!(node["spec"]["unschedulable"], true, "the node is cordoned");

@@ -4,6 +4,9 @@
 //! save, and schema scope. A new kind of source extends that enum and these
 //! three, and touches nothing else.
 //!
+//! A cluster reload replaces only the buffer revision it started from,
+//! preserving edits made while it waited.
+//!
 //! Nothing here blocks the UI thread. Reads, writes, and even the conflict
 //! stamp run on the background executor, and every non-`Ok` outcome becomes a
 //! labelled note rather than a silent absence. A schema fetch that fails gives
@@ -64,6 +67,7 @@ impl EditorView {
     fn reload_cluster(&mut self, request: DescribeRequest, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
+        let stamp = self.buffer_stamp();
         self.status = Some("loading...".to_string());
         let (tx, rx) = futures::channel::oneshot::channel();
         let reply: Reply<ManifestOutcome> = Box::new(move |outcome| {
@@ -87,6 +91,16 @@ impl EditorView {
                             status_subresource,
                             uid,
                         } => {
+                            // A reload can start with an unchanged buffer and
+                            // receive its answer after another edit.
+                            if this.buffer_stamp() != stamp {
+                                this.status = Some(
+                                    "the buffer changed while loading; it was left as it is"
+                                        .to_string(),
+                                );
+                                cx.notify();
+                                return;
+                            }
                             this.title = title.into();
                             this.buffer = Buffer::new(&yaml);
                             this.syntax.reparse(this.buffer.rope());

@@ -762,10 +762,12 @@ async fn tool_write(
     // write: a timer of its own here would also run through connecting and
     // a credential's refresh, and blame Alertmanager for either.
     match crate::connect::send_write(client, request).await {
-        Ok(text) if text.len() > MAX_BODY_BYTES => Err(WriteFailure::Unshown(format!(
-            "Alertmanager answered with more than {MAX_BODY_BYTES} bytes; the body is hidden"
-        ))),
-        Ok(text) => Ok(text.into_bytes()),
+        Ok(response) if response.body().len() > MAX_BODY_BYTES => {
+            Err(WriteFailure::Unshown(format!(
+                "Alertmanager answered with more than {MAX_BODY_BYTES} bytes; the body is hidden"
+            )))
+        }
+        Ok(response) => Ok(response.into_body()),
         Err(kube::Error::Api(status)) => Err(match status.code {
             401 | 403 => WriteFailure::Denied(crate::connect::status_sentence(&status)),
             _ => WriteFailure::Answered(crate::connect::status_sentence(&status)),

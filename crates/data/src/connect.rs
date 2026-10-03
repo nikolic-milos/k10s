@@ -670,20 +670,19 @@ pub(crate) fn never_sent(err: &(dyn std::error::Error + 'static)) -> bool {
 pub(crate) async fn send_write(
     client: &Client,
     request: http::Request<Vec<u8>>,
-) -> Result<String, kube::Error> {
+) -> Result<http::Response<Vec<u8>>, kube::Error> {
     let response = client.send(request.map(Body::from)).await?;
-    let code = response.status();
-    let location = response
-        .headers()
+    let (parts, body) = response.into_parts();
+    let code = parts.status;
+    let location = parts
+        .headers
         .get(http::header::LOCATION)
         .map(|to| String::from_utf8_lossy(to.as_bytes()).into_owned());
-    let bytes = http_body_util::BodyExt::collect(response.into_body())
-        .await?
-        .to_bytes();
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let bytes = http_body_util::BodyExt::collect(body).await?.to_bytes();
     if code.is_success() {
-        return Ok(text);
+        return Ok(http::Response::from_parts(parts, bytes.to_vec()));
     }
+    let text = String::from_utf8_lossy(&bytes);
     let body = error_body(&text);
     if code.is_server_error() {
         let sentence = match &body {

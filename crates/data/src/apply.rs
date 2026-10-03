@@ -258,11 +258,11 @@ pub(crate) async fn apply(
     } else {
         None
     };
-    let text = match crate::connect::send_write(client, built).await {
-        Ok(text) => text,
+    let response = match crate::connect::send_write(client, built).await {
+        Ok(response) => response,
         Err(error) => return classify(&error, request.dry_run),
     };
-    let value = serde_json::from_str::<serde_json::Value>(&text);
+    let value = serde_json::from_slice::<serde_json::Value>(response.body());
     // `live` is there exactly when this was a dry run: it was read above for
     // that and nothing else.
     let Some(live) = live else {
@@ -271,6 +271,17 @@ pub(crate) async fn apply(
         let uid = value.ok().and_then(|value| manifest::uid_of(&value));
         return ApplyOutcome::Applied(Applied { uid });
     };
+    // The dry run reports whether it created or updated an object. A change
+    // since the read leaves no valid left side for this comparison.
+    if matches!(
+        (&live, response.status()),
+        (Live::Absent, http::StatusCode::OK) | (Live::Read { .. }, http::StatusCode::CREATED)
+    ) {
+        return ApplyOutcome::Failed {
+            why: "the object's existence changed between the read and the dry run; compare again"
+                .to_string(),
+        };
+    }
     let mut value = match value {
         Ok(value) => value,
         Err(why) => {

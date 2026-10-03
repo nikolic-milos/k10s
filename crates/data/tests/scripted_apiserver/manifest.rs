@@ -155,65 +155,71 @@ fn patches(script: &Script) -> Vec<Seen> {
 }
 
 #[test]
-fn a_non_json_2xx_confirms_a_real_apply_but_cannot_be_reviewed() {
+fn an_unreadable_2xx_confirms_a_real_apply_but_cannot_be_reviewed() {
     use k10s_data::apply::ApplyOutcome;
-    for dry_run in [false, true] {
-        let script = Script::default();
-        script_discovery(&script);
-        script_rules_review(&script);
-        script_access_reviews(&script, true, 32);
-        script_lists(&script);
-        route_reads(&script, usize::from(dry_run));
-        script.route(
-            "PATCH",
-            "/api/v1/namespaces/prod/pods/api-1?",
-            200,
-            "stored",
-        );
-        let runtime = runtime();
-        let (sync, _live) = sync_on(&runtime, &script);
-        let yaml = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: api-1\n";
-        let (tx, rx) = std::sync::mpsc::channel();
-        sync.reader
-            .apply(apply_request(yaml, dry_run, false), move |outcome| {
-                let _ = tx.send(outcome);
-            });
-        match wait(&rx) {
-            ApplyOutcome::Applied(applied) if !dry_run => assert_eq!(applied.uid, None),
-            ApplyOutcome::Unrendered(unrendered) if dry_run => assert!(
-                unrendered.why.starts_with("the answer is not JSON:"),
-                "{}",
-                unrendered.why
-            ),
-            other => panic!("2xx confirms the write; only a dry run needs its body: {other:?}"),
-        }
-        let writes = patches(&script);
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].method, "PATCH");
-        let dry = if dry_run { "dryRun=All&" } else { "" };
-        assert_eq!(
-            writes[0].path,
-            format!(
-                "/api/v1/namespaces/prod/pods/api-1?&{dry}fieldManager=k10s&fieldValidation=Strict"
-            )
-        );
-        assert_eq!(writes[0].accept, "application/json");
-        assert_eq!(writes[0].content_type, "application/apply-patch+yaml");
-        assert_eq!(writes[0].body, yaml);
-        assert_reads_used(&script, usize::from(dry_run));
-        let reads = script
-            .requests_for("/api/v1/namespaces/prod/pods/api-1")
-            .into_iter()
-            .filter(|sent| sent.method == "GET")
-            .collect::<Vec<_>>();
-        assert_eq!(reads.len(), usize::from(dry_run));
-        if let Some(read) = reads.first() {
-            assert_eq!(read.path, "/api/v1/namespaces/prod/pods/api-1");
-            assert_eq!(read.accept, "");
-            assert!(read.body.is_empty());
+    for body in [
+        b"stored".to_vec(),
+        b"{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"uid\":\"uid-pod-1\"},\"data\":{\"value\":\"\xff\"}}".to_vec(),
+    ] {
+        for dry_run in [false, true] {
+            let script = Script::default();
+            script_discovery(&script);
+            script_rules_review(&script);
+            script_access_reviews(&script, true, 32);
+            script_lists(&script);
+            route_reads(&script, usize::from(dry_run));
+            script.route_bytes(
+                "PATCH",
+                "/api/v1/namespaces/prod/pods/api-1?",
+                200,
+                body.clone(),
+            );
+            let runtime = runtime();
+            let (sync, _live) = sync_on(&runtime, &script);
+            let yaml = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: api-1\n";
+            let (tx, rx) = std::sync::mpsc::channel();
+            sync.reader
+                .apply(apply_request(yaml, dry_run, false), move |outcome| {
+                    let _ = tx.send(outcome);
+                });
+            match wait(&rx) {
+                ApplyOutcome::Applied(applied) if !dry_run => assert_eq!(applied.uid, None),
+                ApplyOutcome::Unrendered(unrendered) if dry_run => assert!(
+                    unrendered.why.starts_with("the answer is not JSON:"),
+                    "{}",
+                    unrendered.why
+                ),
+                other => panic!("2xx confirms the write; only a dry run needs its body: {other:?}"),
+            }
+            let writes = patches(&script);
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].method, "PATCH");
+            let dry = if dry_run { "dryRun=All&" } else { "" };
+            assert_eq!(
+                writes[0].path,
+                format!(
+                    "/api/v1/namespaces/prod/pods/api-1?&{dry}fieldManager=k10s&fieldValidation=Strict"
+                )
+            );
+            assert_eq!(writes[0].accept, "application/json");
+            assert_eq!(writes[0].content_type, "application/apply-patch+yaml");
+            assert_eq!(writes[0].body, yaml);
+            assert_reads_used(&script, usize::from(dry_run));
+            let reads = script
+                .requests_for("/api/v1/namespaces/prod/pods/api-1")
+                .into_iter()
+                .filter(|sent| sent.method == "GET")
+                .collect::<Vec<_>>();
+            assert_eq!(reads.len(), usize::from(dry_run));
+            if let Some(read) = reads.first() {
+                assert_eq!(read.path, "/api/v1/namespaces/prod/pods/api-1");
+                assert_eq!(read.accept, "");
+                assert!(read.body.is_empty());
+            }
         }
     }
 }
+
 fn apply_request(yaml: &str, dry_run: bool, force: bool) -> k10s_data::apply::ApplyRequest {
     k10s_data::apply::ApplyRequest {
         kind: KindId::POD,
@@ -829,7 +835,11 @@ fn a_dry_run_reads_the_object_with_it_and_sends_nothing_it_cannot_compare() {
         script.route(
             "PATCH",
             "/api/v1/namespaces/prod/pods/api-1?",
-            200,
+            if matches!(read, Some((404, _))) {
+                201
+            } else {
+                200
+            },
             pod_json("api-1", "uid-pod-1", false),
         );
         let runtime = runtime();
@@ -948,4 +958,64 @@ fn a_dry_run_reads_the_object_with_it_and_sends_nothing_it_cannot_compare() {
         1,
         "no PATCH after an unrenderable read: {sent:?}"
     );
+}
+
+#[test]
+fn a_dry_run_refuses_an_object_created_or_deleted_after_its_read() {
+    use k10s_data::apply::ApplyOutcome;
+
+    for (read_status, patch_status) in [(404, 200), (200, 201)] {
+        for force in [false, true] {
+            let script = Script::default();
+            script_discovery(&script);
+            script_rules_review(&script);
+            script_access_reviews(&script, true, 32);
+            script_lists(&script);
+            let before = if read_status == 404 {
+                r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":404,"reason":"NotFound","message":"pods not found"}"#.to_string()
+            } else {
+                pod_json("api-1", "uid-pod-1", false)
+            };
+            script.route(
+                "GET",
+                "/api/v1/namespaces/prod/pods/api-1",
+                read_status,
+                before,
+            );
+            script.route(
+                "PATCH",
+                "/api/v1/namespaces/prod/pods/api-1?",
+                patch_status,
+                pod_json("api-1", "uid-new", false),
+            );
+            let runtime = runtime();
+            let (sync, _live) = sync_on(&runtime, &script);
+            let yaml = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: api-1\n";
+            let (tx, rx) = std::sync::mpsc::channel();
+            sync.reader
+                .apply(apply_request(yaml, true, force), move |outcome| {
+                    let _ = tx.send(outcome);
+                });
+            assert!(
+                matches!(wait(&rx), ApplyOutcome::Failed { why } if why == "the object's existence changed between the read and the dry run; compare again")
+            );
+            let sent = script.requests_for("/pods/api-1");
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0].method, "GET");
+            assert_eq!(sent[0].path, "/api/v1/namespaces/prod/pods/api-1");
+            assert_eq!(sent[0].accept, "");
+            assert!(sent[0].body.is_empty());
+            assert_eq!(sent[1].method, "PATCH");
+            let forced = if force { "force=true&" } else { "" };
+            assert_eq!(
+                sent[1].path,
+                format!(
+                    "/api/v1/namespaces/prod/pods/api-1?&dryRun=All&{forced}fieldManager=k10s&fieldValidation=Strict"
+                )
+            );
+            assert_eq!(sent[1].accept, "application/json");
+            assert_eq!(sent[1].content_type, "application/apply-patch+yaml");
+            assert_eq!(sent[1].body, yaml);
+        }
+    }
 }

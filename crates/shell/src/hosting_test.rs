@@ -1,7 +1,4 @@
-//! The two keystroke policies of the item host, as values, and the sentence a
-//! second stored-manifest apply is refused with. Everything else in hosting.rs
-//! needs a live window; these are the rules a comment used to have to explain
-//! because no test could.
+//! The item host's close-target and terminal-toggle policies as values.
 
 use super::{CloseTarget, TerminalToggle, close_target, terminal_toggle};
 

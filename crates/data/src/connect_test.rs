@@ -998,12 +998,11 @@ mod clients {
     // server's sentence and its own code.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_write_is_judged_by_its_status() {
-        assert_eq!(
-            answered("HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\nok")
-                .await
-                .expect("a 201"),
-            "ok"
-        );
+        let response = answered("HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\nok")
+            .await
+            .expect("a 201");
+        assert_eq!(response.status(), http::StatusCode::CREATED);
+        assert_eq!(response.body(), b"ok");
 
         let error =
             answered("HTTP/1.1 302 Found\r\nlocation: /login\r\ncontent-length: 5\r\n\r\nFound")
@@ -1080,7 +1079,7 @@ mod clients {
     // answer, after storage, the object stored. The last two carry no reason.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_5xx_is_no_verdict_whoever_wrote_it() {
-        let no_verdict = |answer: Result<String, kube::Error>| match answer {
+        let no_verdict = |answer: Result<http::Response<Vec<u8>>, kube::Error>| match answer {
             Err(error) if no_verdict(&error as &(dyn std::error::Error + 'static)) => {
                 describe(&error as &(dyn std::error::Error + 'static))
             }
@@ -1121,7 +1120,7 @@ mod clients {
     }
 
     // One write to a listener that answers these bytes.
-    async fn answered(raw: &str) -> Result<String, kube::Error> {
+    async fn answered(raw: &str) -> Result<http::Response<Vec<u8>>, kube::Error> {
         let listener = listen(Answer::Raw(raw.to_string()), 1).await;
         let clients = clients_with(plain(&listener.url), INTERACTIVE_DEADLINE).expect("clients");
         send_write(&clients.interactive, request("POST")).await
