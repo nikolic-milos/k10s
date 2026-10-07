@@ -395,10 +395,13 @@ impl Render for PaletteView {
                 if keystroke.modifiers.control || keystroke.modifiers.alt {
                     return;
                 }
-                if let Some(key_char) = &keystroke.key_char {
+                if let Some(key_char) = &keystroke.key_char
+                    && !key_char.is_empty()
+                {
                     this.query.push_str(key_char);
                     this.requery();
                     cx.notify();
+                    cx.stop_propagation();
                 }
             }))
             .child({

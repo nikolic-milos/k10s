@@ -531,9 +531,12 @@ impl Render for EcosystemView {
                 if keystroke.modifiers.control || keystroke.modifiers.alt {
                     return;
                 }
-                if let Some(key_char) = &keystroke.key_char {
+                if let Some(key_char) = &keystroke.key_char
+                    && !key_char.is_empty()
+                {
                     this.table.push_filter(key_char);
                     cx.notify();
+                    cx.stop_propagation();
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {

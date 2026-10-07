@@ -474,9 +474,12 @@ impl Render for LaunchView {
                 if keystroke.modifiers.control || keystroke.modifiers.alt {
                     return;
                 }
-                if let Some(key_char) = &keystroke.key_char {
+                if let Some(key_char) = &keystroke.key_char
+                    && !key_char.is_empty()
+                {
                     this.state.push_char(key_char);
                     cx.notify();
+                    cx.stop_propagation();
                 }
             }))
             .child(

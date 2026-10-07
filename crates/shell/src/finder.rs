@@ -47,7 +47,7 @@ use k10s_core::SceneSnapshot;
 use k10s_map::MapView;
 
 use crate::fs::{DirEntry, Fs};
-use crate::palette::fuzzy_match;
+use crate::palette::{fuzzy_match, fuzzy_score};
 use crate::reveal::ClusterFinder;
 use crate::ui::{MODAL_MAX_HEIGHT, MODAL_WIDTH};
 use crate::{CancelInput, CommitInput, DeleteInputChar, PickParent, RowDown, RowUp};
@@ -238,7 +238,7 @@ impl PickerState {
                 if segment.is_empty() {
                     Some((0, index))
                 } else {
-                    fuzzy_match(&segment, &entry.label()).map(|(score, _)| (score, index))
+                    fuzzy_score(&segment, &entry.label()).map(|score| (score, index))
                 }
             })
             .collect();
@@ -253,12 +253,12 @@ impl PickerState {
             .and_then(|index| self.entries.get(*index))
     }
 
-    pub(crate) fn complete_selected(&mut self) {
+    pub(crate) fn complete_selected(&mut self) -> bool {
         let Some(entry) = self.selected_entry() else {
-            return;
+            return false;
         };
         if entry.name == std::ffi::OsStr::new(HERE) {
-            return;
+            return false;
         }
         let tail = if entry.is_dir {
             entry.name.to_str().map(|name| format!("{name}/"))
@@ -268,8 +268,18 @@ impl PickerState {
         let lossy = entry.label();
         let (dir, _) = self.split();
         match tail {
-            Some(tail) => self.input = format!("{dir}{tail}"),
-            None => self.note = Some(untypable(&lossy)),
+            Some(tail) => {
+                let completed = format!("{dir}{tail}");
+                if completed == self.input {
+                    return false;
+                }
+                self.input = completed;
+                true
+            }
+            None => {
+                self.note = Some(untypable(&lossy));
+                false
+            }
         }
     }
 
@@ -546,13 +556,20 @@ impl Render for PathPickerView {
                     return;
                 }
                 if keystroke.key == "tab" {
-                    this.state.complete_selected();
-                    this.input_changed(cx);
+                    if this.state.complete_selected() {
+                        this.input_changed(cx);
+                        cx.stop_propagation();
+                    } else {
+                        cx.notify();
+                    }
                     return;
                 }
-                if let Some(key_char) = &keystroke.key_char {
+                if let Some(key_char) = &keystroke.key_char
+                    && !key_char.is_empty()
+                {
                     this.state.input.push_str(key_char);
                     this.input_changed(cx);
+                    cx.stop_propagation();
                 }
             }))
             .child(
@@ -896,10 +913,13 @@ impl Render for FileFinderView {
                 if keystroke.modifiers.control || keystroke.modifiers.alt {
                     return;
                 }
-                if let Some(key_char) = &keystroke.key_char {
+                if let Some(key_char) = &keystroke.key_char
+                    && !key_char.is_empty()
+                {
                     this.query.push_str(key_char);
                     this.requery();
                     cx.notify();
+                    cx.stop_propagation();
                 }
             }))
             .child(
@@ -1100,10 +1120,13 @@ impl Render for ClusterFinderView {
                 if keystroke.modifiers.control || keystroke.modifiers.alt {
                     return;
                 }
-                if let Some(key_char) = &keystroke.key_char {
+                if let Some(key_char) = &keystroke.key_char
+                    && !key_char.is_empty()
+                {
                     this.sync(cx);
                     this.state.push_char(key_char);
                     cx.notify();
+                    cx.stop_propagation();
                 }
             }))
             .child(

@@ -116,7 +116,10 @@ pub fn cull(
         opts.skip_blocks,
     );
     let visible = camera.visible_world(vw, vh);
-    reference_content(scene, *camera, blend.walk_stage(), (vw, vh), opts, &mut st);
+    // Stage zero only refines region label candidates, including budget drops.
+    if st.stage != 0 || st.labels != 0 || st.labels_dropped != 0 {
+        reference_content(scene, *camera, blend.walk_stage(), (vw, vh), opts, &mut st);
+    }
     st.bg_cells = crate::hex::visible_count(&visible, camera.zoom, !opts.hex_shown());
     st.edges = if opts.edges_on && blend.walk_stage() >= 2 && !opts.stress_any() {
         reference_edges(scene, &visible, opts.policy.max_edges)

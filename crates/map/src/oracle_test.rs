@@ -735,6 +735,153 @@ fn dense_spec() -> SceneSpec {
 }
 
 #[test]
+fn stage_zero_without_label_candidates_matches_indexed_and_direct_paint() {
+    let (view, vw, vh) = VIEWPORTS[0];
+    let blends = [
+        StageBlend::settled(0),
+        StageBlend {
+            from: 0,
+            to: 1,
+            t: 0.49,
+        },
+        StageBlend {
+            from: 1,
+            to: 0,
+            t: 0.5,
+        },
+    ];
+    for indexed in [true, false] {
+        let mut scene = snapshot(SceneSpec::uniform(64, 1));
+        if !indexed {
+            scene.spatial_index = Default::default();
+        }
+        let region = scene.regions[0].rect;
+        let (cx, cy) = region.center();
+        let cameras = [
+            ("inside", Camera { cx, cy, zoom: 1.0 }),
+            (
+                "corner",
+                Camera {
+                    cx: region.x,
+                    cy: region.y,
+                    zoom: 1.0,
+                },
+            ),
+            (
+                "empty",
+                Camera {
+                    cx: scene.bounds.max_x() + vw,
+                    cy: scene.bounds.max_y() + vh,
+                    zoom: 1.0,
+                },
+            ),
+        ];
+        for (camera_name, camera) in cameras {
+            assert_eq!(
+                scene.region_index_is_selective(&camera.visible_world(vw, vh)),
+                indexed,
+            );
+            for max_labels in [0, lod::MAX_LABELS] {
+                let policy = LodPolicy {
+                    region_label_min_px: f32::INFINITY,
+                    max_labels,
+                    ..lod::policy(Knobs::default())
+                };
+                for blend in blends {
+                    for hex in [true, false] {
+                        let case = Case {
+                            scene: if indexed { "indexed" } else { "direct" },
+                            view,
+                            vw,
+                            vh,
+                            camera: camera_name,
+                            blend,
+                            knobs: Knobs::default(),
+                            budgets: "no label candidates",
+                            opts: FrameOpts {
+                                policy: &policy,
+                                theme: &k10s_theme::K10S_DARK.map,
+                                type_: k10s_theme::Typography::default().map(),
+                                edges_on: true,
+                                skip_blocks: false,
+                                hex,
+                            },
+                        };
+                        let st = check(&case, &scene, camera);
+                        assert_eq!(st.stage, 0);
+                        assert_eq!((st.labels, st.labels_dropped), (0, 0));
+                        assert_eq!(st.drawn_regions == 0, camera_name == "empty");
+                        assert_eq!(st.bg_cells > 0, hex);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stage_zero_label_candidates_keep_geometry_checks_at_zero_and_nonzero_budgets() {
+    let scene = snapshot(fanout_spec());
+    let region = scene.regions[0].rect;
+    let (cx, _) = region.center();
+    let (view, vw, vh) = VIEWPORTS[0];
+    for (camera_name, zoom, top, retained) in [
+        ("retained", 1.0, 200.0, true),
+        ("top clipped", 1.0, 0.0, false),
+        ("bottom clipped", 1.0, vh - 20.0, false),
+        ("short title band", 0.05, 200.0, false),
+    ] {
+        let camera = Camera {
+            cx,
+            cy: region.y + (vh * 0.5 - top) / zoom,
+            zoom,
+        };
+        for max_labels in [0, 1] {
+            let policy = LodPolicy {
+                max_labels,
+                ..lod::policy(Knobs::default())
+            };
+            let blend = StageBlend::settled(0);
+            let atlas = k10s_atlas::cull(&scene, &camera, &policy, blend, vw, vh, false, false);
+            assert_eq!(atlas.drawn_regions, 1);
+            assert_eq!(
+                (atlas.labels, atlas.labels_dropped),
+                (max_labels, 1 - max_labels)
+            );
+            let case = Case {
+                scene: "fanout",
+                view,
+                vw,
+                vh,
+                camera: camera_name,
+                blend,
+                knobs: Knobs::default(),
+                budgets: "region label candidates",
+                opts: FrameOpts {
+                    policy: &policy,
+                    theme: &k10s_theme::K10S_DARK.map,
+                    type_: k10s_theme::Typography::default().map(),
+                    edges_on: true,
+                    skip_blocks: false,
+                    hex: true,
+                },
+            };
+            let st = check(&case, &scene, camera);
+            assert_eq!(st.stage, 0);
+            assert_eq!(st.drawn_regions, 1);
+            assert_eq!(
+                (st.labels, st.labels_dropped),
+                if retained {
+                    (max_labels, 1 - max_labels)
+                } else {
+                    (0, 0)
+                },
+            );
+        }
+    }
+}
+
+#[test]
 fn oracle_matches_painter_uniform() {
     let scene = snapshot(uniform_spec());
     for (budgets, reached) in sweep("uniform", &scene) {

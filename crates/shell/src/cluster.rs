@@ -250,6 +250,7 @@ impl Workspace {
                         let _ = this.update_in(cx, |this, window, cx| {
                             this.adopt(connection, cx);
                             this.close_launch(window, cx);
+                            this.activate_center(this.center.active_index(), window, cx);
                         });
                     }
                     // The screen stays open and usable, which is the whole point
@@ -339,6 +340,7 @@ impl Workspace {
                         let _ = this.update_in(cx, |this, window, cx| {
                             this.land_generated(summary, cx);
                             this.close_launch(window, cx);
+                            this.activate_center(this.center.active_index(), window, cx);
                         });
                     }
                     DemoOutcome::Failed(why) => {
