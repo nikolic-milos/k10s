@@ -1,5 +1,5 @@
 use gpui::{Bounds, Corners, Pixels, Point, point, px, size};
-use k10s_atlas::{Camera, LodPolicy, WorkloadPresentation};
+use k10s_atlas::{Camera, LodPolicy, Scene, WorkloadPresentation};
 use k10s_core::{Rect, SceneSnapshot};
 use k10s_theme::{MapType, quantize};
 
@@ -33,7 +33,12 @@ pub(crate) const HEADING_CLEARANCE: f32 = 4.0;
 
 #[inline]
 pub(crate) fn name_band_height(type_: MapType) -> f32 {
-    (type_.workload * type_.line_height * 2.0 + TEXT_PAD * 2.0).ceil()
+    (row_pitch(type_.workload, type_.line_height) * 2.0 + TEXT_PAD * 2.0).ceil()
+}
+
+#[inline]
+pub(crate) fn row_pitch(font: f32, line_height: f32) -> f32 {
+    (font * line_height).max(quantize(font.max(16.0)))
 }
 
 #[inline]
@@ -92,6 +97,12 @@ pub(crate) fn workload_label_shown(policy: &LodPolicy, width: f32, zoom: f32) ->
 pub struct MarkPrimitive {
     pub bounds: Bounds<Pixels>,
     pub corners: Corners<Pixels>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WorkloadPrimitive {
+    pub body: MarkPrimitive,
+    pub heading: Option<MarkPrimitive>,
 }
 
 impl MarkPrimitive {
@@ -223,6 +234,48 @@ impl Projection {
         card(self.bounds(rect))
     }
 
+    /// Zero or one observed Pod keeps its published hub and child center, so
+    /// compact chrome does not move relationship anchors. Multiple Pods keep
+    /// their layout chrome and placement.
+    #[inline]
+    pub(crate) fn workload<R, B, C, S>(
+        self,
+        scene: &Scene<R, B, C, S>,
+        block_index: usize,
+        stage: u8,
+        type_: MapType,
+    ) -> WorkloadPrimitive {
+        let block = &scene.blocks[block_index];
+        let mut body = self.card(block.inner);
+        let compact = stage >= 3 && block.children.len() <= 1;
+        let heading = if compact {
+            let (x, y) = block.inner.center();
+            let hub = self.bounds(Rect::new(x, y, 0.0, 0.0));
+            let content = scene
+                .block_cell_indices(block_index)
+                .next()
+                .map_or(hub, |index| {
+                    self.cell_body(scene.cells[index].rect, stage, type_).bounds
+                })
+                .union(&hub);
+            let width =
+                content.size.width.max(px(name_min_width(type_).ceil())) + px(TEXT_PAD * 2.0);
+            let top = content.origin.y - px(TEXT_PAD + name_band_height(type_) + HEADING_CLEARANCE);
+            let bottom = content.bottom() + px(TEXT_PAD);
+            body = card(
+                Bounds {
+                    origin: point(content.center().x - width * 0.5, top),
+                    size: size(width, bottom - top),
+                }
+                .intersect(&body.bounds),
+            );
+            self.name_band_bounds(body.bounds.inset(px(TEXT_PAD)), type_)
+        } else {
+            self.name_band(block.inner, type_)
+        };
+        WorkloadPrimitive { body, heading }
+    }
+
     #[inline]
     pub(crate) fn cell(
         self,
@@ -231,27 +284,7 @@ impl Projection {
         type_: MapType,
         heading: Option<MarkPrimitive>,
     ) -> Option<MarkPrimitive> {
-        let natural = self.bounds(rect);
-        let width = f32::from(natural.size.width);
-        let height = f32::from(natural.size.height);
-        let detailed =
-            stage >= 3 && width >= detail_min_width(type_) && height >= POD_DETAIL_MIN_HEIGHT;
-        let (width, height) = if detailed {
-            (
-                width.min(POD_DETAIL_MAX_WIDTH),
-                (type_.pod * type_.line_height * 2.0 + TEXT_PAD * 2.0)
-                    .ceil()
-                    .clamp(POD_DETAIL_MIN_HEIGHT, POD_DETAIL_MAX_HEIGHT)
-                    .min(height),
-            )
-        } else {
-            (width.min(POD_MARK_MAX), height.min(POD_MARK_MAX))
-        };
-        let center = natural.center();
-        let primitive = pod(Bounds {
-            origin: point(center.x - px(width * 0.5), center.y - px(height * 0.5)),
-            size: size(px(width), px(height)),
-        });
+        let primitive = self.cell_body(rect, stage, type_);
         if heading.is_some_and(|heading| {
             primitive
                 .bounds
@@ -263,8 +296,37 @@ impl Projection {
     }
 
     #[inline]
+    fn cell_body(self, rect: Rect, stage: u8, type_: MapType) -> MarkPrimitive {
+        let natural = self.bounds(rect);
+        let width = f32::from(natural.size.width);
+        let height = f32::from(natural.size.height);
+        let detailed =
+            stage >= 3 && width >= detail_min_width(type_) && height >= POD_DETAIL_MIN_HEIGHT;
+        let (width, height) = if detailed {
+            (
+                width.min(POD_DETAIL_MAX_WIDTH),
+                (row_pitch(type_.pod, type_.line_height) * 2.0 + TEXT_PAD * 2.0)
+                    .ceil()
+                    .clamp(POD_DETAIL_MIN_HEIGHT, POD_DETAIL_MAX_HEIGHT)
+                    .min(height),
+            )
+        } else {
+            (width.min(POD_MARK_MAX), height.min(POD_MARK_MAX))
+        };
+        let center = natural.center();
+        pod(Bounds {
+            origin: point(center.x - px(width * 0.5), center.y - px(height * 0.5)),
+            size: size(px(width), px(height)),
+        })
+    }
+
+    #[inline]
     pub(crate) fn name_band(self, inner: Rect, type_: MapType) -> Option<MarkPrimitive> {
-        let body = self.bounds(inner);
+        self.name_band_bounds(self.bounds(inner), type_)
+    }
+
+    #[inline]
+    fn name_band_bounds(self, body: Bounds<Pixels>, type_: MapType) -> Option<MarkPrimitive> {
         let left = f32::from(body.origin.x).max(self.origin.0 + TEXT_PAD);
         let right = f32::from(body.right()).min(self.origin.0 + self.viewport.0 - TEXT_PAD);
         let top = f32::from(body.origin.y).max(self.origin.1 + top_clearance(type_, self.viewport));
@@ -312,12 +374,12 @@ impl Projection {
         row: usize,
         type_: MapType,
     ) -> MarkPrimitive {
-        let line = type_.workload * type_.line_height;
+        let pitch = row_pitch(type_.workload, type_.line_height);
         let side = quantize(type_.workload.max(16.0));
         glyph(Bounds {
             origin: point(
                 band.bounds.origin.x + px(TEXT_PAD),
-                band.bounds.origin.y + px(TEXT_PAD + row as f32 * line + (line - side) * 0.5),
+                band.bounds.origin.y + px(TEXT_PAD + row as f32 * pitch + (pitch - side) * 0.5),
             ),
             size: size(px(side), px(side)),
         })
@@ -449,7 +511,8 @@ pub(crate) fn mark_primitive_typed(
     scene.regions.get(path.region as usize)?;
     let projection = Projection::new(camera, viewport, origin);
     if let Some(cell_index) = path.cell {
-        let block = scene.blocks.get(path.block? as usize)?;
+        let block_index = path.block? as usize;
+        let block = scene.blocks.get(block_index)?;
         let presentation = workload_presentation(policy, block.inner, camera.zoom, stage, type_);
         if stage < 2
             || !presentation.cells_shown()
@@ -463,7 +526,11 @@ pub(crate) fn mark_primitive_typed(
             return None;
         }
         let heading = workload_label_shown(policy, block.inner.w, camera.zoom)
-            .then(|| projection.name_band(block.inner, type_))
+            .then(|| {
+                projection
+                    .workload(scene, block_index, stage, type_)
+                    .heading
+            })
             .flatten();
         return scene
             .cells
@@ -486,9 +553,11 @@ pub(crate) fn mark_primitive_typed(
         return match workload_presentation(policy, block.inner, camera.zoom, stage, type_) {
             WorkloadPresentation::Hidden => None,
             WorkloadPresentation::Medallion => Some(projection.medallion(block.rect, block.inner)),
-            WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
-                Some(projection.card(block.inner))
-            }
+            WorkloadPresentation::Card | WorkloadPresentation::Detailed => Some(
+                projection
+                    .workload(scene, block_index as usize, stage, type_)
+                    .body,
+            ),
         };
     }
     scene
@@ -500,6 +569,146 @@ pub(crate) fn mark_primitive_typed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_pod_scene() -> Scene {
+        let mut scene = Scene::default();
+        scene.blocks.push(k10s_atlas::BlockNode {
+            rect: Rect::new(40.0, 40.0, 30.0, 56.0),
+            inner: Rect::new(40.0, 40.0, 30.0, 56.0),
+            label: "api".into(),
+            children: 0..1,
+            sats: 0..0,
+            ext: (),
+        });
+        scene.cells.push(k10s_atlas::CellNode {
+            rect: Rect::new(50.0, 76.0, 10.0, 10.0),
+            label: "api-0".into(),
+            ext: (),
+        });
+        scene
+    }
+
+    #[test]
+    fn small_workloads_bound_chrome_without_moving_pods_or_hubs() {
+        let mut scene = one_pod_scene();
+        for pods in [1, 0] {
+            scene.blocks[0].children = 0..pods;
+            for font in [8.0, 14.0, 32.0] {
+                let type_ = MapType {
+                    workload: font,
+                    pod: font,
+                    ..Default::default()
+                };
+                let zoom = crate::lod::STAGE_POD_LABEL.max(detail_min_width(type_) / 10.0);
+                for origin in [(0.0, 0.0), (17.25, 23.5)] {
+                    let projection = Projection::new(
+                        Camera {
+                            cx: 55.0,
+                            cy: if pods == 1 { 81.0 } else { 68.0 },
+                            zoom,
+                        },
+                        (1600.0, 1000.0),
+                        origin,
+                    );
+                    let geometry = projection.workload(&scene, 0, 3, type_);
+                    let envelope = projection.bounds(scene.blocks[0].inner);
+                    let hub = projection.bounds(Rect::new(55.0, 68.0, 0.0, 0.0)).origin;
+                    assert!(geometry.body.bounds.is_contained_within(&envelope));
+                    assert!(geometry.body.contains(hub));
+                    let heading = geometry.heading.expect("the heading fits");
+                    assert!(heading.bounds.is_contained_within(&geometry.body.bounds));
+                    if pods == 1 {
+                        let pod = projection
+                            .cell(scene.cells[0].rect, 3, type_, Some(heading))
+                            .expect("the Pod clears its heading");
+                        assert_eq!(
+                            pod,
+                            projection
+                                .cell(scene.cells[0].rect, 3, type_, None)
+                                .unwrap(),
+                        );
+                        assert_eq!(
+                            pod.bounds.center(),
+                            projection.bounds(scene.cells[0].rect).center()
+                        );
+                        assert!(pod.bounds.is_contained_within(&geometry.body.bounds));
+                    }
+                    if font == 14.0 {
+                        assert_eq!(geometry.body.bounds.size.width, px(168.0));
+                        let height = if pods == 1 { 293.2 } else { 74.0 };
+                        assert!(
+                            (f32::from(geometry.body.bounds.size.height) - height).abs() < 0.001
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_membership_and_removal_choose_actual_child_geometry() {
+        let mut scene = one_pod_scene();
+        let projection = Projection::new(
+            Camera {
+                cx: 55.0,
+                cy: 81.0,
+                zoom: 14.4,
+            },
+            (1600.0, 1000.0),
+            (0.0, 0.0),
+        );
+        let type_ = MapType::default();
+        let direct = projection.workload(&scene, 0, 3, type_);
+        let actual = scene.cells[0].clone();
+        scene.cells[0].rect = Rect::new(1000.0, 1000.0, 10.0, 10.0);
+        scene.cells.push(k10s_atlas::CellNode {
+            rect: Rect::default(),
+            label: "".into(),
+            ext: (),
+        });
+        scene.cells.push(actual);
+        scene.block_cells = vec![2];
+        assert_eq!(projection.workload(&scene, 0, 3, type_), direct);
+        scene.blocks[0].children = 0..0;
+        let removed = projection.workload(&scene, 0, 3, type_);
+        scene.cells.clear();
+        scene.block_cells.clear();
+        assert_eq!(projection.workload(&scene, 0, 3, type_), removed);
+        assert_eq!(removed.body.bounds.size.height, px(74.0));
+    }
+
+    #[test]
+    fn compact_chrome_clamps_but_many_children_and_earlier_lods_keep_their_geometry() {
+        let mut scene = one_pod_scene();
+        let type_ = MapType::default();
+        let projection = Projection::new(
+            Camera {
+                cx: 55.0,
+                cy: 81.0,
+                zoom: 14.4,
+            },
+            (600.0, 420.0),
+            (0.0, 0.0),
+        );
+        let original = WorkloadPrimitive {
+            body: projection.card(scene.blocks[0].inner),
+            heading: projection.name_band(scene.blocks[0].inner, type_),
+        };
+        assert_eq!(projection.workload(&scene, 0, 2, type_), original);
+        scene.blocks[0].children = 0..2048;
+        scene.cells.resize(2048, scene.cells[0].clone());
+        assert_eq!(projection.workload(&scene, 0, 3, type_), original);
+        scene.blocks[0].children = 0..1;
+        scene.cells[0].rect = Rect::new(40.0, 40.0, 10.0, 10.0);
+        let geometry = projection.workload(&scene, 0, 3, type_);
+        let envelope = projection.bounds(scene.blocks[0].inner);
+        assert_eq!(geometry.body.bounds.origin.y, envelope.origin.y);
+        assert!(geometry.body.bounds.is_contained_within(&envelope));
+        assert!(geometry.body.contains(envelope.center()));
+        if let Some(heading) = geometry.heading {
+            assert!(heading.bounds.is_contained_within(&geometry.body.bounds));
+        }
+    }
 
     #[test]
     fn a_name_band_is_admitted_at_its_inclusive_width_minimum() {

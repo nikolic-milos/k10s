@@ -48,9 +48,8 @@ impl PickPath {
 
 /// Where a picked path is on the map, in world units.
 ///
-/// A block answers with its CARD, not its halo: the halo is spacing that the
-/// painter never draws and `pick` never hit-tests, so a ring drawn round it
-/// would sit in empty space well outside the thing it is pointing at.
+/// A block answers with its layout card, excluding orbit spacing. Screen-space
+/// targets and selection rings resolve the bounded primitive separately.
 pub fn path_rect<R, B, C, S>(scene: &Scene<R, B, C, S>, path: &PickPath) -> Option<Rect> {
     if let Some(cell) = path.cell {
         return scene.cells.get(cell as usize).map(|node| node.rect);
@@ -156,19 +155,20 @@ pub(crate) fn pick_typed<R, B, C, S>(
         if presentation == WorkloadPresentation::Hidden {
             return;
         }
-        let block_primitive = match presentation {
-            WorkloadPresentation::Medallion => projection.medallion(block.rect, block.inner),
-            WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
-                projection.card(block.inner)
-            }
-            WorkloadPresentation::Hidden => unreachable!(),
-        };
+        let geometry = presentation
+            .card_shown()
+            .then(|| projection.workload(scene, block_index, stage, type_));
+        let block_primitive = geometry.map_or_else(
+            || projection.medallion(block.rect, block.inner),
+            |geometry| geometry.body,
+        );
         if path.block.is_none() && block_primitive.contains(screen_point) {
             path.block = Some(block_index as u32);
-            let heading = (presentation.card_shown()
-                && crate::primitive::workload_label_shown(policy, block.inner.w, zoom))
-            .then(|| projection.name_band(block.inner, type_))
-            .flatten();
+            let heading = geometry.and_then(|geometry| {
+                crate::primitive::workload_label_shown(policy, block.inner.w, zoom)
+                    .then_some(geometry.heading)
+                    .flatten()
+            });
             heading_hit = heading.is_some_and(|heading| heading.contains(screen_point));
 
             if stage >= 2 && presentation.cells_shown() && !heading_hit {
@@ -270,19 +270,20 @@ mod tests {
             if presentation == WorkloadPresentation::Hidden {
                 continue;
             }
-            let block_primitive = match presentation {
-                WorkloadPresentation::Medallion => projection.medallion(block.rect, block.inner),
-                WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
-                    projection.card(block.inner)
-                }
-                WorkloadPresentation::Hidden => unreachable!(),
-            };
+            let geometry = presentation
+                .card_shown()
+                .then(|| projection.workload(scene, block_index, stage, type_));
+            let block_primitive = geometry.map_or_else(
+                || projection.medallion(block.rect, block.inner),
+                |geometry| geometry.body,
+            );
             if path.block.is_none() && block_primitive.contains(screen_point) {
                 path.block = Some(block_index as u32);
-                let heading = (presentation.card_shown()
-                    && crate::primitive::workload_label_shown(policy, block.inner.w, zoom))
-                .then(|| projection.name_band(block.inner, type_))
-                .flatten();
+                let heading = geometry.and_then(|geometry| {
+                    crate::primitive::workload_label_shown(policy, block.inner.w, zoom)
+                        .then_some(geometry.heading)
+                        .flatten()
+                });
                 heading_hit = heading.is_some_and(|heading| heading.contains(screen_point));
                 if stage >= 2 && presentation.cells_shown() && !heading_hit {
                     let cells = block.children.len();
@@ -322,6 +323,86 @@ mod tests {
             path.sat = Some(sat);
         }
         Some(path)
+    }
+
+    #[test]
+    fn indexed_and_flat_picking_agree_on_compact_targets_and_abandoned_padding() {
+        let (vw, vh) = (1600.0, 1000.0);
+        let policy = crate::lod::policy(Default::default());
+        let camera = Camera {
+            cx: 55.0,
+            cy: 81.0,
+            zoom: crate::lod::STAGE_POD_LABEL,
+        };
+        let blend = StageBlend::settled(3);
+        let type_ = k10s_theme::MapType::default();
+        for sparse in [false, true] {
+            for pods in [0, 1] {
+                let mut s = scene(SceneSpec::uniform(1, 128));
+                s.regions[0].rect = Rect::new(-10000.0, -10000.0, 20000.0, 20000.0);
+                s.blocks[0].inner = Rect::new(40.0, 40.0, 30.0, 56.0);
+                s.blocks[0].rect = s.blocks[0].inner.inflate(20.0);
+                s.blocks[0].sats = 0..0;
+                s.cells[0].rect = Rect::new(50.0, 76.0, 10.0, 10.0);
+                s.blocks[0].children = 0..pods;
+                let cell_index = if sparse {
+                    let actual = s.cells[0].clone();
+                    s.cells[0].rect = Rect::default();
+                    let index = s.cells.len();
+                    s.cells.push(actual);
+                    let mut members = Vec::new();
+                    for (block_index, block) in s.blocks.iter_mut().enumerate() {
+                        let start = members.len() as u32;
+                        if block_index == 0 {
+                            if pods == 1 {
+                                members.push(index as u32);
+                            }
+                        } else {
+                            members.extend(block.children.clone());
+                        }
+                        block.children = start..members.len() as u32;
+                    }
+                    s.block_cells = members;
+                    index
+                } else {
+                    0
+                };
+                s.rebuild_spatial_index();
+                let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
+                let geometry = projection.workload(&s, 0, 3, type_);
+                let original = projection.card(s.blocks[0].inner);
+                let padding = point(
+                    original.bounds.origin.x + px(20.0),
+                    original.bounds.center().y,
+                );
+                assert!(!geometry.body.contains(padding));
+                let heading = geometry.heading.unwrap().bounds.center();
+                let hub = projection.bounds(Rect::new(55.0, 68.0, 0.0, 0.0)).origin;
+                let mut probes = vec![
+                    (padding, Level::Region, None),
+                    (heading, Level::Block, None),
+                    (hub, Level::Block, None),
+                ];
+                if pods == 1 {
+                    let pod = projection
+                        .cell(s.cells[cell_index].rect, 3, type_, geometry.heading)
+                        .unwrap();
+                    probes.push((pod.bounds.center(), Level::Cell, Some(cell_index as u32)));
+                }
+                for (point, level, cell) in probes {
+                    let (sx, sy) = (f32::from(point.x), f32::from(point.y));
+                    let (wx, wy) = camera.s2w(sx, sy, vw, vh);
+                    assert!(s.region_block_index_is_selective(0, &Rect::new(wx, wy, 1e-3, 1e-3)));
+                    let indexed = pick(&s, &camera, &policy, blend, vw, vh, sx, sy).unwrap();
+                    assert_eq!(
+                        Some(indexed),
+                        reference(&s, &camera, &policy, blend, vw, vh, sx, sy)
+                    );
+                    assert_eq!((indexed.level(), indexed.cell), (level, cell));
+                    assert_eq!(indexed.block, (level != Level::Region).then_some(0));
+                }
+            }
+        }
     }
 
     #[test]

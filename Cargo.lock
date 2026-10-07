@@ -3683,6 +3683,7 @@ dependencies = [
  "k10s-bench",
  "k10s-core",
  "k10s-theme",
+ "k10s-world",
  "serde",
  "serde_json",
  "stats_alloc",

@@ -27,6 +27,8 @@
 //! The Grafana failure proof needs the observability lab's monitoring release
 //! and its monitoring-grafana PVC. A generated pod holds a SQLite lock without
 //! changing data. It is deleted even when a check panics; run this suite alone.
+//! Saturated telemetry proves client cancellation and concurrent Kubernetes
+//! reads and watch delivery, not backend cancellation or native UI latency.
 //!
 //! The drain proof requires `live_fixtures.sh --with kwok`: it drains a fake
 //! kwok node whose one pod sits under a PodDisruptionBudget with no disruption
@@ -689,35 +691,18 @@ fn an_unreadable_live_resource_survives_into_the_ecosystem_table() {
     }
 }
 
-#[test]
-#[ignore = "needs the observability lab's Grafana and PVC; see the module comment"]
-fn a_busy_live_grafana_catalog_reports_its_timeout_and_recovers() {
+async fn with_grafana_storage_lock<T>(
+    client: &kube::Client,
+    check: impl std::future::Future<Output = T>,
+) -> T {
     use futures::FutureExt;
     use k8s_openapi::api::core::v1::Pod;
-    use k10s_data::reach::{self, ToolKind, ToolReach};
     use kube::api::{AttachParams, DeleteParams, PostParams, Preconditions};
     use kube::runtime::wait::{await_condition, conditions};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let (_plane, sync) = connect(None);
-    let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader.fetch_grafana_catalog(move |answer| {
-        let _ = tx.send(answer);
-    });
-    let Fetched::Ok(before) = wait(&rx) else {
-        panic!("the lab's Grafana catalog must initially answer");
-    };
-    assert!(before.served && !before.dashboards.is_empty());
-    assert!(
-        before.errors.is_empty(),
-        "the initial catalog must be complete: {:?}",
-        before.errors
-    );
-
-    kube_runtime().block_on(async {
-        let client = kube::Client::try_default().await.expect("the fixture client");
-        let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), "observability");
-        let fixture: Pod = serde_json::from_value(serde_json::json!({
+    let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), "observability");
+    let fixture: Pod = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {"generateName": "k10s-grafana-lock-"},
             "spec": {
@@ -742,17 +727,26 @@ fn a_busy_live_grafana_catalog_reports_its_timeout_and_recovers() {
                     "name": "storage", "persistentVolumeClaim": {"claimName": "monitoring-grafana"},
                 }],
             },
-        })).expect("the lock fixture");
-        let created = pods.create(&PostParams::default(), &fixture).await.expect("the lock pod");
-        let name = created.metadata.name.expect("the generated name");
-        let uid = created.metadata.uid.expect("the generated UID");
+    })).expect("the lock fixture");
+    let created = tokio::time::timeout(
+        Duration::from_secs(60),
+        pods.create(&PostParams::default(), &fixture),
+    )
+    .await
+    .expect("the lock pod create timed out; a write may have landed without a returned UID")
+    .expect("the lock pod");
+    let name = created.metadata.name.expect("the generated name");
+    let uid = created.metadata.uid.expect("the generated UID");
 
-        let checked = std::panic::AssertUnwindSafe(async {
-            tokio::time::timeout(
-                Duration::from_secs(60),
-                await_condition(pods.clone(), &name, conditions::is_pod_running()),
-            ).await.expect("the lock pod starts within a minute").expect("the pod can be watched");
-            let code = r#"
+    let checked = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            await_condition(pods.clone(), &name, conditions::is_pod_running()),
+        )
+        .await
+        .expect("the lock pod starts within a minute")
+        .expect("the pod can be watched");
+        let code = r#"
 import sqlite3
 import sys
 
@@ -763,55 +757,131 @@ sys.stdin.readline()
 database.rollback()
 print("released", flush=True)
 "#;
-            let mut lock = pods.exec(
+        let mut lock = tokio::time::timeout(
+            Duration::from_secs(10),
+            pods.exec(
                 &name,
                 ["python", "-u", "-c", code],
-                &AttachParams::default().stdin(true).stdout(true).stderr(true),
-            ).await.expect("the lock process attaches");
-            let status = lock.take_status().expect("the remote exit status");
-            let mut input = lock.stdin().expect("the release channel");
-            let mut output = BufReader::new(lock.stdout().expect("the lock markers")).lines();
-            let marker = tokio::time::timeout(Duration::from_secs(10), output.next_line())
-                .await.expect("the database can be locked").expect("the lock marker can be read");
-            assert_eq!(marker.as_deref(), Some("locked"));
+                &AttachParams::default()
+                    .stdin(true)
+                    .stdout(true)
+                    .stderr(true),
+            ),
+        )
+        .await
+        .expect("the lock process attaches within 10 seconds")
+        .expect("the lock process attaches");
+        let status = lock.take_status().expect("the remote exit status");
+        let mut input = lock.stdin().expect("the release channel");
+        let mut output = BufReader::new(lock.stdout().expect("the lock markers")).lines();
+        let marker = tokio::time::timeout(Duration::from_secs(10), output.next_line())
+            .await
+            .expect("the database can be locked")
+            .expect("the lock marker can be read");
+        assert_eq!(marker.as_deref(), Some("locked"));
 
+        let checked = std::panic::AssertUnwindSafe(check).catch_unwind().await;
+
+        tokio::time::timeout(Duration::from_secs(10), input.write_all(b"release\n"))
+            .await
+            .expect("the database lock release channel answers within 10 seconds")
+            .expect("release the database lock");
+        let marker = tokio::time::timeout(Duration::from_secs(10), output.next_line())
+            .await
+            .expect("the lock releases")
+            .expect("the release marker can be read");
+        assert_eq!(marker.as_deref(), Some("released"));
+        let status = tokio::time::timeout(Duration::from_secs(10), status)
+            .await
+            .expect("the lock process exits")
+            .expect("the exit status arrives");
+        assert_eq!(status.status.as_deref(), Some("Success"), "{status:?}");
+        tokio::time::timeout(Duration::from_secs(10), lock.join())
+            .await
+            .expect("the lock process ends")
+            .expect("the lock connection closes");
+        checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+    .catch_unwind()
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        match pods
+            .delete(
+                &name,
+                &DeleteParams {
+                    grace_period_seconds: Some(0),
+                    preconditions: Some(Preconditions {
+                        uid: Some(uid.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(error)) if error.code == 404 => {}
+            Err(error) => panic!("generated lock pod {name} UID {uid} cleanup refused: {error}"),
+        }
+        await_condition(pods, &name, conditions::is_deleted(&uid))
+            .await
+            .expect("the lock pod cleanup can be watched");
+    })
+    .await
+    .expect("the generated lock pod is removed within 15 seconds");
+    checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+#[test]
+#[ignore = "needs the observability lab's Grafana and PVC; see the module comment"]
+fn a_busy_live_grafana_catalog_reports_its_timeout_and_recovers() {
+    use k10s_data::reach::{self, ToolKind, ToolReach};
+
+    let (_plane, sync) = connect(None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_grafana_catalog(move |answer| {
+        let _ = tx.send(answer);
+    });
+    let Fetched::Ok(before) = wait(&rx) else {
+        panic!("the lab's Grafana catalog must initially answer");
+    };
+    assert!(before.served && !before.dashboards.is_empty());
+    assert!(
+        before.errors.is_empty(),
+        "the initial catalog must be complete: {:?}",
+        before.errors
+    );
+
+    kube_runtime().block_on(async {
+        let mut config = kube::Config::infer().await.expect("the fixture kubeconfig");
+        config.default_retry = false;
+        let client = kube::Client::try_from(config).expect("the fixture client");
+        let (reached, answer) = with_grafana_storage_lock(&client, async {
             let reached = reach::bind(&client, ToolKind::Grafana, &ReachSettings::default()).await;
             let (tx, rx) = tokio::sync::oneshot::channel();
             sync.reader.fetch_grafana_catalog(move |answer| {
                 let _ = tx.send(answer);
             });
             let answer = tokio::time::timeout(Duration::from_secs(15), rx).await;
-
-            input.write_all(b"release\n").await.expect("release the database lock");
-            let marker = tokio::time::timeout(Duration::from_secs(10), output.next_line())
-                .await.expect("the lock releases").expect("the release marker can be read");
-            assert_eq!(marker.as_deref(), Some("released"));
-            let status = tokio::time::timeout(Duration::from_secs(10), status)
-                .await.expect("the lock process exits").expect("the exit status arrives");
-            assert_eq!(status.status.as_deref(), Some("Success"), "{status:?}");
-            tokio::time::timeout(Duration::from_secs(10), lock.join())
-                .await.expect("the lock process ends").expect("the lock connection closes");
             (reached, answer)
-        }).catch_unwind().await;
-
-        pods.delete(&name, &DeleteParams {
-            grace_period_seconds: Some(0),
-            preconditions: Some(Preconditions {uid: Some(uid.clone()), ..Default::default()}),
-            ..Default::default()
-        }).await.expect("remove only the generated lock pod");
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            await_condition(pods, &name, conditions::is_deleted(&uid)),
-        ).await.expect("the lock pod is removed").expect("the cleanup can be watched");
-
-        let (reached, answer) = checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        assert!(matches!(reached, ToolReach::Bound(_)), "health still answers while storage is locked: {reached:?}");
-        let answer = answer.expect("the catalog reports within the budget").expect("the callback arrives");
+        })
+        .await;
+        assert!(
+            matches!(reached, ToolReach::Bound(_)),
+            "health still answers while storage is locked: {reached:?}"
+        );
+        let answer = answer
+            .expect("the catalog reports within the budget")
+            .expect("the callback arrives");
         let Fetched::Ok(partial) = answer else {
             panic!("healthy provisioned dashboards remain visible beside the timeout: {answer:?}");
         };
         assert!(partial.served && !partial.dashboards.is_empty());
-        assert_eq!(partial.errors, ["Grafana search: grafana did not answer within 4 seconds"]);
+        assert_eq!(
+            partial.errors,
+            ["Grafana search: grafana did not answer within 4 seconds"]
+        );
         for dashboard in &partial.dashboards {
             assert!(before.dashboards.contains(dashboard), "{dashboard:?}");
         }
@@ -826,6 +896,413 @@ print("released", flush=True)
         Fetched::Ok(before),
         "the catalog recovers after releasing the lock"
     );
+}
+
+#[test]
+#[ignore = "needs the owned pilot, Grafana and PVC; run the live suite serially"]
+fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_progress() {
+    use futures::FutureExt;
+    use k8s_openapi::api::{
+        apps::v1::Deployment,
+        core::v1::{Namespace, Pod},
+    };
+    use k10s_core::{Capability, IngestEvent, Op};
+    use k10s_data::integrations::{grafana, prom};
+    use kube::api::{DeleteParams, ListParams, PostParams, Preconditions};
+    use kube::runtime::wait::{await_condition, conditions};
+    use std::time::Instant;
+
+    const NS: &str = "k10s-observe-pilot";
+    const PREFIX: &str = "k10s-telemetry-progress-";
+
+    assert!(
+        std::env::var_os("KUBECONFIG").is_some(),
+        "the real lab kubeconfig is required"
+    );
+    let runtime = kube_runtime();
+    let (client, pod, uid, node) = runtime.block_on(async {
+        let mut config = kube::Config::infer().await.expect("the fixture kubeconfig");
+        config.default_retry = false;
+        let client = kube::Client::try_from(config).expect("the admin client");
+        let namespaces: kube::Api<Namespace> = kube::Api::all(client.clone());
+        let namespace = tokio::time::timeout(Duration::from_secs(15), namespaces.get_metadata(NS))
+            .await
+            .expect("the owned namespace read answers within 15 seconds")
+            .expect("the owned pilot namespace");
+        assert_eq!(
+            namespace
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("k10s.dev/fixture"))
+                .map(String::as_str),
+            Some("observe-pilot")
+        );
+        let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), NS);
+        let page = tokio::time::timeout(
+            Duration::from_secs(15),
+            pods.list_metadata(
+                &ListParams::default()
+                    .labels("app.kubernetes.io/name=pilot-producer")
+                    .limit(2),
+            ),
+        )
+        .await
+        .expect("the producer census answers within 15 seconds")
+        .expect("the current producer metadata");
+        assert_eq!(page.items.len(), 1, "one current producer is required");
+        let item = &page.items[0];
+        let name = item.metadata.name.clone().expect("pod name");
+        let uid = item.metadata.uid.clone().expect("pod UID");
+        let current = tokio::time::timeout(Duration::from_secs(15), pods.get(&name))
+            .await
+            .expect("the current producer read answers within 15 seconds")
+            .expect("the current producer");
+        assert_eq!(
+            current.metadata.uid.as_ref(),
+            Some(&uid),
+            "the producer was recreated during setup"
+        );
+        let node = current
+            .spec
+            .and_then(|spec| spec.node_name)
+            .expect("the actual producer node");
+        (client, name, uid, node)
+    });
+
+    let (sink, events) = crossbeam_channel::bounded(DEFAULT_EVENT_SINK_CAPACITY);
+    let plane = k10s_data::spawn(sink).expect("the production data runtime");
+    let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(16);
+    let drain = std::thread::spawn(move || {
+        for event in events {
+            let keep = match &event {
+                IngestEvent::Resource(event) => {
+                    event.kind == KindId::DEPLOYMENT
+                        && event.namespace.as_ref() == NS
+                        && event.name.starts_with(PREFIX)
+                }
+                IngestEvent::Synced { kind } | IngestEvent::Desync { kind, .. } => {
+                    *kind == KindId::DEPLOYMENT
+                }
+                IngestEvent::Capability { .. } => false,
+            };
+            if keep {
+                let _ = watch_tx.blocking_send((Instant::now(), event));
+            }
+        }
+    });
+    let sync = plane
+        .sync(&Options {
+            context: None,
+            kubeconfig: None,
+            probe_namespaces: vec![NS.into()],
+            sync_timeout: Duration::from_secs(30),
+        })
+        .expect("the real pilot sync");
+    let deployments = kind(&sync.reader, "deployments.apps");
+    assert_eq!(deployments.id, KindId::DEPLOYMENT);
+    assert_eq!(
+        deployments.verdict,
+        Some(Capability::Watchable),
+        "{}",
+        sync.report.summary()
+    );
+    assert!(
+        !sync
+            .report
+            .desyncs
+            .iter()
+            .any(|(kind, _)| *kind == KindId::DEPLOYMENT),
+        "{:?}",
+        sync.report
+    );
+    runtime.block_on(async {
+        if !sync.events.iter().any(
+            |event| matches!(event, IngestEvent::Synced { kind } if *kind == KindId::DEPLOYMENT),
+        ) {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match watch_rx
+                        .recv()
+                        .await
+                        .expect("the Deployment watch stays open")
+                        .1
+                    {
+                        IngestEvent::Synced { .. } => break,
+                        IngestEvent::Desync { reason, .. } => {
+                            panic!("Deployment watch did not settle: {reason:?}")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("the Deployment watch settles before the stall");
+        }
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let catalog_stop = sync.reader.observe_grafana(move |answer| {
+        let _ = tx.send(answer);
+    });
+    let catalog = match wait(&rx) {
+        Fetched::Ok(catalog) => catalog,
+        other => panic!("the owned pilot dashboard must answer: {other:?}"),
+    };
+    assert!(
+        catalog.served && !catalog.truncated && catalog.errors.is_empty(),
+        "{catalog:?}"
+    );
+    let dashboard = catalog
+        .dashboards
+        .iter()
+        .find(|dashboard| dashboard.uid == "k10s-observe-pilot-native")
+        .expect("the actual owned pilot dashboard");
+    let panel = dashboard
+        .panels
+        .iter()
+        .find(|panel| {
+            panel.unsupported.is_none()
+                && !panel.transformed
+                && panel.queries.len() == 1
+                && panel.queries[0].dialect == grafana::QueryDialect::PromQL
+        })
+        .expect("one supported actual pilot panel");
+    let target = panel.queries[0].clone();
+    assert_eq!(target.datasource.as_deref(), Some("prometheus"));
+    let end_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_millis() as i64;
+    let variables = grafana::Variables {
+        namespace: NS.into(),
+        pods: vec![pod.clone()],
+        node: Some(node),
+        start_ms: end_ms - 300_000,
+        end_ms,
+        step_ms: 15_000,
+        min_interval: panel.min_interval.clone(),
+    };
+    let current_panel = |answer: Fetched<Option<prom::QueryResult>>| {
+        let result = match answer {
+            Fetched::Ok(Some(result)) => result,
+            other => panic!("the real current-UID panel must return samples: {other:?}"),
+        };
+        assert!(
+            !result.truncated && result.warnings.is_empty() && result.infos.is_empty(),
+            "{result:?}"
+        );
+        assert!(!result.series.is_empty(), "{result:?}");
+        assert!(
+            result.series.iter().all(|series| {
+                [
+                    ("namespace", NS),
+                    ("pod", pod.as_str()),
+                    ("uid", uid.as_str()),
+                ]
+                .iter()
+                .all(|(key, value)| {
+                    series
+                        .labels
+                        .iter()
+                        .any(|(name, label)| name.as_str() == *key && label.as_str() == *value)
+                })
+            }),
+            "{result:?}"
+        );
+        assert!(
+            result.series.iter().any(|series| series
+                .points
+                .iter()
+                .any(|(_, value)| value.is_finite() && *value > 0.0)),
+            "{result:?}"
+        );
+        result
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let warm_stop = sync
+        .reader
+        .observe_panel(target.clone(), variables.clone(), move |answer| {
+            let _ = tx.send(answer);
+        });
+    let before = current_panel(wait(&rx));
+    drop(warm_stop);
+    drop(catalog_stop);
+
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sync.reader.observe_schedule_counts().admitted != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.expect("warm requests release their scheduler slots");
+        with_grafana_storage_lock(&client, async {
+            let stalled_at = Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(6);
+            let mut stops = Vec::with_capacity(6);
+            for request in 0..6 {
+                let tx = reply_tx.clone();
+                stops.push(sync.reader.observe_panel(target.clone(), variables.clone(), move |answer| {
+                    let _ = tx.try_send((request, answer));
+                }));
+            }
+            drop(reply_tx);
+            tokio::time::timeout_at(deadline, async {
+                loop {
+                    let counts = sync.reader.observe_schedule_counts();
+                    if counts.active == 2 && counts.admitted == 6 { break; }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.expect("two requests run while four wait against locked Grafana");
+            let saturated = sync.reader.observe_schedule_counts();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _rejected = sync.reader.observe_panel(target.clone(), variables.clone(), move |answer| { let _ = tx.send(answer); });
+            let rejected = tokio::time::timeout_at(deadline, rx).await.expect("capacity refusal is immediate").expect("the refusal callback");
+            assert_eq!(rejected, Fetched::Failed {
+                what: "telemetry",
+                why: "telemetry is busy: two requests are active and four are waiting".into(),
+            });
+
+            let api: kube::Api<Deployment> = kube::Api::namespaced(client.clone(), NS);
+            let probe_label = format!("{}-{end_ms}", std::process::id());
+            let probe_selector = format!("k10s.dev/probe={probe_label}");
+            let fixture: Deployment = serde_json::from_value(serde_json::json!({
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": {"generateName": PREFIX, "labels": {"k10s.dev/fixture": "observe-pilot"}},
+                "spec": {
+                    "replicas": 0,
+                    "selector": {"matchLabels": {"k10s.dev/probe": probe_label}},
+                    "template": {
+                        "metadata": {"labels": {"k10s.dev/probe": probe_label}},
+                        "spec": {
+                            "automountServiceAccountToken": false,
+                            "containers": [{"name": "never-started", "image": "python:3.14.7-alpine3.24"}]
+                        }
+                    }
+                }
+            })).expect("the zero-replica progress fixture");
+            let metrics_before = plane.metrics();
+            let created_at = Instant::now();
+            let created = tokio::time::timeout_at(deadline, api.create(&PostParams::default(), &fixture))
+                .await.expect("progress Deployment create timed out; a write may have landed without a returned UID")
+                .expect("create only the generated progress Deployment");
+            let name = created.metadata.name.expect("generated Deployment name");
+            let probe_uid = created.metadata.uid.expect("generated Deployment UID");
+            let checked = std::panic::AssertUnwindSafe(async {
+                assert_eq!(created.spec.as_ref().and_then(|spec| spec.replicas), Some(0));
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let read_started = Instant::now();
+                sync.reader.fetch_manifest(DescribeRequest {
+                    kind: deployments.id, namespace: Some(NS.into()), name: name.clone(), uid: probe_uid.clone(),
+                }, move |answer| { let _ = tx.send((answer, Instant::now())); });
+                let delivered_at = tokio::time::timeout_at(deadline, async {
+                    loop {
+                        let (at, event) = watch_rx.recv().await.expect("the production watch remains open");
+                        match event {
+                            IngestEvent::Resource(event) if event.uid.as_ref() == probe_uid.as_str() && event.op == Op::Added => {
+                                assert_eq!(event.namespace.as_ref(), NS);
+                                assert_eq!(event.name.as_ref(), name.as_str());
+                                break at;
+                            }
+                            IngestEvent::Desync { reason, .. } => panic!("Deployment watch stalled with {reason:?}"),
+                            _ => {}
+                        }
+                    }
+                }).await.expect("the exact created UID reaches the watch while telemetry remains stalled");
+                let (read, read_at) = tokio::time::timeout_at(deadline, rx).await
+                    .expect("an ordinary Kubernetes read progresses during saturation").expect("the ordinary read callback");
+                match read {
+                    Fetched::Ok(manifest) => assert_eq!(manifest.uid.as_deref(), Some(probe_uid.as_str())),
+                    other => panic!("the owned zero-replica Deployment read failed: {other:?}"),
+                }
+                let still_stalled = sync.reader.observe_schedule_counts();
+                assert_eq!(still_stalled.active, 2, "{still_stalled:?}");
+                assert_eq!(still_stalled.admitted, 6, "{still_stalled:?}");
+                let premature = reply_rx.try_recv();
+                assert!(matches!(premature, Err(tokio::sync::mpsc::error::TryRecvError::Empty)), "locked requests must not finish before cancellation: {premature:?}");
+
+                let cancelled_at = Instant::now();
+                drop(stops);
+                tokio::time::timeout_at(deadline, async {
+                    loop {
+                        let counts = sync.reader.observe_schedule_counts();
+                        if counts.active == 0 && counts.admitted == 0 { break; }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }).await.expect("cancellation releases active and waiting capacity before backend timeout");
+                let released_at = Instant::now();
+                let cancelled_reply = tokio::time::timeout_at(deadline, reply_rx.recv()).await
+                    .expect("all cancelled callback senders are dropped");
+                assert!(cancelled_reply.is_none(), "cancelled requests published a reply: {cancelled_reply:?}");
+                let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), NS);
+                let spawned = tokio::time::timeout(Duration::from_secs(5),
+                    pods.list_metadata(&ListParams::default().labels(&probe_selector).limit(1)))
+                    .await.expect("the zero-replica Pod census answers within five seconds")
+                    .expect("the generated probe Pod census");
+                assert!(spawned.items.is_empty(), "the zero-replica probe must not create Pods: {:?}", spawned.items);
+                assert!(spawned.metadata.continue_.as_deref().is_none_or(str::is_empty));
+                let counts = sync.reader.observe_schedule_counts();
+                assert_eq!(counts.peak_active, 2);
+                assert_eq!(counts.peak_admitted, 6);
+                assert_eq!(counts.rejected, 1);
+                let metrics_after = plane.metrics();
+                assert!(metrics_after.forwarded > metrics_before.forwarded, "{metrics_before:?} -> {metrics_after:?}");
+                println!("live telemetry client cancellation and data-plane progress: producer={NS}/{pod} UID={uid}, probe={name} UID={probe_uid}, saturated={saturated:?}, recovered={counts:?}, watch={:?}, ordinary_read={:?}, cancellation={:?}, stall_total={:?}, ingest={metrics_before:?}->{metrics_after:?}; server cancellation, unfinished wire bytes and GPUI responsiveness are not measured",
+                    delivered_at.duration_since(created_at), read_at.duration_since(read_started), released_at.duration_since(cancelled_at), stalled_at.elapsed());
+            }).catch_unwind().await;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                match api.delete(&name, &DeleteParams {
+                    preconditions: Some(Preconditions {uid: Some(probe_uid.clone()), ..Default::default()}),
+                    propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
+                    ..Default::default()
+                }).await {
+                    Ok(_) => {},
+                    Err(kube::Error::Api(error)) if error.code == 404 => {},
+                    Err(error) => panic!("generated Deployment {name} UID {probe_uid} cleanup refused: {error}"),
+                }
+                await_condition(api, &name, conditions::is_deleted(&probe_uid)).await.expect("the progress fixture cleanup can be watched");
+            }).await.expect("the owned progress Deployment is removed within 15 seconds");
+            checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }).await;
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _stop = sync.reader.observe_panel(target, variables, move |answer| {
+        let _ = tx.send(answer);
+    });
+    let after = current_panel(wait(&rx));
+    runtime.block_on(async {
+        let pods: kube::Api<Pod> = kube::Api::namespaced(client, NS);
+        let current = tokio::time::timeout(Duration::from_secs(15), pods.get_metadata(&pod))
+            .await
+            .expect("the recovered producer identity read answers within 15 seconds")
+            .expect("the producer still exists after recovery");
+        assert_eq!(
+            current.metadata.uid.as_ref(),
+            Some(&uid),
+            "recovery must use the same current producer UID"
+        );
+    });
+    assert_eq!(
+        (after.source, after.expr, after.step_ms),
+        (before.source, before.expr, before.step_ms)
+    );
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sync.reader.observe_schedule_counts().admitted != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the successful recovery query releases its slot");
+    });
+    drop(_stop);
+    drop(sync);
+    drop(watch_rx);
+    drop(plane);
+    drain
+        .join()
+        .expect("the production event receiver drains and closes");
 }
 
 #[test]

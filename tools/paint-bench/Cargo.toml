@@ -9,6 +9,12 @@ publish = false
 [workspace]
 resolver = "3"
 
+[profile.release]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+lto = "thin"
+codegen-units = 1
+
 [dependencies]
 k10s-atlas = { path = "../../crates/atlas", features = ["testing"] }
 k10s-clustergen = { path = "../../crates/clustergen" }

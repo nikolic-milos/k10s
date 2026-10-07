@@ -63,6 +63,346 @@ fn one_of_each(pod_state: State) -> SceneSnapshot {
     }
 }
 
+fn small_workload(pod_state: State, sparse: bool) -> SceneSnapshot {
+    let mut scene = one_of_each(pod_state);
+    scene.blocks[0].inner = Rect::new(40.0, 40.0, 30.0, 56.0);
+    let mut pod_ids = vec![Arc::<str>::from("pod-current")];
+    if sparse {
+        let actual = scene.cells[0].clone();
+        scene.cells[0].rect = Rect::default();
+        scene.cells[0].label = "".into();
+        scene.cells.push(PodNode {
+            rect: Rect::new(300.0, 200.0, 10.0, 10.0),
+            label: "another-workload-pod".into(),
+            ext: PodExt { state: State::OK },
+        });
+        scene.cells.push(actual);
+        scene.block_cells = vec![2];
+        pod_ids = vec![
+            Arc::from(""),
+            Arc::from("other-pod"),
+            Arc::from("pod-current"),
+        ];
+    }
+    scene.ids = Arc::new(k10s_core::SceneIds {
+        regions: [Arc::<str>::from("namespace")].into_iter().collect(),
+        blocks: [Arc::<str>::from("workload")].into_iter().collect(),
+        cells: pod_ids.into_iter().collect(),
+        sats: [Arc::<str>::from("satellite")].into_iter().collect(),
+    });
+    scene.rebuild_spatial_index();
+    scene
+}
+
+#[test]
+fn compact_workload_geometry_agrees_across_paint_pick_marks_overlays_and_counters() {
+    use crate::overlay::{OverlayFrame, OverlayKind, OverlayMark, StampCache};
+
+    let pol = policy(Knobs::default());
+    let blend = StageBlend::settled(3);
+    for sparse in [false, true] {
+        let scene = small_workload(State::of(ReasonId::FAILED), sparse);
+        let cell_index = if sparse { 2 } else { 0 };
+        for theme in [&k10s_theme::K10S_DARK.map, &k10s_theme::K10S_LIGHT.map] {
+            for font in [8.0, 14.0, 32.0] {
+                let type_ = MapType {
+                    workload: font,
+                    pod: font,
+                    ..Default::default()
+                };
+                let zoom = crate::lod::STAGE_POD_LABEL
+                    .max(crate::primitive::detail_min_width(type_) / 10.0);
+                for (vw, vh, pan) in [(VW, VH, 0.0), (600.0, 420.0, 0.0), (384.0, 300.0, 5.0)] {
+                    let height = (row_pitch(font, type_.line_height) * 2.0 + TEXT_PAD * 2.0)
+                        .ceil()
+                        .clamp(64.0, 104.0);
+                    let pod_y = vh - crate::primitive::bottom_clearance(type_) - height * 0.5 - 4.0;
+                    let camera = Camera {
+                        cx: 55.0 + pan,
+                        cy: 81.0 - (pod_y - vh * 0.5) / zoom,
+                        zoom,
+                    };
+                    let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
+                    let geometry = projection.workload(&scene, 0, 3, type_);
+                    let pod =
+                        projection.cell(scene.cells[cell_index].rect, 3, type_, geometry.heading);
+                    let bounds = Bounds {
+                        origin: point(px(0.0), px(0.0)),
+                        size: size(px(vw), px(vh)),
+                    };
+                    let opts = FrameOpts {
+                        policy: &pol,
+                        theme,
+                        type_,
+                        edges_on: false,
+                        skip_blocks: false,
+                        hex: false,
+                    };
+                    let mut sink = Collect::default();
+                    let stats = walk(bounds, &scene, camera, blend, opts, &mut sink);
+                    assert_eq!(
+                        stats,
+                        crate::lod::cull(&scene, &camera, blend, vw, vh, opts)
+                    );
+                    assert!(
+                        sink.fg
+                            .iter()
+                            .any(|quad| quad.bounds == geometry.body.bounds)
+                    );
+                    let block_path = crate::PickPath {
+                        region: 0,
+                        block: Some(0),
+                        cell: None,
+                        sat: None,
+                    };
+                    assert_eq!(
+                        crate::primitive::mark_primitive_typed(
+                            &scene,
+                            block_path,
+                            camera,
+                            &pol,
+                            3,
+                            (vw, vh),
+                            (0.0, 0.0),
+                            type_
+                        ),
+                        Some(geometry.body)
+                    );
+                    let block_overlay = OverlayFrame {
+                        kind: Some(OverlayKind::Policy),
+                        marks: vec![OverlayMark {
+                            uid: "workload".into(),
+                            tint: Some(Severity::Warn),
+                            sparkline: None,
+                            label: None,
+                        }],
+                    };
+                    let shown = block_overlay.visible_stamps_typed(
+                        &mut StampCache::default(),
+                        &scene,
+                        camera,
+                        &pol,
+                        blend,
+                        vw,
+                        vh,
+                        type_,
+                    );
+                    assert_eq!(shown.len(), 1);
+                    assert_eq!(
+                        shown[0].screen,
+                        Rect::new(
+                            f32::from(geometry.body.bounds.origin.x),
+                            f32::from(geometry.body.bounds.origin.y),
+                            f32::from(geometry.body.bounds.size.width),
+                            f32::from(geometry.body.bounds.size.height)
+                        )
+                    );
+                    if let Some(heading) = geometry.heading {
+                        assert!(sink.fg.iter().any(|quad| quad.bounds == heading.bounds));
+                        assert!(heading.bounds.is_contained_within(&geometry.body.bounds));
+                        let point = heading.bounds.center();
+                        let picked = crate::pick::pick_typed(
+                            &scene,
+                            &camera,
+                            &pol,
+                            blend,
+                            vw,
+                            vh,
+                            f32::from(point.x),
+                            f32::from(point.y),
+                            type_,
+                        )
+                        .unwrap();
+                        assert_eq!(picked, block_path);
+                        let first = projection.band_icon(heading, 0, type_);
+                        let second = projection.band_icon(heading, 1, type_);
+                        assert!(first.bounds.bottom() <= second.bounds.origin.y);
+                        assert!(first.bounds.is_contained_within(&heading.bounds));
+                        assert!(second.bounds.is_contained_within(&heading.bounds));
+                        assert!(
+                            sink.icons
+                                .iter()
+                                .any(|job| icon_bounds(job) == first.bounds)
+                        );
+                        assert!(
+                            sink.icons
+                                .iter()
+                                .any(|job| icon_bounds(job) == second.bounds)
+                        );
+                        let name = sink
+                            .labels
+                            .iter()
+                            .find(|job| job.text == scene.blocks[0].label.as_ref())
+                            .unwrap();
+                        let status = sink
+                            .labels
+                            .iter()
+                            .find(|job| job.text == "Healthy")
+                            .unwrap();
+                        assert!(name.y + name.height <= f32::from(second.bounds.origin.y));
+                        assert!(f32::from(first.bounds.bottom()) <= status.y);
+                    }
+                    let cell_path = crate::PickPath {
+                        cell: Some(cell_index as u32),
+                        ..block_path
+                    };
+                    assert_eq!(
+                        crate::primitive::mark_primitive_typed(
+                            &scene,
+                            cell_path,
+                            camera,
+                            &pol,
+                            3,
+                            (vw, vh),
+                            (0.0, 0.0),
+                            type_
+                        ),
+                        pod
+                    );
+                    let pod_overlay = OverlayFrame {
+                        kind: Some(OverlayKind::Policy),
+                        marks: vec![OverlayMark {
+                            uid: "pod-current".into(),
+                            tint: Some(Severity::Err),
+                            sparkline: None,
+                            label: None,
+                        }],
+                    };
+                    let shown = pod_overlay.visible_stamps_typed(
+                        &mut StampCache::default(),
+                        &scene,
+                        camera,
+                        &pol,
+                        blend,
+                        vw,
+                        vh,
+                        type_,
+                    );
+                    assert_eq!(shown.len(), usize::from(pod.is_some()));
+                    if let Some(pod) = pod {
+                        assert!(pod.bounds.is_contained_within(&geometry.body.bounds));
+                        assert_eq!(
+                            pod.bounds.center(),
+                            projection.bounds(scene.cells[cell_index].rect).center()
+                        );
+                        assert!(sink.fg.iter().any(|quad| quad.bounds == pod.bounds));
+                        let point = pod.bounds.center();
+                        let picked = crate::pick::pick_typed(
+                            &scene,
+                            &camera,
+                            &pol,
+                            blend,
+                            vw,
+                            vh,
+                            f32::from(point.x),
+                            f32::from(point.y),
+                            type_,
+                        )
+                        .unwrap();
+                        assert_eq!(picked, cell_path);
+                        assert_eq!(shown[0].screen.x, f32::from(pod.bounds.origin.x));
+                        assert_eq!(shown[0].screen.y, f32::from(pod.bounds.origin.y));
+                        let name = sink
+                            .labels
+                            .iter()
+                            .find(|job| job.text == scene.cells[cell_index].label.as_ref())
+                            .expect("the visible Pod has its name");
+                        let icon = sink
+                            .icons
+                            .iter()
+                            .find_map(|job| match job {
+                                IconJob::Status(Severity::Err, primitive) => Some(primitive),
+                                _ => None,
+                            })
+                            .expect("the visible Pod has its status glyph");
+                        assert!(name.y + name.height <= f32::from(icon.bounds.origin.y));
+                    } else {
+                        assert!(
+                            !sink
+                                .labels
+                                .iter()
+                                .any(|job| job.text == scene.cells[cell_index].label.as_ref())
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn normal_map_rows_keep_their_existing_pitch_and_heading_height() {
+    let type_ = MapType::default();
+    assert_eq!(
+        row_pitch(type_.workload, type_.line_height),
+        type_.workload * type_.line_height
+    );
+    assert_eq!(
+        row_pitch(type_.pod, type_.line_height),
+        type_.pod * type_.line_height
+    );
+    assert_eq!(crate::primitive::name_band_height(type_), 54.0);
+}
+
+#[test]
+fn removing_the_only_pod_keeps_observed_truth_and_a_bounded_workload_target() {
+    let mut scene = small_workload(State::OK, true);
+    scene.blocks[0].children = 0..0;
+    let ids = Arc::make_mut(&mut scene.ids);
+    ids.cells[2] = Arc::from("");
+    scene.identity_rev += 1;
+    scene.rebuild_spatial_index();
+    let camera = Camera {
+        cx: 55.0,
+        cy: 68.0,
+        zoom: crate::lod::STAGE_POD_LABEL,
+    };
+    let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
+    let geometry = projection.workload(&scene, 0, 3, MapType::default());
+    let sink = walk_at(&scene, camera);
+    assert_eq!(geometry.body.bounds.size, size(px(168.0), px(74.0)));
+    assert!(
+        sink.fg
+            .iter()
+            .any(|quad| quad.bounds == geometry.body.bounds)
+    );
+    assert!(sink.labels.iter().any(|job| job.text == "0 observed pods"));
+    assert!(
+        !sink
+            .labels
+            .iter()
+            .any(|job| job.text == "Healthy" || job.text == scene.cells[2].label.as_ref())
+    );
+    let point = geometry.heading.unwrap().bounds.center();
+    let pol = policy(Knobs::default());
+    let picked = crate::pick::pick(
+        &scene,
+        &camera,
+        &pol,
+        StageBlend::settled(3),
+        VW,
+        VH,
+        f32::from(point.x),
+        f32::from(point.y),
+    )
+    .unwrap();
+    assert_eq!((picked.block, picked.cell), (Some(0), None));
+    let overlay = crate::OverlayFrame {
+        kind: Some(crate::OverlayKind::Policy),
+        marks: vec![crate::OverlayMark {
+            uid: "pod-current".into(),
+            tint: Some(Severity::Err),
+            sparkline: None,
+            label: None,
+        }],
+    };
+    assert!(
+        overlay
+            .visible_stamps(&scene, camera, &pol, StageBlend::settled(3), VW, VH)
+            .is_empty()
+    );
+}
+
 fn cameras() -> Vec<Camera> {
     // Across every stage the map has, including both sides of the chrome
     // threshold, because that is where the glyph changes what it is doing.
@@ -489,12 +829,14 @@ fn a_painted_severity_footer_picks_its_card_without_filling_the_rounded_gap() {
     ] {
         let camera = Camera {
             cx: inner.center().0,
-            cy: inner.max_y(),
+            cy: scene.cells[0].rect.center().1,
             zoom,
         };
         let blend = StageBlend::settled(pol.stage_for_zoom(zoom));
         let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
-        let body = projection.card(inner);
+        let body = projection
+            .workload(&scene, 0, blend.walk_stage(), MapType::default())
+            .body;
         let footer = body.severity_strip();
         let opts = FrameOpts {
             policy: &pol,
@@ -519,6 +861,7 @@ fn a_painted_severity_footer_picks_its_card_without_filling_the_rounded_gap() {
         assert_eq!(painted.corner_radii, footer.corners);
         let probe = footer.bounds.center();
         assert!(body.contains(probe));
+        assert!(viewport().contains(&probe));
         let path = crate::pick::pick(
             &scene,
             &camera,
@@ -576,7 +919,7 @@ fn detailed_pods_keep_identity_status_and_picking_inside_the_same_body() {
         ] {
             let camera = Camera { cx, cy, zoom };
             let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
-            let heading = projection.name_band(scene.blocks[0].inner, type_);
+            let heading = projection.workload(&scene, 0, 3, type_).heading;
             let body = projection
                 .cell(cell.rect, 3, type_, heading)
                 .expect("the centered pod clears its heading");
@@ -692,7 +1035,8 @@ fn a_pinned_heading_selects_the_workload_and_excludes_obscured_pods() {
     let type_ = k10s_theme::MapType::default();
     let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
     let heading = projection
-        .name_band(scene.blocks[0].inner, type_)
+        .workload(&scene, 0, 3, type_)
+        .heading
         .expect("the workload enters the viewport");
     assert_eq!(
         f32::from(heading.bounds.origin.y),
@@ -755,7 +1099,8 @@ fn large_workload_names_stay_in_the_visible_band_while_panning() {
             let camera = Camera { cx, cy, zoom: 16.0 };
             let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
             let band = projection
-                .name_band(scene.blocks[0].inner, type_)
+                .workload(&scene, 0, 3, type_)
+                .heading
                 .expect("part of the workload remains visible");
             let frame = walk_at(&scene, camera);
             let name = frame

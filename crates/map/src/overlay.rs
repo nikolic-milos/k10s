@@ -6,6 +6,7 @@
 //! keyed by uid, and only for what is already being drawn.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use gpui::{Corners, Pixels, Window, point, px, quad, size, transparent_black};
 use k10s_atlas::{Camera, Level, LodPolicy, Rect, StageBlend, WorkloadPresentation};
@@ -112,6 +113,8 @@ impl OverlayFrame {
         }
         if !cache.valid || cache.identity_rev != scene.identity_rev {
             cache.rebuild(&self.marks, scene);
+        } else if cache.scene_rev != scene.rev {
+            cache.refresh_parents(scene);
         }
         let visible = camera.visible_world(vw, vh);
         let stage = blend.walk_stage();
@@ -139,29 +142,33 @@ impl OverlayFrame {
             let projection = crate::primitive::Projection::new(camera, (vw, vh), (0.0, 0.0));
             let primitive = match located.level {
                 Level::Region => Some(projection.region(located.rect)),
-                Level::Block => {
-                    block.and_then(|block| {
-                        match crate::primitive::workload_presentation(
-                            policy,
-                            block.inner,
-                            camera.zoom,
-                            stage,
-                            type_,
-                        ) {
-                            WorkloadPresentation::Hidden => None,
-                            WorkloadPresentation::Medallion => {
-                                Some(projection.medallion(block.rect, block.inner))
-                            }
-                            WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
-                                Some(projection.card(block.inner))
-                            }
+                Level::Block => cached.block.and_then(|block_index| {
+                    let block = scene.blocks.get(block_index)?;
+                    match crate::primitive::workload_presentation(
+                        policy,
+                        block.inner,
+                        camera.zoom,
+                        stage,
+                        type_,
+                    ) {
+                        WorkloadPresentation::Hidden => None,
+                        WorkloadPresentation::Medallion => {
+                            Some(projection.medallion(block.rect, block.inner))
                         }
-                    })
-                }
-                Level::Cell => block.and_then(|block| {
+                        WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
+                            Some(projection.workload(scene, block_index, stage, type_).body)
+                        }
+                    }
+                }),
+                Level::Cell => cached.block.and_then(|block_index| {
+                    let block = scene.blocks.get(block_index)?;
                     let heading =
                         crate::primitive::workload_label_shown(policy, block.inner.w, camera.zoom)
-                            .then(|| projection.name_band(block.inner, type_))
+                            .then(|| {
+                                projection
+                                    .workload(scene, block_index, stage, type_)
+                                    .heading
+                            })
                             .flatten();
                     projection.cell(located.rect, stage, type_, heading)
                 }),
@@ -201,11 +208,20 @@ impl OverlayFrame {
 /// identity does, so cached (level, slot) pairs survive health-only publishes
 /// and die on a cluster switch. The mark table itself has no revision; the
 /// owner must call [`StampCache::invalidate`] when it replaces the marks.
+/// Parent links are checked separately on each new scene revision because an
+/// object can change ownership without changing its UID or slot.
 #[derive(Debug, Default)]
 pub(crate) struct StampCache {
     identity_rev: u64,
+    scene_rev: u64,
     valid: bool,
     slots: Vec<Option<CachedSlot>>,
+    #[cfg(test)]
+    identity_builds: usize,
+    #[cfg(test)]
+    parent_checks: usize,
+    #[cfg(test)]
+    parent_searches: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -215,6 +231,65 @@ struct CachedSlot {
     /// Owning block slot: the mark's own slot for a Block, the containing
     /// block for a Cell or Sat, absent for regions and orphans.
     block: Option<usize>,
+    /// Absolute child-link position, permitting a constant-time membership
+    /// check even when the snapshot uses indirect child indices.
+    link: u32,
+}
+
+impl CachedSlot {
+    fn links(scene: &SceneSnapshot, level: Level, block: usize) -> Option<(&Range<u32>, &[u32])> {
+        let block = scene.blocks.get(block)?;
+        match level {
+            Level::Cell => Some((&block.children, &scene.block_cells)),
+            Level::Sat => Some((&block.sats, &scene.block_sats)),
+            Level::Region | Level::Block => None,
+        }
+    }
+
+    fn parent_valid(self, scene: &SceneSnapshot) -> bool {
+        self.block
+            .and_then(|block| Self::links(scene, self.level, block))
+            .is_some_and(|(range, links)| {
+                if links.is_empty() {
+                    range.contains(&(self.slot as u32))
+                } else {
+                    range.contains(&self.link)
+                        && links.get(self.link as usize) == Some(&(self.slot as u32))
+                }
+            })
+    }
+
+    fn find_parent(self, scene: &SceneSnapshot) -> Option<(usize, u32)> {
+        let rect = slot_rect(scene, self.level, self.slot)?;
+        if rect.w <= 0.0 || rect.h <= 0.0 {
+            return None;
+        }
+        let mut parent = None;
+        scene.for_each_region_candidate(&rect, |region, _| {
+            scene.for_each_region_block_candidate(region, &rect, |block, _| {
+                if parent.is_some() {
+                    return;
+                }
+                let Some((range, links)) = Self::links(scene, self.level, block) else {
+                    return;
+                };
+                let link = if links.is_empty() {
+                    range
+                        .contains(&(self.slot as u32))
+                        .then_some(self.slot as u32)
+                } else {
+                    links[range.start as usize..range.end as usize]
+                        .iter()
+                        .position(|&slot| slot as usize == self.slot)
+                        .map(|offset| range.start + offset as u32)
+                };
+                if let Some(link) = link {
+                    parent = Some((block, link));
+                }
+            });
+        });
+        parent
+    }
 }
 
 impl StampCache {
@@ -222,7 +297,33 @@ impl StampCache {
         self.valid = false;
     }
 
+    fn refresh_parents(&mut self, scene: &SceneSnapshot) {
+        for cached in self.slots.iter_mut().flatten() {
+            if !matches!(cached.level, Level::Cell | Level::Sat) {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                self.parent_checks += 1;
+            }
+            if !cached.parent_valid(scene) {
+                #[cfg(test)]
+                {
+                    self.parent_searches += 1;
+                }
+                let parent = cached.find_parent(scene);
+                cached.block = parent.map(|(block, _)| block);
+                cached.link = parent.map_or(0, |(_, link)| link);
+            }
+        }
+        self.scene_rev = scene.rev;
+    }
+
     fn rebuild(&mut self, marks: &[OverlayMark], scene: &SceneSnapshot) {
+        #[cfg(test)]
+        {
+            self.identity_builds += 1;
+        }
         // Tombstones hold the empty string; leaving them out keeps an empty
         // mark uid unresolved, exactly as `SceneSnapshot::locate` answers it.
         fn index(ids: &SlotIds) -> HashMap<&str, usize> {
@@ -242,15 +343,18 @@ impl StampCache {
         let regions = index(&scene.ids.regions);
         let mut cell_block = vec![None; scene.cells.len()];
         let mut sat_block = vec![None; scene.sats.len()];
-        for (owner, block) in scene.blocks.iter().enumerate() {
-            for child in block.children.clone() {
-                if let Some(slot) = cell_block.get_mut(child as usize) {
-                    *slot = Some(owner);
+        for owner in 0..scene.blocks.len() {
+            for (offset, child) in scene.block_cell_indices(owner).enumerate() {
+                if let Some(slot) = cell_block.get_mut(child) {
+                    *slot = Some((
+                        owner as u32,
+                        scene.blocks[owner].children.start + offset as u32,
+                    ));
                 }
             }
-            for sat in block.sats.clone() {
-                if let Some(slot) = sat_block.get_mut(sat as usize) {
-                    *slot = Some(owner);
+            for (offset, sat) in scene.block_sat_indices(owner).enumerate() {
+                if let Some(slot) = sat_block.get_mut(sat) {
+                    *slot = Some((owner as u32, scene.blocks[owner].sats.start + offset as u32));
                 }
             }
         }
@@ -259,17 +363,21 @@ impl StampCache {
             let uid = mark.uid.as_str();
             // Deepest-first, the same priority as `SceneSnapshot::locate`.
             if let Some(&slot) = sats.get(uid) {
+                let parent = sat_block.get(slot).copied().flatten();
                 return Some(CachedSlot {
                     level: Level::Sat,
                     slot,
-                    block: sat_block.get(slot).copied().flatten(),
+                    block: parent.map(|(block, _)| block as usize),
+                    link: parent.map_or(0, |(_, link)| link),
                 });
             }
             if let Some(&slot) = cells.get(uid) {
+                let parent = cell_block.get(slot).copied().flatten();
                 return Some(CachedSlot {
                     level: Level::Cell,
                     slot,
-                    block: cell_block.get(slot).copied().flatten(),
+                    block: parent.map(|(block, _)| block as usize),
+                    link: parent.map_or(0, |(_, link)| link),
                 });
             }
             if let Some(&slot) = blocks.get(uid) {
@@ -277,15 +385,18 @@ impl StampCache {
                     level: Level::Block,
                     slot,
                     block: Some(slot),
+                    link: 0,
                 });
             }
             regions.get(uid).map(|&slot| CachedSlot {
                 level: Level::Region,
                 slot,
                 block: None,
+                link: 0,
             })
         }));
         self.identity_rev = scene.identity_rev;
+        self.scene_rev = scene.rev;
         self.valid = true;
     }
 }
@@ -486,6 +597,187 @@ mod tests {
         State, ToolId, WlExt, WorkloadNode,
     };
     use k10s_theme::{K10S_DARK, Sample, Series};
+    use k10s_world::{LayoutMode, PublishBench};
+
+    fn attached(uid: &str, parent: &str, op: k10s_core::Op) -> k10s_core::IngestEvent {
+        k10s_core::IngestEvent::Resource(k10s_core::ResourceEvent {
+            kind: KindId::SERVICE,
+            uid: uid.into(),
+            namespace: "prod".into(),
+            name: uid.into(),
+            resource_version: 0,
+            parent: Some(parent.into()),
+            op,
+            payload: k10s_core::Payload::Attached {
+                kind: KindId::SERVICE,
+                detail: "ClusterIP".into(),
+            },
+        })
+    }
+
+    fn published_owners(mode: LayoutMode) -> PublishBench {
+        use k10s_core::{Op, replay};
+        PublishBench::new(
+            &[
+                replay::scope("ns-prod", "prod", Op::Added),
+                replay::owner("wl-a", "prod", "a", KindId::DEPLOYMENT, Op::Added),
+                replay::owner("wl-b", "prod", "b", KindId::DEPLOYMENT, Op::Added),
+                replay::instance("pod-moving", "prod", "wl-a", State::OK, Op::Added),
+                replay::instance("pod-a", "prod", "wl-a", State::OK, Op::Added),
+                replay::instance("pod-b", "prod", "wl-b", State::OK, Op::Added),
+                attached("sat-moving", "wl-a", Op::Added),
+                attached("sat-a", "wl-a", Op::Added),
+                attached("sat-b", "wl-b", Op::Added),
+            ],
+            mode,
+        )
+    }
+
+    fn child_marks<'a>(uids: impl IntoIterator<Item = &'a str>) -> OverlayFrame {
+        OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: uids
+                .into_iter()
+                .map(|uid| OverlayMark {
+                    uid: uid.into(),
+                    tint: Some(Severity::Warn),
+                    sparkline: None,
+                    label: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn published_same_uid_reparenting_refreshes_only_marked_parent_links() {
+        use k10s_core::{Op, replay};
+        for mode in [LayoutMode::Spread, LayoutMode::Dense] {
+            let mut bench = published_owners(mode);
+            let before = bench.snapshot();
+            let old_owner = before.locate("wl-a").unwrap().slot;
+            let new_owner = before.locate("wl-b").unwrap().slot;
+            let pod_uid =
+                before.ids.cells[before.block_cell_indices(old_owner).next().unwrap()].as_ref();
+            let sat_uid = before
+                .block_sat_indices(old_owner)
+                .next()
+                .map(|slot| before.ids.sats[slot].as_ref());
+            assert_eq!(sat_uid.is_some(), mode.emits_attachments());
+            let frame = child_marks([Some(pod_uid), sat_uid].into_iter().flatten());
+            let mut cache = StampCache::default();
+            let pol = policy();
+            let blend = StageBlend::settled(3);
+            let camera = Camera {
+                cx: 0.0,
+                cy: 0.0,
+                zoom: crate::lod::STAGE_POD_LABEL,
+            };
+            frame.visible_stamps_cached(&mut cache, &before, camera, &pol, blend, 1600.0, 1000.0);
+            assert!(
+                cache
+                    .slots
+                    .iter()
+                    .flatten()
+                    .all(|slot| slot.block == Some(old_owner))
+            );
+            let slots = cache.slots.as_ptr();
+            let mut events = vec![replay::instance(
+                pod_uid,
+                "prod",
+                "wl-b",
+                State::OK,
+                Op::Modified,
+            )];
+            if let Some(uid) = sat_uid {
+                events.push(attached(uid, "wl-b", Op::Modified));
+            }
+            bench.apply_events(&events);
+            bench.run_publish();
+            let after = bench.snapshot();
+            assert!(after.rev > before.rev);
+            assert_eq!(after.identity_rev, before.identity_rev);
+            assert_eq!(after.ids.cells, before.ids.cells);
+            assert_eq!(after.ids.sats, before.ids.sats);
+            assert_ne!(after.block_cells, before.block_cells);
+            if sat_uid.is_some() {
+                assert_ne!(after.block_sats, before.block_sats);
+            } else {
+                assert!(after.sats.is_empty());
+            }
+            for uid in [Some(pod_uid), sat_uid].into_iter().flatten() {
+                let before_location = before.locate(uid).unwrap();
+                let location = after.locate(uid).unwrap();
+                assert_eq!(
+                    (location.level, location.slot),
+                    (before_location.level, before_location.slot)
+                );
+                assert_ne!(location.rect, before_location.rect);
+                let (cx, cy) = location.rect.center();
+                let camera = Camera { cx, cy, ..camera };
+                let warm = frame
+                    .visible_stamps_cached(&mut cache, &after, camera, &pol, blend, 1600.0, 1000.0);
+                let cold = frame.visible_stamps(&after, camera, &pol, blend, 1600.0, 1000.0);
+                assert!(!warm.is_empty());
+                assert_eq!(warm, cold);
+                assert!(
+                    cache
+                        .slots
+                        .iter()
+                        .flatten()
+                        .all(|slot| slot.block == Some(new_owner) && slot.parent_valid(&after))
+                );
+            }
+            assert_eq!(cache.slots.as_ptr(), slots);
+            assert_eq!(cache.identity_builds, 1);
+            assert_eq!(cache.parent_checks, frame.marks.len());
+            assert_eq!(cache.parent_searches, frame.marks.len());
+        }
+    }
+
+    #[test]
+    fn published_status_changes_and_camera_frames_preserve_identity_and_membership_caches() {
+        let mut bench = published_owners(LayoutMode::Spread);
+        let frame = child_marks(["pod-moving", "sat-moving"]);
+        let mut cache = StampCache::default();
+        let pol = policy();
+        let blend = StageBlend::settled(3);
+        let initial = bench.snapshot();
+        let (cx, cy) = initial.locate("pod-moving").unwrap().rect.center();
+        let camera = Camera {
+            cx,
+            cy,
+            zoom: crate::lod::STAGE_POD_LABEL,
+        };
+        frame.visible_stamps_cached(&mut cache, &initial, camera, &pol, blend, 1600.0, 1000.0);
+        let slots = cache.slots.as_ptr();
+        let capacity = cache.slots.capacity();
+        for publish in 1..=4 {
+            bench.flip_pods(1);
+            bench.run_publish();
+            let scene = bench.snapshot();
+            assert_eq!(scene.identity_rev, initial.identity_rev);
+            assert_eq!(scene.block_cells, initial.block_cells);
+            assert_eq!(scene.block_sats, initial.block_sats);
+            for pan in [0.0, 2.0, -2.0] {
+                let camera = Camera {
+                    cx: cx + pan,
+                    ..camera
+                };
+                let warm = frame
+                    .visible_stamps_cached(&mut cache, &scene, camera, &pol, blend, 1600.0, 1000.0);
+                assert_eq!(
+                    warm,
+                    frame.visible_stamps(&scene, camera, &pol, blend, 1600.0, 1000.0)
+                );
+                assert_eq!(cache.scene_rev, scene.rev);
+                assert_eq!(cache.identity_builds, 1);
+                assert_eq!(cache.parent_checks, publish * 2);
+                assert_eq!(cache.parent_searches, 0);
+                assert_eq!(cache.slots.as_ptr(), slots);
+                assert_eq!(cache.slots.capacity(), capacity);
+            }
+        }
+    }
 
     fn policy() -> LodPolicy {
         crate::lod::policy(Default::default())
@@ -722,7 +1014,7 @@ mod tests {
         };
         let type_ = MapType::default();
         let projection = crate::primitive::Projection::new(camera, (800.0, 600.0), (0.0, 0.0));
-        let heading = projection.name_band(scene.blocks[0].inner, type_);
+        let heading = projection.workload(&scene, 0, 3, type_).heading;
         let body = projection
             .cell(scene.cells[0].rect, 3, type_, heading)
             .expect("visible pod body");
@@ -733,7 +1025,24 @@ mod tests {
         assert_eq!(shown[0].screen.x, f32::from(body.bounds.origin.x));
         assert_eq!(shown[0].screen.y, f32::from(body.bounds.origin.y));
         assert_eq!(shown[0].corners, body.corners);
-        let obscured = Camera { cy: 65.0, ..camera };
+        let top = crate::primitive::top_clearance(type_, (800.0, 600.0));
+        let target = top + crate::primitive::name_band_height(type_) * 0.5;
+        let obscured = Camera {
+            cy: scene.cells[0].rect.center().1 - (target - 300.0) / camera.zoom,
+            ..camera
+        };
+        let projection = crate::primitive::Projection::new(obscured, (800.0, 600.0), (0.0, 0.0));
+        let geometry = projection.workload(&scene, 0, 3, type_);
+        let heading = geometry
+            .heading
+            .expect("the pinned heading fits inside its owner");
+        assert_eq!(heading.bounds.origin.y, px(top));
+        assert!(heading.bounds.is_contained_within(&geometry.body.bounds));
+        assert!(
+            projection
+                .cell(scene.cells[0].rect, 3, type_, Some(heading))
+                .is_none()
+        );
         assert!(stamps(&frame, &scene, obscured, 800.0, 600.0).is_empty());
     }
 
@@ -973,6 +1282,83 @@ mod tests {
             rebuilt.is_empty(),
             "a new identity_rev re-resolves the mark"
         );
+    }
+
+    #[test]
+    fn sparse_overlay_parents_follow_published_cell_and_satellite_membership() {
+        let mut scene = scene_two_islands();
+        let mut other = scene.blocks[0].clone();
+        other.children = 1..2;
+        other.sats = 1..2;
+        other.inner = Rect::new(8000.0, 8000.0, 30.0, 56.0);
+        other.rect = other.inner;
+        scene.blocks.push(other);
+        let cell = scene.cells[0].clone();
+        scene.cells.push(cell);
+        scene.cells[0].rect = Rect::default();
+        let sat = scene.sats[0].clone();
+        scene.sats.push(sat);
+        scene.sats[0].rect = Rect::default();
+        scene.block_cells = vec![1, 0];
+        scene.block_sats = vec![1, 0];
+        scene.ids = Arc::new(ids(
+            &["ns-near", "ns-far"],
+            &["wl-api", "other-wl"],
+            &["", "pod-api"],
+            &["", "svc-api"],
+        ));
+        scene.identity_rev = 1;
+        let frame = OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: vec![
+                OverlayMark {
+                    uid: "pod-api".into(),
+                    tint: None,
+                    sparkline: None,
+                    label: None,
+                },
+                OverlayMark {
+                    uid: "svc-api".into(),
+                    tint: None,
+                    sparkline: None,
+                    label: None,
+                },
+            ],
+        };
+        let mut cache = StampCache::default();
+        cache.rebuild(&frame.marks, &scene);
+        assert_eq!(cache.slots[0].unwrap().block, Some(0));
+        assert_eq!(cache.slots[1].unwrap().block, Some(0));
+        let camera = Camera {
+            cx: 60.0,
+            cy: 50.0,
+            zoom: 16.0,
+        };
+        let shown = frame.visible_stamps_cached(
+            &mut cache,
+            &scene,
+            camera,
+            &policy(),
+            StageBlend::settled(3),
+            1600.0,
+            1000.0,
+        );
+        assert_eq!(shown.len(), 2);
+        Arc::make_mut(&mut scene.ids).cells[1] = Arc::from("");
+        scene.blocks[0].children = 0..0;
+        scene.identity_rev += 1;
+        let removed = frame.visible_stamps_cached(
+            &mut cache,
+            &scene,
+            camera,
+            &policy(),
+            StageBlend::settled(3),
+            1600.0,
+            1000.0,
+        );
+        assert_eq!(removed.len(), 1);
+        assert!(cache.slots[0].is_none());
+        assert_eq!(cache.slots[1].unwrap().block, Some(0));
     }
 
     #[test]

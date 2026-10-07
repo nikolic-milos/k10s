@@ -12,7 +12,7 @@ use k10s_core::{
 use crate::hex;
 use crate::primitive::{
     ISLAND_DETAIL_MIN_PX, POD_DETAIL_MIN_WIDTH, POD_MARK_MIN, Projection, STATUS_GAP, TEXT_PAD,
-    card, region as region_primitive, workload_presentation,
+    region as region_primitive, row_pitch, workload_presentation,
 };
 #[cfg(test)]
 use crate::primitive::{SAT_ICON_MAX_PX, WL_ICON_MAX_PX, WL_MEDALLION_MIN_PX, island_radii};
@@ -390,17 +390,22 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         };
         let chrome = presentation == WorkloadPresentation::Detailed
             && self.policy.block_chrome_shown(block.inner.w, self.zoom);
-        let heading = (presentation.card_shown()
-            && crate::primitive::workload_label_shown(self.policy, block.inner.w, self.zoom))
-        .then(|| self.projection().name_band(block.inner, self.type_))
-        .flatten();
+        let geometry = presentation.card_shown().then(|| {
+            self.projection()
+                .workload(scene, block_index, self.stage, self.type_)
+        });
+        let heading = geometry.and_then(|geometry| {
+            crate::primitive::workload_label_shown(self.policy, block.inner.w, self.zoom)
+                .then_some(geometry.heading)
+                .flatten()
+        });
         if presentation != WorkloadPresentation::Hidden {
             self.stats.drawn_blocks += 1;
         }
-        if presentation.card_shown() {
+        if let Some(geometry) = geometry {
             let severity = severity_index(block.ext.rollup);
             let (fill_color, border) = self.workload_paint[severity];
-            let primitive = card(self.screen_bounds(&block.inner));
+            let primitive = geometry.body;
             self.sink.fg_quad(quad(
                 primitive.bounds,
                 primitive.corners,
@@ -463,8 +468,9 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             let width = f32::from(heading.bounds.size.width) - inset - TEXT_PAD;
             let size_px = self.type_.workload;
             let line = size_px * self.type_.line_height;
+            let pitch = row_pitch(size_px, self.type_.line_height);
             let x = f32::from(heading.bounds.origin.x) + inset;
-            let y = f32::from(heading.bounds.origin.y) + TEXT_PAD;
+            let y = f32::from(heading.bounds.origin.y) + TEXT_PAD + (pitch - line) * 0.5;
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::from(&block.label),
                 x,
@@ -482,7 +488,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                     block.ext.rollup,
                 )),
                 x,
-                y: y + line,
+                y: y + pitch,
                 size_px,
                 color: self.workload_label,
                 face: LabelFace::Ui,
@@ -726,14 +732,14 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                     .min(width - TEXT_PAD)
                     .min(height - TEXT_PAD),
             );
-            let line = self.type_.pod * self.type_.line_height;
+            let pitch = row_pitch(self.type_.pod, self.type_.line_height);
             let center = primitive.bounds.center();
             let icon = crate::MarkPrimitive {
                 bounds: Bounds {
                     origin: if detailed {
                         point(
                             primitive.bounds.origin.x + px(TEXT_PAD),
-                            primitive.bounds.origin.y + px(TEXT_PAD + line + (line - side) * 0.5),
+                            primitive.bounds.origin.y + px(TEXT_PAD + pitch + (pitch - side) * 0.5),
                         )
                     } else {
                         point(center.x - px(side * 0.5), center.y - px(side * 0.5))
@@ -749,11 +755,12 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         if detailed {
             let size_px = self.type_.pod;
             let line = size_px * self.type_.line_height;
+            let pitch = row_pitch(size_px, self.type_.line_height);
             let x = f32::from(primitive.bounds.origin.x) + TEXT_PAD;
-            let y = f32::from(primitive.bounds.origin.y) + TEXT_PAD;
+            let y = f32::from(primitive.bounds.origin.y) + TEXT_PAD + (pitch - line) * 0.5;
             let label_bounds = Bounds {
                 origin: point(px(x), px(y)),
-                size: size(px(width - TEXT_PAD * 2.0), px(line * 2.0)),
+                size: size(px(width - TEXT_PAD * 2.0), px(pitch + line)),
             };
             if !self.projection().label_visible(label_bounds, self.type_) {
                 return;
@@ -778,7 +785,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::new_static(crate::status::reason_label(cell.ext.state.reason)),
                 x: x + inset,
-                y: y + line,
+                y: y + pitch,
                 size_px,
                 color: self.pod_label,
                 face: LabelFace::Ui,

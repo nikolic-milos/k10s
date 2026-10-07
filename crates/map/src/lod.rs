@@ -135,7 +135,7 @@ fn reference_content(
     st: &mut CullStats,
 ) {
     use crate::primitive::{
-        POD_DETAIL_MIN_WIDTH, POD_MARK_MIN, Projection, TEXT_PAD, name_band_height,
+        POD_DETAIL_MIN_WIDTH, POD_MARK_MIN, Projection, TEXT_PAD, name_band_height, row_pitch,
     };
     use k10s_atlas::WorkloadPresentation;
     use k10s_core::layout::{NS_HEADER, NS_PAD};
@@ -206,7 +206,11 @@ fn reference_content(
                 && block.inner.w * zoom >= policy.block_label_min_px
                 && zoom > policy.block_label_min_zoom;
             let heading = named
-                .then(|| projection.name_band(block.inner, type_))
+                .then(|| {
+                    projection
+                        .workload(scene, block_index, stage, type_)
+                        .heading
+                })
                 .flatten();
             let chrome = presentation == WorkloadPresentation::Detailed
                 && policy.block_chrome_shown(block.inner.w, zoom);
@@ -286,12 +290,13 @@ fn reference_content(
                     && policy.cell_label_shown(cell.rect.w, zoom)
                 {
                     let line = type_.pod * type_.line_height;
+                    let pitch = row_pitch(type_.pod, type_.line_height);
                     let rows = Bounds {
                         origin: point(
                             primitive.bounds.origin.x + px(TEXT_PAD),
-                            primitive.bounds.origin.y + px(TEXT_PAD),
+                            primitive.bounds.origin.y + px(TEXT_PAD + (pitch - line) * 0.5),
                         ),
-                        size: size(px(width - TEXT_PAD * 2.0), px(line * 2.0)),
+                        size: size(px(width - TEXT_PAD * 2.0), px(pitch + line)),
                     };
                     st.labels += 2 * usize::from(projection.label_visible(rows, type_));
                 }
