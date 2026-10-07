@@ -216,13 +216,18 @@ fn main() {
                         "a deeply zoomed workload must retain individual visible pods"
                     );
                 }
-                if scenario == Scenario::WlFanOut
-                    && camera_name == "fit deepest wl"
-                    && wl_degree > policy.max_cells_per_block
-                {
-                    assert!(stats.aggregated_blocks > 0);
-                    assert!(stats.aggregated_cells >= wl_degree);
-                    assert!(stats.drawn_cells <= policy.max_cells_per_block);
+                if scenario == Scenario::WlFanOut && camera_name == "fit deepest wl" {
+                    if stats.stage < 2 {
+                        assert_eq!(stats.drawn_cells, 0);
+                        assert_eq!(stats.drawn_sats, 0);
+                        assert_eq!(stats.curves, 0);
+                        assert_eq!(stats.aggregated_blocks, 0);
+                        assert_eq!(stats.aggregated_cells, 0);
+                    } else if wl_degree > policy.max_cells_per_block {
+                        assert!(stats.aggregated_blocks > 0);
+                        assert!(stats.aggregated_cells >= wl_degree);
+                        assert!(stats.drawn_cells <= policy.max_cells_per_block);
+                    }
                 }
                 let on = samples(&snap, &policy, &camera, true);
                 let off = samples(&snap, &policy, &camera, false);
