@@ -1,4 +1,5 @@
 use super::*;
+use crate::reach::MAX_BODY_BYTES;
 
 fn vector_json(series: &str) -> String {
     format!(r#"{{"status":"success","data":{{"resultType":"vector","result":[{series}]}}}}"#)

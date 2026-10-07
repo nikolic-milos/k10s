@@ -88,7 +88,8 @@ impl FrameSink for Tally {
         let b = match icon {
             IconJob::Wl(_, primitive)
             | IconJob::ToolId(_, primitive)
-            | IconJob::Sat(_, primitive) => primitive.bounds,
+            | IconJob::Sat(_, primitive)
+            | IconJob::Status(_, primitive) => primitive.bounds,
         };
         self.place(f32::from(b.origin.x), f32::from(b.origin.y));
     }

@@ -54,8 +54,12 @@ mod inspector;
 mod kargo;
 #[path = "scripted_apiserver/kyverno.rs"]
 mod kyverno;
+#[path = "scripted_apiserver/live_hplane.rs"]
+mod live_hplane;
 #[path = "scripted_apiserver/logs.rs"]
 mod logs;
+#[path = "scripted_apiserver/loki.rs"]
+mod loki;
 #[path = "scripted_apiserver/manifest.rs"]
 mod manifest;
 #[path = "scripted_apiserver/metrics.rs"]
@@ -64,6 +68,8 @@ mod metrics;
 mod netpol;
 #[path = "scripted_apiserver/nodes.rs"]
 mod nodes;
+#[path = "scripted_apiserver/observe_sources.rs"]
+mod observe_sources;
 #[path = "scripted_apiserver/otel.rs"]
 mod otel;
 #[path = "scripted_apiserver/overlay.rs"]
@@ -82,8 +88,12 @@ mod schema;
 mod secrets;
 #[path = "scripted_apiserver/tables.rs"]
 mod tables;
+#[path = "scripted_apiserver/telemetry.rs"]
+mod telemetry;
 #[path = "scripted_apiserver/tetragon.rs"]
 mod tetragon;
+#[path = "scripted_apiserver/traces.rs"]
+mod traces;
 #[path = "scripted_apiserver/traefik.rs"]
 mod traefik;
 #[path = "scripted_apiserver/vault.rs"]

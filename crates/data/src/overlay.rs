@@ -435,6 +435,7 @@ mod tests {
         let result = prom::QueryResult {
             result_type: prom::ResultType::Matrix,
             series: vec![prom::Series {
+                gaps: Vec::new(),
                 labels: vec![
                     ("namespace".into(), "prod".into()),
                     ("pod".into(), "api-0".into()),
@@ -443,6 +444,12 @@ mod tests {
             }],
             truncated: false,
             dropped_series: 0,
+            warnings: Vec::new(),
+            infos: Vec::new(),
+            source: String::new(),
+            timing: Default::default(),
+            step_ms: 0,
+            expr: String::new(),
         };
         let frame = from_prometheus(&result);
         assert_eq!(frame.stamps.len(), 1);

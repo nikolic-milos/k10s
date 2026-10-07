@@ -77,33 +77,23 @@ fn bound_on(port: u16, port_name: Option<&str>) -> Bound {
     }
 }
 
-fn api_error(code: u16) -> kube::Error {
-    kube::Error::Api(Box::new(
-        kube::core::Status::failure("scripted", "Scripted").with_code(code),
-    ))
-}
-
 #[test]
-fn a_collector_keeps_name_mode_replicas_ready_and_image() {
+fn a_collector_inventory_keeps_metadata_and_labels_unfetched_fields() {
     let collector = parse_collector(&collector_cr()).expect("the fixture is a collector");
     assert_eq!(collector.name, "simplest");
     assert_eq!(collector.namespace, "observability");
-    assert_eq!(collector.mode, "deployment");
-    assert_eq!(collector.replicas, Some(2));
-    assert_eq!(collector.ready, "True");
-    assert!(
-        collector.image.contains("opentelemetry-collector:0.96.0"),
-        "{}",
-        collector.image
-    );
+    assert_eq!(collector.mode, "Metadata only");
+    assert_eq!(collector.replicas, None);
+    assert_eq!(collector.ready, "Not fetched");
+    assert!(collector.image.is_empty());
 }
 
 #[test]
-fn a_sidecar_has_no_replicas_and_falls_back_to_available() {
+fn a_sidecar_does_not_fetch_config_or_status() {
     let collector = parse_collector(&sidecar_cr()).expect("sidecar");
-    assert_eq!(collector.mode, "sidecar");
+    assert_eq!(collector.mode, "Metadata only");
     assert_eq!(collector.replicas, None);
-    assert_eq!(collector.ready, "True");
+    assert_eq!(collector.ready, "Not fetched");
     assert!(collector.image.is_empty());
 }
 
@@ -135,6 +125,7 @@ fn config_bytes_never_appear_in_debug() {
             truncated: false,
             unreadable: 0,
         },
+        ..Inventory::default()
     };
     let debug = format!("{inventory:?}");
     assert!(!debug.contains(CONFIG_TOKEN), "{debug}");
@@ -149,12 +140,7 @@ fn a_long_image_is_clipped_where_it_is_carried() {
         "spec": { "mode": huge, "image": huge }
     });
     let collector = parse_collector(&value).expect("clipped");
-    for field in [
-        &collector.name,
-        &collector.namespace,
-        &collector.mode,
-        &collector.image,
-    ] {
+    for field in [&collector.name, &collector.namespace] {
         assert!(
             field.chars().count() <= MAX_FIELD_CHARS + 1,
             "clipped where carried: {} chars",
@@ -162,23 +148,6 @@ fn a_long_image_is_clipped_where_it_is_carried() {
         );
         assert!(field.ends_with('\u{2026}'));
     }
-}
-
-#[test]
-fn a_missing_group_is_invisible_and_a_forbidden_one_is_denied() {
-    assert!(matches!(
-        after_group(&api_error(404)),
-        GroupAnswer::NotServed
-    ));
-    assert!(
-        matches!(after_group(&api_error(403)), GroupAnswer::Denied),
-        "a 403 is Denied, never an empty inventory that looks like the operator is absent"
-    );
-    assert!(matches!(after_group(&api_error(401)), GroupAnswer::Denied));
-    assert!(matches!(
-        after_group(&api_error(500)),
-        GroupAnswer::Failed(_)
-    ));
 }
 
 #[test]
@@ -193,6 +162,7 @@ fn an_unserved_inventory_has_no_table() {
 fn a_denied_kind_is_a_labelled_row_not_an_empty_pane() {
     let page = table_page(&Inventory {
         collectors: KindSet::Denied,
+        ..Inventory::default()
     })
     .expect("Denied is served, so the table exists");
     let text = page
@@ -216,13 +186,14 @@ fn a_served_fixture_is_one_row_per_collector() {
             truncated: false,
             unreadable: 0,
         },
+        ..Inventory::default()
     })
     .expect("a served kind is a table");
     assert_eq!(page.rows.len(), 1);
     assert_eq!(page.rows[0].name, "simplest");
-    assert_eq!(page.rows[0].cells[2], "deployment");
-    assert_eq!(page.rows[0].cells[3], "2");
-    assert_eq!(page.rows[0].cells[4], "Ready");
+    assert_eq!(page.rows[0].cells[2], "Metadata only");
+    assert_eq!(page.rows[0].cells[3], "Unknown");
+    assert_eq!(page.rows[0].cells[4], "Not fetched");
 }
 
 #[test]
@@ -234,6 +205,7 @@ fn an_unreadable_count_is_a_labelled_row_not_a_silently_shorter_list() {
             truncated: false,
             unreadable: 2,
         },
+        ..Inventory::default()
     })
     .expect("a served kind is a table");
     assert_eq!(page.rows.len(), 2);
@@ -253,6 +225,7 @@ fn a_fully_readable_inventory_has_no_unreadable_row() {
             truncated: false,
             unreadable: 0,
         },
+        ..Inventory::default()
     })
     .expect("a served kind is a table");
     assert_eq!(page.rows.len(), 1);

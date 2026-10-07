@@ -37,6 +37,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
     // The ecosystem pane is a Browse-shaped table plus a family column; its
     // own context keeps tab/shift-tab from stealing focus travel elsewhere.
     let ecosystem = Some("Ecosystem");
+    let observe = Some("Observe");
     let doc = Some("Doc");
     let typing = Some("Typing");
     let editor = Some("Editor");
@@ -107,6 +108,16 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("/", EnterFilter, ecosystem),
         KeyBinding::new("escape", Back, ecosystem),
         KeyBinding::new("enter", OpenRow, ecosystem),
+        KeyBinding::new("1", ObserveRangeFifteenMinutes, observe),
+        KeyBinding::new("2", ObserveRangeOneHour, observe),
+        KeyBinding::new("x", ObserveToggleResolution, observe),
+        KeyBinding::new("t", ObserveToggleDialect, observe),
+        KeyBinding::new("p", ObserveReadiness, observe),
+        KeyBinding::new("o", ObserveOtlpLogs, observe),
+        KeyBinding::new("shift-o", ObservePodLabelLogs, observe),
+        KeyBinding::new("g", ObserveOpenGrafana, observe),
+        KeyBinding::new("tab", ObserveFocusLogs, observe),
+        KeyBinding::new("shift-tab", ObserveFocusPanels, observe),
         KeyBinding::new("up", DocScrollUp, doc),
         KeyBinding::new("down", DocScrollDown, doc),
         KeyBinding::new("pageup", DocPageUp, doc),
@@ -436,6 +447,19 @@ mod tests {
                  nothing there teaches the wrong keystroke"
             );
         }
+    }
+
+    #[test]
+    fn observe_commands_are_scoped_to_the_observe_surface() {
+        let bindings = keybindings();
+        let observe: Vec<_> = scoped_to(&bindings, "Observe").collect();
+        assert_eq!(observe.len(), 10);
+        for binding in &bindings {
+            if binding.action().name().starts_with("k10s_shell::Observe") {
+                assert_eq!(context_of(binding).as_deref(), Some("Observe"));
+            }
+        }
+        assert!(KEY_CONTEXTS.contains(&"Observe"));
     }
 
     #[test]

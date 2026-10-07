@@ -22,8 +22,8 @@ mod observe;
 
 use observe::{
     alert_pod_outcome, alertmanager_bound, alertmanager_outcome, grafana_outcome, loki_outcome,
-    omitted_notice_answer, optional_table_outcome, prom_outcome, silence_outcome, silence_spec,
-    tool_presence, trace_outcome,
+    observe_reach, omitted_notice_answer, optional_table_outcome, prom_outcome, silence_outcome,
+    silence_spec, trace_outcome,
 };
 
 mod inventory;
@@ -355,54 +355,159 @@ impl k10s_provider::ClusterProvider for PlaneProvider {
             });
     }
 
-    fn fetch_grafana(&self, reply: k10s_provider::Reply<k10s_provider::GrafanaOutcome>) {
-        self.reader
-            .fetch_grafana_catalog(move |fetched| reply(grafana_outcome(fetched)));
+    fn fetch_grafana(
+        &self,
+        reply: k10s_provider::Reply<k10s_provider::GrafanaOutcome>,
+    ) -> k10s_provider::RequestStop {
+        let stop = self
+            .reader
+            .observe_grafana(move |fetched| reply(grafana_outcome(fetched)));
+        k10s_provider::RequestStop::new(move || drop(stop))
     }
 
-    fn probe_observe(&self, reply: k10s_provider::Reply<k10s_provider::ObserveReach>) {
-        self.reader.probe_observe_tools(move |tools| {
-            reply(k10s_provider::ObserveReach {
-                prometheus: tool_presence(tools.prometheus),
-                loki: tool_presence(tools.loki),
-                traces: tool_presence(tools.traces),
-            });
+    fn probe_observe(
+        &self,
+        reply: k10s_provider::Reply<k10s_provider::ObserveReach>,
+    ) -> k10s_provider::RequestStop {
+        let stop = self.reader.observe_probe(move |fetched| {
+            reply(observe_reach(fetched));
         });
+        k10s_provider::RequestStop::new(move || drop(stop))
     }
 
-    fn query_promql(&self, expr: String, reply: k10s_provider::Reply<k10s_provider::PromOutcome>) {
-        let end = unix_secs();
-        let start = end - k10s_data::overlay::RANGE_SECS;
-        self.reader.query_prometheus(
-            expr,
-            start,
-            end,
-            k10s_data::overlay::STEP.to_string(),
+    fn resolve_observe_scope(
+        &self,
+        request: k10s_provider::DescribeRequest,
+        reply: k10s_provider::Reply<k10s_provider::ScopeOutcome>,
+    ) -> k10s_provider::RequestStop {
+        let data_request = k10s_data::describe::DescribeRequest {
+            kind: request.kind,
+            namespace: request.namespace.clone(),
+            name: request.name.clone(),
+            uid: request.uid.clone(),
+        };
+        let stop = self
+            .reader
+            .resolve_observe_scope(data_request, move |fetched| {
+                use k10s_provider::{ObserveScope, PodIdentity, ScopeOutcome};
+                reply(match fetched {
+                    k10s_data::read::Fetched::Ok(scope) => ScopeOutcome::Ready(ObserveScope {
+                        request,
+                        namespace: scope.namespace,
+                        pods: scope
+                            .pods
+                            .into_iter()
+                            .map(|pod| PodIdentity {
+                                name: pod.name,
+                                uid: pod.uid,
+                                node: pod.node,
+                            })
+                            .collect(),
+                    }),
+                    k10s_data::read::Fetched::Denied { what } => ScopeOutcome::Denied(what),
+                    k10s_data::read::Fetched::Failed { why, .. } => ScopeOutcome::Failed(why),
+                });
+            });
+        k10s_provider::RequestStop::new(move || drop(stop))
+    }
+
+    fn query_panel(
+        &self,
+        panel: k10s_provider::GrafanaPanelRow,
+        scope: k10s_provider::ObserveScope,
+        window: k10s_provider::QueryWindow,
+        reply: k10s_provider::Reply<k10s_provider::PromOutcome>,
+    ) -> k10s_provider::RequestStop {
+        if let Err(why) = window.validate() {
+            reply(k10s_provider::PromOutcome::Failed(why.to_string()));
+            return k10s_provider::RequestStop::noop();
+        }
+        if let Some(why) = panel.unsupported {
+            reply(k10s_provider::PromOutcome::Failed(why));
+            return k10s_provider::RequestStop::noop();
+        }
+        if panel.dialect != k10s_provider::QueryDialect::PromQL {
+            reply(k10s_provider::PromOutcome::Failed(
+                "unsupported datasource query dialect".into(),
+            ));
+            return k10s_provider::RequestStop::noop();
+        }
+        let variables = k10s_data::integrations::grafana::Variables {
+            namespace: scope.namespace,
+            pods: scope.pods.iter().map(|pod| pod.name.clone()).collect(),
+            node: (scope.pods.len() == 1)
+                .then(|| scope.pods[0].node.clone())
+                .filter(|node| !node.is_empty()),
+            start_ms: window.start_ms,
+            end_ms: window.end_ms,
+            step_ms: window.step_ms,
+            min_interval: panel.min_interval,
+        };
+        let target = k10s_data::integrations::grafana::PanelQuery {
+            ref_id: panel.ref_id,
+            expr: panel.expr,
+            dialect: k10s_data::integrations::grafana::QueryDialect::PromQL,
+            datasource: panel.datasource_uid,
+            min_step: panel.min_step,
+            unsupported: None,
+        };
+        let stop = self
+            .reader
+            .observe_panel(target, variables, move |fetched| {
+                reply(prom_outcome(fetched))
+            });
+        k10s_provider::RequestStop::new(move || drop(stop))
+    }
+
+    fn query_promql(
+        &self,
+        request: k10s_provider::PromRequest,
+        reply: k10s_provider::Reply<k10s_provider::PromOutcome>,
+    ) -> k10s_provider::RequestStop {
+        if let Err(why) = request.window.validate() {
+            reply(k10s_provider::PromOutcome::Failed(why.to_string()));
+            return k10s_provider::RequestStop::noop();
+        }
+        let stop = self.reader.observe_prometheus(
+            request.expr,
+            request.window.start_ms as f64 / 1000.0,
+            request.window.end_ms as f64 / 1000.0,
+            k10s_data::integrations::grafana::duration_text(request.window.step_ms),
             move |fetched| reply(prom_outcome(fetched)),
         );
+        k10s_provider::RequestStop::new(move || drop(stop))
     }
 
-    fn query_loki(&self, query: String, reply: k10s_provider::Reply<k10s_provider::LokiOutcome>) {
-        let end_ns = unix_nanos();
-        let start_ns = end_ns.saturating_sub(3_600 * 1_000_000_000);
-        self.reader.query_loki(
+    fn query_loki(
+        &self,
+        request: k10s_provider::LokiRequest,
+        reply: k10s_provider::Reply<k10s_provider::LokiOutcome>,
+    ) -> k10s_provider::RequestStop {
+        if let Err(why) = request.window.validate() {
+            reply(k10s_provider::LokiOutcome::Failed(why.to_string()));
+            return k10s_provider::RequestStop::noop();
+        }
+        let stop = self.reader.observe_loki(
             k10s_data::integrations::loki::RangeQuery {
-                query,
-                start_ns,
-                end_ns,
-                limit: 0,
+                query: request.query,
+                start_ns: request.window.start_ms as u64 * 1_000_000,
+                end_ns: request.window.end_ms as u64 * 1_000_000,
+                limit: request.limit.clamp(1, 2000),
             },
             move |fetched| reply(loki_outcome(fetched)),
         );
+        k10s_provider::RequestStop::new(move || drop(stop))
     }
 
     fn lookup_trace(
         &self,
         trace_id: String,
         reply: k10s_provider::Reply<k10s_provider::TraceOutcome>,
-    ) {
-        self.reader
-            .lookup_trace(trace_id, move |fetched| reply(trace_outcome(fetched)));
+    ) -> k10s_provider::RequestStop {
+        let stop = self
+            .reader
+            .observe_trace(trace_id, move |fetched| reply(trace_outcome(fetched)));
+        k10s_provider::RequestStop::new(move || drop(stop))
     }
 
     fn fetch_policy(&self, reply: k10s_provider::Reply<k10s_provider::TableOutcome>) {
@@ -517,20 +622,6 @@ impl k10s_provider::ClusterProvider for PlaneProvider {
                 reply(helm_rollback_outcome(fetched))
             });
     }
-}
-
-fn unix_secs() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
-fn unix_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

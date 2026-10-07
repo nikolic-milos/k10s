@@ -37,19 +37,10 @@ impl DetailBand {
 
     fn label(self) -> &'static str {
         match self {
-            DetailBand::Orbit => "ORBIT",
-            DetailBand::Region => "REGION",
-            DetailBand::System => "SYSTEM",
-            DetailBand::Instance => "INSTANCE",
-        }
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            DetailBand::Orbit => "namespace health",
-            DetailBand::Region => "workload landmarks",
-            DetailBand::System => "pods and resources",
-            DetailBand::Instance => "instance detail",
+            DetailBand::Orbit => "Namespaces",
+            DetailBand::Region => "Workloads",
+            DetailBand::System => "Pods",
+            DetailBand::Instance => "Pod details",
         }
     }
 }
@@ -67,13 +58,13 @@ pub(crate) fn detail_band(policy: &LodPolicy, zoom: f32) -> DetailBand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Density {
+pub(crate) enum Density {
     Full,
     Compact,
     Minimal,
 }
 
-fn density(width: f32, height: f32) -> Density {
+pub(crate) fn density(width: f32, height: f32) -> Density {
     if width < 500.0 || height < 300.0 {
         Density::Minimal
     } else if width < 820.0 || height < 520.0 {
@@ -112,7 +103,6 @@ struct HoverInfo {
     namespace: Option<SharedString>,
     owner: Option<SharedString>,
     status: &'static str,
-    mark: &'static str,
     severity: Option<Severity>,
     overlay_kind: Option<OverlayKind>,
     overlay_label: Option<SharedString>,
@@ -140,23 +130,30 @@ impl HoverInfo {
             )),
             k10s_core::Level::Block => {
                 let node = scene.blocks.get(path.block? as usize)?;
-                Some(HoverInfo::new(
+                let mut info = HoverInfo::new(
                     kind_name(node.ext.kind),
                     SharedString::from(&node.label),
                     Some(namespace),
                     None,
-                    Some(node.ext.rollup),
-                ))
+                    Some(crate::status::workload_severity(
+                        node.children.len(),
+                        node.ext.rollup,
+                    )),
+                );
+                info.status = crate::status::workload_label(node.children.len(), node.ext.rollup);
+                Some(info)
             }
             k10s_core::Level::Cell => {
                 let node = scene.cells.get(path.cell? as usize)?;
-                Some(HoverInfo::new(
+                let mut info = HoverInfo::new(
                     "Pod",
                     SharedString::from(&node.label),
                     Some(namespace),
                     owner(),
                     Some(node.ext.state.severity),
-                ))
+                );
+                info.status = crate::status::reason_label(node.ext.state.reason);
+                Some(info)
             }
             k10s_core::Level::Sat => {
                 let node = scene.sats.get(path.sat? as usize)?;
@@ -166,7 +163,6 @@ impl HoverInfo {
                     namespace: Some(namespace),
                     owner: owner(),
                     status: "Attached",
-                    mark: "◇",
                     severity: None,
                     overlay_kind: None,
                     overlay_label: None,
@@ -184,19 +180,13 @@ impl HoverInfo {
         owner: Option<SharedString>,
         severity: Option<Severity>,
     ) -> HoverInfo {
-        let (status, mark) = match severity.unwrap_or(Severity::Unknown) {
-            Severity::Ok => ("Healthy", "✓"),
-            Severity::Warn => ("Warning", "!"),
-            Severity::Err => ("Critical", "×"),
-            Severity::Unknown => ("Unknown", "?"),
-        };
+        let status = crate::status::label(severity.unwrap_or(Severity::Unknown));
         HoverInfo {
             kind,
             name,
             namespace,
             owner,
             status,
-            mark,
             severity,
             overlay_kind: None,
             overlay_label: None,

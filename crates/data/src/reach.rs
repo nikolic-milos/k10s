@@ -22,9 +22,12 @@
 
 use std::time::Duration;
 
+use futures::StreamExt;
+use http_body_util::BodyExt;
+
 use k8s_openapi::api::core::v1::{Service, ServicePort};
 use kube::Client;
-use kube::api::{Api, ListParams};
+use kube::api::{ListParams, ObjectList, Request};
 
 use crate::read::{Fetched, classify};
 
@@ -38,6 +41,7 @@ pub const MAX_BODY_BYTES: usize = 8 << 20;
 
 const PAGE_LIMIT: u32 = 200;
 const MAX_SERVICES: usize = 2_000;
+const MAX_SERVICE_PAGES: usize = 16;
 
 /// One ecosystem tool k10s knows how to find. Independent of [`k10s_core::ToolId`]:
 /// that table is the map's vendor glyphs, and growing it re-lays theme arrays.
@@ -179,6 +183,24 @@ pub struct Bound {
     pub found: Option<FoundService>,
     pub transport: Transport,
     pub auth: ToolAuth,
+}
+
+impl Bound {
+    pub fn source(&self) -> String {
+        match &self.transport {
+            Transport::Proxy {
+                namespace,
+                service,
+                port,
+            } => format!("{namespace}/{service}:{port}"),
+            Transport::NeedsForward {
+                namespace,
+                name,
+                port,
+            } => format!("{namespace}/{name}:{port} (forward required)"),
+            Transport::Url { base } => base.clone(),
+        }
+    }
 }
 
 /// Why a visible tool still has no section.
@@ -422,35 +444,115 @@ fn pick_port(ports: Option<&[ServicePort]>, spec: &Fingerprint) -> Option<Picked
 /// List Services and keep the ones that match a fingerprint. Cluster-wide,
 /// paged, capped: a tool hunt is not a watch and must not grow without bound.
 pub async fn find_services(client: &Client, kind: ToolKind) -> Fetched<Vec<FoundService>> {
-    let api: Api<Service> = Api::all(client.clone());
-    let mut found = Vec::new();
+    match discover_services(client).await {
+        Fetched::Ok(services) => Fetched::Ok(service_candidates(kind, &services)),
+        Fetched::Denied { what } => Fetched::Denied { what },
+        Fetched::Failed { what, why } => Fetched::Failed { what, why },
+    }
+}
+
+pub(crate) async fn discover_services(client: &Client) -> Fetched<Vec<Service>> {
+    let mut services = Vec::new();
     let mut token: Option<String> = None;
-    let mut scanned = 0usize;
-    loop {
+    let mut body_bytes = 0usize;
+    for _ in 0..MAX_SERVICE_PAGES {
+        if body_bytes == MAX_BODY_BYTES {
+            return Fetched::Failed {
+                what: "services",
+                why: "tool discovery exceeds 8 MiB; no partial binding is chosen".to_string(),
+            };
+        }
         let mut params = ListParams::default().limit(PAGE_LIMIT);
         if let Some(token) = token.as_deref() {
             params = params.continue_token(token);
         }
-        let page = match api.list(&params).await {
-            Ok(page) => page,
-            Err(error) => return classify("services", &error),
+        let request = Request::new("/api/v1/services".to_string())
+            .list(&params)
+            .expect("service list parameters");
+        let bytes = match bounded_request_with_status(
+            client,
+            "services",
+            request,
+            MAX_BODY_BYTES - body_bytes,
+        )
+        .await
+        .1
+        {
+            Fetched::Ok(bytes) => bytes,
+            Fetched::Denied { what } => return Fetched::Denied { what },
+            Fetched::Failed { what, why } => return Fetched::Failed { what, why },
         };
-        for svc in page.items {
-            scanned += 1;
-            if scanned > MAX_SERVICES {
-                break;
+        body_bytes += bytes.len();
+        let page: ObjectList<Service> = match serde_json::from_slice(&bytes) {
+            Ok(page) => page,
+            Err(error) => {
+                return Fetched::Failed {
+                    what: "services",
+                    why: format!("services returned an unsupported response: {error}"),
+                };
             }
-            if let Some(hit) = match_service(kind, &svc) {
-                found.push(hit);
-            }
+        };
+        if services.len() + page.items.len() > MAX_SERVICES
+            || services.len() + page.items.len() == MAX_SERVICES
+                && page
+                    .metadata
+                    .continue_
+                    .as_deref()
+                    .is_some_and(|token| !token.is_empty())
+        {
+            return Fetched::Failed {
+                what: "services",
+                why: format!(
+                    "tool discovery exceeds {MAX_SERVICES} Services; no partial binding is chosen"
+                ),
+            };
         }
-        token = page.metadata.continue_.filter(|s| !s.is_empty());
-        if token.is_none() || scanned > MAX_SERVICES {
-            break;
+        services.extend(page.items);
+        let next = page.metadata.continue_.filter(|token| !token.is_empty());
+        if next.is_none() {
+            return Fetched::Ok(services);
         }
+        if next == token {
+            return Fetched::Failed {
+                what: "services",
+                why: "tool discovery repeated a continuation token; no partial binding is chosen"
+                    .to_string(),
+            };
+        }
+        token = next;
     }
+    Fetched::Failed {
+        what: "services",
+        why: format!(
+            "tool discovery exceeds {MAX_SERVICE_PAGES} pages; no partial binding is chosen"
+        ),
+    }
+}
+
+pub(crate) fn service_candidates(kind: ToolKind, services: &[Service]) -> Vec<FoundService> {
+    let mut found: Vec<_> = services
+        .iter()
+        .filter_map(|service| {
+            match_service(kind, service).map(|found| {
+                (
+                    found,
+                    service
+                        .spec
+                        .as_ref()
+                        .and_then(|spec| spec.cluster_ip.as_deref())
+                        == Some("None"),
+                )
+            })
+        })
+        .collect();
+    // API-server routes use ordinary Services; headless controller discovery
+    // is considered only when no routed endpoint exists.
+    if found.iter().any(|(_, headless)| !headless) {
+        found.retain(|(_, headless)| !headless);
+    }
+    let mut found: Vec<_> = found.into_iter().map(|(found, _)| found).collect();
     found.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
-    Fetched::Ok(found)
+    found
 }
 
 /// Bind one tool: settings URL, then an in-cluster Service via proxy, then a
@@ -481,6 +583,27 @@ pub async fn bind(client: &Client, kind: ToolKind, settings: &ReachSettings) -> 
         }
     };
 
+    bind_candidates(client, kind, over, found).await
+}
+
+pub(crate) async fn bind_candidates(
+    client: &Client,
+    kind: ToolKind,
+    over: &ToolOverride,
+    found: Vec<FoundService>,
+) -> ToolReach {
+    if found.len() > 1 {
+        return ToolReach::Unbound(Unbound {
+            kind,
+            found: None,
+            browser_url: None,
+            why: format!(
+                "{} matches {} routed Services; name a source URL in settings before querying",
+                kind.as_str(),
+                found.len()
+            ),
+        });
+    }
     let Some(service) = found.into_iter().next() else {
         return ToolReach::Absent { kind };
     };
@@ -509,31 +632,41 @@ pub async fn bind(client: &Client, kind: ToolKind, settings: &ReachSettings) -> 
             },
             auth: ToolAuth::Anonymous,
         }),
-        Probe::Unauthorized => ToolReach::Unbound(Unbound {
+        Probe::Denied(what) => ToolReach::Unbound(Unbound {
             kind,
             found: Some(service.clone()),
             why: format!(
-                "{} answered through the API-server proxy but wants a token; name one in settings, \
-                 or it can be reached by port-forward",
-                kind.as_str()
+                "{} proxy: {what} access denied for this account",
+                kind.as_str(),
             ),
             browser_url: Some(browser_hint(&service)),
         }),
-        Probe::Failed => ToolReach::Bound(Bound {
+        Probe::Failed(why) => ToolReach::Unbound(Unbound {
             kind,
-            found: Some(service.clone()),
-            transport: Transport::NeedsForward {
-                namespace: service.namespace,
-                name: service.name,
-                port: service.port,
-            },
-            auth: ToolAuth::Anonymous,
+            found: Some(service),
+            why,
+            browser_url: None,
         }),
     }
 }
 
 fn bind_url(kind: ToolKind, url: &str, auth: ToolAuth) -> ToolReach {
     let trimmed = url.trim();
+    if http::Uri::try_from(trimmed)
+        .ok()
+        .and_then(|uri| {
+            uri.authority()
+                .map(|authority| authority.as_str().contains('@'))
+        })
+        .unwrap_or(false)
+    {
+        return ToolReach::Unbound(Unbound {
+            kind,
+            found: None,
+            why: "tool URLs must not contain credentials; use named authentication".into(),
+            browser_url: None,
+        });
+    }
     if trimmed.starts_with("https://") {
         return ToolReach::Unbound(Unbound {
             kind,
@@ -576,25 +709,24 @@ fn browser_hint(found: &FoundService) -> String {
 
 enum Probe {
     Ready,
-    Unauthorized,
-    Failed,
+    Denied(&'static str),
+    Failed(String),
 }
 
 async fn probe_proxy(client: &Client, found: &FoundService) -> Probe {
     let spec = fingerprint(found.kind);
     let path = proxy_path(found, spec.probe_path);
-    let request = match http::Request::get(&path).body(Vec::new()) {
+    let request = match http::Request::get(&path)
+        .header(http::header::ACCEPT, "application/json")
+        .body(Vec::new())
+    {
         Ok(request) => request,
-        Err(_) => return Probe::Failed,
+        Err(error) => return Probe::Failed(error.to_string()),
     };
-    match tokio::time::timeout(PROBE_DEADLINE, client.request_text(request)).await {
-        Err(_) => Probe::Failed,
-        Ok(Ok(text)) if text.len() > MAX_BODY_BYTES => Probe::Failed,
-        Ok(Ok(_)) => Probe::Ready,
-        Ok(Err(kube::Error::Api(response))) if matches!(response.code, 401 | 403) => {
-            Probe::Unauthorized
-        }
-        Ok(Err(_)) => Probe::Failed,
+    match bounded_request(client, found.kind.slug(), request).await {
+        Fetched::Ok(_) => Probe::Ready,
+        Fetched::Denied { what } => Probe::Denied(what),
+        Fetched::Failed { why, .. } => Probe::Failed(why),
     }
 }
 
@@ -622,6 +754,14 @@ pub fn proxy_path(found: &FoundService, rest: &str) -> String {
 /// settings https URL is a browser hole. The body is capped; oversize is
 /// Failed, not truncated.
 pub async fn tool_get(client: &Client, bound: &Bound, rest: &str) -> Fetched<Vec<u8>> {
+    tool_get_with_status(client, bound, rest).await.1
+}
+
+pub(crate) async fn tool_get_with_status(
+    client: &Client,
+    bound: &Bound,
+    rest: &str,
+) -> (Option<http::StatusCode>, Fetched<Vec<u8>>) {
     match &bound.transport {
         Transport::Proxy {
             namespace,
@@ -635,49 +775,47 @@ pub async fn tool_get(client: &Client, bound: &Bound, rest: &str) -> Fetched<Vec
                 port: *port,
                 port_name: None,
             };
-            proxy_get(client, &found, rest).await
+            proxy_get_with_status(client, &found, rest).await
         }
-        Transport::NeedsForward { .. } => Fetched::Failed {
-            what: bound.kind.slug(),
-            why: format!(
-                "{} needs a port-forward before it can be queried; open one from the forwards panel",
-                bound.kind.as_str()
-            ),
-        },
-        Transport::Url { base } => plaintext_http_get(base, rest, &bound.auth).await,
+        Transport::NeedsForward { .. } => (
+            None,
+            Fetched::Failed {
+                what: bound.kind.slug(),
+                why: format!(
+                    "{} needs a port-forward before it can be queried; open one from the forwards panel",
+                    bound.kind.as_str()
+                ),
+            },
+        ),
+        Transport::Url { base } => plaintext_http_get_with_status(base, rest, &bound.auth).await,
     }
 }
 
-async fn proxy_get(client: &Client, found: &FoundService, rest: &str) -> Fetched<Vec<u8>> {
+async fn proxy_get_with_status(
+    client: &Client,
+    found: &FoundService,
+    rest: &str,
+) -> (Option<http::StatusCode>, Fetched<Vec<u8>>) {
     let path = proxy_path(found, rest);
-    let request = match http::Request::get(&path).body(Vec::new()) {
+    let request = match http::Request::get(&path)
+        .header(http::header::ACCEPT, "application/json")
+        .body(Vec::new())
+    {
         Ok(request) => request,
         Err(error) => {
-            return Fetched::Failed {
-                what: found.kind.slug(),
-                why: error.to_string(),
-            };
+            return (
+                None,
+                Fetched::Failed {
+                    what: found.kind.slug(),
+                    why: error.to_string(),
+                },
+            );
         }
     };
-    match tokio::time::timeout(PROBE_DEADLINE, client.request_text(request)).await {
-        Err(_) => Fetched::Failed {
-            what: found.kind.slug(),
-            why: format!("{} did not answer within 4 seconds", found.kind.as_str()),
-        },
-        Ok(Ok(text)) if text.len() > MAX_BODY_BYTES => Fetched::Failed {
-            what: found.kind.slug(),
-            why: format!(
-                "{} answered with more than {MAX_BODY_BYTES} bytes; the body is hidden",
-                found.kind.as_str()
-            ),
-        },
-        Ok(Ok(text)) => Fetched::Ok(text.into_bytes()),
-        Ok(Err(error)) => classify(found.kind.slug(), &error),
-    }
+    bounded_request_with_status(client, found.kind.slug(), request, MAX_BODY_BYTES).await
 }
 
-/// POST form or JSON through the service proxy. Prometheus `query_range` is
-/// a POST; the content type is the caller's.
+/// POST form or JSON through the service proxy. The content type is the caller's.
 pub async fn tool_post(
     client: &Client,
     bound: &Bound,
@@ -714,6 +852,7 @@ pub async fn tool_post(
     };
     let path = proxy_path(&found, rest);
     let request = match http::Request::post(&path)
+        .header(http::header::ACCEPT, "application/json")
         .header(http::header::CONTENT_TYPE, content_type)
         .body(body)
     {
@@ -725,26 +864,115 @@ pub async fn tool_post(
             };
         }
     };
-    match tokio::time::timeout(PROBE_DEADLINE, client.request_text(request)).await {
-        Err(_) => Fetched::Failed {
-            what: bound.kind.slug(),
-            why: format!("{} did not answer within 4 seconds", bound.kind.as_str()),
-        },
-        Ok(Ok(text)) if text.len() > MAX_BODY_BYTES => Fetched::Failed {
-            what: bound.kind.slug(),
-            why: format!(
-                "{} answered with more than {MAX_BODY_BYTES} bytes; the body is hidden",
-                found.kind.as_str()
-            ),
-        },
-        Ok(Ok(text)) => Fetched::Ok(text.into_bytes()),
-        Ok(Err(error)) => classify(found.kind.slug(), &error),
-    }
+    bounded_request(client, bound.kind.slug(), request).await
 }
 
-async fn plaintext_http_get(base: &str, rest: &str, auth: &ToolAuth) -> Fetched<Vec<u8>> {
+pub(crate) async fn bounded_request(
+    client: &Client,
+    what: &'static str,
+    request: http::Request<Vec<u8>>,
+) -> Fetched<Vec<u8>> {
+    bounded_request_with_status(client, what, request, MAX_BODY_BYTES)
+        .await
+        .1
+}
+
+/// Absence and version fallback statuses require a complete bounded body.
+/// Denied statuses are returned without reading the body.
+pub(crate) async fn bounded_request_with_status(
+    client: &Client,
+    what: &'static str,
+    request: http::Request<Vec<u8>>,
+    body_limit: usize,
+) -> (Option<http::StatusCode>, Fetched<Vec<u8>>) {
+    let started = std::time::Instant::now();
+    let mut response_status = None;
+    let mut received_bytes = 0usize;
+    let exchange = async {
+        let response = match client.send(request.map(kube::client::Body::from)).await {
+            Ok(response) => response,
+            Err(error) => return classify(what, &error),
+        };
+        let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            response_status = Some(status);
+            return Fetched::Denied { what };
+        }
+        let cap = if status.is_success() {
+            body_limit
+        } else {
+            body_limit.min(32 << 10)
+        };
+        let mut body = response.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    return Fetched::Failed {
+                        what,
+                        why: crate::connect::describe(&error),
+                    };
+                }
+            };
+            received_bytes += chunk.len();
+            if chunk.len() > cap.saturating_sub(bytes.len()) {
+                return Fetched::Failed {
+                    what,
+                    why: format!(
+                        "{} answered with more than {cap} bytes; the body is refused",
+                        what
+                    ),
+                };
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        response_status = Some(status);
+        if status.is_success() {
+            return Fetched::Ok(bytes);
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let sentence = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .or_else(|| value.get("error"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| {
+                if text.trim().is_empty() {
+                    status.to_string()
+                } else {
+                    text.trim().to_string()
+                }
+            });
+        Fetched::Failed {
+            what,
+            why: sentence,
+        }
+    };
+    let outcome = tokio::time::timeout(PROBE_DEADLINE, exchange)
+        .await
+        .unwrap_or_else(|_| Fetched::Failed {
+            what,
+            why: format!("{what} did not answer within 4 seconds"),
+        });
+    crate::telemetry::record_request(started.elapsed().as_nanos() as u64, received_bytes);
+    (response_status, outcome)
+}
+
+async fn plaintext_http_get_with_status(
+    base: &str,
+    rest: &str,
+    auth: &ToolAuth,
+) -> (Option<http::StatusCode>, Fetched<Vec<u8>>) {
     let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
-    plaintext_http_get_until(base, rest, auth, deadline).await
+    let mut status = None;
+    let outcome = plaintext_http_get_until(base, rest, auth, deadline, &mut status).await;
+    (status, outcome)
 }
 
 /// One deadline bounds the whole exchange -- connect, write, and every read --
@@ -754,6 +982,7 @@ async fn plaintext_http_get_until(
     rest: &str,
     auth: &ToolAuth,
     deadline: tokio::time::Instant,
+    response_status: &mut Option<http::StatusCode>,
 ) -> Fetched<Vec<u8>> {
     let Ok(url) = http::Uri::try_from(join_url(base, rest)) else {
         return Fetched::Failed {
@@ -852,7 +1081,9 @@ async fn plaintext_http_get_until(
             }
         }
     }
-    split_http_body(&buf)
+    let (status, outcome) = split_http_body_with_status(&buf);
+    *response_status = status;
+    outcome
 }
 
 fn join_url(base: &str, rest: &str) -> String {
@@ -864,12 +1095,20 @@ fn join_url(base: &str, rest: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn split_http_body(raw: &[u8]) -> Fetched<Vec<u8>> {
+    split_http_body_with_status(raw).1
+}
+
+fn split_http_body_with_status(raw: &[u8]) -> (Option<http::StatusCode>, Fetched<Vec<u8>>) {
     let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return Fetched::Failed {
-            what: "url",
-            why: "the settings URL answered with no HTTP header terminator".to_string(),
-        };
+        return (
+            None,
+            Fetched::Failed {
+                what: "url",
+                why: "the settings URL answered with no HTTP header terminator".to_string(),
+            },
+        );
     };
     let headers = &raw[..split];
     let body = &raw[split + 4..];
@@ -881,22 +1120,31 @@ fn split_http_body(raw: &[u8]) -> Fetched<Vec<u8>> {
             line.split_whitespace().nth(1)?.parse::<u16>().ok()
         })
         .unwrap_or(0);
+    let response_status = (body.len() <= MAX_BODY_BYTES)
+        .then(|| http::StatusCode::from_u16(status).ok())
+        .flatten();
     if matches!(status, 401 | 403) {
-        return Fetched::Denied { what: "url" };
+        return (response_status, Fetched::Denied { what: "url" });
     }
     if !(200..300).contains(&status) {
-        return Fetched::Failed {
-            what: "url",
-            why: format!("the settings URL answered {status}"),
-        };
+        return (
+            response_status,
+            Fetched::Failed {
+                what: "url",
+                why: format!("the settings URL answered {status}"),
+            },
+        );
     }
     if body.len() > MAX_BODY_BYTES {
-        return Fetched::Failed {
-            what: "url",
-            why: format!("the answer exceeded {MAX_BODY_BYTES} bytes; it is hidden"),
-        };
+        return (
+            None,
+            Fetched::Failed {
+                what: "url",
+                why: format!("the answer exceeded {MAX_BODY_BYTES} bytes; it is hidden"),
+            },
+        );
     }
-    Fetched::Ok(body.to_vec())
+    (response_status, Fetched::Ok(body.to_vec()))
 }
 
 /// Bytes that must not outlive the action that revealed them.

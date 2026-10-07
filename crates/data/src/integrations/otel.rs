@@ -1,4 +1,4 @@
-//! OpenTelemetry Collector inventory from the CRs the operator already
+//! OpenTelemetry Collector metadata from the CRs the operator already
 //! publishes, plus a health GET on a bound collector.
 //!
 //! `OpenTelemetryCollector` lives on `opentelemetry.io`. A cluster that does
@@ -9,7 +9,9 @@
 //! YAML or a structured object and routinely holds exporter tokens. Revealing
 //! it would need [`crate::reach::Scratch`] and an explicit click; that path
 //! is out of scope here. The inventory types have nowhere to put those bytes,
-//! and their `Debug` impls therefore cannot print them.
+//! and the request requires PartialObjectMetadataList without a full-object fallback.
+//! Group discovery is capped at 64 KiB. Metadata pages share an eight-MiB
+//! budget and sixteen LIST exchanges; each exchange has a four-second deadline.
 //!
 //! Health is a GET of a well-known extension path on a [`crate::reach::Bound`]
 //! `OtelCollector`. zpages (55679) and the health_check extension (13133)
@@ -26,7 +28,7 @@ use serde_json::Value;
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::reach::{Bound, ToolAuth, ToolKind, Transport, tool_get};
 use crate::read::Fetched;
-use crate::served::{ListErr, after_list};
+use crate::served::ListErr;
 
 pub const MAX_COLLECTORS: usize = 2_000;
 pub const MAX_FIELD_CHARS: usize = 200;
@@ -37,6 +39,8 @@ pub const METRICS_PORT: u16 = 8888;
 pub const OTLP_HTTP_PORT: u16 = 4318;
 
 const PAGE_LIMIT: u32 = 200;
+const MAX_GROUP_BYTES: usize = 64 << 10;
+const MAX_LIST_REQUESTS: usize = 16;
 const GROUP: &str = "opentelemetry.io";
 const PLURAL: &str = "opentelemetrycollectors";
 const FALLBACK_VERSION: &str = "v1beta1";
@@ -88,12 +92,23 @@ impl KindSet {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Inventory {
     pub collectors: KindSet,
+    pub services: Vec<CollectorService>,
+    pub services_truncated: bool,
 }
 
 impl Inventory {
     pub fn served(&self) -> bool {
-        self.collectors.served()
+        self.collectors.served() || !self.services.is_empty()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectorService {
+    pub name: String,
+    pub namespace: String,
+    pub port: u16,
+    pub health: String,
+    pub source: String,
 }
 
 /// The extension answered. The path is kept so a UI can say which one spoke.
@@ -118,10 +133,17 @@ struct WireGroupVersion {
 
 #[derive(Deserialize)]
 struct WireList {
+    kind: String,
     #[serde(default)]
     metadata: WireListMeta,
-    #[serde(default)]
+    #[serde(deserialize_with = "list_items")]
     items: Vec<WireObject>,
+}
+
+fn list_items<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<WireObject>, D::Error> {
+    Ok(Option::<Vec<WireObject>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Deserialize, Default)]
@@ -134,10 +156,6 @@ struct WireListMeta {
 struct WireObject {
     #[serde(default)]
     metadata: WireMeta,
-    #[serde(default)]
-    spec: WireSpec,
-    #[serde(default)]
-    status: WireStatus,
 }
 
 #[derive(Deserialize, Default)]
@@ -148,51 +166,11 @@ struct WireMeta {
     namespace: String,
 }
 
-#[derive(Deserialize, Default)]
-struct WireSpec {
-    #[serde(default)]
-    mode: String,
-    #[serde(default)]
-    replicas: Option<i32>,
-    #[serde(default)]
-    image: String,
-}
-
-#[derive(Deserialize, Default)]
-struct WireStatus {
-    #[serde(default)]
-    image: String,
-    #[serde(default)]
-    conditions: Vec<WireCondition>,
-}
-
-#[derive(Deserialize, Default)]
-struct WireCondition {
-    #[serde(default, rename = "type")]
-    type_name: String,
-    #[serde(default)]
-    status: String,
-}
-
 pub(crate) enum GroupAnswer {
     Served(Vec<String>),
     NotServed,
     Denied,
     Failed(String),
-}
-
-pub(crate) fn after_group(error: &kube::Error) -> GroupAnswer {
-    if let kube::Error::Api(response) = error {
-        if matches!(response.code, 401 | 403) {
-            return GroupAnswer::Denied;
-        }
-        if response.code == 404 {
-            return GroupAnswer::NotServed;
-        }
-    }
-    GroupAnswer::Failed(crate::connect::describe(
-        error as &(dyn std::error::Error + 'static),
-    ))
 }
 
 fn clip(text: &str) -> String {
@@ -206,39 +184,21 @@ fn clip(text: &str) -> String {
     }
 }
 
-fn ready_of(conditions: &[WireCondition]) -> String {
-    conditions
-        .iter()
-        .find(|condition| condition.type_name == "Ready")
-        .or_else(|| {
-            conditions
-                .iter()
-                .find(|condition| condition.type_name == "Available")
-        })
-        .map(|condition| clip(&condition.status))
-        .unwrap_or_default()
-}
-
 fn from_wire(wire: WireObject) -> Option<Collector> {
     if wire.metadata.name.is_empty() {
         return None;
     }
-    let image = if !wire.spec.image.is_empty() {
-        wire.spec.image.as_str()
-    } else {
-        wire.status.image.as_str()
-    };
     Some(Collector {
         name: clip(&wire.metadata.name),
         namespace: clip(&wire.metadata.namespace),
-        mode: clip(&wire.spec.mode),
-        replicas: wire.spec.replicas,
-        ready: ready_of(&wire.status.conditions),
-        image: clip(image),
+        mode: "Metadata only".into(),
+        replicas: None,
+        ready: "Not fetched".into(),
+        image: String::new(),
     })
 }
 
-/// Reduce one CR. `spec.config` is ignored by the wire types on purpose.
+/// Reduce metadata; configuration and status are never required for inventory.
 pub fn parse_collector(value: &Value) -> Option<Collector> {
     let wire: WireObject = serde_json::from_value(value.clone()).ok()?;
     from_wire(wire)
@@ -273,12 +233,25 @@ fn collection_url(version: &str, namespace: Option<&str>) -> String {
 }
 
 async fn probe_group(client: &Client) -> GroupAnswer {
-    let request = match http::Request::get(format!("/apis/{GROUP}")).body(Vec::new()) {
+    let request = match http::Request::get(format!("/apis/{GROUP}"))
+        .header(http::header::ACCEPT, "application/json")
+        .body(Vec::new())
+    {
         Ok(request) => request,
         Err(error) => return GroupAnswer::Failed(error.to_string()),
     };
-    match client.request::<WireGroup>(request).await {
-        Ok(group) => {
+    let (status, outcome) =
+        crate::reach::bounded_request_with_status(client, WHAT, request, MAX_GROUP_BYTES).await;
+    match outcome {
+        Fetched::Ok(bytes) => {
+            let group: WireGroup = match serde_json::from_slice(&bytes) {
+                Ok(group) => group,
+                Err(error) => {
+                    return GroupAnswer::Failed(format!(
+                        "{GROUP} discovery returned an unsupported response: {error}"
+                    ));
+                }
+            };
             let versions = order_versions(&group.preferred.version, {
                 group
                     .versions
@@ -286,42 +259,96 @@ async fn probe_group(client: &Client) -> GroupAnswer {
                     .map(|item| item.version)
                     .collect()
             });
+            if versions.iter().any(|version| {
+                version.bytes().any(|byte| {
+                    !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && byte != b'-'
+                })
+            }) {
+                return GroupAnswer::Failed(format!(
+                    "{GROUP} discovery returned an unsupported API version"
+                ));
+            }
             GroupAnswer::Served(versions)
         }
-        Err(error) => after_group(&error),
+        Fetched::Denied { .. } => GroupAnswer::Denied,
+        Fetched::Failed { .. } if status == Some(http::StatusCode::NOT_FOUND) => {
+            GroupAnswer::NotServed
+        }
+        Fetched::Failed { why, .. } => GroupAnswer::Failed(why),
     }
+}
+
+#[derive(Default)]
+struct ListBudget {
+    requests: usize,
+    bytes: usize,
 }
 
 async fn list_at_version(
     client: &Client,
     version: &str,
     namespace: Option<&str>,
+    budget: &mut ListBudget,
 ) -> Result<KindSet, ListErr> {
     let path = collection_url(version, namespace);
     let mut items = Vec::new();
     let mut unreadable = 0usize;
     let mut token: Option<String> = None;
     let mut truncated = false;
+    let mut pages = 0usize;
     loop {
+        if budget.requests == MAX_LIST_REQUESTS {
+            return Err(ListErr::Failed(format!(
+                "{WHAT} exceed {MAX_LIST_REQUESTS} LIST exchanges; no partial inventory is used"
+            )));
+        }
+        if budget.bytes == crate::reach::MAX_BODY_BYTES {
+            return Err(ListErr::Failed(format!(
+                "{WHAT} exceed 8 MiB; no partial inventory is used"
+            )));
+        }
         let mut params = ListParams::default().limit(PAGE_LIMIT);
         if let Some(token) = &token {
             params = params.continue_token(token);
         }
-        let request = match Request::new(path.clone()).list(&params) {
+        let mut request = match Request::new(path.clone()).list(&params) {
             Ok(request) => request,
             Err(error) => return Err(ListErr::Failed(error.to_string())),
         };
-        let page = match client.request::<WireList>(request).await {
-            Ok(page) => page,
-            Err(error) if items.is_empty() && unreadable == 0 => return Err(after_list(&error)),
-            Err(error) => {
-                return Err(ListErr::Failed(crate::connect::describe(
-                    &error as &(dyn std::error::Error + 'static),
-                )));
+        request.headers_mut().insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static(
+                "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            ),
+        );
+        budget.requests += 1;
+        let (status, outcome) = crate::reach::bounded_request_with_status(
+            client,
+            WHAT,
+            request,
+            crate::reach::MAX_BODY_BYTES - budget.bytes,
+        )
+        .await;
+        let bytes = match outcome {
+            Fetched::Ok(bytes) => bytes,
+            Fetched::Denied { .. } => return Err(ListErr::Denied),
+            Fetched::Failed { .. } if pages == 0 && status == Some(http::StatusCode::NOT_FOUND) => {
+                return Err(ListErr::NotFound);
             }
+            Fetched::Failed { why, .. } => return Err(ListErr::Failed(why)),
         };
+        budget.bytes += bytes.len();
+        pages += 1;
+        let page: WireList = serde_json::from_slice(&bytes).map_err(|error| {
+            ListErr::Failed(format!("{WHAT} returned an unsupported response: {error}"))
+        })?;
+        if page.kind != "PartialObjectMetadataList" {
+            return Err(ListErr::Failed(format!(
+                "{WHAT} did not return PartialObjectMetadataList; no full-object inventory is used"
+            )));
+        }
         for wire in page.items {
-            if items.len() == MAX_COLLECTORS {
+            if items.len() + unreadable == MAX_COLLECTORS {
                 truncated = true;
                 break;
             }
@@ -330,10 +357,19 @@ async fn list_at_version(
                 None => unreadable += 1,
             }
         }
-        token = (!page.metadata.cont.is_empty() && !truncated).then_some(page.metadata.cont);
-        if token.is_none() {
+        if page.metadata.cont.is_empty() {
             break;
         }
+        if items.len() + unreadable == MAX_COLLECTORS || truncated {
+            truncated = true;
+            break;
+        }
+        if token.as_deref() == Some(page.metadata.cont.as_str()) {
+            return Err(ListErr::Failed(format!(
+                "{WHAT} repeated a continuation token; no partial inventory is used"
+            )));
+        }
+        token = Some(page.metadata.cont);
     }
     Ok(KindSet::Served {
         items,
@@ -349,11 +385,13 @@ pub async fn fetch(client: &Client, namespace: Option<&str>) -> Fetched<Inventor
         GroupAnswer::NotServed => {
             return Fetched::Ok(Inventory {
                 collectors: KindSet::NotServed,
+                ..Inventory::default()
             });
         }
         GroupAnswer::Denied => {
             return Fetched::Ok(Inventory {
                 collectors: KindSet::Denied,
+                ..Inventory::default()
             });
         }
         GroupAnswer::Failed(why) => {
@@ -361,15 +399,20 @@ pub async fn fetch(client: &Client, namespace: Option<&str>) -> Fetched<Inventor
         }
         GroupAnswer::Served(versions) => versions,
     };
+    let mut budget = ListBudget::default();
     for version in versions {
-        match list_at_version(client, &version, namespace).await {
+        match list_at_version(client, &version, namespace, &mut budget).await {
             Ok(set) => {
-                return Fetched::Ok(Inventory { collectors: set });
+                return Fetched::Ok(Inventory {
+                    collectors: set,
+                    ..Inventory::default()
+                });
             }
             Err(ListErr::NotFound) => continue,
             Err(ListErr::Denied) => {
                 return Fetched::Ok(Inventory {
                     collectors: KindSet::Denied,
+                    ..Inventory::default()
                 });
             }
             Err(ListErr::Failed(why)) => {
@@ -379,7 +422,56 @@ pub async fn fetch(client: &Client, namespace: Option<&str>) -> Fetched<Inventor
     }
     Fetched::Ok(Inventory {
         collectors: KindSet::NotServed,
+        ..Inventory::default()
     })
+}
+
+/// Metadata plus individually identified extension endpoints. Process health
+/// does not claim that receivers, exporters or end-to-end ingestion work.
+pub async fn fetch_inventory(client: &Client, namespace: Option<&str>) -> Fetched<Inventory> {
+    let mut inventory = match fetch(client, namespace).await {
+        Fetched::Ok(inventory) => inventory,
+        Fetched::Denied { what } => return Fetched::Denied { what },
+        Fetched::Failed { what, why } => return Fetched::Failed { what, why },
+    };
+    let services = match crate::reach::find_services(client, ToolKind::OtelCollector).await {
+        Fetched::Ok(services) => services,
+        Fetched::Denied { what } => return Fetched::Denied { what },
+        Fetched::Failed { what, why } => return Fetched::Failed { what, why },
+    };
+    for (index, found) in services
+        .into_iter()
+        .filter(|found| namespace.is_none_or(|namespace| found.namespace == namespace))
+        .enumerate()
+    {
+        if index == 16 {
+            inventory.services_truncated = true;
+            break;
+        }
+        let bound = Bound {
+            kind: ToolKind::OtelCollector,
+            transport: Transport::Proxy {
+                namespace: found.namespace.clone(),
+                service: found.name.clone(),
+                port: found.port,
+            },
+            found: Some(found.clone()),
+            auth: ToolAuth::Anonymous,
+        };
+        let outcome = match health(client, &bound).await {
+            Fetched::Ok(health) => format!("Process extension answered {}", health.path),
+            Fetched::Denied { what } => format!("{what}: access denied for this account"),
+            Fetched::Failed { why, .. } => why,
+        };
+        inventory.services.push(CollectorService {
+            name: found.name,
+            namespace: found.namespace,
+            port: found.port,
+            health: outcome,
+            source: bound.source(),
+        });
+    }
+    Fetched::Ok(inventory)
 }
 
 /// Native list rows. `None` when the group answered 404, so a UI stays
@@ -390,13 +482,20 @@ pub fn table_page(inventory: &Inventory) -> Option<TablePage> {
     if !inventory.served() {
         return None;
     }
-    let columns = ["Name", "Namespace", "Mode", "Replicas", "Ready", "Image"]
-        .iter()
-        .map(|name| TableColumn {
-            name: name.to_string(),
-            wide: false,
-        })
-        .collect();
+    let columns = [
+        "Name",
+        "Namespace",
+        "Kind",
+        "Replicas / Port",
+        "State",
+        "Source",
+    ]
+    .iter()
+    .map(|name| TableColumn {
+        name: name.to_string(),
+        wide: false,
+    })
+    .collect();
     let mut rows = Vec::new();
     let mut truncated = false;
     match &inventory.collectors {
@@ -429,7 +528,9 @@ pub fn table_page(inventory: &Inventory) -> Option<TablePage> {
                         item.name.clone(),
                         item.namespace.clone(),
                         item.mode.clone(),
-                        item.replicas.map(|n| n.to_string()).unwrap_or_default(),
+                        item.replicas
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "Unknown".to_string()),
                         ready_label(&item.ready),
                         item.image.clone(),
                     ],
@@ -464,10 +565,23 @@ pub fn table_page(inventory: &Inventory) -> Option<TablePage> {
             }
         }
     }
+    rows.extend(inventory.services.iter().map(|service| TableRow {
+        name: service.name.clone(),
+        namespace: Some(service.namespace.clone()),
+        uid: format!("service:{}/{}", service.namespace, service.name),
+        cells: vec![
+            service.name.clone(),
+            service.namespace.clone(),
+            "Service".into(),
+            service.port.to_string(),
+            service.health.clone(),
+            service.source.clone(),
+        ],
+    }));
     Some(TablePage {
         columns,
         rows,
-        truncated,
+        truncated: truncated || inventory.services_truncated,
         continue_token: None,
     })
 }

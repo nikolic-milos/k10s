@@ -120,6 +120,8 @@ pub struct Reader {
     caps: Arc<HashMap<KindId, day2::Caps>>,
     forwards: ForwardRegistry,
     netpol: Arc<Mutex<Option<(Instant, netpol::Inventory)>>>,
+    telemetry: Arc<crate::telemetry::Scheduler>,
+    observe_sources: Arc<observe::Sources>,
 }
 
 impl Reader {
@@ -147,6 +149,8 @@ impl Reader {
             verdicts: Arc::new(verdicts.iter().copied().collect()),
             caps: Arc::new(caps.iter().copied().collect()),
             netpol: Arc::new(Mutex::new(None)),
+            telemetry: Arc::new(crate::telemetry::Scheduler::default()),
+            observe_sources: Arc::new(observe::Sources::default()),
         }
     }
 

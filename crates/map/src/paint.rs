@@ -15,8 +15,9 @@ use k10s_theme::scale_alpha;
 
 use crate::frame::{self, FrameOpts, IconJob, LabelFace, LabelJob, PaintSink};
 use crate::lod::lod;
+use crate::primitive::mark_primitive_typed;
 use crate::text::{self, Grouped, TextCache};
-use crate::{OverlayFrame, PickPath, hex, mark_primitive, overlay};
+use crate::{OverlayFrame, PickPath, hex, overlay};
 
 fn skip_workloads() -> bool {
     static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -133,6 +134,7 @@ fn paint_marks(
     stage: u8,
     marks: Marks,
     theme: &k10s_theme::MapTheme,
+    type_: k10s_theme::MapType,
     window: &mut Window,
 ) {
     let vw = f32::from(bounds.size.width);
@@ -146,7 +148,8 @@ fn paint_marks(
         (marks.hovered, theme.hover_ring),
     ] {
         let Some(path) = path else { continue };
-        let Some(target) = mark_primitive(scene, path, camera, lod(), stage, (vw, vh), origin)
+        let Some(target) =
+            mark_primitive_typed(scene, path, camera, lod(), stage, (vw, vh), origin, type_)
         else {
             continue;
         };
@@ -306,7 +309,7 @@ pub(super) fn paint_map(
     if !overlay.marks.is_empty() {
         let vw = f32::from(bounds.size.width);
         let vh = f32::from(bounds.size.height);
-        let stamps = overlay.visible_stamps_cached(
+        let stamps = overlay.visible_stamps_typed(
             &mut overlay_cache.borrow_mut(),
             scene,
             camera,
@@ -314,6 +317,7 @@ pub(super) fn paint_map(
             blend,
             vw,
             vh,
+            opts.type_,
         );
         overlay::paint_stamps(
             &stamps,
@@ -330,6 +334,7 @@ pub(super) fn paint_map(
             blend.walk_stage(),
             marks,
             &theme.map,
+            opts.type_,
             window,
         );
     }
@@ -369,6 +374,15 @@ pub(super) fn paint_map(
                             scale_alpha(theme.map.kind_color(*kind), cell_alpha).into(),
                         )
                     }
+                    IconJob::Status(severity, primitive) => {
+                        let (key, data) = crate::status::icon(*severity);
+                        (
+                            key,
+                            data,
+                            snap_to_device(primitive.bounds, scale),
+                            scale_alpha(theme.map.pod_color(*severity), cell_alpha).into(),
+                        )
+                    }
                 };
                 if window
                     .paint_svg(
@@ -392,7 +406,6 @@ pub(super) fn paint_map(
     let text_start = std::time::Instant::now();
     let ui_font = gpui::font(typography.ui_family.clone());
     let display_font = gpui::font(typography.display_family.clone());
-    let line_factor = typography.map().line_height;
     let mut label_counts = LabelCounts::default();
     let mut cache = text_cache.borrow_mut();
     let cache_before = cache.stats();
@@ -403,44 +416,31 @@ pub(super) fn paint_map(
         };
         let line = cache.shape_label(
             job.text.clone(),
+            job.text_start,
             font,
             job.size_px,
             job.color.into(),
             blend.is_settled(),
             window.text_system(),
         );
-        let origin = point(px(job.x), px(job.y));
-        let line_height = px(job.size_px * line_factor);
-        // A label with a box is centred in it and clipped to it; one without is
-        // set left and runs, which is what a pod cell's name wants. Clipping is
-        // a content mask rather than an ellipsis because building the elided
-        // string would allocate once per label per frame, and the walk's
-        // zero-allocation ratchet is worth more than three dots.
-        let painted = if job.width > 0.0 {
-            let mask = gpui::ContentMask {
-                bounds: Bounds {
-                    origin: point(origin.x, origin.y - line_height),
-                    size: size(px(job.width), line_height * 3.0),
-                },
-            };
-            // Centred while it fits, set left the moment it does not. Centring
-            // an overlong name clips it at BOTH ends, and a Kubernetes name is
-            // informative from the front: `payments-redis-primary` cut to
-            // `ments-redis-pri` names nothing. The line is already shaped, so
-            // this costs a comparison and no second pass.
-            let align = if line.width() > px(job.width) {
-                TextAlign::Left
-            } else {
-                TextAlign::Center
-            };
-            window.with_content_mask(Some(mask), |window| {
-                line.paint(origin, line_height, align, Some(px(job.width)), window, cx)
-            })
-        } else {
-            line.paint(origin, line_height, TextAlign::Left, None, window, cx)
+        let line_height = px(job.height).max(line.ascent + line.descent);
+        let origin = point(px(job.x), px(job.y) + (px(job.height) - line_height) * 0.5);
+        let mask = gpui::ContentMask {
+            bounds: Bounds {
+                origin: point(px(job.x), px(job.y)),
+                size: size(px(job.width), px(job.height)),
+            },
         };
+        let align = if job.face == LabelFace::Display && line.width() <= px(job.width) {
+            TextAlign::Center
+        } else {
+            TextAlign::Left
+        };
+        let painted = window.with_content_mask(Some(mask), |window| {
+            line.paint(origin, line_height, align, Some(px(job.width)), window, cx)
+        });
         if painted.is_ok() {
-            label_counts.count(&job.text);
+            label_counts.count(&line.text);
         }
     }
     let cache_delta = cache.stats().since(cache_before);

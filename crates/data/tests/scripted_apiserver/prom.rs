@@ -1,4 +1,4 @@
-//! PromQL over the API-server service proxy: instant GET and query_range POST
+//! PromQL over the API-server service proxy: instant and range GET
 //! land on the Prometheus HTTP paths, and a named token never rides that proxy.
 
 use crate::*;
@@ -90,11 +90,11 @@ fn an_instant_query_is_a_get_through_the_service_proxy() {
 }
 
 #[test]
-fn a_range_query_posts_form_urlencoded_query_start_end_step() {
+fn a_range_query_gets_urlencoded_query_start_end_step() {
     let script = Script::default();
     script.route(
-        "POST",
-        "/api/v1/namespaces/monitoring/services/prometheus:9090/proxy/api/v1/query_range",
+        "GET",
+        "/api/v1/namespaces/monitoring/services/prometheus:9090/proxy/api/v1/query_range?",
         200,
         RANGE_JSON,
     );
@@ -117,12 +117,11 @@ fn a_range_query_posts_form_urlencoded_query_start_end_step() {
     assert_eq!(result.series[0].points.len(), 2);
 
     let hits = script.requests_for("/proxy/api/v1/query_range");
-    assert_eq!(hits.len(), 1, "one POST: {hits:?}");
-    assert_eq!(hits[0].method, "POST");
-    assert_eq!(
-        hits[0].content_type, "application/x-www-form-urlencoded",
-        "query_range is a form, not JSON"
-    );
+    assert_eq!(hits.len(), 1, "one GET: {hits:?}");
+    assert_eq!(hits[0].method, "GET");
+    assert_eq!(hits[0].content_type, "");
+    assert_eq!(hits[0].accept, "application/json");
+    assert!(hits[0].body.is_empty());
     assert!(
         hits[0].path.ends_with("/proxy/api/v1/query_range")
             || hits[0].path.contains("/proxy/api/v1/query_range?"),
@@ -130,26 +129,27 @@ fn a_range_query_posts_form_urlencoded_query_start_end_step() {
         hits[0].path
     );
     assert!(
-        hits[0].body.contains("query=%7Bjob%3D%22api%22%7D"),
-        "the expression is the form field Prometheus names query: {}",
-        hits[0].body
+        hits[0].path.contains("query=%7Bjob%3D%22api%22%7D"),
+        "the expression is the encoded query parameter: {}",
+        hits[0].path
     );
     assert!(
-        hits[0].body.contains("start=1700000000"),
+        hits[0].path.contains("start=1700000000"),
         "start is unix seconds: {}",
-        hits[0].body
+        hits[0].path
     );
     assert!(
-        hits[0].body.contains("end=1700000900"),
+        hits[0].path.contains("end=1700000900"),
         "end is unix seconds: {}",
-        hits[0].body
+        hits[0].path
     );
     assert!(
-        hits[0].body.contains("step=15s"),
-        "step rides the form: {}",
-        hits[0].body
+        hits[0].path.contains("step=15s"),
+        "step is an encoded query parameter: {}",
+        hits[0].path
     );
 
+    assert!(hits[0].path.contains("limit=256"));
     drop(runtime);
 }
 

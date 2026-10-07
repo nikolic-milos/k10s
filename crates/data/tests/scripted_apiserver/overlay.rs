@@ -65,14 +65,14 @@ fn script_prometheus_bind(script: &Script) {
 fn script_query_range(script: &Script, times: usize) {
     for _ in 0..times {
         script.route(
-            "POST",
-            "/api/v1/namespaces/monitoring/services/prometheus:9090/proxy/api/v1/query_range",
+            "GET",
+            "/api/v1/namespaces/monitoring/services/prometheus:9090/proxy/api/v1/query_range?",
             200,
             EMPTY_MATRIX,
         );
         script.route(
-            "POST",
-            "/api/v1/namespaces/monitoring/services/prometheus:http/proxy/api/v1/query_range",
+            "GET",
+            "/api/v1/namespaces/monitoring/services/prometheus:http/proxy/api/v1/query_range?",
             200,
             EMPTY_MATRIX,
         );
@@ -123,34 +123,34 @@ fn mesh_observed_queries_istio_hubble_and_linkerd_as_their_own_promql() {
         seen_paths(&script)
     );
 
-    let posts = script.requests_for("/proxy/api/v1/query_range");
+    let queries = script.requests_for("/proxy/api/v1/query_range");
     assert_eq!(
-        posts.len(),
+        queries.len(),
         3,
         "Istio, Hubble, and Linkerd are three queries: {:?}\n{:?}",
-        posts,
+        queries,
         seen_paths(&script)
     );
-    let bodies: Vec<&str> = posts.iter().map(|seen| seen.body.as_str()).collect();
+    let params: Vec<&str> = queries.iter().map(|seen| seen.path.as_str()).collect();
     assert!(
-        bodies
+        params
             .iter()
             .any(|body| body.contains("istio_requests_total")),
-        "{bodies:?}"
+        "{params:?}"
     );
     assert!(
-        bodies
+        params
             .iter()
             .any(|body| body.contains("hubble_flows_processed_total")),
-        "{bodies:?}"
+        "{params:?}"
     );
     assert!(
-        bodies.iter().any(|body| body.contains("response_total")),
-        "{bodies:?}"
+        params.iter().any(|body| body.contains("response_total")),
+        "{params:?}"
     );
     assert!(
-        bodies.iter().all(|body| !body.contains("container_cpu")),
-        "cadvisor CPU is not a mesh observation: {bodies:?}"
+        params.iter().all(|body| !body.contains("container_cpu")),
+        "cadvisor CPU is not a mesh observation: {params:?}"
     );
     assert!(
         script.seen().iter().all(|seen| !seen.path.contains("4245")
@@ -191,17 +191,19 @@ fn metrics_overlay_runs_promql_grafana_already_wrote() {
         seen_paths(&script)
     );
 
-    let posts = script.requests_for("/proxy/api/v1/query_range");
-    assert_eq!(posts.len(), 1, "{posts:?}\n{:?}", seen_paths(&script));
+    let queries = script.requests_for("/proxy/api/v1/query_range");
+    assert_eq!(queries.len(), 1, "{queries:?}\n{:?}", seen_paths(&script));
     assert!(
-        posts[0].body.contains("node_cpu_seconds_total"),
+        queries[0].path.contains("node_cpu_seconds_total"),
         "the provisioned dashboard's expr is the one sent: {}",
-        posts[0].body
+        queries[0].path
     );
     assert!(
-        !posts[0].body.contains("container_cpu_usage_seconds_total"),
+        !queries[0]
+            .path
+            .contains("container_cpu_usage_seconds_total"),
         "cadvisor CPU is the fallback, not the named expr: {}",
-        posts[0].body
+        queries[0].path
     );
     assert!(
         script.requests_for("/proxy/api/search").is_empty(),
@@ -239,12 +241,14 @@ fn metrics_overlay_keeps_cadvisor_cpu_when_grafana_names_nothing() {
         seen_paths(&script)
     );
 
-    let posts = script.requests_for("/proxy/api/v1/query_range");
-    assert_eq!(posts.len(), 1, "{posts:?}\n{:?}", seen_paths(&script));
+    let queries = script.requests_for("/proxy/api/v1/query_range");
+    assert_eq!(queries.len(), 1, "{queries:?}\n{:?}", seen_paths(&script));
     assert!(
-        posts[0].body.contains("container_cpu_usage_seconds_total"),
+        queries[0]
+            .path
+            .contains("container_cpu_usage_seconds_total"),
         "CPU_EXPR is the fallback: {}",
-        posts[0].body
+        queries[0].path
     );
 
     drop(runtime);

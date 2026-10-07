@@ -368,6 +368,7 @@ fn observed_edges_come_from_hubble_series_not_from_policy() {
         result_type: ResultType::Vector,
         series: vec![
             Series {
+                gaps: Vec::new(),
                 labels: vec![
                     ("__name__".into(), "hubble_flows_processed_total".into()),
                     ("source".into(), "prod/web".into()),
@@ -376,6 +377,7 @@ fn observed_edges_come_from_hubble_series_not_from_policy() {
                 points: vec![(1, 1.0)],
             },
             Series {
+                gaps: Vec::new(),
                 labels: vec![
                     (
                         "__name__".into(),
@@ -387,6 +389,7 @@ fn observed_edges_come_from_hubble_series_not_from_policy() {
                 points: vec![(1, 1.0)],
             },
             Series {
+                gaps: Vec::new(),
                 labels: vec![
                     ("source_namespace".into(), "prod".into()),
                     ("source_pod".into(), "web".into()),
@@ -397,6 +400,12 @@ fn observed_edges_come_from_hubble_series_not_from_policy() {
         ],
         truncated: false,
         dropped_series: 0,
+        warnings: Vec::new(),
+        infos: Vec::new(),
+        source: String::new(),
+        timing: Default::default(),
+        step_ms: 0,
+        expr: String::new(),
     };
     let observed = observed_from_query(&result);
     assert_eq!(observed.edges.len(), 2);
@@ -427,6 +436,7 @@ fn observed_edges_come_from_hubble_series_not_from_policy() {
 fn observed_cap_is_stated() {
     let series = (0..MAX_OBSERVED_EDGES + 3)
         .map(|index| Series {
+            gaps: Vec::new(),
             labels: vec![
                 ("__name__".into(), "hubble_flows_processed_total".into()),
                 ("source".into(), format!("src-{index}")),
@@ -440,6 +450,12 @@ fn observed_cap_is_stated() {
         series,
         truncated: false,
         dropped_series: 0,
+        warnings: Vec::new(),
+        infos: Vec::new(),
+        source: String::new(),
+        timing: Default::default(),
+        step_ms: 0,
+        expr: String::new(),
     });
     assert_eq!(observed.edges.len(), MAX_OBSERVED_EDGES);
     assert!(observed.truncated);

@@ -74,6 +74,19 @@ impl ForwardsView {
     }
 
     pub fn start(&mut self, request: ForwardRequest, cx: &mut Context<Self>) {
+        self.start_route(request, None, cx);
+    }
+
+    pub fn open_browser(&mut self, request: ForwardRequest, path: String, cx: &mut Context<Self>) {
+        self.start_route(request, Some(path), cx);
+    }
+
+    fn start_route(
+        &mut self,
+        request: ForwardRequest,
+        browser_path: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.generation += 1;
         let generation = self.generation;
         self.status = Some(format!(
@@ -92,10 +105,18 @@ impl ForwardsView {
                 let _ = this.update(cx, |this, cx| {
                     if this.generation == generation {
                         this.status = Some(match outcome {
-                            ForwardOutcome::Opened(row) => format!(
-                                "forwarding 127.0.0.1:{} -> {}:{}",
-                                row.local_port, row.pod, row.remote_port
-                            ),
+                            ForwardOutcome::Opened(row) => {
+                                if let Some(path) = &browser_path {
+                                    cx.open_url(&format!(
+                                        "http://127.0.0.1:{}{path}",
+                                        row.local_port
+                                    ));
+                                }
+                                format!(
+                                    "forwarding 127.0.0.1:{} -> {}:{}",
+                                    row.local_port, row.pod, row.remote_port
+                                )
+                            }
                             ForwardOutcome::Denied(what) => {
                                 format!("{what}: access denied for this account")
                             }

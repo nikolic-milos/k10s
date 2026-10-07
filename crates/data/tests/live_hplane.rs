@@ -138,23 +138,25 @@ fn helm_traefik_release_secret_still_exists() {
             .labels("owner=helm,name=traefik")
             .fields("type=helm.sh/release.v1");
         let request = Request::new("/api/v1/namespaces/kube-system/secrets")
-            .list(&params)
-            .expect("a secret list");
+            .list_metadata(&params)
+            .expect("a Secret metadata list");
         let list = client
             .request::<Value>(request)
             .await
-            .expect("Helm release Secrets list");
+            .expect("Helm release Secret metadata list");
         let items = list
             .get("items")
             .and_then(Value::as_array)
             .expect("a Secret list");
+        let names: Vec<_> = items
+            .iter()
+            .filter_map(|item| item.pointer("/metadata/name").and_then(Value::as_str))
+            .collect();
         assert!(
-            items.iter().any(|item| {
-                item.pointer("/metadata/name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| name.starts_with("sh.helm.release.v1.traefik."))
-            }),
-            "k3s Traefik Helm release Secret must still exist: {items:?}"
+            names
+                .iter()
+                .any(|name| name.starts_with("sh.helm.release.v1.traefik.")),
+            "k3s Traefik Helm release Secret must still exist: {names:?}"
         );
     });
 }

@@ -45,6 +45,7 @@ pub mod rbac_index;
 pub mod reach;
 pub mod read;
 mod served;
+pub mod telemetry;
 pub mod watch;
 
 mod runtime;

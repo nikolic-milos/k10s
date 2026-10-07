@@ -137,7 +137,7 @@ fn every_hover_level_names_its_object_and_carries_its_ancestry() {
     assert_eq!(cell.name.as_ref(), "checkout-api-7f9c8");
     assert_eq!(cell.namespace.as_deref(), Some("payments"));
     assert_eq!(cell.owner.as_deref(), Some("checkout-api"));
-    assert_eq!(cell.status, "Critical");
+    assert_eq!(cell.status, "CrashLoopBackOff");
 
     let sat = HoverInfo::resolve(&scene, path(Some(0), None, Some(0))).expect("sat hover");
     assert_eq!(sat.kind, "Service");
@@ -255,20 +255,34 @@ fn overlay_kind_is_named_apart_from_the_lod_band() {
     let mut scene = hover_scene();
     overlay_ids(&mut scene);
     let empty = OverlayFrame::default();
-    let none = State::resolve(chrome_overlay(&scene, None, &empty));
-    assert_eq!(none.overlay_kind, None);
-    assert_eq!(none.band, DetailBand::System);
+    let policy = crate::lod::lod();
+    for (zoom, band, label) in [
+        (policy.stage_block * 0.5, DetailBand::Orbit, "Namespaces"),
+        (policy.stage_block, DetailBand::Region, "Workloads"),
+        (policy.stage_cell, DetailBand::System, "Pods"),
+        (policy.stage_cell_label, DetailBand::Instance, "Pod details"),
+    ] {
+        let mut overlay = chrome_overlay(&scene, None, &empty);
+        overlay.camera.zoom = zoom;
+        let none = State::resolve(overlay);
+        assert_eq!(none.overlay_kind, None);
+        assert_eq!(none.band, band);
+        assert_eq!(none.band.label(), label);
 
-    for kind in OverlayKind::ALL {
-        let frame = OverlayFrame {
-            kind: Some(kind),
-            marks: Vec::new(),
-        };
-        let state = State::resolve(chrome_overlay(&scene, None, &frame));
-        assert_eq!(state.overlay_kind, Some(kind));
-        assert_eq!(state.band, DetailBand::System);
-        assert_ne!(kind.badge(), state.band.label());
-        assert_ne!(kind.blurb(), state.band.description());
+        for kind in OverlayKind::ALL {
+            let frame = OverlayFrame {
+                kind: Some(kind),
+                marks: Vec::new(),
+            };
+            let mut overlay = chrome_overlay(&scene, None, &frame);
+            overlay.camera.zoom = zoom;
+            let state = State::resolve(overlay);
+            assert_eq!(state.overlay_kind, Some(kind));
+            assert_eq!(state.band, band);
+            assert_eq!(state.band.label(), label);
+            assert_eq!(state.summary, none.summary);
+            assert_ne!(kind.badge(), state.band.label());
+        }
     }
     assert_ne!(
         OverlayKind::MeshDeclared.blurb(),

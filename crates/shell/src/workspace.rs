@@ -61,6 +61,36 @@ pub(crate) enum PickerPurpose {
     SavedView,
 }
 
+#[derive(Default)]
+pub(crate) struct UsageState {
+    generation: u64,
+    outcome: Option<UsageOutcome>,
+}
+
+impl UsageState {
+    fn restart(&mut self) -> u64 {
+        self.generation += 1;
+        self.outcome = None;
+        self.generation
+    }
+
+    fn current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    fn publish(&mut self, generation: u64, outcome: UsageOutcome) -> bool {
+        if !self.current(generation) || self.outcome.as_ref() == Some(&outcome) {
+            return false;
+        }
+        self.outcome = Some(outcome);
+        true
+    }
+
+    pub(crate) fn outcome(&self) -> Option<&UsageOutcome> {
+        self.outcome.as_ref()
+    }
+}
+
 pub struct Workspace {
     pub(crate) map: Entity<MapView>,
     pub(crate) palette: ModalSlot<PaletteView>,
@@ -71,6 +101,7 @@ pub struct Workspace {
     pub(crate) bottom: Dock<Tab>,
     pub(crate) selection: Option<Selection>,
     pub(crate) inspector_open: bool,
+    pub(crate) observe_sparkline: Option<Entity<crate::chart::ChartView>>,
     pub(crate) app_menu_open: bool,
     // Zed's title bar drag state machine: armed on mouse down, fires the
     // compositor move on the first movement, disarmed everywhere else.
@@ -108,7 +139,7 @@ pub struct Workspace {
     // labelled outcome the poll delivered; the guard is the poll -- dropping
     // it ends the fetching, so usage stops costing anything the moment the
     // inspector stops showing it.
-    pub(crate) usage: Option<UsageOutcome>,
+    pub(crate) usage: UsageState,
     pub(crate) usage_stop: Option<LogStop>,
     pub(crate) posture: Option<PostureOutcome>,
     pub(crate) overlay_kind: Option<OverlayKind>,
@@ -157,6 +188,7 @@ impl Workspace {
             bottom: Dock::default(),
             selection: None,
             inspector_open: false,
+            observe_sparkline: None,
             app_menu_open: false,
             should_move: false,
             bench,
@@ -180,7 +212,7 @@ impl Workspace {
             scene_chosen: scene_chosen || connected || bench,
             events: None,
             log: None,
-            usage: None,
+            usage: UsageState::default(),
             usage_stop: None,
             posture: None,
             overlay_kind: None,
@@ -205,6 +237,37 @@ impl Workspace {
     // Every selection change invalidates whatever was in flight: replies race
     // clicks, and a stale answer must never land under a newer question.
     pub(crate) fn refresh_detail(&mut self, cx: &mut Context<Self>) {
+        let mut metrics = None;
+        if let Some(index) = self.center.find(|tab| tab.tag == ItemTag::Observe) {
+            if let Ok(view) = self
+                .center
+                .get(index)
+                .expect("found tab")
+                .view
+                .to_any()
+                .downcast::<crate::observe::ObserveView>()
+            {
+                metrics = view.update(cx, |view, cx| {
+                    view.set_selection(self.selection.as_ref(), cx);
+                    view.metrics(cx)
+                });
+            }
+        }
+        self.set_observe_samples(metrics, cx);
+        if let Some(index) = self.center.find(|tab| tab.tag == ItemTag::Traces) {
+            if let Ok(view) = self
+                .center
+                .get(index)
+                .expect("found tab")
+                .view
+                .to_any()
+                .downcast::<crate::traces::TracesView>()
+            {
+                view.update(cx, |view, cx| {
+                    view.set_selection(self.selection.as_ref(), cx)
+                });
+            }
+        }
         self.fetch_generation += 1;
         self.events = None;
         self.log = None;
@@ -283,14 +346,17 @@ impl Workspace {
     pub(crate) fn sync_usage_poll(&mut self, cx: &mut Context<Self>) {
         // Dropping the previous guard first means two polls never overlap.
         self.usage_stop = None;
-        self.usage = None;
+        let generation = self.usage.restart();
         if !self.connected || !self.inspector_open {
+            if let Some(chart) = &self.observe_sparkline {
+                chart.update(cx, |chart, _| chart.pause_preparation());
+            }
             return;
         }
         let Some(request) = self.selection.as_ref().and_then(Selection::usage_target) else {
             return;
         };
-        let generation = self.fetch_generation;
+        let source = self.slot.current();
         // A slow UI drops ticks rather than queueing them: the next tick
         // supersedes whatever a full lane would have carried anyway.
         let (tx, mut rx) = futures::channel::mpsc::channel::<UsageOutcome>(8);
@@ -302,11 +368,15 @@ impl Workspace {
             use futures::StreamExt as _;
             while let Some(outcome) = rx.next().await {
                 let live = this.update(cx, |this, cx| {
-                    if this.fetch_generation != generation {
+                    if !this.usage.current(generation)
+                        || !this.inspector_open
+                        || !std::rc::Rc::ptr_eq(&source, &this.slot.current())
+                    {
                         return false;
                     }
-                    this.usage = Some(outcome);
-                    cx.notify();
+                    if this.usage.publish(generation, outcome) {
+                        cx.notify();
+                    }
                     true
                 });
                 if !matches!(live, Ok(true)) {
@@ -315,6 +385,34 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    pub(crate) fn set_observe_samples(
+        &mut self,
+        data: Option<Arc<crate::chart::ChartData>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match (self.observe_sparkline.as_ref(), data.as_ref()) {
+            (None, None) => return false,
+            (Some(chart), Some(data))
+                if chart
+                    .read(cx)
+                    .data()
+                    .is_some_and(|current| Arc::ptr_eq(current, data)) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+        if let Some(data) = data {
+            let chart = self
+                .observe_sparkline
+                .get_or_insert_with(|| cx.new(|_| crate::chart::ChartView::new(true)));
+            chart.update(cx, |chart, cx| chart.set_data(Some(data), cx));
+        } else {
+            self.observe_sparkline = None;
+        }
+        true
     }
 
     /// Park one detail reply and put it where it goes, unless a newer question
@@ -692,6 +790,119 @@ impl Workspace {
         );
         self.palette.open(view, subscription, window, cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::UsageState;
+    use k10s_provider::{Bytes, Millicores, UsageOutcome, UsageSample, UsageSource};
+
+    fn sample() -> UsageSample {
+        UsageSample {
+            cpu: Some(Millicores(10)),
+            memory: Some(Bytes(1024)),
+            cpu_request: Some(Millicores(100)),
+            cpu_limit: Some(Millicores(200)),
+            memory_request: Some(Bytes(2048)),
+            memory_limit: Some(Bytes(4096)),
+            source: UsageSource::MetricsServer,
+            pods_measured: 1,
+            pods_total: 1,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn identical_poll_replies_do_not_publish_but_real_usage_changes_do() {
+        let mut state = UsageState::default();
+        let generation = state.restart();
+        let first = UsageOutcome::Usage(sample());
+        assert!(state.publish(generation, first.clone()));
+        assert!(!state.publish(generation, first.clone()));
+        let changed = UsageOutcome::Usage(UsageSample {
+            cpu: Some(Millicores(11)),
+            ..sample()
+        });
+        assert!(state.publish(generation, changed.clone()));
+        assert!(!state.publish(generation, changed));
+        assert!(state.publish(generation, UsageOutcome::Denied("pod metrics")));
+        assert!(!state.publish(generation, UsageOutcome::Denied("pod metrics")));
+        assert!(state.publish(generation, first));
+    }
+
+    #[test]
+    fn a_hidden_or_replaced_poll_cannot_land_after_a_new_poll_starts() {
+        let mut state = UsageState::default();
+        let old = state.restart();
+        assert!(state.publish(old, UsageOutcome::Usage(sample())));
+        let hidden = state.restart();
+        assert!(state.outcome().is_none());
+        assert!(!state.publish(old, UsageOutcome::Failed("late old reply".into())));
+        let visible = state.restart();
+        assert!(!state.publish(hidden, UsageOutcome::Usage(sample())));
+        assert!(state.publish(visible, UsageOutcome::Usage(sample())));
+    }
+
+    #[test]
+    fn source_coverage_requests_limits_and_failure_sentences_are_visible_changes() {
+        let mut state = UsageState::default();
+        let generation = state.restart();
+        assert!(state.publish(generation, UsageOutcome::Usage(sample())));
+        for changed in [
+            UsageSample {
+                memory: Some(Bytes(1025)),
+                ..sample()
+            },
+            UsageSample {
+                cpu: None,
+                ..sample()
+            },
+            UsageSample {
+                source: UsageSource::Kubelet,
+                ..sample()
+            },
+            UsageSample {
+                cpu_request: None,
+                ..sample()
+            },
+            UsageSample {
+                cpu_limit: None,
+                ..sample()
+            },
+            UsageSample {
+                memory_request: None,
+                ..sample()
+            },
+            UsageSample {
+                memory_limit: None,
+                ..sample()
+            },
+            UsageSample {
+                pods_measured: 0,
+                ..sample()
+            },
+            UsageSample {
+                pods_total: 2,
+                ..sample()
+            },
+            UsageSample {
+                truncated: true,
+                ..sample()
+            },
+        ] {
+            assert!(state.publish(generation, UsageOutcome::Usage(changed)));
+            assert!(state.publish(generation, UsageOutcome::Usage(sample())));
+        }
+        for outcome in [
+            UsageOutcome::Absent("metrics API unavailable".into()),
+            UsageOutcome::Denied("kubelet summary"),
+            UsageOutcome::Failed("server connection failed".into()),
+            UsageOutcome::Failed("server response timed out".into()),
+        ] {
+            assert!(state.publish(generation, outcome.clone()));
+            assert!(!state.publish(generation, outcome));
+        }
     }
 }
 

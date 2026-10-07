@@ -2,7 +2,7 @@
 
 use gpui::{
     Action, Context, Div, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, Role,
-    SharedString, Stateful, Styled, Toggled, Window, div, prelude::*, px, rgb, svg,
+    SharedString, Stateful, Styled, Toggled, Window, canvas, div, prelude::*, px, rgb, svg,
 };
 use k10s_core::Severity;
 use k10s_theme::{Theme, Typography};
@@ -83,6 +83,7 @@ fn summary_panel(
 ) -> impl IntoElement {
     panel(theme)
         .id("map-summary")
+        .line_height(px(fonts.ui_size * fonts.map().line_height))
         .absolute()
         .top(px(14.0))
         .left(px(14.0))
@@ -101,10 +102,11 @@ fn summary_panel(
                 .gap(px(8.0))
                 .child(
                     div()
-                        .font_family(fonts.display_family.clone())
+                        .font_family(fonts.ui_family.clone())
                         .text_size(px(fonts.ui_size))
+                        .line_height(px(fonts.ui_size * fonts.map().line_height))
                         .text_color(rgb(theme.shell.text))
-                        .child("STARMAP"),
+                        .child("Starmap"),
                 )
                 .child(
                     div()
@@ -127,22 +129,6 @@ fn summary_panel(
                             .text_color(rgb(theme.shell.text_accent))
                             .child(kind.badge()),
                     )
-                })
-                .when(expanded, |row| {
-                    row.child(
-                        div()
-                            .text_size(px(fonts.xsmall()))
-                            .text_color(rgb(theme.shell.text_muted))
-                            .child(active.description()),
-                    )
-                    .when_some(overlay_kind, |row, kind| {
-                        row.child(
-                            div()
-                                .text_size(px(fonts.xsmall()))
-                                .text_color(rgb(theme.shell.text_muted))
-                                .child(kind.blurb()),
-                        )
-                    })
                 }),
         )
         .when(expanded, |card| {
@@ -150,7 +136,8 @@ fn summary_panel(
                 div()
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .text_size(px(fonts.small()))
+                    .text_size(px(fonts.ui_size))
+                    .line_height(px(fonts.ui_size * fonts.map().line_height))
                     .text_color(rgb(theme.shell.text_muted))
                     .child(summary),
             )
@@ -323,6 +310,26 @@ fn swatch_label(severity: Severity, overlay: bool) -> &'static str {
     }
 }
 
+fn status_glyph(severity: Severity, color: gpui::Rgba) -> impl IntoElement {
+    div().size(px(16.0)).flex_none().child(
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                let (key, data) = crate::status::icon(severity);
+                let _ = window.paint_svg(
+                    bounds,
+                    key,
+                    Some(data),
+                    gpui::TransformationMatrix::unit(),
+                    color.into(),
+                    cx,
+                );
+            },
+        )
+        .size_full(),
+    )
+}
+
 fn legend(
     overlay_kind: Option<OverlayKind>,
     theme: &Theme,
@@ -351,38 +358,23 @@ fn legend(
         )
         .children(
             [
-                (Severity::Ok, "✓", swatch_label(Severity::Ok, overlay)),
-                (Severity::Warn, "!", swatch_label(Severity::Warn, overlay)),
-                (Severity::Err, "×", swatch_label(Severity::Err, overlay)),
-                (
-                    Severity::Unknown,
-                    "?",
-                    swatch_label(Severity::Unknown, overlay),
-                ),
+                Severity::Ok,
+                Severity::Warn,
+                Severity::Err,
+                Severity::Unknown,
             ]
             .into_iter()
-            .map(|(severity, mark, label)| {
+            .map(|severity| {
                 div()
                     .flex()
                     .items_center()
                     .gap(px(4.0))
-                    .child(
-                        div()
-                            .size(px(16.0))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(theme.map.pod_color(severity))
-                            .text_size(px(fonts.xsmall()))
-                            .text_color(rgb(theme.map.bg))
-                            .child(mark),
-                    )
+                    .child(status_glyph(severity, theme.map.pod_color(severity)))
                     .child(
                         div()
                             .text_size(px(fonts.xsmall()))
                             .text_color(rgb(theme.shell.text_muted))
-                            .child(label),
+                            .child(swatch_label(severity, overlay)),
                     )
             }),
         )
@@ -411,7 +403,7 @@ fn hover_card(
         .flex()
         .items_center()
         .gap(px(9.0))
-        .child(
+        .children(info.severity.map(|severity| {
             div()
                 .size(px(24.0))
                 .flex_none()
@@ -422,10 +414,8 @@ fn hover_card(
                 .bg(color.alpha(0.18))
                 .border_1()
                 .border_color(color)
-                .text_size(px(fonts.small()))
-                .text_color(color)
-                .child(info.mark),
-        )
+                .child(status_glyph(severity, color))
+        }))
         .child(
             div()
                 .min_w(px(0.0))
@@ -449,8 +439,8 @@ fn hover_card(
                         .child(
                             div()
                                 .flex_none()
-                                .text_size(px(fonts.xsmall()))
                                 .text_color(color)
+                                .text_size(px(fonts.ui_size))
                                 .child(info.status),
                         ),
                 )

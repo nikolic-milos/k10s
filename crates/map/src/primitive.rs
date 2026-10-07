@@ -1,7 +1,7 @@
 use gpui::{Bounds, Corners, Pixels, Point, point, px, size};
 use k10s_atlas::{Camera, LodPolicy, WorkloadPresentation};
 use k10s_core::{Rect, SceneSnapshot};
-use k10s_theme::quantize;
+use k10s_theme::{MapType, quantize};
 
 use crate::PickPath;
 
@@ -14,12 +14,77 @@ const CARD_RADIUS: f32 = 0.14;
 const CARD_RADIUS_MAX_PX: f32 = 14.0;
 const POD_RADIUS: f32 = 0.22;
 const GLYPH_RADIUS: f32 = 0.22;
-const WL_ICON_OF_HEADER: f32 = 0.84;
 pub(crate) const WL_MEDALLION_MIN_PX: f32 = 16.0;
 const WL_MEDALLION_OF_HALO: f32 = 0.55;
 pub(crate) const WL_ICON_MAX_PX: f32 = 96.0;
 const SAT_ICON_OF_CELL: f32 = 1.05;
 pub(crate) const SAT_ICON_MAX_PX: f32 = 48.0;
+
+pub(crate) const NAME_MIN_WIDTH: f32 = 152.0;
+pub(crate) const POD_MARK_MIN: f32 = 24.0;
+pub(crate) const POD_DETAIL_MIN_WIDTH: f32 = 144.0;
+pub(crate) const POD_DETAIL_MAX_WIDTH: f32 = 224.0;
+const POD_MARK_MAX: f32 = 96.0;
+const POD_DETAIL_MIN_HEIGHT: f32 = 64.0;
+const POD_DETAIL_MAX_HEIGHT: f32 = 104.0;
+pub(crate) const TEXT_PAD: f32 = 8.0;
+pub(crate) const STATUS_GAP: f32 = 6.0;
+pub(crate) const HEADING_CLEARANCE: f32 = 4.0;
+
+#[inline]
+pub(crate) fn name_band_height(type_: MapType) -> f32 {
+    (type_.workload * type_.line_height * 2.0 + TEXT_PAD * 2.0).ceil()
+}
+
+#[inline]
+pub(crate) fn name_min_width(type_: MapType) -> f32 {
+    (NAME_MIN_WIDTH * type_.workload / MapType::default().workload).max(NAME_MIN_WIDTH)
+}
+
+#[inline]
+pub(crate) fn top_clearance(type_: MapType, viewport: (f32, f32)) -> f32 {
+    let line = type_.workload * type_.line_height;
+    match crate::chrome::density(viewport.0, viewport.1) {
+        crate::chrome::Density::Minimal => 64.0,
+        crate::chrome::Density::Compact => (line + 40.0).max(64.0),
+        crate::chrome::Density::Full => line * 2.0 + 60.0,
+    }
+}
+
+#[inline]
+pub(crate) fn bottom_clearance(type_: MapType) -> f32 {
+    ((type_.workload - 4.0).max(6.0) * type_.line_height + 40.0).max(64.0)
+}
+
+#[inline]
+pub(crate) fn detail_min_width(type_: MapType) -> f32 {
+    (POD_DETAIL_MIN_WIDTH * type_.pod / MapType::default().pod)
+        .clamp(POD_DETAIL_MIN_WIDTH, POD_DETAIL_MAX_WIDTH)
+}
+
+#[inline]
+pub(crate) fn workload_presentation(
+    policy: &LodPolicy,
+    inner: Rect,
+    zoom: f32,
+    stage: u8,
+    type_: MapType,
+) -> WorkloadPresentation {
+    let stage = if stage == 1
+        && inner.w * zoom >= name_min_width(type_)
+        && inner.h * zoom >= name_band_height(type_)
+    {
+        2
+    } else {
+        stage
+    };
+    policy.workload_presentation(inner.w, zoom, stage)
+}
+
+#[inline]
+pub(crate) fn workload_label_shown(policy: &LodPolicy, width: f32, zoom: f32) -> bool {
+    width * zoom >= policy.block_label_min_px && zoom > policy.block_label_min_zoom
+}
 
 /// Keeping bounds and corners together prevents post-walk chrome and hit tests
 /// from quietly rebuilding a different silhouette than the painter used.
@@ -139,8 +204,72 @@ impl Projection {
     }
 
     #[inline]
-    pub(crate) fn pod(self, rect: Rect) -> MarkPrimitive {
-        pod(self.bounds(rect))
+    pub(crate) fn cell(
+        self,
+        rect: Rect,
+        stage: u8,
+        type_: MapType,
+        heading: Option<MarkPrimitive>,
+    ) -> Option<MarkPrimitive> {
+        let natural = self.bounds(rect);
+        let width = f32::from(natural.size.width);
+        let height = f32::from(natural.size.height);
+        let detailed =
+            stage >= 3 && width >= detail_min_width(type_) && height >= POD_DETAIL_MIN_HEIGHT;
+        let (width, height) = if detailed {
+            (
+                width.min(POD_DETAIL_MAX_WIDTH),
+                (type_.pod * type_.line_height * 2.0 + TEXT_PAD * 2.0)
+                    .ceil()
+                    .clamp(POD_DETAIL_MIN_HEIGHT, POD_DETAIL_MAX_HEIGHT)
+                    .min(height),
+            )
+        } else {
+            (width.min(POD_MARK_MAX), height.min(POD_MARK_MAX))
+        };
+        let center = natural.center();
+        let primitive = pod(Bounds {
+            origin: point(center.x - px(width * 0.5), center.y - px(height * 0.5)),
+            size: size(px(width), px(height)),
+        });
+        if heading.is_some_and(|heading| {
+            primitive
+                .bounds
+                .intersects(&heading.outset(HEADING_CLEARANCE).bounds)
+        }) {
+            return None;
+        }
+        Some(primitive)
+    }
+
+    #[inline]
+    pub(crate) fn name_band(self, inner: Rect, type_: MapType) -> Option<MarkPrimitive> {
+        let body = self.bounds(inner);
+        let left = f32::from(body.origin.x).max(self.origin.0 + TEXT_PAD);
+        let right = f32::from(body.right()).min(self.origin.0 + self.viewport.0 - TEXT_PAD);
+        let top = f32::from(body.origin.y).max(self.origin.1 + top_clearance(type_, self.viewport));
+        let bottom =
+            f32::from(body.bottom()).min(self.origin.1 + self.viewport.1 - bottom_clearance(type_));
+        let height = name_band_height(type_);
+        if right - left < name_min_width(type_) || bottom - top < height {
+            return None;
+        }
+        Some(MarkPrimitive {
+            bounds: Bounds {
+                origin: point(px(left), px(top)),
+                size: size(px(right - left), px(height)),
+            },
+            corners: Corners::all(px(6.0)),
+        })
+    }
+
+    #[inline]
+    pub(crate) fn label_visible(self, bounds: Bounds<Pixels>, type_: MapType) -> bool {
+        f32::from(bounds.origin.y) >= self.origin.1 + top_clearance(type_, self.viewport)
+            && f32::from(bounds.bottom())
+                <= self.origin.1 + self.viewport.1 - bottom_clearance(type_)
+            && f32::from(bounds.right()) > self.origin.0
+            && f32::from(bounds.origin.x) < self.origin.0 + self.viewport.0
     }
 
     #[inline]
@@ -157,15 +286,19 @@ impl Projection {
     }
 
     #[inline]
-    pub(crate) fn header_icon(self, inner: Rect, header_height: f32) -> MarkPrimitive {
-        let header_px = header_height * self.camera.zoom;
-        let side = icon_side(header_px * WL_ICON_OF_HEADER, WL_ICON_MAX_PX);
-        let (x, y) = self
-            .camera
-            .w2s(inner.x, inner.y, self.viewport.0, self.viewport.1);
-        let inset = (header_px - side) * 0.5;
+    pub(crate) fn band_icon(
+        self,
+        band: MarkPrimitive,
+        row: usize,
+        type_: MapType,
+    ) -> MarkPrimitive {
+        let line = type_.workload * type_.line_height;
+        let side = quantize(type_.workload.max(16.0));
         glyph(Bounds {
-            origin: point(px(self.origin.0 + x + inset), px(self.origin.1 + y + inset)),
+            origin: point(
+                band.bounds.origin.x + px(TEXT_PAD),
+                band.bounds.origin.y + px(TEXT_PAD + row as f32 * line + (line - side) * 0.5),
+            ),
             size: size(px(side), px(side)),
         })
     }
@@ -224,7 +357,7 @@ pub(crate) fn pod(bounds: Bounds<Pixels>) -> MarkPrimitive {
     let short = f32::from(bounds.size.width).min(f32::from(bounds.size.height));
     MarkPrimitive {
         bounds,
-        corners: Corners::all(px(short * POD_RADIUS)),
+        corners: Corners::all(px((short * POD_RADIUS).min(CARD_RADIUS_MAX_PX))),
     }
 }
 
@@ -270,12 +403,36 @@ pub fn mark_primitive(
     viewport: (f32, f32),
     origin: (f32, f32),
 ) -> Option<MarkPrimitive> {
+    mark_primitive_typed(
+        scene,
+        path,
+        camera,
+        policy,
+        stage,
+        viewport,
+        origin,
+        MapType::default(),
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn mark_primitive_typed(
+    scene: &SceneSnapshot,
+    path: PickPath,
+    camera: Camera,
+    policy: &LodPolicy,
+    stage: u8,
+    viewport: (f32, f32),
+    origin: (f32, f32),
+    type_: MapType,
+) -> Option<MarkPrimitive> {
     scene.regions.get(path.region as usize)?;
     let projection = Projection::new(camera, viewport, origin);
     if let Some(cell_index) = path.cell {
         let block = scene.blocks.get(path.block? as usize)?;
-        let presentation = policy.workload_presentation(block.inner.w, camera.zoom, stage);
-        if !presentation.cells_shown()
+        let presentation = workload_presentation(policy, block.inner, camera.zoom, stage, type_);
+        if stage < 2
+            || !presentation.cells_shown()
             || policy.cells_aggregated(
                 block.children.len(),
                 block
@@ -285,10 +442,13 @@ pub fn mark_primitive(
         {
             return None;
         }
+        let heading = workload_label_shown(policy, block.inner.w, camera.zoom)
+            .then(|| projection.name_band(block.inner, type_))
+            .flatten();
         return scene
             .cells
             .get(cell_index as usize)
-            .map(|cell| projection.pod(cell.rect));
+            .and_then(|cell| projection.cell(cell.rect, stage, type_, heading));
     }
     if let Some(sat_index) = path.sat {
         let block = scene.blocks.get(path.block? as usize)?;
@@ -303,7 +463,7 @@ pub fn mark_primitive(
     }
     if let Some(block_index) = path.block {
         let block = scene.blocks.get(block_index as usize)?;
-        return match policy.workload_presentation(block.inner.w, camera.zoom, stage) {
+        return match workload_presentation(policy, block.inner, camera.zoom, stage, type_) {
             WorkloadPresentation::Hidden => None,
             WorkloadPresentation::Medallion => Some(projection.medallion(block.rect, block.inner)),
             WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
@@ -320,6 +480,31 @@ pub fn mark_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_band_is_admitted_at_its_inclusive_width_minimum() {
+        let policy = crate::lod::policy(Default::default());
+        let camera = Camera {
+            cx: 0.0,
+            cy: 0.0,
+            zoom: 1.0,
+        };
+        let projection = Projection::new(camera, (600.0, 420.0), (0.0, 0.0));
+        let inner = Rect::new(-76.0, -60.0, NAME_MIN_WIDTH, 120.0);
+        assert!(workload_label_shown(&policy, inner.w, camera.zoom));
+        assert!(projection.name_band(inner, MapType::default()).is_some());
+        assert!(
+            projection
+                .name_band(
+                    Rect {
+                        w: NAME_MIN_WIDTH - 1.0,
+                        ..inner
+                    },
+                    MapType::default()
+                )
+                .is_none()
+        );
+    }
 
     #[test]
     fn outset_preserves_each_corner_at_fractional_scale() {

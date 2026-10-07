@@ -3,8 +3,9 @@
 //!
 //! A dashboard is a title, a uid, and the panels we can run. Each panel keeps
 //! the title Grafana gave it and the PromQL/LogQL/TraceQL its targets already
-//! carry. Transformations, variables, and plugin panel types are not executed:
-//! those panels are [`PanelKind::Unsupported`] so a UI can deep-link them
+//! carry. The declared label and duration variables are expanded after datasource
+//! verification. Transformations and unsupported panel semantics carry a reason
+//! so a UI can deep-link them
 //! rather than fake Grafana's engine. Nested row panels are walked; the row
 //! itself is not a query.
 //!
@@ -13,15 +14,21 @@
 //! read: the sidecar can watch those too, and this path refuses that. Parse is
 //! shared. The bytes are attacker-shaped. Caps refuse a dashboard rather than
 //! truncating one: a missing panel is visible, a silent drop is not.
+//! Provisioned lists share an eight-MiB body budget and sixteen pages, with
+//! four seconds per exchange. A failed later page keeps healthy dashboards
+//! with a named error; denial remains an explicit denied result.
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::Client;
-use kube::api::{Api, ListParams};
+use kube::api::{ListParams, ObjectList, Request};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::reach::{Bound, tool_get};
-use crate::read::{Fetched, classify};
+use crate::read::Fetched;
+
+mod variables;
+pub use variables::{Variables, duration_ms, duration_text, interpolate};
 
 pub const MAX_DASHBOARD_BYTES: usize = 8 << 20;
 pub const MAX_PANELS: usize = 512;
@@ -36,6 +43,7 @@ pub const MAX_NAMED_FROM_SEARCH: usize = 16;
 
 const PAGE_LIMIT: u32 = 200;
 const MAX_CONFIGMAPS: usize = 2_000;
+const MAX_PROVISIONED_PAGES: usize = 16;
 /// kube-prometheus-stack's sidecar default, and the boolean spelling some
 /// charts use instead.
 const DASHBOARD_SELECTOR: &str = "grafana_dashboard in (1,true)";
@@ -67,6 +75,8 @@ pub struct PanelQuery {
     pub expr: String,
     pub dialect: QueryDialect,
     pub datasource: Option<String>,
+    pub min_step: String,
+    pub unsupported: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +89,10 @@ pub struct Panel {
     /// person can still see the raw series, and the UI must say the picture
     /// is not Grafana's.
     pub transformed: bool,
+    pub unit: String,
+    pub reducer: String,
+    pub min_interval: String,
+    pub unsupported: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,10 +219,119 @@ fn read_panel(panel: &Value, fallback_id: i64) -> Panel {
         kind,
         queries,
         transformed,
+        unit: panel
+            .pointer("/fieldConfig/defaults/unit")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        reducer: panel
+            .pointer("/options/reduceOptions/calcs/0")
+            .and_then(Value::as_str)
+            .unwrap_or("lastNotNull")
+            .to_string(),
+        min_interval: panel
+            .get("interval")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        unsupported: panel_support_error(panel, kind, transformed),
     }
 }
 
+fn panel_support_error(panel: &Value, kind: PanelKind, transformed: bool) -> Option<String> {
+    if transformed {
+        let names = panel
+            .get("transformations")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return Some(format!("unsupported Grafana transformations: {names}"));
+    }
+    let type_name = panel
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if !matches!(type_name, "timeseries" | "stat") {
+        return Some(format!("unsupported Grafana panel type {type_name}"));
+    }
+    if panel
+        .get("targets")
+        .and_then(Value::as_array)
+        .is_some_and(|targets| {
+            targets
+                .iter()
+                .filter(|target| target.get("hide").and_then(Value::as_bool) != Some(true))
+                .take(2)
+                .count()
+                > 1
+        })
+    {
+        return Some(
+            "unsupported Grafana multi-target panel; run an explicit raw query or open in Grafana"
+                .to_string(),
+        );
+    }
+    if panel
+        .pointer("/fieldConfig/overrides")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        return Some("unsupported Grafana field overrides".to_string());
+    }
+    if panel
+        .pointer("/fieldConfig/defaults/custom/stacking/mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode != "none")
+    {
+        return Some("unsupported Grafana stacked series".to_string());
+    }
+    if panel
+        .pointer("/fieldConfig/defaults/custom/scaleDistribution/type")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode != "linear")
+    {
+        return Some("unsupported Grafana nonlinear axis".to_string());
+    }
+    if panel
+        .pointer("/fieldConfig/defaults/custom/spanNulls")
+        .is_some_and(|value| value != &Value::Bool(false))
+    {
+        return Some("unsupported Grafana connected null values".to_string());
+    }
+    if kind == PanelKind::Stat {
+        let options = panel.pointer("/options/reduceOptions");
+        if options
+            .and_then(|value| value.get("values"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Some("unsupported Grafana all-values stat".to_string());
+        }
+        let calcs = options
+            .and_then(|value| value.get("calcs"))
+            .and_then(Value::as_array);
+        if calcs.is_some_and(|calcs| {
+            calcs.len() != 1
+                || !calcs[0].as_str().is_some_and(|calc| {
+                    matches!(calc, "lastNotNull" | "min" | "max" | "mean" | "sum")
+                })
+        }) {
+            return Some("unsupported Grafana stat reducer".to_string());
+        }
+    }
+    None
+}
+
 fn read_query(target: &Value, panel_datasource: Option<&Value>) -> Option<PanelQuery> {
+    if target.get("hide").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
     let expr = target
         .get("expr")
         .and_then(Value::as_str)
@@ -239,9 +362,31 @@ fn read_query(target: &Value, panel_datasource: Option<&Value>) -> Option<PanelQ
             .and_then(Value::as_str)
             .unwrap_or("A")
             .to_string(),
-        expr: clip(expr, MAX_EXPR_CHARS),
+        expr: if expr.len() > super::prom::MAX_EXPR_BYTES {
+            String::new()
+        } else {
+            expr.to_string()
+        },
         dialect,
         datasource: datasource.map(|(name, _)| name),
+        min_step: target
+            .get("interval")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        unsupported: if expr.len() > super::prom::MAX_EXPR_BYTES {
+            Some("panel expression exceeds 8 KiB".to_string())
+        } else if target.get("instant").and_then(Value::as_bool) == Some(true) {
+            Some("instant Grafana targets are unsupported in a range panel".to_string())
+        } else if target
+            .get("format")
+            .and_then(Value::as_str)
+            .is_some_and(|format| format != "time_series")
+        {
+            Some("unsupported Grafana target format".to_string())
+        } else {
+            None
+        },
     })
 }
 
@@ -305,6 +450,97 @@ fn clip(text: &str, max_chars: usize) -> String {
     }
 }
 
+#[derive(Deserialize)]
+struct Datasource {
+    uid: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default, rename = "jsonData")]
+    settings: DatasourceSettings,
+}
+#[derive(Default, Deserialize)]
+struct DatasourceSettings {
+    #[serde(default, rename = "timeInterval")]
+    scrape_interval: String,
+}
+
+/// Grafana's UID proxy keeps its configured backend and authentication together.
+/// Datasource URLs and credential fields are never used to guess another Service.
+pub async fn query_target(
+    client: &Client,
+    bound: &Bound,
+    target: &PanelQuery,
+    vars: &Variables,
+) -> Fetched<super::prom::QueryResult> {
+    let run = async {
+        if let Some(why) = &target.unsupported {
+            return Err(why.clone());
+        }
+        if target.dialect != QueryDialect::PromQL {
+            return Err("the target is not a Prometheus datasource query".to_string());
+        }
+        let uid = target
+            .datasource
+            .as_deref()
+            .ok_or("panel target has no explicit datasource UID")?;
+        if uid.is_empty()
+            || uid.len() > 128
+            || !uid
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(format!("unsupported datasource UID {uid}"));
+        }
+        let bytes = match tool_get(client, bound, &format!("api/datasources/uid/{uid}")).await {
+            Fetched::Ok(bytes) => bytes,
+            Fetched::Denied { what } => return Ok(Fetched::Denied { what }),
+            Fetched::Failed { what, why } => return Ok(Fetched::Failed { what, why }),
+        };
+        let source: Datasource = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("datasource metadata is unsupported: {error}"))?;
+        if source.uid != uid || source.kind != "prometheus" {
+            return Err(format!(
+                "datasource {uid} is {}, expected the same Prometheus UID",
+                source.kind
+            ));
+        }
+        let scrape = if source.settings.scrape_interval.is_empty() {
+            15_000
+        } else {
+            duration_ms(&source.settings.scrape_interval)?
+        };
+        let (expr, step) = interpolate(target, vars, scrape)?;
+        let path = format!("api/datasources/proxy/uid/{uid}/api/v1/query_range");
+        let mut fetched = super::prom::query_range_path(
+            client,
+            bound,
+            &path,
+            &expr,
+            vars.start_ms as f64 / 1000.0,
+            vars.end_ms as f64 / 1000.0,
+            &duration_text(step),
+        )
+        .await;
+        if let Fetched::Ok(result) = &mut fetched {
+            result.source = format!(
+                "{} / datasource {uid} / target {}",
+                bound.source(),
+                target.ref_id
+            );
+            result.step_ms = step;
+            result.expr = expr;
+        }
+        Ok(fetched)
+    };
+    match run.await {
+        Ok(fetched) => fetched,
+        Err(why) => Fetched::Failed {
+            what: "grafana panel",
+            why,
+        },
+    }
+}
+
 /// A Grafana search hit: enough to fetch the dashboard by uid.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SearchHit {
@@ -353,7 +589,7 @@ pub async fn fetch_search(
     folder_allowlist: &[String],
 ) -> Fetched<Vec<SearchHit>> {
     match into_parsed(
-        tool_get(client, bound, "api/search?type=dash-db").await,
+        tool_get(client, bound, "api/search?type=dash-db&limit=100").await,
         parse_search,
     ) {
         Fetched::Ok(hits) => Fetched::Ok(filter_folders(hits, folder_allowlist)),
@@ -361,12 +597,21 @@ pub async fn fetch_search(
     }
 }
 
-/// One dashboard by uid, through the same bind as search.
+/// One dashboard by uid, through the same bind as search, with its returned identity checked.
 pub async fn fetch_dashboard(client: &Client, bound: &Bound, uid: &str) -> Fetched<Dashboard> {
-    into_parsed(
+    match into_parsed(
         tool_get(client, bound, &format!("api/dashboards/uid/{uid}")).await,
         parse_dashboard,
-    )
+    ) {
+        Fetched::Ok(dashboard) if dashboard.uid != uid => Fetched::Failed {
+            what: "grafana",
+            why: format!(
+                "Grafana returned dashboard UID {:?} for requested UID {uid:?}",
+                dashboard.uid
+            ),
+        },
+        other => other,
+    }
 }
 
 /// Dashboards Grafana's sidecar already stored as ConfigMaps.
@@ -375,48 +620,94 @@ pub struct Provisioned {
     pub dashboards: Vec<Dashboard>,
     /// ConfigMaps or keys past [`MAX_PROVISIONED`] were not walked.
     pub truncated: bool,
+    pub errors: Vec<String>,
+}
+
+impl Provisioned {
+    fn failed(mut self, why: String) -> Fetched<Self> {
+        if self.dashboards.is_empty() {
+            return Fetched::Failed {
+                what: "grafana",
+                why,
+            };
+        }
+        self.errors.push(why);
+        self.truncated = true;
+        Fetched::Ok(self)
+    }
 }
 
 /// List ConfigMaps labelled `grafana_dashboard=1` (or `true`) and parse each
 /// `data` value as dashboard JSON. No Grafana API. `binaryData` is ignored.
 /// Secrets are never listed: that is the sidecar's other watch, and not ours.
 pub async fn fetch_provisioned_from_configmaps(client: &Client) -> Fetched<Provisioned> {
-    let api: Api<ConfigMap> = Api::all(client.clone());
-    let mut dashboards = Vec::new();
-    let mut truncated = false;
+    let mut provisioned = Provisioned::default();
     let mut scanned = 0usize;
+    let mut body_bytes = 0usize;
     let mut token: Option<String> = None;
-    loop {
+    for _ in 0..MAX_PROVISIONED_PAGES {
+        if body_bytes == crate::reach::MAX_BODY_BYTES {
+            return provisioned.failed("provisioned dashboards exceed 8 MiB".to_string());
+        }
         let mut params = ListParams::default()
             .limit(PAGE_LIMIT)
             .labels(DASHBOARD_SELECTOR);
         if let Some(token) = token.as_deref() {
             params = params.continue_token(token);
         }
-        let page = match api.list(&params).await {
+        let request = Request::new("/api/v1/configmaps".to_string())
+            .list(&params)
+            .expect("fixed provisioning list parameters");
+        let bytes = match crate::reach::bounded_request_with_status(
+            client,
+            "grafana",
+            request,
+            crate::reach::MAX_BODY_BYTES - body_bytes,
+        )
+        .await
+        .1
+        {
+            Fetched::Ok(bytes) => bytes,
+            Fetched::Denied { what } => return Fetched::Denied { what },
+            Fetched::Failed { why, .. } => return provisioned.failed(why),
+        };
+        body_bytes += bytes.len();
+        let page: ObjectList<ConfigMap> = match serde_json::from_slice(&bytes) {
             Ok(page) => page,
-            Err(error) => return classify("grafana", &error),
+            Err(error) => {
+                return provisioned.failed(format!(
+                    "provisioned dashboards returned an unsupported response: {error}"
+                ));
+            }
         };
         for cm in page.items {
             scanned += 1;
-            if scanned > MAX_CONFIGMAPS || dashboards.len() >= MAX_PROVISIONED {
-                truncated = true;
+            if scanned > MAX_CONFIGMAPS || provisioned.dashboards.len() >= MAX_PROVISIONED {
+                provisioned.truncated = true;
                 break;
             }
-            collect_from_configmap(&cm, &mut dashboards, &mut truncated);
-            if truncated {
+            collect_from_configmap(&cm, &mut provisioned.dashboards, &mut provisioned.truncated);
+            if provisioned.truncated {
                 break;
             }
         }
-        token = page.metadata.continue_.filter(|s| !s.is_empty());
-        if token.is_none() || truncated || scanned > MAX_CONFIGMAPS {
-            break;
+        let next = page.metadata.continue_.filter(|s| !s.is_empty());
+        if next.is_none() || provisioned.truncated {
+            return Fetched::Ok(provisioned);
         }
+        if scanned == MAX_CONFIGMAPS || provisioned.dashboards.len() == MAX_PROVISIONED {
+            provisioned.truncated = true;
+            return Fetched::Ok(provisioned);
+        }
+        if next == token {
+            return provisioned
+                .failed("provisioned dashboards repeated a continuation token".to_string());
+        }
+        token = next;
     }
-    Fetched::Ok(Provisioned {
-        dashboards,
-        truncated,
-    })
+    provisioned.failed(format!(
+        "provisioned dashboards exceed {MAX_PROVISIONED_PAGES} pages"
+    ))
 }
 
 fn collect_from_configmap(cm: &ConfigMap, dashboards: &mut Vec<Dashboard>, truncated: &mut bool) {

@@ -566,7 +566,7 @@ fn the_alerts_read_preserves_the_namespace_and_full_pod_name_for_a_join() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].method, "GET");
     assert_eq!(hits[0].path, path);
-    assert_eq!(hits[0].accept, "");
+    assert_eq!(hits[0].accept, "application/json");
     assert_eq!(hits[0].body, "");
 }
 

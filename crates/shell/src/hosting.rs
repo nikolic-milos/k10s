@@ -29,7 +29,7 @@ use crate::forwards::ForwardsView;
 use crate::helm_values::HelmReportView;
 use crate::item::{Item, ItemHandle};
 use crate::lists::{InventoryEvent, InventoryView};
-use crate::observe::ObserveView;
+use crate::observe::{ObserveEvent, ObserveView};
 use crate::tag::ItemTag;
 use crate::term::TerminalView;
 use crate::text::TextView;
@@ -143,10 +143,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if index != self.center.active_index() && self.center.get(index).is_some() {
+            if let Some(tab) = self.center.active() {
+                tab.view.set_visible(false, cx);
+            }
+        }
         if !self.center.activate(index) {
             return;
         }
         if let Some(tab) = self.center.active() {
+            tab.view.set_visible(true, cx);
             window.focus(&tab.view.focus_handle(cx), cx);
         }
         cx.notify();
@@ -200,6 +206,9 @@ impl Workspace {
     }
 
     fn open_center(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.center.active() {
+            previous.view.set_visible(false, cx);
+        }
         let index = self.center.push(tab);
         self.activate_center(index, window, cx);
     }
@@ -650,7 +659,84 @@ impl Workspace {
                 let provider = this.provider();
                 let selection = this.selection.clone();
                 let view = cx.new(|cx| ObserveView::new(provider, selection.as_ref(), cx));
-                let subscription = this.subscribe_inventory_events(&view, window, cx);
+                let source = this.slot.current();
+                let subscription = cx.subscribe_in(
+                    &view,
+                    window,
+                    move |this, _, event: &ObserveEvent, window, cx| {
+                        if !std::rc::Rc::ptr_eq(&source, &this.slot.current()) {
+                            return;
+                        }
+                        match event {
+                            ObserveEvent::Metrics { uid, data } => {
+                                if this
+                                    .selection
+                                    .as_ref()
+                                    .is_some_and(|selection| selection.uid.as_ref() == uid)
+                                {
+                                    if this.set_observe_samples(data.clone(), cx) {
+                                        cx.notify();
+                                    }
+                                }
+                            }
+                            ObserveEvent::Trace { id, scope } => {
+                                if this
+                                    .selection
+                                    .as_ref()
+                                    .map(|selection| selection.describe_request())
+                                    .as_ref()
+                                    != Some(&scope.request)
+                                {
+                                    return;
+                                }
+                                this.show_traces(window, cx);
+                                if let Some(index) =
+                                    this.center.find(|tab| tab.tag == ItemTag::Traces)
+                                {
+                                    if let Ok(view) = this
+                                        .center
+                                        .get(index)
+                                        .expect("found tab")
+                                        .view
+                                        .to_any()
+                                        .downcast::<TracesView>()
+                                    {
+                                        view.update(cx, |view, cx| {
+                                            view.open_link(id.clone(), scope.clone(), cx)
+                                        });
+                                    }
+                                }
+                            }
+                            ObserveEvent::GrafanaRoute { request, path } => {
+                                this.open_forwards(None, window, cx);
+                                if let Some(index) =
+                                    this.bottom.find(|tab| tab.tag == ItemTag::Forwards)
+                                {
+                                    if let Ok(view) = this
+                                        .bottom
+                                        .get(index)
+                                        .expect("found tab")
+                                        .view
+                                        .to_any()
+                                        .downcast::<ForwardsView>()
+                                    {
+                                        view.update(cx, |view, cx| {
+                                            view.open_browser(request.clone(), path.clone(), cx)
+                                        });
+                                    }
+                                }
+                            }
+                            ObserveEvent::NotServed => {
+                                this.close_tagged(&ItemTag::Observe, window, cx);
+                                this.status_note = Some(
+                                    "Grafana, Prometheus and Loki are not served by this cluster"
+                                        .into(),
+                                );
+                                cx.notify();
+                            }
+                        }
+                    },
+                );
                 (view, Some(subscription))
             },
         );

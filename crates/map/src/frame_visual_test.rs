@@ -226,7 +226,7 @@ fn workload_lod_never_stacks_medallion_card_and_pods() {
     let near = Camera {
         cx: center.0,
         cy: center.1,
-        zoom: 0.90,
+        zoom: 3.0,
     };
     let near_frame = walk_at(&scene, near);
     assert!(
@@ -418,5 +418,244 @@ fn a_terminating_pod_is_hollow_and_costs_the_same_quad() {
     assert_ne!(
         running.background, leaving.background,
         "a terminating pod must not be filled like a running one"
+    );
+}
+
+#[test]
+fn detailed_pods_keep_identity_status_and_picking_inside_the_same_body() {
+    let mut scene = one_of_each(State::of(ReasonId::FAILED));
+    scene.blocks[0].label = Arc::from("payments-redis-primary");
+    let cell = &scene.cells[0];
+    let (cx, cy) = cell.rect.center();
+    let pol = policy(Knobs::default());
+    let mut details = 0;
+    for ui_size in [8.0, 14.0, 24.0, 32.0] {
+        let type_ = k10s_theme::Typography {
+            ui_size,
+            ..Default::default()
+        }
+        .map();
+        for zoom in [
+            crate::lod::STAGE_POD_LABEL,
+            crate::lod::MAX_USEFUL_ZOOM,
+            40.0,
+        ] {
+            let camera = Camera { cx, cy, zoom };
+            let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
+            let heading = projection.name_band(scene.blocks[0].inner, type_);
+            let body = projection
+                .cell(cell.rect, 3, type_, heading)
+                .expect("the centered pod clears its heading");
+            let mut sink = Collect::default();
+            let opts = FrameOpts {
+                policy: &pol,
+                theme: &k10s_theme::K10S_DARK.map,
+                type_,
+                edges_on: false,
+                skip_blocks: false,
+                hex: false,
+            };
+            let stats = walk(
+                viewport(),
+                &scene,
+                camera,
+                StageBlend::settled(3),
+                opts,
+                &mut sink,
+            );
+            assert_eq!(
+                stats,
+                crate::lod::cull(&scene, &camera, StageBlend::settled(3), VW, VH, opts)
+            );
+            assert!(sink.fg.iter().any(|quad| quad.bounds == body.bounds));
+            let path = crate::pick::pick_typed(
+                &scene,
+                &camera,
+                &pol,
+                StageBlend::settled(3),
+                VW,
+                VH,
+                VW * 0.5,
+                VH * 0.5,
+                type_,
+            )
+            .expect("the painted pod is pickable");
+            assert_eq!(path.cell, Some(0));
+            assert_eq!(
+                crate::primitive::mark_primitive_typed(
+                    &scene,
+                    path,
+                    camera,
+                    &pol,
+                    3,
+                    (VW, VH),
+                    (0.0, 0.0),
+                    type_
+                ),
+                Some(body),
+            );
+            let width = f32::from(body.bounds.size.width);
+            if width < POD_DETAIL_MIN_WIDTH {
+                assert!(
+                    !sink
+                        .labels
+                        .iter()
+                        .any(|job| job.text == cell.label.as_ref())
+                );
+                continue;
+            }
+            details += 1;
+            assert!((144.0..=224.0).contains(&width));
+            assert!((64.0..=104.0).contains(&f32::from(body.bounds.size.height)));
+            let name = sink
+                .labels
+                .iter()
+                .find(|job| job.text == cell.label.as_ref())
+                .expect("actual pod name");
+            assert_eq!(&name.text[name.text_start..], "0");
+            assert_eq!(name.size_px, ui_size);
+            let status = sink
+                .labels
+                .iter()
+                .find(|job| job.text == "Failed")
+                .expect("actual pod status");
+            for job in [name, status] {
+                assert_eq!(job.size_px, ui_size);
+                assert!(job.width > 0.0);
+                assert!(job.x >= f32::from(body.bounds.origin.x) + TEXT_PAD);
+                assert!(job.y >= f32::from(body.bounds.origin.y) + TEXT_PAD);
+                assert!(job.x + job.width <= f32::from(body.bounds.right()));
+                assert!(job.y + job.height <= f32::from(body.bounds.bottom()) - TEXT_PAD);
+            }
+            let mark = sink
+                .icons
+                .iter()
+                .find_map(|job| match job {
+                    IconJob::Status(Severity::Err, primitive) => Some(primitive),
+                    _ => None,
+                })
+                .expect("the status has its vector mark");
+            assert!(mark.bounds.origin.x >= body.bounds.origin.x);
+            assert!(mark.bounds.origin.y >= body.bounds.origin.y);
+            assert!(mark.bounds.right() <= body.bounds.right());
+            assert!(mark.bounds.bottom() <= body.bounds.bottom());
+        }
+    }
+    assert!(
+        details >= 8,
+        "the font and zoom sweep did not reach enough detail cases"
+    );
+}
+
+#[test]
+fn a_pinned_heading_selects_the_workload_and_excludes_obscured_pods() {
+    let scene = one_of_each(State::OK);
+    let camera = Camera {
+        cx: 55.0,
+        cy: 105.0,
+        zoom: 16.0,
+    };
+    let type_ = k10s_theme::MapType::default();
+    let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
+    let heading = projection
+        .name_band(scene.blocks[0].inner, type_)
+        .expect("the workload enters the viewport");
+    assert_eq!(
+        f32::from(heading.bounds.origin.y),
+        crate::primitive::top_clearance(type_, (VW, VH))
+    );
+    assert!(
+        projection
+            .cell(scene.cells[0].rect, 3, type_, Some(heading))
+            .is_none()
+    );
+    let pol = policy(Knobs::default());
+    let center = heading.bounds.center();
+    let path = crate::pick::pick_typed(
+        &scene,
+        &camera,
+        &pol,
+        StageBlend::settled(3),
+        VW,
+        VH,
+        f32::from(center.x),
+        f32::from(center.y),
+        type_,
+    )
+    .expect("the pinned heading is a workload target");
+    assert_eq!(path.block, Some(0));
+    assert_eq!(path.cell, None);
+    let cell_path = crate::PickPath {
+        region: 0,
+        block: Some(0),
+        cell: Some(0),
+        sat: None,
+    };
+    assert!(
+        crate::primitive::mark_primitive_typed(
+            &scene,
+            cell_path,
+            camera,
+            &pol,
+            3,
+            (VW, VH),
+            (0.0, 0.0),
+            type_,
+        )
+        .is_none()
+    );
+    assert_eq!(
+        walk_at(&scene, camera).fg.len(),
+        3,
+        "the obscured pod still emitted a body"
+    );
+}
+
+#[test]
+fn large_workload_names_stay_in_the_visible_band_while_panning() {
+    let scene = one_of_each(State::OK);
+    let type_ = k10s_theme::MapType::default();
+    let mut observed = 0;
+    for cx in [55.0, 95.0, 130.0] {
+        for cy in [81.0, 100.0, 125.0] {
+            let camera = Camera { cx, cy, zoom: 16.0 };
+            let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
+            let band = projection
+                .name_band(scene.blocks[0].inner, type_)
+                .expect("part of the workload remains visible");
+            let frame = walk_at(&scene, camera);
+            let name = frame
+                .labels
+                .iter()
+                .find(|job| job.text == scene.blocks[0].label.as_ref())
+                .expect("pinned workload name");
+            assert!(name.x >= f32::from(band.bounds.origin.x) + TEXT_PAD);
+            assert!(name.x + name.width <= f32::from(band.bounds.right()) - TEXT_PAD);
+            assert!(name.y >= f32::from(band.bounds.origin.y) + TEXT_PAD);
+            assert!(name.y + name.height <= f32::from(band.bounds.bottom()) - TEXT_PAD);
+            observed += 1;
+        }
+    }
+    assert_eq!(observed, 9);
+}
+
+#[test]
+fn a_workload_without_observed_pods_does_not_claim_health() {
+    let mut scene = one_of_each(State::OK);
+    scene.blocks[0].children = 0..0;
+    scene.cells.clear();
+    let camera = Camera {
+        cx: 100.0,
+        cy: 100.0,
+        zoom: 4.0,
+    };
+    let frame = walk_at(&scene, camera);
+    assert!(frame.labels.iter().any(|job| job.text == "0 observed pods"));
+    assert!(!frame.labels.iter().any(|job| job.text == "Healthy"));
+    assert!(
+        frame
+            .icons
+            .iter()
+            .any(|job| matches!(job, IconJob::Status(Severity::Unknown, _)))
     );
 }

@@ -18,10 +18,11 @@ use crate::bench::{Bench, BenchOp};
 use crate::frame::{IconJob, LabelJob};
 use crate::lod::{self, lod};
 use crate::paint::{Marks, device_px, paint_map};
+use crate::pick::pick_typed;
 use crate::present::PresentProbe;
 use crate::selection::Mark;
 use crate::text::TextCache;
-use crate::{BenchMeta, OverlayFrame, PickPath, chrome, overlay, path_rect, pick};
+use crate::{BenchMeta, OverlayFrame, PickPath, chrome, overlay, path_rect};
 
 // A click resolved against the snapshot that was on screen when it landed.
 // The snapshot rides along so the consumer names slots from the exact scene
@@ -40,12 +41,14 @@ struct HoverBasis {
     camera: Camera,
     viewport: (f32, f32),
     stage: u8,
+    type_: k10s_theme::MapType,
 }
 
 pub struct MapView {
     scene: SharedScene,
     ctrl: Sender<WorldCtrl>,
     camera: Camera,
+    type_: k10s_theme::MapType,
     drag: Option<Point<Pixels>>,
     drag_total: f32,
     map_bounds: Rc<Cell<k10s_core::Rect>>,
@@ -88,6 +91,8 @@ pub struct MapView {
     displayed_stage: u8,
     last_stage_tick: Option<std::time::Instant>,
     bench: Option<Bench>,
+    #[cfg(feature = "testing")]
+    testing_camera: bool,
     // The flight in progress, if any. `None` is the whole idle case: no flight
     // means no frame requested on its account, which is what keeps the measured
     // zero paints at idle true through an animation rather than despite one.
@@ -121,6 +126,48 @@ fn advance_flight(fly: &mut Option<FlyTo>, camera: &mut Camera, dt: f32) -> bool
     false
 }
 
+fn zoom_camera(camera: &mut Camera, factor: f32, sx: f32, sy: f32, vw: f32, vh: f32) -> bool {
+    if !factor.is_finite() || factor <= 0.0 {
+        return false;
+    }
+    let current = camera.clamped();
+    let next = (current.zoom * factor).clamp(k10s_atlas::MIN_ZOOM, lod::MAX_USEFUL_ZOOM);
+    if next == current.zoom {
+        return false;
+    }
+    camera.zoom_around(next / current.zoom, sx, sy, vw, vh);
+    true
+}
+
+fn reveal_camera(
+    camera: Camera,
+    rect: k10s_core::Rect,
+    viewport: (f32, f32),
+    type_: k10s_theme::MapType,
+    cell: bool,
+) -> Camera {
+    let mut target = camera.reveal(rect, viewport.0, viewport.1);
+    target.zoom = target.zoom.min(lod::MAX_USEFUL_ZOOM);
+    if cell {
+        target.zoom = target
+            .zoom
+            .max(crate::primitive::detail_min_width(type_) / rect.w)
+            .min(lod::MAX_USEFUL_ZOOM);
+        let projection = crate::primitive::Projection::new(target, viewport, (0.0, 0.0));
+        let height = projection
+            .cell(rect, 3, type_, None)
+            .map_or(0.0, |primitive| f32::from(primitive.bounds.size.height));
+        let top = crate::primitive::top_clearance(type_, viewport)
+            + crate::primitive::name_band_height(type_)
+            + crate::primitive::HEADING_CLEARANCE;
+        let bottom = viewport.1 - crate::primitive::bottom_clearance(type_);
+        if bottom - top >= height {
+            target.cy -= ((top + bottom) * 0.5 - viewport.1 * 0.5) / target.zoom;
+        }
+    }
+    target
+}
+
 impl MapView {
     /// `bench_failed` is set if a bench flight gives up, and read by the binary
     /// after the app loop returns: a view is the wrong place to decide a
@@ -150,6 +197,7 @@ impl MapView {
             scene,
             ctrl,
             camera: Camera::default(),
+            type_: k10s_theme::typography(cx).map(),
             drag: None,
             drag_total: 0.0,
             map_bounds: Rc::new(Cell::new(k10s_core::Rect::ZERO)),
@@ -187,6 +235,8 @@ impl MapView {
             displayed_stage: lod().stage_for_zoom(Camera::default().zoom),
             last_stage_tick: None,
             bench: bench.map(Bench::new),
+            #[cfg(feature = "testing")]
+            testing_camera: false,
         }
     }
 
@@ -266,7 +316,9 @@ impl MapView {
 
     fn zoom_by(&mut self, factor: f32, window: &Window, cx: &mut Context<Self>) {
         let (_, vw, vh) = self.map_viewport(window);
-        self.camera.zoom_around(factor, vw * 0.5, vh * 0.5, vw, vh);
+        if !zoom_camera(&mut self.camera, factor, vw * 0.5, vh * 0.5, vw, vh) {
+            return;
+        }
         self.fly = None;
         self.suppress_hover();
         self.interacted = true;
@@ -320,7 +372,13 @@ impl MapView {
             return false;
         };
         let (_, vw, vh) = self.map_viewport(window);
-        let target = self.camera.reveal(found.rect, vw, vh);
+        let target = reveal_camera(
+            self.camera,
+            found.rect,
+            (vw, vh),
+            self.type_,
+            found.level == k10s_core::Level::Cell,
+        );
         if self.bench.is_some() {
             self.camera = target;
             self.fly = None;
@@ -339,7 +397,9 @@ impl MapView {
     /// movement rather than snapping back to where the first one began. Marks the
     /// camera as touched, because a flight is a camera the user chose and the
     /// automatic fit must not overrule it mid-air.
-    pub fn fly_to(&mut self, target: Camera, motion: Motion) {
+    pub fn fly_to(&mut self, mut target: Camera, motion: Motion) {
+        target = target.clamped();
+        target.zoom = target.zoom.min(lod::MAX_USEFUL_ZOOM);
         match self.fly.as_mut() {
             Some(flight) => flight.retarget(target, motion),
             None => self.fly = Some(FlyTo::new(self.camera, target, motion)),
@@ -396,6 +456,7 @@ impl MapView {
             camera: self.camera,
             viewport: (rect.w, rect.h),
             stage: self.displayed_stage,
+            type_: self.type_,
         }
     }
 
@@ -417,7 +478,7 @@ impl MapView {
         }
         let policy = lod();
         let blend = StageBlend::settled(self.displayed_stage);
-        let path = pick(
+        let path = pick_typed(
             scene,
             &self.camera,
             policy,
@@ -426,6 +487,7 @@ impl MapView {
             rect.h,
             f32::from(position.x) - rect.x,
             f32::from(position.y) - rect.y,
+            self.type_,
         )?;
         Mark::new(scene, path)
     }
@@ -458,6 +520,7 @@ impl MapView {
     #[cfg(feature = "testing")]
     pub fn testing_set_camera(&mut self, camera: Camera) {
         self.camera = camera.clamped();
+        self.testing_camera = true;
         self.fitted = true;
         self.interacted = true;
         self.stage = StageMachine::new(0.0);
@@ -503,7 +566,7 @@ impl MapView {
         }
         let policy = lod();
         let blend = StageBlend::settled(self.displayed_stage);
-        let Some(path) = pick(
+        let Some(path) = pick_typed(
             &snapshot,
             &self.camera,
             policy,
@@ -512,6 +575,7 @@ impl MapView {
             rect.h,
             f32::from(position.x) - rect.x,
             f32::from(position.y) - rect.y,
+            self.type_,
         ) else {
             return None;
         };
@@ -535,7 +599,13 @@ impl MapView {
             return;
         };
         let (_, vw, vh) = self.map_viewport(window);
-        let target = self.camera.reveal(rect, vw, vh);
+        let target = reveal_camera(
+            self.camera,
+            rect,
+            (vw, vh),
+            self.type_,
+            path.level() == k10s_core::Level::Cell,
+        );
         self.fly_to(target, Motion::reduced_when(cx.reduce_motion()));
         self.suppress_hover();
         cx.notify();
@@ -622,6 +692,13 @@ impl Render for MapView {
         // be repaired before LOD and paint divide by it, not a million times
         // during them.
         self.camera = self.camera.clamped();
+        let measuring_camera = self.bench.is_some();
+        #[cfg(feature = "testing")]
+        let measuring_camera = measuring_camera || self.testing_camera;
+        if !measuring_camera {
+            self.camera.zoom = self.camera.zoom.min(lod::MAX_USEFUL_ZOOM);
+        }
+        self.type_ = k10s_theme::typography(cx).map();
         let blend = if cx.reduce_motion() {
             self.stage.settle(lod(), self.camera.zoom)
         } else {
@@ -754,13 +831,16 @@ impl Render for MapView {
                 let dy = f32::from(ev.delta.pixel_delta(px(24.0)).y);
                 let factor = (dy * 0.0035).exp();
                 let (origin, vw, vh) = this.map_viewport(window);
-                this.camera.zoom_around(
+                if !zoom_camera(
+                    &mut this.camera,
                     factor,
                     f32::from(ev.position.x) - origin.0,
                     f32::from(ev.position.y) - origin.1,
                     vw,
                     vh,
-                );
+                ) {
+                    return;
+                }
                 this.fly = None;
                 this.suppress_hover();
                 this.interacted = true;

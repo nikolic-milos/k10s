@@ -13,8 +13,8 @@
 //! ([`QueryResult::truncated`] plus [`QueryResult::dropped_series`]), never
 //! applied silently: a prefix of a range is not the range.
 //!
-//! Instant queries GET; range queries POST
-//! `application/x-www-form-urlencoded`. The HTTP round trip is bounded by
+//! Queries use GET so API-server proxy authorization requires only read access.
+//! Parameters are URL-encoded. The HTTP round trip is bounded by
 //! [`crate::reach::PROBE_DEADLINE`]. A named token never rides
 //! [`crate::reach::Transport::Proxy`]: the kube client's Authorization header
 //! is already spoken for, so a token on that path would either clobber kube
@@ -26,11 +26,12 @@
 //! crate edge.
 
 use kube::Client;
-use serde::Deserialize;
-use serde_json::Value;
+use std::time::Instant;
 
-use crate::reach::{Bound, MAX_BODY_BYTES, ToolAuth, ToolKind, Transport, tool_get, tool_post};
+use crate::reach::{Bound, ToolAuth, ToolKind, Transport, tool_get};
 use crate::read::Fetched;
+
+mod decode;
 
 /// PromQL text, not the encoded URL. Grafana's extractor uses the same figure.
 pub const MAX_EXPR_BYTES: usize = 8 << 10;
@@ -41,10 +42,8 @@ pub const MAX_SERIES: usize = 256;
 /// One series denser than this chose a step that this view will not draw.
 pub const MAX_POINTS_PER_SERIES: usize = 5_000;
 
-const FORM_URLENCODED: &str = "application/x-www-form-urlencoded";
-
 /// One sample. Time is unix milliseconds; value is the already-parsed number.
-/// NaN and Inf are dropped before a Sample exists.
+/// Non-finite samples are retained separately as gaps.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     pub t_ms: i64,
@@ -56,6 +55,8 @@ pub struct Sample {
 pub struct Series {
     pub labels: Vec<(String, String)>,
     pub points: Vec<(i64, f64)>,
+    /// Non-finite values break a line at their original timestamp.
+    pub gaps: Vec<i64>,
 }
 
 impl Series {
@@ -84,26 +85,20 @@ pub struct QueryResult {
     /// How many series were refused (over the series cap, over the point cap,
     /// or not an object). Zero when [`Self::truncated`] is false.
     pub dropped_series: usize,
+    pub warnings: Vec<String>,
+    pub infos: Vec<String>,
+    pub source: String,
+    pub timing: QueryTiming,
+    pub step_ms: u64,
+    pub expr: String,
 }
 
-#[derive(Deserialize)]
-struct WireEnvelope {
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    data: Option<WireData>,
-    #[serde(default)]
-    error: String,
-    #[serde(default, rename = "errorType")]
-    error_type: String,
-}
-
-#[derive(Deserialize, Default)]
-struct WireData {
-    #[serde(default, rename = "resultType")]
-    result_type: String,
-    #[serde(default)]
-    result: Value,
+/// The transport and decoder are measured separately from queueing and paint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryTiming {
+    pub bytes: usize,
+    pub network_ns: u64,
+    pub decode_ns: u64,
 }
 
 /// Instant query: GET `/api/v1/query`. `time` is unix seconds, Prometheus's unit.
@@ -138,8 +133,8 @@ pub async fn query(
     }
 }
 
-/// Range query: POST `/api/v1/query_range` as form fields `query`, `start`,
-/// `end`, `step`. `start` and `end` are unix seconds.
+/// Range query: GET `/api/v1/query_range` with `query`, `start`, `end`, `step`
+/// and a server-side series limit. `start` and `end` are unix seconds.
 pub async fn query_range(
     client: &Client,
     bound: &Bound,
@@ -160,30 +155,80 @@ pub async fn query_range(
             "the query_range window is not a pair of finite unix timestamps".to_string(),
         );
     }
-    if step.trim().is_empty() {
+    if end < start || step.trim().is_empty() {
         return failed(
             bound,
-            "the query_range step is empty; it is not sent".to_string(),
+            "the query_range window or step is invalid; it is not sent".to_string(),
         );
     }
+    query_range_path(client, bound, "api/v1/query_range", expr, start, end, step).await
+}
+
+pub(crate) async fn query_range_path(
+    client: &Client,
+    bound: &Bound,
+    path: &str,
+    expr: &str,
+    start: f64,
+    end: f64,
+    step: &str,
+) -> Fetched<QueryResult> {
+    if let Some(why) = refuse_expr(expr) {
+        return failed(bound, why);
+    }
+    if !start.is_finite() || !end.is_finite() || end < start || step.trim().is_empty() {
+        return failed(
+            bound,
+            "the query range or resolution is invalid".to_string(),
+        );
+    }
+    let step_ms = match super::grafana::duration_ms(step).or_else(|_| {
+        let seconds: f64 = step
+            .parse()
+            .map_err(|_| "invalid numeric resolution".to_string())?;
+        let milliseconds = seconds * 1000.0;
+        if !milliseconds.is_finite()
+            || milliseconds < 1.0
+            || milliseconds >= u64::MAX as f64
+            || (milliseconds - milliseconds.round()).abs() > 1e-6
+        {
+            return Err("resolution requires positive whole milliseconds".to_string());
+        }
+        Ok(milliseconds.round() as u64)
+    }) {
+        Ok(step_ms) => step_ms,
+        Err(why) => return failed(bound, why),
+    };
     let start_text = unix_text(start);
     let end_text = unix_text(end);
-    let body = form_body(&[
-        ("query", expr),
-        ("start", &start_text),
-        ("end", &end_text),
-        ("step", step),
-    ]);
-    match tool_post(
-        client,
-        bound,
-        "api/v1/query_range",
-        FORM_URLENCODED,
-        body.into_bytes(),
-    )
-    .await
-    {
-        Fetched::Ok(bytes) => into_fetched(bound.kind.slug(), parse_response(&bytes)),
+    let rest = query_path(
+        path,
+        &[
+            ("query", expr),
+            ("start", &start_text),
+            ("end", &end_text),
+            ("step", step),
+            ("limit", "256"),
+        ],
+    );
+    let started = Instant::now();
+    match tool_get(client, bound, &rest).await {
+        Fetched::Ok(bytes) => {
+            let network_ns = started.elapsed().as_nanos() as u64;
+            let decode_started = Instant::now();
+            let result = parse_response(&bytes).map(|mut result| {
+                result.timing = QueryTiming {
+                    bytes: bytes.len(),
+                    network_ns,
+                    decode_ns: decode_started.elapsed().as_nanos() as u64,
+                };
+                result.source = bound.source();
+                result.step_ms = step_ms;
+                result.expr = expr.to_string();
+                result
+            });
+            into_fetched(bound.kind.slug(), result)
+        }
         Fetched::Denied { what } => Fetched::Denied { what },
         Fetched::Failed { what, why } => Fetched::Failed { what, why },
     }
@@ -192,146 +237,7 @@ pub async fn query_range(
 /// Parse a Prometheus HTTP API JSON body. The byte cap is checked here too so
 /// a caller who did not go through [`tool_get`] still cannot expand a bomb.
 pub fn parse_response(bytes: &[u8]) -> Result<QueryResult, String> {
-    if bytes.len() > MAX_BODY_BYTES {
-        return Err(format!(
-            "the Prometheus answer is more than {MAX_BODY_BYTES} bytes; it is hidden"
-        ));
-    }
-    let envelope: WireEnvelope = serde_json::from_slice(bytes)
-        .map_err(|error| format!("the Prometheus answer is not JSON: {error}"))?;
-    if envelope.status != "success" {
-        let why = if envelope.error.is_empty() {
-            format!(
-                "Prometheus status is {}",
-                if envelope.status.is_empty() {
-                    "missing"
-                } else {
-                    envelope.status.as_str()
-                }
-            )
-        } else if envelope.error_type.is_empty() {
-            envelope.error
-        } else {
-            format!("{}: {}", envelope.error_type, envelope.error)
-        };
-        return Err(why);
-    }
-    let data = match envelope.data {
-        Some(data) => data,
-        None => return Err("Prometheus success carried no data".to_string()),
-    };
-    match data.result_type.as_str() {
-        "vector" => parse_array(ResultType::Vector, &data.result, Mode::Instant),
-        "matrix" => parse_array(ResultType::Matrix, &data.result, Mode::Range),
-        "scalar" => parse_scalar(&data.result),
-        "string" => Err("Prometheus returned a string result, not a numeric series".to_string()),
-        "histogram" => Err(
-            "native histograms are not parsed; JSON vector and matrix are the contract".to_string(),
-        ),
-        other => {
-            let label = if other.is_empty() { "missing" } else { other };
-            Err(format!(
-                "Prometheus resultType {label} is not JSON vector, matrix, or scalar"
-            ))
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Mode {
-    Instant,
-    Range,
-}
-
-fn parse_array(result_type: ResultType, result: &Value, mode: Mode) -> Result<QueryResult, String> {
-    let items = match result.as_array() {
-        Some(items) => items,
-        None => {
-            return Err("Prometheus result is not an array of series".to_string());
-        }
-    };
-    let mut dropped_series = items.len().saturating_sub(MAX_SERIES);
-    let mut series = Vec::new();
-    for item in items.iter().take(MAX_SERIES) {
-        match read_series(item, mode) {
-            None => dropped_series += 1,
-            Some(found) if found.points.len() > MAX_POINTS_PER_SERIES => {
-                dropped_series += 1;
-            }
-            Some(found) => series.push(found),
-        }
-    }
-    Ok(QueryResult {
-        result_type,
-        series,
-        truncated: dropped_series > 0,
-        dropped_series,
-    })
-}
-
-fn parse_scalar(result: &Value) -> Result<QueryResult, String> {
-    let points: Vec<(i64, f64)> = read_sample(result).into_iter().collect();
-    Ok(QueryResult {
-        result_type: ResultType::Scalar,
-        series: vec![Series {
-            labels: Vec::new(),
-            points,
-        }],
-        truncated: false,
-        dropped_series: 0,
-    })
-}
-
-fn read_series(item: &Value, mode: Mode) -> Option<Series> {
-    let obj = item.as_object()?;
-    let labels = labels_of(obj.get("metric"));
-    let points = match mode {
-        Mode::Instant => obj.get("value").and_then(read_sample).into_iter().collect(),
-        Mode::Range => obj
-            .get("values")
-            .and_then(Value::as_array)
-            .map(|values| read_samples(values))
-            .unwrap_or_default(),
-    };
-    Some(Series { labels, points })
-}
-
-fn read_samples(values: &[Value]) -> Vec<(i64, f64)> {
-    values.iter().filter_map(read_sample).collect()
-}
-
-fn read_sample(value: &Value) -> Option<(i64, f64)> {
-    let pair = value.as_array()?;
-    if pair.len() < 2 {
-        return None;
-    }
-    let ts = json_f64(&pair[0])?;
-    let sample = json_f64(&pair[1])?;
-    if !ts.is_finite() || !sample.is_finite() {
-        return None;
-    }
-    let t_ms = (ts * 1000.0).round() as i64;
-    Some((t_ms, sample))
-}
-
-fn json_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
-}
-
-fn labels_of(metric: Option<&Value>) -> Vec<(String, String)> {
-    let Some(Value::Object(map)) = metric else {
-        return Vec::new();
-    };
-    let mut labels: Vec<(String, String)> = map
-        .iter()
-        .filter_map(|(key, value)| value.as_str().map(|text| (key.clone(), text.to_string())))
-        .collect();
-    labels.sort_by(|a, b| a.0.cmp(&b.0));
-    labels
+    decode::parse(bytes)
 }
 
 pub(crate) fn refuse_bind(bound: &Bound) -> Option<Fetched<QueryResult>> {
@@ -404,8 +310,24 @@ fn into_fetched(what: &'static str, parsed: Result<QueryResult, String>) -> Fetc
     }
 }
 
-fn form_body(pairs: &[(&str, &str)]) -> String {
-    let mut out = String::new();
+fn query_path(path: &str, pairs: &[(&str, &str)]) -> String {
+    let encoded_len = |text: &str| {
+        text.bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b' ' => 1,
+                _ => 3,
+            })
+            .sum::<usize>()
+    };
+    let mut out = String::with_capacity(
+        path.len()
+            + pairs
+                .iter()
+                .map(|(key, value)| encoded_len(key) + encoded_len(value) + 2)
+                .sum::<usize>(),
+    );
+    out.push_str(path);
+    out.push('?');
     for (i, (key, value)) in pairs.iter().enumerate() {
         if i > 0 {
             out.push('&');

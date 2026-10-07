@@ -25,6 +25,7 @@ impl CacheStats {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     text: SharedString,
+    text_start: usize,
     font: Font,
     size_bits: u32,
     color: Hsla,
@@ -51,6 +52,7 @@ impl BoundedCache {
     fn shape(
         &mut self,
         text: SharedString,
+        text_start: usize,
         font: &Font,
         size_px: f32,
         color: Hsla,
@@ -58,6 +60,7 @@ impl BoundedCache {
     ) -> ShapedLine {
         let key = CacheKey {
             text: text.clone(),
+            text_start,
             font: font.clone(),
             size_bits: size_px.to_bits(),
             color,
@@ -78,15 +81,20 @@ impl BoundedCache {
             self.stats.evictions += 1;
         }
 
+        let displayed = if text_start == 0 {
+            text
+        } else {
+            SharedString::from(&text[text_start..])
+        };
         let run = TextRun {
-            len: text.len(),
+            len: displayed.len(),
             font: font.clone(),
             color,
             background_color: None,
             underline: None,
             strikethrough: None,
         };
-        let line = text_system.shape_line(text, px(size_px), &[run], None);
+        let line = text_system.shape_line(displayed, px(size_px), &[run], None);
         self.insertion_order.push_back(key.clone());
         self.entries.insert(key, line.clone());
         line
@@ -95,21 +103,27 @@ impl BoundedCache {
     fn shape_uncached(
         &mut self,
         text: SharedString,
+        text_start: usize,
         font: &Font,
         size_px: f32,
         color: Hsla,
         text_system: &WindowTextSystem,
     ) -> ShapedLine {
         self.stats.misses += 1;
+        let displayed = if text_start == 0 {
+            text
+        } else {
+            SharedString::from(&text[text_start..])
+        };
         let run = TextRun {
-            len: text.len(),
+            len: displayed.len(),
             font: font.clone(),
             color,
             background_color: None,
             underline: None,
             strikethrough: None,
         };
-        text_system.shape_line(text, px(size_px), &[run], None)
+        text_system.shape_line(displayed, px(size_px), &[run], None)
     }
 }
 
@@ -138,6 +152,7 @@ impl TextCache {
     pub(crate) fn shape_label(
         &mut self,
         text: SharedString,
+        text_start: usize,
         font: &Font,
         size_px: f32,
         color: Hsla,
@@ -145,10 +160,11 @@ impl TextCache {
         text_system: &WindowTextSystem,
     ) -> ShapedLine {
         if self.enabled && settled {
-            self.labels.shape(text, font, size_px, color, text_system)
+            self.labels
+                .shape(text, text_start, font, size_px, color, text_system)
         } else {
             self.labels
-                .shape_uncached(text, font, size_px, color, text_system)
+                .shape_uncached(text, text_start, font, size_px, color, text_system)
         }
     }
 
@@ -210,9 +226,9 @@ mod tests {
         let color = gpui::rgb(0xffffff).into();
         let mut cache = BoundedCache::new(2);
 
-        cache.shape("a".into(), &font, 12.0, color, &system);
-        cache.shape("b".into(), &font, 12.0, color, &system);
-        cache.shape("a".into(), &font, 12.0, color, &system);
+        cache.shape("a".into(), 0, &font, 12.0, color, &system);
+        cache.shape("b".into(), 0, &font, 12.0, color, &system);
+        cache.shape("a".into(), 0, &font, 12.0, color, &system);
         assert_eq!(
             cache.stats,
             CacheStats {
@@ -222,7 +238,7 @@ mod tests {
             }
         );
 
-        cache.shape("c".into(), &font, 12.0, color, &system);
+        cache.shape("c".into(), 0, &font, 12.0, color, &system);
         assert_eq!(cache.entries.len(), 2);
         assert!(!cache.entries.keys().any(|key| key.text == "a"));
         assert_eq!(cache.stats.evictions, 1);
@@ -235,6 +251,24 @@ mod tests {
     }
 
     #[test]
+    fn suffix_shaping_retains_canonical_identity_and_reuses_the_cached_line() {
+        let system = text_system();
+        let font = gpui::font(k10s_theme::DEFAULT_UI_FAMILY);
+        let color = gpui::rgb(k10s_theme::K10S_DARK.map.pod_label).into();
+        let text: SharedString = Arc::<str>::from("checkout-api-7f9c8d6b5-tzq4x").into();
+        let mut cache = BoundedCache::new(2);
+        let suffix = cache.shape(text.clone(), 13, &font, 14.0, color, &system);
+        assert_eq!(suffix.text, "7f9c8d6b5-tzq4x");
+        let before = cache.stats;
+        let warm = cache.shape(text.clone(), 13, &font, 14.0, color, &system);
+        assert_eq!(warm.text, suffix.text);
+        assert_eq!(cache.stats.since(before).hits, 1);
+        let full = cache.shape(text.clone(), 0, &font, 14.0, color, &system);
+        assert_eq!(full.text, text);
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
     fn an_unsettled_frame_never_evicts_the_warm_settled_set() {
         let system = text_system();
         let font = gpui::font("Noto Sans");
@@ -244,14 +278,14 @@ mod tests {
             ..TextCache::default()
         };
 
-        cache.shape_label("a".into(), &font, 12.0, opaque, true, &system);
-        cache.shape_label("b".into(), &font, 12.0, opaque, true, &system);
+        cache.shape_label("a".into(), 0, &font, 12.0, opaque, true, &system);
+        cache.shape_label("b".into(), 0, &font, 12.0, opaque, true, &system);
 
         let mut faded = opaque;
         for step in 1..=50 {
             faded.a = step as f32 / 51.0;
-            cache.shape_label("a".into(), &font, 12.0, faded, false, &system);
-            cache.shape_label("b".into(), &font, 12.0, faded, false, &system);
+            cache.shape_label("a".into(), 0, &font, 12.0, faded, false, &system);
+            cache.shape_label("b".into(), 0, &font, 12.0, faded, false, &system);
         }
         assert_eq!(
             cache.stats().evictions,
@@ -260,8 +294,8 @@ mod tests {
         );
 
         let before = cache.stats();
-        cache.shape_label("a".into(), &font, 12.0, opaque, true, &system);
-        cache.shape_label("b".into(), &font, 12.0, opaque, true, &system);
+        cache.shape_label("a".into(), 0, &font, 12.0, opaque, true, &system);
+        cache.shape_label("b".into(), 0, &font, 12.0, opaque, true, &system);
         let after = cache.stats().since(before);
         assert_eq!(
             (after.hits, after.misses),
@@ -271,7 +305,7 @@ mod tests {
 
         cache.set_enabled(false);
         let before = cache.stats();
-        cache.shape_label("a".into(), &font, 12.0, opaque, true, &system);
+        cache.shape_label("a".into(), 0, &font, 12.0, opaque, true, &system);
         let after = cache.stats().since(before);
         assert_eq!(
             (after.hits, after.misses),

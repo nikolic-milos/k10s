@@ -28,10 +28,16 @@ mod table;
 pub use table::{EcosystemEntry, KindRow, TableColumn, TableOutcome, TablePage, TableRow};
 
 mod observe;
+mod telemetry;
 pub use observe::{
     AlertMatcher, AlertPodOutcome, AlertmanagerEndpoint, AlertmanagerOutcome, GrafanaOutcome,
-    GrafanaPanelKind, GrafanaPanelRow, LokiOutcome, ObserveReach, PromOutcome, PromSeriesView,
-    QueryDialect, SilenceOutcome, SilenceRequest, SpanView, ToolPresence, TraceOutcome,
+    GrafanaPanelKind, GrafanaPanelRow, LogEntry, LokiOutcome, ObserveReach, PromOutcome,
+    PromSeriesView, QueryDialect, SilenceOutcome, SilenceRequest, SpanView, ToolPresence,
+    TraceOutcome, grafana_panel_path,
+};
+pub use telemetry::{
+    FetchTiming, LokiRequest, ObserveScope, PodIdentity, PromRequest, QueryWindow, RequestStop,
+    ScopeOutcome, exact_pattern, quote,
 };
 
 mod helm;
@@ -157,11 +163,13 @@ cluster_provider! {
     fn fetch_pod_posture(&self, namespace: &str, name: &str, reply: Reply<PostureOutcome>);
     /// Grafana dashboards reduced to queries. [`GrafanaOutcome::Absent`] hides
     /// the Grafana pane.
-    fn fetch_grafana(&self, reply: Reply<GrafanaOutcome>);
-    fn probe_observe(&self, reply: Reply<ObserveReach>);
-    fn query_promql(&self, expr: String, reply: Reply<PromOutcome>);
-    fn query_loki(&self, query: String, reply: Reply<LokiOutcome>);
-    fn lookup_trace(&self, trace_id: String, reply: Reply<TraceOutcome>);
+    fn fetch_grafana(&self, reply: Reply<GrafanaOutcome>) -> RequestStop;
+    fn probe_observe(&self, reply: Reply<ObserveReach>) -> RequestStop;
+    fn resolve_observe_scope(&self, request: DescribeRequest, reply: Reply<ScopeOutcome>) -> RequestStop;
+    fn query_panel(&self, panel: GrafanaPanelRow, scope: ObserveScope, window: QueryWindow, reply: Reply<PromOutcome>) -> RequestStop;
+    fn query_promql(&self, request: PromRequest, reply: Reply<PromOutcome>) -> RequestStop;
+    fn query_loki(&self, request: LokiRequest, reply: Reply<LokiOutcome>) -> RequestStop;
+    fn lookup_trace(&self, trace_id: String, reply: Reply<TraceOutcome>) -> RequestStop;
     /// PolicyReport findings. Absent hides the pane.
     fn fetch_policy(&self, reply: Reply<TableOutcome>);
     /// Harbor projects. Absent hides the pane.
@@ -330,28 +338,49 @@ impl ClusterProvider for NullProvider {
         reply(PostureOutcome::Failed(NO_CLUSTER.to_string()));
     }
 
-    fn fetch_grafana(&self, reply: Reply<GrafanaOutcome>) {
+    fn fetch_grafana(&self, reply: Reply<GrafanaOutcome>) -> RequestStop {
         reply(GrafanaOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
     }
 
-    fn probe_observe(&self, reply: Reply<ObserveReach>) {
+    fn probe_observe(&self, reply: Reply<ObserveReach>) -> RequestStop {
         reply(ObserveReach {
             prometheus: ToolPresence::Missing,
             loki: ToolPresence::Missing,
             traces: ToolPresence::Missing,
+            error: None,
         });
+        RequestStop::noop()
     }
 
-    fn query_promql(&self, _: String, reply: Reply<PromOutcome>) {
+    fn resolve_observe_scope(&self, _: DescribeRequest, reply: Reply<ScopeOutcome>) -> RequestStop {
+        reply(ScopeOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
+    }
+    fn query_panel(
+        &self,
+        _: GrafanaPanelRow,
+        _: ObserveScope,
+        _: QueryWindow,
+        reply: Reply<PromOutcome>,
+    ) -> RequestStop {
         reply(PromOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
     }
 
-    fn query_loki(&self, _: String, reply: Reply<LokiOutcome>) {
+    fn query_promql(&self, _: PromRequest, reply: Reply<PromOutcome>) -> RequestStop {
+        reply(PromOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
+    }
+
+    fn query_loki(&self, _: LokiRequest, reply: Reply<LokiOutcome>) -> RequestStop {
         reply(LokiOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
     }
 
-    fn lookup_trace(&self, _: String, reply: Reply<TraceOutcome>) {
+    fn lookup_trace(&self, _: String, reply: Reply<TraceOutcome>) -> RequestStop {
         reply(TraceOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
     }
 
     fn fetch_policy(&self, reply: Reply<TableOutcome>) {

@@ -118,7 +118,10 @@ impl Workspace {
                     body = body.child(Self::row(theme, &fonts, "UID", selection.uid.to_string()));
                 }
                 if selection.usage_target().is_some() {
-                    body = body.child(Self::usage_section(theme, &fonts, self.usage.as_ref()));
+                    body = body.child(Self::usage_section(theme, &fonts, self.usage.outcome()));
+                }
+                if let Some(chart) = &self.observe_sparkline {
+                    body = body.child(chart.clone());
                 }
                 if selection.level == Level::Cell {
                     body = body.child(Self::posture_section(theme, &fonts, self.posture.as_ref()));

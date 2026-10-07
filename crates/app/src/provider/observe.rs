@@ -132,6 +132,30 @@ pub(super) fn optional_table_outcome(
     }
 }
 
+pub(super) fn observe_reach(
+    fetched: Fetched<k10s_data::read::ObserveTools>,
+) -> k10s_provider::ObserveReach {
+    use k10s_provider::{ObserveReach, ToolPresence};
+    let error = match fetched {
+        Fetched::Ok(tools) => {
+            return ObserveReach {
+                prometheus: tool_presence(tools.prometheus),
+                loki: tool_presence(tools.loki),
+                traces: tool_presence(tools.traces),
+                error: (!tools.errors.is_empty()).then(|| tools.errors.join("; ")),
+            };
+        }
+        Fetched::Denied { what } => format!("{what}: access denied for this account"),
+        Fetched::Failed { why, .. } => why,
+    };
+    ObserveReach {
+        prometheus: ToolPresence::Blocked,
+        loki: ToolPresence::Blocked,
+        traces: ToolPresence::Blocked,
+        error: Some(error),
+    }
+}
+
 pub(super) fn tool_presence(seen: k10s_data::read::Seen) -> k10s_provider::ToolPresence {
     match seen {
         k10s_data::read::Seen::Bound => k10s_provider::ToolPresence::Ready,
@@ -149,18 +173,7 @@ fn grafana_panel_url(base: Option<&str>, uid: &str, panel_id: i64) -> Option<Str
     if uid.is_empty() {
         return Some(base.to_string());
     }
-    let mut encoded = String::with_capacity(uid.len());
-    for byte in uid.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => encoded.push(byte as char),
-            _ => {
-                encoded.push('%');
-                encoded.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-                encoded.push(char::from_digit(u32::from(byte & 0xf), 16).unwrap_or('0'));
-            }
-        }
-    }
-    Some(format!("{base}/d/{encoded}?viewPanel={panel_id}"))
+    k10s_provider::grafana_panel_path(uid, panel_id).map(|path| format!("{base}{path}"))
 }
 
 fn panel_kind(
@@ -208,6 +221,7 @@ fn query_dialect(
 fn flatten_dashboard(
     dashboard: &k10s_data::integrations::grafana::Dashboard,
     browser_base: Option<&str>,
+    browser_service: Option<&(String, String)>,
     into: &mut Vec<k10s_provider::GrafanaPanelRow>,
 ) {
     for panel in &dashboard.panels {
@@ -222,6 +236,20 @@ fn flatten_dashboard(
                 dialect: k10s_provider::QueryDialect::Unknown,
                 transformed: panel.transformed,
                 browser_url: grafana_panel_url(browser_base, &dashboard.uid, panel.id),
+                browser_forward: browser_service.map(|(namespace, name)| {
+                    k10s_provider::ForwardRequest {
+                        namespace: namespace.clone(),
+                        name: name.clone(),
+                        service: true,
+                    }
+                }),
+                datasource_uid: None,
+                ref_id: String::new(),
+                unit: panel.unit.clone(),
+                reducer: panel.reducer.clone(),
+                min_step: String::new(),
+                min_interval: panel.min_interval.clone(),
+                unsupported: panel.unsupported.clone(),
             });
             continue;
         }
@@ -240,6 +268,23 @@ fn flatten_dashboard(
                 dialect: query_dialect(query.dialect),
                 transformed: panel.transformed,
                 browser_url: grafana_panel_url(browser_base, &dashboard.uid, panel.id),
+                browser_forward: browser_service.map(|(namespace, name)| {
+                    k10s_provider::ForwardRequest {
+                        namespace: namespace.clone(),
+                        name: name.clone(),
+                        service: true,
+                    }
+                }),
+                datasource_uid: query.datasource.clone(),
+                ref_id: query.ref_id.clone(),
+                unit: panel.unit.clone(),
+                reducer: panel.reducer.clone(),
+                min_step: query.min_step.clone(),
+                min_interval: panel.min_interval.clone(),
+                unsupported: panel
+                    .unsupported
+                    .clone()
+                    .or_else(|| query.unsupported.clone()),
             });
         }
     }
@@ -249,11 +294,18 @@ pub(super) fn grafana_outcome(
     fetched: Fetched<k10s_data::read::GrafanaCatalog>,
 ) -> k10s_provider::GrafanaOutcome {
     match fetched {
-        Fetched::Ok(catalog) if !catalog.served => k10s_provider::GrafanaOutcome::Absent,
+        Fetched::Ok(catalog) if !catalog.served && catalog.errors.is_empty() => {
+            k10s_provider::GrafanaOutcome::Absent
+        }
         Fetched::Ok(catalog) => {
             let mut panels = Vec::new();
             for dashboard in &catalog.dashboards {
-                flatten_dashboard(dashboard, catalog.browser_base.as_deref(), &mut panels);
+                flatten_dashboard(
+                    dashboard,
+                    catalog.browser_base.as_deref(),
+                    catalog.browser_service.as_ref(),
+                    &mut panels,
+                );
             }
             for hit in catalog.extra_hits {
                 panels.push(k10s_provider::GrafanaPanelRow {
@@ -266,11 +318,26 @@ pub(super) fn grafana_outcome(
                     dialect: k10s_provider::QueryDialect::Unknown,
                     transformed: false,
                     browser_url: grafana_panel_url(catalog.browser_base.as_deref(), &hit.uid, 0),
+                    browser_forward: catalog.browser_service.as_ref().map(|(namespace, name)| {
+                        k10s_provider::ForwardRequest {
+                            namespace: namespace.clone(),
+                            name: name.clone(),
+                            service: true,
+                        }
+                    }),
+                    datasource_uid: None,
+                    ref_id: String::new(),
+                    unit: String::new(),
+                    reducer: String::new(),
+                    min_step: String::new(),
+                    min_interval: String::new(),
+                    unsupported: Some("dashboard was not fetched at the catalog limit".to_string()),
                 });
             }
             k10s_provider::GrafanaOutcome::Catalog {
                 panels,
                 truncated: catalog.truncated,
+                notices: catalog.errors,
             }
         }
         Fetched::Denied { what } => k10s_provider::GrafanaOutcome::Denied(what),
@@ -279,59 +346,117 @@ pub(super) fn grafana_outcome(
 }
 
 fn series_labels(labels: &[(String, String)]) -> String {
-    if labels.is_empty() {
-        return "{}".to_string();
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(
+        labels
+            .iter()
+            .map(|(name, value)| name.len() + value.len() + 4)
+            .sum::<usize>()
+            + 2,
+    );
+    text.push('{');
+    for (index, (name, value)) in labels.iter().enumerate() {
+        if index > 0 {
+            text.push(',');
+        }
+        write!(&mut text, "{name}={value:?}").expect("writing to a String");
     }
-    let inner = labels
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{inner}}}")
+    text.push('}');
+    text
 }
 
 pub(super) fn prom_outcome(
     fetched: Fetched<Option<k10s_data::integrations::prom::QueryResult>>,
 ) -> k10s_provider::PromOutcome {
+    use k10s_provider::{FetchTiming, PromOutcome, PromSeriesView};
     match fetched {
-        Fetched::Ok(None) => k10s_provider::PromOutcome::Absent,
-        Fetched::Ok(Some(result)) => k10s_provider::PromOutcome::Series {
-            series: result
+        Fetched::Ok(None) => PromOutcome::Absent,
+        Fetched::Ok(Some(result)) => {
+            let started = std::time::Instant::now();
+            let metrics = k10s_data::telemetry::request_metrics().unwrap_or_default();
+            let series = result
                 .series
                 .into_iter()
-                .map(|series| k10s_provider::PromSeriesView {
+                .map(|series| PromSeriesView {
                     labels: series_labels(&series.labels),
+                    label_set: series.labels,
                     points: series.points,
+                    gaps: series.gaps,
                 })
-                .collect(),
-            truncated: result.truncated,
-            dropped_series: result.dropped_series,
-        },
-        Fetched::Denied { what } => k10s_provider::PromOutcome::Denied(what),
-        Fetched::Failed { why, .. } => k10s_provider::PromOutcome::Failed(why),
+                .collect();
+            let projection_ns = started.elapsed().as_nanos() as u64;
+            let total_ns = k10s_data::telemetry::request_metrics()
+                .map_or(metrics.total_ns, |metrics| metrics.total_ns);
+            PromOutcome::Series {
+                series,
+                truncated: result.truncated,
+                dropped_series: result.dropped_series,
+                warnings: result.warnings,
+                infos: result.infos,
+                source: result.source,
+                step_ms: result.step_ms,
+                expr: result.expr,
+                timing: FetchTiming {
+                    bytes: result.timing.bytes,
+                    network_ns: result.timing.network_ns,
+                    decode_ns: result.timing.decode_ns,
+                    projection_ns,
+                    queue_ns: metrics.queue_ns,
+                    total_ns,
+                    requests: metrics.requests,
+                    total_bytes: metrics.bytes,
+                    binding_network_ns: metrics.network_ns.saturating_sub(result.timing.network_ns),
+                },
+            }
+        }
+        Fetched::Denied { what } => PromOutcome::Denied(what),
+        Fetched::Failed { why, .. } => PromOutcome::Failed(why),
     }
 }
 
 pub(super) fn loki_outcome(
     fetched: Fetched<Option<k10s_data::integrations::loki::Logs>>,
 ) -> k10s_provider::LokiOutcome {
+    use k10s_provider::{LogEntry, LokiOutcome};
     match fetched {
-        Fetched::Ok(None) => k10s_provider::LokiOutcome::Absent,
+        Fetched::Ok(None) => LokiOutcome::Absent,
         Fetched::Ok(Some(logs)) => {
-            let mut lines = Vec::new();
-            for stream in &logs.streams {
-                let labels = series_labels(&stream.labels);
-                for line in &stream.lines {
-                    lines.push(format!("{} {labels} {}", line.ts_ns, line.line));
+            let mut entries = Vec::new();
+            for stream in logs.streams {
+                let labels: std::sync::Arc<[(String, String)]> = stream.labels.into();
+                for line in stream.lines {
+                    let trace_id = line
+                        .metadata
+                        .iter()
+                        .chain(labels.iter())
+                        .find(|(key, _)| key == "trace_id")
+                        .map(|(_, value)| value.as_str())
+                        .filter(|value| {
+                            value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                        .map(str::to_ascii_lowercase);
+                    entries.push(LogEntry {
+                        timestamp_ns: line.ts_ns,
+                        line: line.line,
+                        labels: labels.clone(),
+                        metadata: line.metadata,
+                        trace_id,
+                    });
                 }
             }
-            k10s_provider::LokiOutcome::Logs {
-                lines,
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp_ns));
+            LokiOutcome::Logs {
+                entries,
                 truncated: logs.truncated,
+                dropped_streams: logs.dropped_streams,
+                dropped_lines: logs.dropped_lines,
+                clipped_lines: logs.clipped_lines,
+                limit_reached: logs.limit_reached,
+                source: logs.source,
             }
         }
-        Fetched::Denied { what } => k10s_provider::LokiOutcome::Denied(what),
-        Fetched::Failed { why, .. } => k10s_provider::LokiOutcome::Failed(why),
+        Fetched::Denied { what } => LokiOutcome::Denied(what),
+        Fetched::Failed { why, .. } => LokiOutcome::Failed(why),
     }
 }
 
@@ -340,6 +465,9 @@ pub(super) fn trace_outcome(
 ) -> k10s_provider::TraceOutcome {
     match fetched {
         Fetched::Ok(None) => k10s_provider::TraceOutcome::Absent,
+        Fetched::Ok(Some(trace)) if trace.spans.is_empty() && trace.trace_id.is_empty() => {
+            k10s_provider::TraceOutcome::Empty
+        }
         Fetched::Ok(Some(trace)) => k10s_provider::TraceOutcome::Trace {
             trace_id: trace.trace_id,
             spans: trace
@@ -353,6 +481,10 @@ pub(super) fn trace_outcome(
                     start_us: span.start_us,
                     duration_us: span.duration_us,
                     status: span.status,
+                    namespace: span.namespace,
+                    pod: span.pod,
+                    pod_uid: span.pod_uid,
+                    node: span.node,
                 })
                 .collect(),
         },

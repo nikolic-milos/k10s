@@ -708,6 +708,11 @@ fn a_busy_live_grafana_catalog_reports_its_timeout_and_recovers() {
         panic!("the lab's Grafana catalog must initially answer");
     };
     assert!(before.served && !before.dashboards.is_empty());
+    assert!(
+        before.errors.is_empty(),
+        "the initial catalog must be complete: {:?}",
+        before.errors
+    );
 
     kube_runtime().block_on(async {
         let client = kube::Client::try_default().await.expect("the fixture client");
@@ -802,8 +807,14 @@ print("released", flush=True)
         let (reached, answer) = checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         assert!(matches!(reached, ToolReach::Bound(_)), "health still answers while storage is locked: {reached:?}");
         let answer = answer.expect("the catalog reports within the budget").expect("the callback arrives");
-        assert!(matches!(&answer, Fetched::Failed {what: "grafana", why}
-            if why == "Grafana did not answer within 4 seconds"), "{answer:?}");
+        let Fetched::Ok(partial) = answer else {
+            panic!("healthy provisioned dashboards remain visible beside the timeout: {answer:?}");
+        };
+        assert!(partial.served && !partial.dashboards.is_empty());
+        assert_eq!(partial.errors, ["Grafana search: grafana did not answer within 4 seconds"]);
+        for dashboard in &partial.dashboards {
+            assert!(before.dashboards.contains(dashboard), "{dashboard:?}");
+        }
     });
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2154,4 +2165,641 @@ fn a_drain_names_the_disruption_budget_promptly() {
         .expect("a get request");
     let node = admin_request(request).expect("the node");
     assert_eq!(node["spec"]["unschedulable"], true, "the node is cordoned");
+}
+
+#[test]
+#[ignore = "needs the owned k10s-observe-pilot Collector and producer fixture"]
+fn a_service_forward_reads_the_pilot_through_a_named_prometheus_url() {
+    use k10s_data::forward::{ForwardRegistry, ForwardRequest};
+    use k10s_data::integrations::prom;
+    use k10s_data::reach::{Bound, ToolAuth, ToolKind, Transport};
+    struct OwnedForward(ForwardRegistry, u64);
+    impl Drop for OwnedForward {
+        fn drop(&mut self) {
+            self.0.close(self.1);
+        }
+    }
+    let (_plane, sync) = connect(None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.open_forward(
+        ForwardRequest {
+            namespace: "observability".into(),
+            name: "monitoring-kube-prometheus-prometheus".into(),
+            service: true,
+        },
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
+    let row = match wait(&rx) {
+        Fetched::Ok(row) => row,
+        other => panic!("the actual Prometheus Service forward: {other:?}"),
+    };
+    let _forward = OwnedForward(sync.reader.forwards().clone(), row.id);
+    assert_eq!(row.spec.remote_port, 9090);
+    let bound = Bound {
+        kind: ToolKind::Prometheus,
+        found: None,
+        transport: Transport::Url {
+            base: format!("http://127.0.0.1:{}", row.spec.local_port),
+        },
+        auth: ToolAuth::Anonymous,
+    };
+    let end = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs_f64();
+    let result = kube_runtime().block_on(async {
+        let client = kube::Client::try_default().await.expect("the live client");
+        prom::query_range(
+            &client,
+            &bound,
+            "k10s_pilot_requests_total{namespace=\"k10s-observe-pilot\"}",
+            end - 300.0,
+            end,
+            "15s",
+        )
+        .await
+    });
+    let result = match result {
+        Fetched::Ok(result) => result,
+        other => panic!("the named URL range read through the kubelet: {other:?}"),
+    };
+    assert!(result.series.iter().any(|series| {
+        series
+            .points
+            .iter()
+            .any(|(_, value)| value.is_finite() && *value > 0.0)
+    }));
+    assert!(!result.truncated);
+    println!(
+        "named URL read through {} / {}: {} series",
+        row.spec.namespace,
+        row.spec.pod,
+        result.series.len()
+    );
+}
+
+#[test]
+#[ignore = "needs the owned k10s-observe-pilot namespace; creates only a zero-replica probe"]
+fn zero_replica_scope_and_recreation_use_real_metadata_and_controller_uids() {
+    use k8s_openapi::api::{apps::v1::Deployment, core::v1::Namespace};
+    use kube::api::{DeleteParams, PostParams, Preconditions};
+    const NS: &str = "k10s-observe-pilot";
+    struct OwnedDeployment<'a> {
+        runtime: &'a tokio::runtime::Runtime,
+        api: kube::Api<Deployment>,
+        name: String,
+        uid: Option<String>,
+    }
+    impl OwnedDeployment<'_> {
+        fn remove(&mut self) -> Result<(), String> {
+            let Some(uid) = &self.uid else {
+                return Ok(());
+            };
+            let params = DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: Some(uid.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            self.runtime.block_on(async {
+                self.api
+                    .delete(&self.name, &params)
+                    .await
+                    .map_err(|error| said(&error))?;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let current = self
+                            .api
+                            .get_metadata_opt(&self.name)
+                            .await
+                            .map_err(|error| said(&error))?;
+                        if current.as_ref().and_then(|item| item.metadata.uid.as_ref()) != Some(uid)
+                        {
+                            return Ok::<(), String>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .map_err(|_| format!("deletion of {} UID {uid} did not finish in 10s", self.name))?
+            })?;
+            self.uid = None;
+            Ok(())
+        }
+    }
+    impl Drop for OwnedDeployment<'_> {
+        fn drop(&mut self) {
+            if let Err(error) = self.remove() {
+                eprintln!("owned scope probe cleanup refused: {error}");
+            }
+        }
+    }
+    let runtime = kube_runtime();
+    let (api, item) = runtime.block_on(async {
+        let client = kube::Client::try_default().await.expect("the admin client");
+        let namespaces: kube::Api<Namespace> = kube::Api::all(client.clone());
+        let namespace = namespaces.get_metadata(NS).await.expect("the owned namespace");
+        assert_eq!(
+            namespace.metadata.labels.as_ref().and_then(|labels| labels.get("k10s.dev/fixture")).map(String::as_str),
+            Some("observe-pilot")
+        );
+        let api: kube::Api<Deployment> = kube::Api::namespaced(client, NS);
+        let item: Deployment = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "generateName": "scope-zero-",
+                "labels": {"k10s.dev/fixture": "observe-pilot"}
+            },
+            "spec": {
+                "replicas": 0,
+                "selector": {"matchLabels": {"k10s.dev/probe": "scope-zero"}},
+                "template": {
+                    "metadata": {"labels": {"k10s.dev/probe": "scope-zero"}},
+                    "spec": {
+                        "automountServiceAccountToken": false,
+                        "containers": [{"name": "never-started", "image": "python:3.14.7-alpine3.24"}]
+                    }
+                }
+            }
+        })).expect("the zero-replica fixture");
+        let created = api.create(&PostParams::default(), &item).await.expect("create only the probe");
+        (api, created)
+    });
+    let name = item.metadata.name.clone().expect("generated name");
+    let uid = item.metadata.uid.clone().expect("created UID");
+    let mut guard = OwnedDeployment {
+        runtime: &runtime,
+        api,
+        name: name.clone(),
+        uid: Some(uid.clone()),
+    };
+    println!("owned zero-replica probe {NS}/{} UID={uid}", guard.name);
+    let (_plane, sync) = connect(None);
+    let request = DescribeRequest {
+        kind: KindId::DEPLOYMENT,
+        namespace: Some(NS.into()),
+        name,
+        uid: uid.clone(),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _stop = sync
+        .reader
+        .resolve_observe_scope(request.clone(), move |answer| {
+            let _ = tx.send(answer);
+        });
+    let scope = match wait(&rx) {
+        Fetched::Ok(scope) => scope,
+        other => panic!("zero replicas are a complete empty scope: {other:?}"),
+    };
+    assert!(scope.pods.is_empty());
+    assert_eq!(scope.resource_uid, uid);
+    guard.remove().expect("delete only the original probe UID");
+    let mut replacement = item;
+    replacement.metadata.uid = None;
+    replacement.metadata.resource_version = None;
+    replacement.metadata.creation_timestamp = None;
+    replacement.metadata.managed_fields = None;
+    replacement.metadata.generate_name = None;
+    replacement.status = None;
+    let replacement = runtime
+        .block_on(guard.api.create(&PostParams::default(), &replacement))
+        .expect("recreate the same zero-replica name");
+    let next_uid = replacement.metadata.uid.expect("replacement UID");
+    guard.uid = Some(next_uid.clone());
+    assert_ne!(uid, next_uid);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _stop = sync.reader.resolve_observe_scope(request, move |answer| {
+        let _ = tx.send(answer);
+    });
+    assert!(matches!(wait(&rx),Fetched::Failed {why,..} if why.contains("recreated")));
+    guard
+        .remove()
+        .expect("delete only the replacement probe UID");
+    println!("same-name recreation refused old UID {uid}, current UID {next_uid}");
+}
+
+#[test]
+#[ignore = "needs the owned k10s-observe-pilot Collector and producer fixture"]
+fn restricted_accounts_read_current_pilot_metrics_and_grafana_panels() {
+    use k8s_openapi::api::core::v1::Pod;
+    use k10s_data::integrations::grafana;
+    use kube::api::ListParams;
+    const NS: &str = "k10s-observe-pilot";
+    let (pod, uid) = kube_runtime().block_on(async {
+        let client = kube::Client::try_default().await.expect("the admin client");
+        let pods: kube::Api<Pod> = kube::Api::namespaced(client, NS);
+        let page = pods
+            .list_metadata(
+                &ListParams::default()
+                    .labels("app.kubernetes.io/name=pilot-producer")
+                    .limit(2),
+            )
+            .await
+            .expect("owned producer metadata");
+        assert_eq!(page.items.len(), 1);
+        let item = &page.items[0];
+        (
+            item.metadata.name.clone().expect("pod name"),
+            item.metadata.uid.clone().expect("pod UID"),
+        )
+    });
+    let nometrics = std::env::var("K10S_LIVE_NOMETRICS_CONTEXT")
+        .unwrap_or_else(|_| "nometrics@k10s-lab".into());
+    for context in [reader_context(), nometrics] {
+        let (_plane, sync) = connect(Some(&context));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _scope_stop = sync.reader.resolve_observe_scope(
+            DescribeRequest {
+                kind: KindId::POD,
+                namespace: Some(NS.into()),
+                name: pod.clone(),
+                uid: uid.clone(),
+            },
+            move |answer| {
+                let _ = tx.send(answer);
+            },
+        );
+        let scope = match wait(&rx) {
+            Fetched::Ok(scope) => scope,
+            other => panic!("{context} selected identity: {other:?}"),
+        };
+        assert_eq!(scope.pods.len(), 1);
+        assert_eq!(scope.pods[0].uid, uid);
+        assert!(!scope.pods[0].node.is_empty());
+        let end_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_millis() as i64;
+        let start_ms = end_ms - 300_000;
+        let expr =
+            format!("k10s_pilot_requests_total{{namespace=\"{NS}\",pod=\"{pod}\",uid=\"{uid}\"}}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _query_stop = sync.reader.observe_prometheus(
+            expr,
+            start_ms as f64 / 1000.0,
+            end_ms as f64 / 1000.0,
+            "15s".into(),
+            move |answer| {
+                let _ = tx.send(answer);
+            },
+        );
+        let result = match wait(&rx) {
+            Fetched::Ok(Some(result)) => result,
+            other => panic!("{context} metric read: {other:?}"),
+        };
+        assert_eq!(result.series.len(), 1);
+        assert!(
+            result.series[0]
+                .labels
+                .contains(&("uid".into(), uid.clone()))
+        );
+        assert!(
+            result.series[0]
+                .points
+                .iter()
+                .any(|(_, value)| value.is_finite() && *value > 0.0)
+        );
+        assert!(!result.truncated);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _catalog_stop = sync.reader.observe_grafana(move |answer| {
+            let _ = tx.send(answer);
+        });
+        let catalog = match wait(&rx) {
+            Fetched::Ok(catalog) => catalog,
+            other => panic!("{context} dashboard read: {other:?}"),
+        };
+        let dashboard = catalog
+            .dashboards
+            .iter()
+            .find(|dashboard| dashboard.uid == "k10s-observe-pilot-native")
+            .expect("the owned dashboard");
+        assert_eq!(dashboard.panels.len(), 2);
+        for panel in &dashboard.panels {
+            assert!(panel.unsupported.is_none());
+            let target = panel.queries.first().expect("a supported target").clone();
+            let variables = grafana::Variables {
+                namespace: NS.into(),
+                pods: vec![pod.clone()],
+                node: Some(scope.pods[0].node.clone()),
+                start_ms,
+                end_ms,
+                step_ms: 15_000,
+                min_interval: panel.min_interval.clone(),
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _panel_stop = sync.reader.observe_panel(target, variables, move |answer| {
+                let _ = tx.send(answer);
+            });
+            let result = match wait(&rx) {
+                Fetched::Ok(Some(result)) => result,
+                other => panic!("{context} panel {}: {other:?}", panel.title),
+            };
+            assert!(result.source.contains("datasource prometheus"));
+            assert!(result.series.iter().any(|series| {
+                series
+                    .points
+                    .iter()
+                    .any(|(_, value)| value.is_finite() && *value > 0.0)
+            }));
+            assert!(!result.truncated);
+            println!("{context} read panel {}: {}", panel.title, result.source);
+        }
+        assert_eq!(sync.reader.observe_schedule_counts().rejected, 0);
+    }
+}
+
+#[test]
+#[ignore = "needs the owned k10s-observe-pilot Collector and producer fixture"]
+fn collector_pipeline_links_current_workload_metrics_logs_and_trace() {
+    use k8s_openapi::api::{apps::v1::Deployment, core::v1::Pod};
+    use k10s_data::integrations::{grafana, loki, otel};
+    use kube::api::{ListParams, LogParams};
+    const NS: &str = "k10s-observe-pilot";
+    let (pod, uid, node, deployment_uid, marker) = kube_runtime().block_on(async {
+        let client = kube::Client::try_default().await.expect("the live client");
+        let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), NS);
+        let page = pods
+            .list(
+                &ListParams::default()
+                    .labels("app.kubernetes.io/name=pilot-producer")
+                    .limit(2),
+            )
+            .await
+            .expect("owned producer discovery");
+        assert_eq!(page.items.len(), 1);
+        let item = &page.items[0];
+        let pod = item.metadata.name.clone().expect("pod name");
+        let uid = item.metadata.uid.clone().expect("pod UID");
+        let node = item
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.node_name.clone())
+            .expect("scheduled node");
+        let logs = pods
+            .logs(
+                &pod,
+                &LogParams {
+                    container: Some("producer".into()),
+                    tail_lines: Some(4),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("producer receipt");
+        let marker = logs
+            .lines()
+            .rev()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|marker| marker["event"] == "pilot.complete")
+            .expect("an actual Collector emission");
+        assert_eq!(marker["namespace"], NS);
+        assert_eq!(marker["pod"], pod);
+        assert_eq!(marker["uid"], uid);
+        let deployments: kube::Api<Deployment> = kube::Api::namespaced(client, NS);
+        let deployment_uid = deployments
+            .get("pilot-producer")
+            .await
+            .expect("owned deployment")
+            .metadata
+            .uid
+            .expect("deployment UID");
+        (pod, uid, node, deployment_uid, marker)
+    });
+    let (_plane, sync) = connect(None);
+    let request = DescribeRequest {
+        kind: KindId::DEPLOYMENT,
+        namespace: Some(NS.into()),
+        name: "pilot-producer".into(),
+        uid: deployment_uid,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _stop = sync.reader.resolve_observe_scope(request, move |answer| {
+        let _ = tx.send(answer);
+    });
+    let scope = match wait(&rx) {
+        Fetched::Ok(scope) => scope,
+        other => panic!("owned scope: {other:?}"),
+    };
+    assert_eq!(scope.pods.len(), 1);
+    assert_eq!(scope.pods[0].name, pod);
+    assert_eq!(scope.pods[0].uid, uid);
+    let trace_id = marker["trace_id"]
+        .as_str()
+        .expect("emitted trace ID")
+        .to_string();
+    let emitted_count = marker["count"].as_u64().expect("counter receipt");
+    assert_eq!(trace_id.len(), 32);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let expr =
+        format!("k10s_pilot_requests_total{{namespace=\"{NS}\",pod=\"{pod}\",uid=\"{uid}\"}}");
+    let mut attempts = 0;
+    let (start_ms, end_ms) = loop {
+        let end_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_millis() as i64;
+        let start_ms = end_ms - 300_000;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _stop = sync.reader.observe_prometheus(
+            expr.clone(),
+            start_ms as f64 / 1000.0,
+            end_ms as f64 / 1000.0,
+            "15s".into(),
+            move |answer| {
+                let _ = tx.send((answer, k10s_data::telemetry::request_metrics()));
+            },
+        );
+        let (answer, metrics) = wait(&rx);
+        let result = match answer {
+            Fetched::Ok(Some(result)) => result,
+            other => {
+                panic!("Collector metric query must succeed while awaiting its scrape: {other:?}")
+            }
+        };
+        let metrics = metrics.expect("admitted request counters");
+        if attempts == 0 {
+            assert_eq!(metrics.requests, 3, "the first source binding is cold");
+        } else {
+            assert!(
+                matches!(metrics.requests, 2 | 4),
+                "a verified source hit has two requests; an expired snapshot adds discovery and probe: {metrics:?}"
+            );
+        }
+        attempts += 1;
+        assert!(metrics.bytes > 0);
+        assert!(!result.truncated);
+        println!("pilot metric polling attempt={attempts}, request={metrics:?}");
+        if result.series.iter().any(|series| {
+            series
+                .points
+                .iter()
+                .any(|(_, value)| *value >= emitted_count as f64)
+        }) {
+            assert_eq!(result.series.len(), 1);
+            assert!(
+                result.series[0]
+                    .labels
+                    .iter()
+                    .any(|(name, value)| name == "uid" && value == &uid)
+            );
+            println!(
+                "pilot metric source={}, samples={}, counter>={emitted_count}, network/decode={:?}, request={metrics:?}",
+                result.source,
+                result.series[0].points.len(),
+                result.timing
+            );
+            break (start_ms, end_ms);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Collector metrics never reached Prometheus: {result:?}"
+        );
+        std::thread::sleep(Duration::from_secs(3));
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _stop = sync.reader.observe_grafana(move |answer| {
+        let _ = tx.send(answer);
+    });
+    let catalog = match wait(&rx) {
+        Fetched::Ok(catalog) => catalog,
+        other => panic!("Grafana catalogue: {other:?}"),
+    };
+    let dashboard = catalog
+        .dashboards
+        .iter()
+        .find(|dashboard| dashboard.uid == "k10s-observe-pilot-native")
+        .expect("the actually provisioned pilot dashboard");
+    assert_eq!(dashboard.panels.len(), 2);
+    for panel in &dashboard.panels {
+        assert!(panel.unsupported.is_none(), "{panel:?}");
+        assert!(!panel.transformed);
+        let target = panel.queries.first().expect("a dashboard target").clone();
+        assert_eq!(target.datasource.as_deref(), Some("prometheus"));
+        assert_eq!(target.ref_id, "A");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let vars = grafana::Variables {
+            namespace: NS.into(),
+            pods: vec![pod.clone()],
+            node: Some(node.clone()),
+            start_ms,
+            end_ms,
+            step_ms: 15000,
+            min_interval: panel.min_interval.clone(),
+        };
+        let _stop = sync.reader.observe_panel(target, vars, move |answer| {
+            let _ = tx.send((answer, k10s_data::telemetry::request_metrics()));
+        });
+        let (answer, metrics) = wait(&rx);
+        let result = match answer {
+            Fetched::Ok(Some(result)) => result,
+            other => panic!("bound native panel {}: {other:?}", panel.title),
+        };
+        assert!(
+            !result.series.is_empty(),
+            "{} must contain ingested samples",
+            panel.title
+        );
+        assert!(result.series.iter().any(|series| {
+            series
+                .points
+                .iter()
+                .any(|(_, value)| value.is_finite() && *value > 0.0)
+        }));
+        assert!(!result.truncated);
+        assert!(result.source.contains("datasource prometheus"));
+        assert!(!result.expr.contains('$'));
+        println!(
+            "pilot panel {} unit={} reducer={} step={} expr={} request={metrics:?}",
+            panel.title, panel.unit, panel.reducer, result.step_ms, result.expr
+        );
+    }
+    let query = loki::RangeQuery {
+        query: format!(
+            "{{k8s_namespace_name=\"{NS}\",k8s_pod_name=\"{pod}\"}} | k8s_pod_uid=\"{uid}\" | trace_id=\"{trace_id}\""
+        ),
+        start_ns: start_ms as u64 * 1_000_000,
+        end_ns: end_ms as u64 * 1_000_000,
+        limit: 10,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _stop = sync.reader.observe_loki(query, move |answer| {
+        let _ = tx.send(answer);
+    });
+    let logs = match wait(&rx) {
+        Fetched::Ok(Some(logs)) => logs,
+        other => panic!("Collector OTLP log: {other:?}"),
+    };
+    let (stream, line) = logs
+        .streams
+        .iter()
+        .flat_map(|stream| stream.lines.iter().map(move |line| (stream, line)))
+        .find(|(stream, line)| {
+            line.metadata
+                .iter()
+                .chain(&stream.labels)
+                .any(|(key, value)| key == "trace_id" && value == &trace_id)
+        })
+        .expect("the emitted log trace ID in labels or structured metadata");
+    assert!(
+        line.metadata
+            .iter()
+            .chain(&stream.labels)
+            .any(|(key, value)| key == "k8s_pod_uid" && value == &uid)
+    );
+    let body: serde_json::Value = serde_json::from_str(&line.line).expect("the producer body");
+    assert_eq!(body, marker);
+    assert!(!logs.truncated);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _stop = sync.reader.observe_trace(trace_id.clone(), move |answer| {
+        let _ = tx.send(answer);
+    });
+    let trace = match wait(&rx) {
+        Fetched::Ok(Some(trace)) => trace,
+        other => panic!("Collector OTLP trace: {other:?}"),
+    };
+    assert_eq!(trace.trace_id, trace_id);
+    assert_eq!(trace.spans.len(), 2);
+    for span in &trace.spans {
+        assert_eq!(span.namespace, NS);
+        assert_eq!(span.pod, pod);
+        assert_eq!(span.pod_uid, uid);
+        assert_eq!(span.node, node);
+        assert_eq!(span.service, "k10s-observe-pilot");
+        assert!(span.duration_us > 0);
+    }
+    let root = trace
+        .spans
+        .iter()
+        .find(|span| span.name == "pilot.investigation")
+        .expect("instrumented operation");
+    let child = trace
+        .spans
+        .iter()
+        .find(|span| span.name == "pilot.hash")
+        .expect("instrumented child");
+    assert_eq!(child.parent, root.id);
+    assert_eq!(marker["span_id"], root.id);
+    let inventory = kube_runtime().block_on(async {
+        let client = kube::Client::try_default().await.expect("client");
+        otel::fetch_inventory(&client, Some(NS)).await
+    });
+    let inventory = match inventory {
+        Fetched::Ok(inventory) => inventory,
+        other => panic!("safe Collector inventory: {other:?}"),
+    };
+    assert_eq!(inventory.services.len(), 1);
+    assert_eq!(inventory.services[0].name, "collector");
+    assert_eq!(inventory.services[0].port, 13133);
+    assert!(inventory.services[0].health.contains("Process extension"));
+    println!(
+        "pilot pipeline proven: {NS}/{pod} UID={uid}, trace={trace_id}, spans={}, log_time_ns={}, Collector={:?}",
+        trace.spans.len(),
+        line.ts_ns,
+        inventory.services[0]
+    );
+    assert_eq!(sync.reader.observe_schedule_counts().rejected, 0);
 }

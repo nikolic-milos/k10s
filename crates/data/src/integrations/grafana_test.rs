@@ -345,3 +345,26 @@ fn provisioned_caps_are_stated_not_silent() {
     assert_eq!(dashboards.len(), MAX_PROVISIONED);
     assert!(truncated);
 }
+
+#[test]
+fn multiple_visible_targets_cannot_impersonate_one_complete_panel() {
+    let panel = serde_json::json!({
+        "type": "timeseries",
+        "targets": [{"refId":"A", "expr":"up"}, {"refId":"B", "expr":"down"}]
+    });
+    let parsed = read_panel(&panel, 1);
+    assert_eq!(parsed.queries.len(), 2);
+    assert!(
+        parsed
+            .unsupported
+            .as_deref()
+            .is_some_and(|why| why.contains("multi-target"))
+    );
+    let mut single = panel;
+    single["targets"][1]["hide"] = serde_json::json!(true);
+    let parsed = read_panel(&single, 1);
+    assert_eq!(parsed.queries.len(), 1);
+    assert!(parsed.unsupported.is_none());
+    single["targets"][0]["format"] = serde_json::json!("table");
+    assert!(read_panel(&single, 1).queries[0].unsupported.is_some());
+}

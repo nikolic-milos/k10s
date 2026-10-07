@@ -9,6 +9,7 @@
 //! [`MAX_ROWS`]; past it the machine refuses more and says so.
 
 use k10s_provider::{TablePage, TableRow};
+use std::{ops::Range, sync::Arc};
 
 const MIN_COL: usize = 2;
 const MAX_COL: usize = 48;
@@ -29,6 +30,7 @@ pub struct TableState {
     top: usize,
     viewport: usize,
     capped: bool,
+    content_revision: u64,
 }
 
 impl TableState {
@@ -43,6 +45,7 @@ impl TableState {
     pub fn reset(&mut self) {
         *self = Self {
             viewport: self.viewport,
+            content_revision: self.content_revision + 1,
             ..Self::default()
         };
     }
@@ -96,6 +99,23 @@ impl TableState {
         self.visible.len()
     }
 
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
+    pub fn visible_range(&self) -> Range<usize> {
+        self.top
+            ..self.top
+                + self
+                    .viewport
+                    .min(self.visible.len().saturating_sub(self.top))
+    }
+
+    pub fn line_selected(&self, offset: usize) -> bool {
+        let range = self.visible_range();
+        offset < range.len() && self.selected == range.start + offset
+    }
+
     pub fn set_viewport(&mut self, rows: usize) {
         self.viewport = rows.max(1);
         self.ensure_selected_visible();
@@ -121,6 +141,7 @@ impl TableState {
     }
 
     fn recompute(&mut self, keep_uid: Option<&str>) {
+        self.content_revision += 1;
         let needle = self.filter.to_lowercase();
         self.visible = self
             .page
@@ -246,6 +267,42 @@ impl TableState {
     }
 }
 
+/// Keep only the visible formatted rows, independently of cursor highlighting.
+#[derive(Debug, Default)]
+pub struct TableText {
+    key: Option<(u64, Range<usize>)>,
+    header: Arc<str>,
+    lines: Vec<Arc<str>>,
+}
+
+impl TableText {
+    pub fn update(&mut self, table: &TableState) {
+        let key = (table.content_revision(), table.visible_range());
+        if self.key.as_ref() == Some(&key) {
+            return;
+        }
+        if self.key.as_ref().is_none_or(|old| old.0 != key.0) {
+            self.header = table.header_line().into();
+        }
+        self.lines.clear();
+        self.lines.extend(
+            table
+                .visible_lines()
+                .into_iter()
+                .map(|(_, line)| Arc::from(line)),
+        );
+        self.key = Some(key);
+    }
+
+    pub fn header(&self) -> Arc<str> {
+        self.header.clone()
+    }
+
+    pub fn lines(&self) -> &[Arc<str>] {
+        &self.lines
+    }
+}
+
 // Whether a cell holds an already-lowercased needle, ignoring case. A filter
 // keystroke asks this of every cell of every row -- five thousand of them at
 // the cap -- so the ASCII answer, which is nearly every cell a cluster has,
@@ -332,6 +389,63 @@ mod tests {
             truncated: token.is_some(),
             continue_token: token.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn cursor_highlighting_reuses_visible_text_until_the_rows_scroll() {
+        let mut table = TableState::new();
+        table.set_viewport(3);
+        table.set_page(numbered_page(0..20, None));
+        let mut text = TableText::default();
+        text.update(&table);
+        let first = text.lines()[0].clone();
+        let header = text.header();
+        let revision = table.content_revision();
+        table.move_selection(1);
+        text.update(&table);
+        assert_eq!(table.content_revision(), revision);
+        assert!(Arc::ptr_eq(&first, &text.lines()[0]));
+        assert!(Arc::ptr_eq(&header, &text.header()));
+        assert!(!table.line_selected(0));
+        assert!(table.line_selected(1));
+        table.move_selection(5);
+        text.update(&table);
+        assert_eq!(table.content_revision(), revision);
+        assert!(!Arc::ptr_eq(&first, &text.lines()[0]));
+        assert!(Arc::ptr_eq(&header, &text.header()));
+        assert_eq!(text.lines().len(), 3);
+    }
+
+    #[test]
+    fn every_content_or_filter_mutation_invalidates_the_visible_text() {
+        let mut table = TableState::new();
+        let mut revision = table.content_revision();
+        for mutation in [0, 1, 2, 3, 4, 5] {
+            match mutation {
+                0 => table.set_page(numbered_page(0..5, None)),
+                1 => table.append_page(numbered_page(5..10, None)),
+                2 => table.push_filter("row-1"),
+                3 => table.pop_filter(),
+                4 => table.clear_filter(),
+                5 => table.reset(),
+                _ => unreachable!(),
+            }
+            assert!(table.content_revision() > revision);
+            revision = table.content_revision();
+        }
+        table.set_viewport(3);
+        table.set_page(numbered_page(0..5, None));
+        let mut text = TableText::default();
+        text.update(&table);
+        assert!(text.lines()[0].contains("row-0"));
+        table.push_filter("row-1");
+        text.update(&table);
+        assert_eq!(text.lines().len(), 1);
+        assert!(text.lines()[0].contains("row-1"));
+        table.reset();
+        text.update(&table);
+        assert!(text.lines().is_empty());
+        assert!(text.header().is_empty());
     }
 
     #[test]

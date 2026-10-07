@@ -12,7 +12,7 @@ use k10s_atlas::{Camera, Level, LodPolicy, Rect, StageBlend, WorkloadPresentatio
 use k10s_core::{SceneSnapshot, Severity, SlotIds};
 
 pub use k10s_core::OverlayKind;
-use k10s_theme::{MapTheme, Point as UnitPoint, Series, scale_alpha, sparkline};
+use k10s_theme::{MapTheme, MapType, Point as UnitPoint, Series, scale_alpha, sparkline};
 
 use crate::PickPath;
 
@@ -83,6 +83,30 @@ impl OverlayFrame {
         vw: f32,
         vh: f32,
     ) -> Vec<OverlayStamp> {
+        self.visible_stamps_typed(
+            cache,
+            scene,
+            camera,
+            policy,
+            blend,
+            vw,
+            vh,
+            MapType::default(),
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn visible_stamps_typed(
+        &self,
+        cache: &mut StampCache,
+        scene: &SceneSnapshot,
+        camera: Camera,
+        policy: &LodPolicy,
+        blend: StageBlend,
+        vw: f32,
+        vh: f32,
+        type_: MapType,
+    ) -> Vec<OverlayStamp> {
         if self.marks.is_empty() {
             return Vec::new();
         }
@@ -108,16 +132,47 @@ impl OverlayFrame {
             };
             let block = cached.block.and_then(|slot| scene.blocks.get(slot));
             if !object_is_drawn(
-                scene, policy, camera, stage, vw, vh, &visible, located, block,
+                scene, policy, camera, stage, vw, vh, &visible, located, block, type_,
             ) {
                 continue;
             }
-            let (x, y) = camera.w2s(located.rect.x, located.rect.y, vw, vh);
+            let projection = crate::primitive::Projection::new(camera, (vw, vh), (0.0, 0.0));
+            let primitive = match located.level {
+                Level::Region => Some(projection.region(located.rect)),
+                Level::Block => {
+                    block.and_then(|block| {
+                        match crate::primitive::workload_presentation(
+                            policy,
+                            block.inner,
+                            camera.zoom,
+                            stage,
+                            type_,
+                        ) {
+                            WorkloadPresentation::Hidden => None,
+                            WorkloadPresentation::Medallion => {
+                                Some(projection.medallion(block.rect, block.inner))
+                            }
+                            WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
+                                Some(projection.card(block.inner))
+                            }
+                        }
+                    })
+                }
+                Level::Cell => block.and_then(|block| {
+                    let heading =
+                        crate::primitive::workload_label_shown(policy, block.inner.w, camera.zoom)
+                            .then(|| projection.name_band(block.inner, type_))
+                            .flatten();
+                    projection.cell(located.rect, stage, type_, heading)
+                }),
+                Level::Sat => Some(projection.satellite(located.rect)),
+            };
+            let Some(primitive) = primitive else { continue };
             let screen = Rect::new(
-                x,
-                y,
-                located.rect.w * camera.zoom,
-                located.rect.h * camera.zoom,
+                f32::from(primitive.bounds.origin.x),
+                f32::from(primitive.bounds.origin.y),
+                f32::from(primitive.bounds.size.width),
+                f32::from(primitive.bounds.size.height),
             );
             let island = located.level == Level::Region;
             let spark = match (located.level, mark.sparkline.as_ref()) {
@@ -132,6 +187,7 @@ impl OverlayFrame {
                 screen,
                 tint: mark.tint,
                 island,
+                corners: primitive.corners,
                 spark,
             });
         }
@@ -251,6 +307,7 @@ pub struct OverlayStamp {
     pub screen: Rect,
     pub tint: Option<Severity>,
     pub island: bool,
+    pub corners: Corners<Pixels>,
     pub spark: Vec<UnitPoint>,
 }
 
@@ -258,9 +315,6 @@ const TINT_ALPHA: f32 = 0.32;
 const SPARK_STROKE: f32 = 1.5;
 const SPARK_INSET: f32 = 0.08;
 const SPARK_BAND: f32 = 0.22;
-const CARD_RADIUS: f32 = 0.14;
-const CARD_RADIUS_MAX_PX: f32 = 14.0;
-const ISLAND_RADIUS: f32 = 0.34;
 
 #[expect(clippy::too_many_arguments)]
 fn object_is_drawn(
@@ -274,6 +328,7 @@ fn object_is_drawn(
     located: k10s_core::Located,
     // The owning block, resolved once at cache build, not per painted frame.
     block: Option<&k10s_core::WorkloadNode>,
+    type_: MapType,
 ) -> bool {
     if !located.rect.intersects(visible) {
         return false;
@@ -281,12 +336,19 @@ fn object_is_drawn(
     match located.level {
         Level::Region => true,
         Level::Block => block.is_some_and(|block| {
-            policy.workload_presentation(block.inner.w, camera.zoom, stage)
+            crate::primitive::workload_presentation(policy, block.inner, camera.zoom, stage, type_)
                 != WorkloadPresentation::Hidden
         }),
         Level::Cell => block.is_some_and(|block| {
-            let presentation = policy.workload_presentation(block.inner.w, camera.zoom, stage);
-            presentation.cells_shown()
+            let presentation = crate::primitive::workload_presentation(
+                policy,
+                block.inner,
+                camera.zoom,
+                stage,
+                type_,
+            );
+            stage >= 2
+                && presentation.cells_shown()
                 && !policy.cells_aggregated(
                     block.children.len(),
                     block
@@ -379,18 +441,12 @@ pub(crate) fn paint_stamps(
     }
     for stamp in stamps {
         if let Some(severity) = stamp.tint {
-            let short = stamp.screen.w.min(stamp.screen.h);
-            let radius = if stamp.island {
-                px(short * ISLAND_RADIUS)
-            } else {
-                px((short * CARD_RADIUS).min(CARD_RADIUS_MAX_PX))
-            };
             window.paint_quad(quad(
                 gpui::Bounds::<Pixels> {
                     origin: point(px(origin.0 + stamp.screen.x), px(origin.1 + stamp.screen.y)),
                     size: size(px(stamp.screen.w), px(stamp.screen.h)),
                 },
-                Corners::all(radius),
+                stamp.corners,
                 tint_fill(theme, severity),
                 px(0.0),
                 transparent_black(),
@@ -480,7 +536,7 @@ mod tests {
             },
         });
         scene.cells.push(PodNode {
-            rect: Rect::new(12.0, 12.0, 16.0, 16.0),
+            rect: Rect::new(12.0, 42.0, 16.0, 16.0),
             label: "api-0".into(),
             ext: PodExt {
                 state: State::of(ReasonId::RUNNING),
@@ -648,6 +704,40 @@ mod tests {
     }
 
     #[test]
+    fn pod_stamps_follow_the_bounded_body_and_skip_pinned_headings() {
+        let scene = scene_two_islands();
+        let frame = OverlayFrame {
+            kind: Some(OverlayKind::Policy),
+            marks: vec![OverlayMark {
+                uid: "pod-api".into(),
+                tint: Some(Severity::Err),
+                sparkline: None,
+                label: None,
+            }],
+        };
+        let camera = Camera {
+            cx: 20.0,
+            cy: 50.0,
+            zoom: 16.0,
+        };
+        let type_ = MapType::default();
+        let projection = crate::primitive::Projection::new(camera, (800.0, 600.0), (0.0, 0.0));
+        let heading = projection.name_band(scene.blocks[0].inner, type_);
+        let body = projection
+            .cell(scene.cells[0].rect, 3, type_, heading)
+            .expect("visible pod body");
+        let shown = stamps(&frame, &scene, camera, 800.0, 600.0);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].screen.w, f32::from(body.bounds.size.width));
+        assert_eq!(shown[0].screen.h, f32::from(body.bounds.size.height));
+        assert_eq!(shown[0].screen.x, f32::from(body.bounds.origin.x));
+        assert_eq!(shown[0].screen.y, f32::from(body.bounds.origin.y));
+        assert_eq!(shown[0].corners, body.corners);
+        let obscured = Camera { cy: 65.0, ..camera };
+        assert!(stamps(&frame, &scene, obscured, 800.0, 600.0).is_empty());
+    }
+
+    #[test]
     fn a_tiny_card_is_not_stamped_when_the_walk_would_not_draw_it() {
         let mut scene = scene_two_islands();
         scene.blocks[0].inner = Rect::new(10.0, 10.0, 1.0, 1.0);
@@ -798,7 +888,7 @@ mod tests {
         let camera = Camera {
             cx: 50.0,
             cy: 40.0,
-            zoom: 1.0,
+            zoom: 2.4,
         };
         let stamps = stamps(&frame, &scene, camera, 800.0, 600.0);
         assert_eq!(stamps.len(), 1);

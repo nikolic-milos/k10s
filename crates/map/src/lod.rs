@@ -1,13 +1,17 @@
 use std::sync::OnceLock;
 
+use gpui::{Bounds, point, px, size};
 use k10s_atlas::{Camera, CullStats, LodPolicy, StageBlend};
 use k10s_core::{Endpoint, Level, Rect, SceneSnapshot};
 
 use crate::frame::FrameOpts;
 
 pub const STAGE_WL: f32 = 0.09;
-pub const STAGE_POD: f32 = 0.55;
-pub const STAGE_POD_LABEL: f32 = 3.0;
+pub const STAGE_POD: f32 = crate::primitive::POD_MARK_MIN / k10s_core::layout::POD_SIZE;
+pub const STAGE_POD_LABEL: f32 =
+    crate::primitive::POD_DETAIL_MIN_WIDTH / k10s_core::layout::POD_SIZE;
+pub(crate) const MAX_USEFUL_ZOOM: f32 =
+    crate::primitive::POD_DETAIL_MAX_WIDTH / k10s_core::layout::POD_SIZE;
 
 pub const STAGE_EXIT: f32 = 0.85;
 pub const STAGE_FADE_SECS: f32 = 0.18;
@@ -19,11 +23,11 @@ pub const WL_MIN_PX: f32 = 4.0;
 // this redesign existed to fix. How big the glyph then gets is decided by the
 // space the workload owns, not here.
 pub const WL_ICON_MIN_PX: f32 = 4.0;
-pub const WL_CHROME_MIN_PX: f32 = 34.0;
+pub const WL_CHROME_MIN_PX: f32 = crate::primitive::NAME_MIN_WIDTH;
 pub const NS_LABEL_MIN_PX: f32 = 70.0;
-pub const WL_LABEL_MIN_PX: f32 = 60.0;
-pub const WL_LABEL_MIN_ZOOM: f32 = 0.22;
-pub const POD_LABEL_MIN_PX: f32 = 34.0;
+pub const WL_LABEL_MIN_PX: f32 = crate::primitive::NAME_MIN_WIDTH;
+pub const WL_LABEL_MIN_ZOOM: f32 = 0.0;
+pub const POD_LABEL_MIN_PX: f32 = crate::primitive::POD_DETAIL_MIN_WIDTH;
 pub const SAT_MIN_PX: f32 = 5.0;
 pub const SAT_LABEL_MIN_PX: f32 = 30.0;
 
@@ -112,6 +116,7 @@ pub fn cull(
         opts.skip_blocks,
     );
     let visible = camera.visible_world(vw, vh);
+    reference_content(scene, *camera, blend.walk_stage(), (vw, vh), opts, &mut st);
     st.bg_cells = crate::hex::visible_count(&visible, camera.zoom, !opts.hex_shown());
     st.edges = if opts.edges_on && blend.walk_stage() >= 2 && !opts.stress_any() {
         reference_edges(scene, &visible, opts.policy.max_edges)
@@ -119,6 +124,184 @@ pub fn cull(
         0
     };
     st
+}
+
+fn reference_content(
+    scene: &SceneSnapshot,
+    camera: Camera,
+    stage: u8,
+    viewport: (f32, f32),
+    opts: FrameOpts<'_>,
+    st: &mut CullStats,
+) {
+    use crate::primitive::{
+        POD_DETAIL_MIN_WIDTH, POD_MARK_MIN, Projection, TEXT_PAD, name_band_height,
+    };
+    use k10s_atlas::WorkloadPresentation;
+    use k10s_core::layout::{NS_HEADER, NS_PAD};
+
+    let policy = opts.policy;
+    let type_ = opts.type_;
+    let zoom = camera.zoom;
+    let visible = camera.visible_world(viewport.0, viewport.1);
+    let projection = Projection::new(camera, viewport, (0.0, 0.0));
+    st.quads = 1 + st.drawn_regions;
+    st.drawn_blocks = 0;
+    st.drawn_cells = 0;
+    st.aggregated_blocks = 0;
+    st.aggregated_cells = 0;
+    st.labels = 0;
+    st.labels_dropped = 0;
+    st.icons = 0;
+    st.icons_dropped = 0;
+
+    // This independently counts admitted primitives. It never calls the frame
+    // traversal or reads its jobs; the atlas oracle still supplies satellites,
+    // curves and the unchanged region cardinality.
+    scene.for_each_region_candidate(&visible, |region_index, region| {
+        if !region.rect.intersects(&visible) {
+            return;
+        }
+        if policy.region_label_shown(region.rect.w, zoom) {
+            let band = (NS_HEADER + NS_PAD) * zoom;
+            let width = region.rect.w * zoom;
+            let font = k10s_theme::quantize(
+                (width * 0.055)
+                    .min(band * 0.8)
+                    .clamp(type_.region_min, type_.region_max),
+            );
+            let line = font * type_.line_height;
+            let bounds = projection.bounds(region.rect);
+            let row = Bounds {
+                origin: point(
+                    bounds.origin.x,
+                    bounds.origin.y + px((band - line).max(0.0) * 0.5),
+                ),
+                size: size(px(width), px(line)),
+            };
+            st.labels += usize::from(band >= line && projection.label_visible(row, type_));
+        }
+        if stage == 0 {
+            return;
+        }
+        let region_inside = visible.contains(&region.rect);
+        scene.for_each_region_block_candidate(region_index, &visible, |block_index, block| {
+            if !(region_inside || block.rect.intersects(&visible)) {
+                return;
+            }
+            let effective_stage = if stage == 1
+                && block.inner.w * zoom >= crate::primitive::name_min_width(type_)
+                && block.inner.h * zoom >= name_band_height(type_)
+            {
+                2
+            } else {
+                stage
+            };
+            let presentation = if opts.skip_blocks {
+                WorkloadPresentation::Hidden
+            } else {
+                policy.workload_presentation(block.inner.w, zoom, effective_stage)
+            };
+            let named = presentation.card_shown()
+                && block.inner.w * zoom >= policy.block_label_min_px
+                && zoom > policy.block_label_min_zoom;
+            let heading = named
+                .then(|| projection.name_band(block.inner, type_))
+                .flatten();
+            let chrome = presentation == WorkloadPresentation::Detailed
+                && policy.block_chrome_shown(block.inner.w, zoom);
+            if presentation != WorkloadPresentation::Hidden {
+                st.drawn_blocks += 1;
+            }
+            if presentation.card_shown() {
+                st.quads += 1;
+                if chrome {
+                    st.quads += 1 + usize::from(heading.is_some());
+                }
+            }
+            if policy.block_icon_shown(block.inner.w, zoom) {
+                st.icons += usize::from(
+                    presentation == WorkloadPresentation::Medallion
+                        || (presentation == WorkloadPresentation::Detailed && heading.is_some()),
+                );
+            }
+            if heading.is_some() {
+                st.labels += 2;
+                st.icons += usize::from(policy.sat_icon_shown());
+            }
+            if stage < 2 {
+                return;
+            }
+            let inside = region_inside || visible.contains(&block.rect);
+            if presentation != WorkloadPresentation::Hidden || policy.stress_curves {
+                scene.for_each_block_sat(block_index, |_, sat| {
+                    if (inside || sat.rect.intersects(&visible))
+                        && policy.sat_painted(sat.rect.w, zoom)
+                    {
+                        st.icons += usize::from(policy.sat_icon_shown());
+                        st.labels += 2 * usize::from(policy.sat_label_shown(sat.rect.w, zoom));
+                    }
+                });
+            }
+            if !presentation.cells_shown() {
+                return;
+            }
+            let cells = block.children.len();
+            if policy.cells_aggregated(cells, block.inner.intersection_fraction(&visible)) {
+                let inset = (2.0 / zoom).clamp(0.5, 6.0);
+                let header = scene.card_header.min(block.inner.h * 0.5);
+                let aggregate = projection.bounds(Rect::new(
+                    block.inner.x + inset,
+                    block.inner.y + header + inset,
+                    (block.inner.w - inset * 2.0).max(1.0),
+                    (block.inner.h - header - inset * 2.0).max(1.0),
+                ));
+                let top = heading.map_or(aggregate.origin.y, |heading| {
+                    aggregate
+                        .origin
+                        .y
+                        .max(heading.bounds.bottom() + px(crate::primitive::HEADING_CLEARANCE))
+                });
+                st.quads += usize::from(aggregate.bottom() > top);
+                st.aggregated_blocks += 1;
+                st.aggregated_cells += cells;
+                return;
+            }
+            scene.for_each_block_cell_candidate(block_index, &visible, |_, cell| {
+                if !(inside || cell.rect.intersects(&visible)) {
+                    return;
+                }
+                let Some(primitive) = projection.cell(cell.rect, stage, type_, heading) else {
+                    return;
+                };
+                st.drawn_cells += 1;
+                st.quads += 1;
+                let width = f32::from(primitive.bounds.size.width);
+                let height = f32::from(primitive.bounds.size.height);
+                if policy.sat_icon_shown() && width >= POD_MARK_MIN && height >= POD_MARK_MIN {
+                    st.icons += 1;
+                }
+                if stage >= 3
+                    && width >= POD_DETAIL_MIN_WIDTH
+                    && policy.cell_label_shown(cell.rect.w, zoom)
+                {
+                    let line = type_.pod * type_.line_height;
+                    let rows = Bounds {
+                        origin: point(
+                            primitive.bounds.origin.x + px(TEXT_PAD),
+                            primitive.bounds.origin.y + px(TEXT_PAD),
+                        ),
+                        size: size(px(width - TEXT_PAD * 2.0), px(line * 2.0)),
+                    };
+                    st.labels += 2 * usize::from(projection.label_visible(rows, type_));
+                }
+            });
+        });
+    });
+    st.labels_dropped = st.labels.saturating_sub(policy.max_labels);
+    st.labels = st.labels.min(policy.max_labels);
+    st.icons_dropped = st.icons.saturating_sub(policy.max_icons);
+    st.icons = st.icons.min(policy.max_icons);
 }
 
 fn reference_edges(scene: &SceneSnapshot, visible: &Rect, max_edges: usize) -> usize {
@@ -277,7 +460,7 @@ mod tests {
         let cam = Camera {
             cx: 100.0,
             cy: 50.0,
-            zoom: 1.0,
+            zoom: 3.0,
         };
         let pol = policy(Knobs::default());
         let blend = StageBlend::settled(pol.stage_for_zoom(cam.zoom));

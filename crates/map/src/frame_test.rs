@@ -24,7 +24,7 @@ pub(crate) const VH: f32 = 1000.0;
 const CAMERA: Camera = Camera {
     cx: 50.0,
     cy: 50.0,
-    zoom: 4.0,
+    zoom: 16.0,
 };
 
 pub(crate) fn viewport() -> Bounds<Pixels> {
@@ -66,7 +66,7 @@ fn scene(cell_label: &str) -> SceneSnapshot {
                 },
             }],
             cells: vec![PodNode {
-                rect: Rect::new(12.0, 12.0, 20.0, 20.0),
+                rect: Rect::new(22.0, 40.0, 20.0, 20.0),
                 label: Arc::from(cell_label),
                 ext: PodExt {
                     state: State::of(ReasonId::RUNNING),
@@ -113,9 +113,10 @@ impl FrameSink for Collect {
 
 pub(crate) fn icon_bounds(job: &IconJob) -> Bounds<Pixels> {
     match job {
-        IconJob::Wl(_, primitive) | IconJob::ToolId(_, primitive) | IconJob::Sat(_, primitive) => {
-            primitive.bounds
-        }
+        IconJob::Wl(_, primitive)
+        | IconJob::ToolId(_, primitive)
+        | IconJob::Sat(_, primitive)
+        | IconJob::Status(_, primitive) => primitive.bounds,
     }
 }
 
@@ -160,7 +161,11 @@ fn walk_labels(scene: &SceneSnapshot) -> Collect {
 fn every_label_site_shares_the_scenes_arc() {
     let scene = scene("checkout-api-7f9c8d6b5-tzq4x");
     let sink = walk_labels(&scene);
-    assert_eq!(sink.labels.len(), 5, "the fixture must fire all five sites");
+    assert_eq!(
+        sink.labels.len(),
+        7,
+        "the fixture must fire all name and status sites"
+    );
 
     for (site, label) in [
         ("region", &scene.regions[0].label),

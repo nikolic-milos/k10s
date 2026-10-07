@@ -3700,8 +3700,10 @@ name = "k10s-shell"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "chrono",
  "futures",
  "gpui",
+ "image",
  "k10s-assets",
  "k10s-atlas",
  "k10s-bench",

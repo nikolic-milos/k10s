@@ -35,6 +35,7 @@
 
 pub mod attribution;
 pub mod browse;
+pub mod chart;
 pub mod config_schema;
 pub mod day2;
 pub mod diff;

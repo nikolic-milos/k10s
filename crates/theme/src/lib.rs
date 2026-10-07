@@ -23,6 +23,8 @@
 
 mod builtin;
 mod charts;
+mod plot;
+pub use plot::{Plot, prepare_plot};
 mod load;
 mod registry;
 
@@ -246,6 +248,20 @@ pub struct MapType {
     pub line_height: f32,
 }
 
+impl Default for MapType {
+    fn default() -> Self {
+        Self {
+            region_min: 14.0,
+            region_max: 42.0,
+            workload: 14.0,
+            pod: 14.0,
+            sat: 12.0,
+            sat_detail: 12.0,
+            line_height: 1.35,
+        }
+    }
+}
+
 /// The default UI face is Inter and the default mono face is Lilex, both
 /// shipped by `k10s-assets`; League Spartan is the display face and is
 /// registered but never a default, because it is a headline typeface.
@@ -311,18 +327,16 @@ impl Typography {
             .max(1.0)
     }
 
-    /// The map's ladder, on the same steps as the shell's so that scaling the
-    /// interface scales the map with it. The two smallest sizes floor at 6 px
-    /// exactly as [`Typography::xsmall`] does: a label nobody can read is worse
-    /// than a label nobody drew.
+    /// Resource identity and status use the normal UI size. Secondary satellite
+    /// details follow the shell's small text step.
     pub fn map(&self) -> MapType {
         MapType {
             region_min: self.ui_size,
             region_max: self.ui_size * 3.0,
-            workload: self.small(),
-            pod: self.xsmall(),
-            sat: self.xsmall(),
-            sat_detail: (self.ui_size - 5.5).max(6.0),
+            workload: self.ui_size,
+            pod: self.ui_size,
+            sat: self.small(),
+            sat_detail: self.small(),
             line_height: 1.35,
         }
     }
@@ -604,8 +618,9 @@ mod tests {
         let map = Typography::default().map();
         assert_eq!(
             (map.region_min, map.workload, map.pod, map.sat_detail),
-            (14.0, 12.0, 10.0, 8.5)
+            (14.0, 14.0, 14.0, 12.0)
         );
+        assert_eq!(map, MapType::default());
         assert!(map.region_max > map.region_min);
 
         // Every step of the ladder must stay ordered and above the legibility
@@ -618,6 +633,8 @@ mod tests {
                 ..Typography::default()
             }
             .map();
+            assert_eq!(map.workload, ui_size);
+            assert_eq!(map.pod, ui_size);
             assert!(
                 map.sat_detail >= 6.0 && map.pod >= 6.0 && map.sat >= 6.0,
                 "ui {ui_size}: {map:?} drops below the legibility floor"

@@ -1,30 +1,33 @@
 //! Trace lookup against Tempo or Jaeger, via [`crate::reach`].
 //!
 //! A bound Tempo or Jaeger is queried by hex id. The answer is reduced here
-//! to identity, parent, service, timing and status: attributes, events and
-//! logs stay on the wire. Those fields are attacker-shaped and often hold
+//! to identity, parent, service, timing, status and Kubernetes resource
+//! attributes. Other attributes, events and logs stay on the wire. Those fields are attacker-shaped and often hold
 //! tokens, and this type has nowhere to put them.
 //!
-//! JSON only. Tempo's original `/api/traces/{id}` answers protobuf unless the
-//! caller sends `Accept: application/json`, and [`crate::reach::tool_get`]
-//! does not set that header on the proxy path, so Tempo is asked at
-//! `/api/v2/traces/{id}` first (JSON by default) and the v1 path is the
-//! fallback. A protobuf body is refused, not decoded. Jaeger is the query
+//! JSON only. Both Tempo routes request `Accept: application/json` explicitly.
+//! Tempo is asked at `/api/v2/traces/{id}` first; a completed 404 permits the
+//! v1 compatibility path. A partial v2 envelope is refused with its message.
+//! A protobuf body is refused, not decoded. Jaeger is the query
 //! service's `/api/traces/{id}` envelope.
 //!
-//! Two caps, both refuse rather than truncate: the body at
+//! The body and span caps refuse rather than truncate: the body at
 //! [`crate::reach::MAX_BODY_BYTES`], and the span list at [`MAX_SPANS`]. A
 //! missing trace is visible; a silent drop is not.
+//! Kubernetes resource identities retain their exact bytes up to 253, the
+//! maximum DNS subdomain name length. Larger attributes are refused so a
+//! clipped prefix cannot become an identity match.
 
 use base64::Engine;
 use kube::Client;
 use serde_json::Value;
 
-use crate::reach::{Bound, MAX_BODY_BYTES, ToolKind, tool_get};
+use crate::reach::{Bound, MAX_BODY_BYTES, ToolKind, tool_get_with_status};
 use crate::read::Fetched;
 
 pub const MAX_SPANS: usize = 4096;
 const MAX_FIELD_CHARS: usize = 200;
+const MAX_RESOURCE_IDENTITY_BYTES: usize = 253;
 
 /// One span, reduced to what a waterfall shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +41,10 @@ pub struct Span {
     pub duration_us: u64,
     /// `ok`, `error`, or empty when the backend did not say.
     pub status: String,
+    pub namespace: String,
+    pub pod: String,
+    pub pod_uid: String,
+    pub node: String,
 }
 
 /// One trace: the id the backend named, and every span it returned, in
@@ -56,6 +63,7 @@ pub enum TraceError {
     TooManySpans,
     NotATrace,
     Rejected(String),
+    ResourceIdentityTooLarge { field: &'static str, bytes: usize },
 }
 
 impl std::fmt::Display for TraceError {
@@ -78,23 +86,18 @@ impl std::fmt::Display for TraceError {
                 write!(f, "JSON is not a Tempo or Jaeger trace")
             }
             TraceError::Rejected(why) => write!(f, "{why}"),
+            TraceError::ResourceIdentityTooLarge { field, bytes } => write!(
+                f,
+                "trace resource attribute {field} is {bytes} bytes; the identity cap is {MAX_RESOURCE_IDENTITY_BYTES}"
+            ),
         }
-    }
-}
-
-impl TraceError {
-    fn fatal(&self) -> bool {
-        matches!(
-            self,
-            TraceError::TooLarge { .. } | TraceError::TooManySpans | TraceError::Protobuf
-        )
     }
 }
 
 /// GET a trace by id from a bound Tempo or Jaeger.
 ///
-/// Tempo tries `/api/v2/traces/{id}` then `/api/traces/{id}`. Jaeger uses
-/// `/api/traces/{id}`. The id must be hex; anything else is not sent.
+/// Tempo uses `/api/v2/traces/{id}` and falls back to `/api/traces/{id}` only
+/// after a completed 404. Jaeger uses `/api/traces/{id}`. The id must be hex.
 pub async fn lookup(client: &Client, bound: &Bound, trace_id: &str) -> Fetched<Trace> {
     let paths = match lookup_paths(bound.kind, trace_id) {
         Fetched::Ok(paths) => paths,
@@ -106,14 +109,31 @@ pub async fn lookup(client: &Client, bound: &Bound, trace_id: &str) -> Fetched<T
         why: "no trace endpoint answered".to_string(),
     };
     for rest in &paths {
-        match tool_get(client, bound, rest).await {
+        let (status, outcome) = tool_get_with_status(client, bound, rest).await;
+        match outcome {
             Fetched::Ok(bytes) => match parse(&bytes) {
-                Ok(trace) => return Fetched::Ok(trace),
-                Err(error) if error.fatal() => return fail(bound, error),
-                Err(error) => last = fail(bound, error),
+                Ok(trace)
+                    if trace.trace_id.eq_ignore_ascii_case(trace_id.trim())
+                        || trace.trace_id.is_empty() && trace.spans.is_empty() =>
+                {
+                    return Fetched::Ok(trace);
+                }
+                Ok(_) => {
+                    return Fetched::Failed {
+                        what: bound.kind.slug(),
+                        why: "the trace response does not match the requested trace ID".to_string(),
+                    };
+                }
+                Err(error) => return fail(bound, error),
             },
             Fetched::Denied { what } => return Fetched::Denied { what },
-            Fetched::Failed { what, why } => last = Fetched::Failed { what, why },
+            Fetched::Failed { what, why }
+                if rest.starts_with("api/v2/traces/")
+                    && status == Some(http::StatusCode::NOT_FOUND) =>
+            {
+                last = Fetched::Failed { what, why };
+            }
+            Fetched::Failed { what, why } => return Fetched::Failed { what, why },
         }
     }
     last
@@ -194,24 +214,58 @@ fn is_jaeger_shape(value: &Value) -> bool {
 }
 
 fn trace_from_tempo(root: &Value) -> Result<Trace, TraceError> {
+    if let Some(status) = root.get("status") {
+        if status.as_str() == Some("PARTIAL") || status.as_u64() == Some(1) {
+            return Err(TraceError::Rejected(
+                root.get("message")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or("Tempo returned a partial trace")
+                    .to_string(),
+            ));
+        }
+        if status.as_str() != Some("COMPLETE") && status.as_u64() != Some(0) {
+            return Err(TraceError::Rejected(
+                "Tempo returned an unsupported trace completion status".to_string(),
+            ));
+        }
+    }
     let mut spans = Vec::new();
     let mut trace_id = String::new();
-    if let Some(batches) = tempo_batches(root) {
-        for batch in batches {
-            collect_otel_batch(batch, &mut trace_id, &mut spans)?;
+    let batches = tempo_batches(root)?;
+    for batch in batches {
+        if !batch.is_object() {
+            return Err(TraceError::NotATrace);
         }
+        collect_otel_batch(batch, &mut trace_id, &mut spans)?;
     }
     Ok(Trace { trace_id, spans })
 }
 
-fn tempo_batches(root: &Value) -> Option<&Vec<Value>> {
-    let inner = root.get("trace").unwrap_or(root);
-    inner
-        .get("resourceSpans")
-        .or_else(|| inner.get("batches"))
-        .or_else(|| root.get("resourceSpans"))
-        .or_else(|| root.get("batches"))
-        .and_then(Value::as_array)
+fn tempo_batches(root: &Value) -> Result<&[Value], TraceError> {
+    let inner = root
+        .get("trace")
+        .filter(|value| !value.is_null())
+        .unwrap_or(root);
+    if !inner.is_object() {
+        return Err(TraceError::NotATrace);
+    }
+    span_array(
+        inner
+            .get("resourceSpans")
+            .or_else(|| inner.get("batches"))
+            .or_else(|| root.get("resourceSpans"))
+            .or_else(|| root.get("batches")),
+    )
+}
+
+fn span_array(value: Option<&Value>) -> Result<&[Value], TraceError> {
+    // ProtoJSON treats omitted or null repeated fields as an empty list.
+    match value {
+        None | Some(Value::Null) => Ok(&[]),
+        Some(Value::Array(array)) => Ok(array),
+        _ => Err(TraceError::NotATrace),
+    }
 }
 
 fn collect_otel_batch(
@@ -221,15 +275,17 @@ fn collect_otel_batch(
 ) -> Result<(), TraceError> {
     let service = service_of(batch.get("resource"));
     for key in ["scopeSpans", "instrumentationLibrarySpans"] {
-        let Some(scopes) = batch.get(key).and_then(Value::as_array) else {
-            continue;
-        };
+        let scopes = span_array(batch.get(key))?;
         for scope in scopes {
-            let Some(raw) = scope.get("spans").and_then(Value::as_array) else {
-                continue;
-            };
+            if !scope.is_object() {
+                return Err(TraceError::NotATrace);
+            }
+            let raw = span_array(scope.get("spans"))?;
             for span in raw {
-                push_otel_span(span, &service, trace_id, spans)?;
+                if !span.is_object() {
+                    return Err(TraceError::NotATrace);
+                }
+                push_otel_span(span, &service, batch.get("resource"), trace_id, spans)?;
             }
         }
     }
@@ -239,15 +295,22 @@ fn collect_otel_batch(
 fn push_otel_span(
     span: &Value,
     service: &str,
+    resource: Option<&Value>,
     trace_id: &mut String,
     spans: &mut Vec<Span>,
 ) -> Result<(), TraceError> {
     if spans.len() >= MAX_SPANS {
         return Err(TraceError::TooManySpans);
     }
+    let span_trace = normalize_id(str_in(span, &["traceId", "trace_id"]));
     if trace_id.is_empty() {
-        *trace_id = normalize_id(str_in(span, &["traceId", "trace_id"]));
+        *trace_id = span_trace;
+    } else if *trace_id != span_trace {
+        return Err(TraceError::Rejected(
+            "the response mixes multiple trace IDs".to_string(),
+        ));
     }
+
     let start_nano = as_u64(
         span.get("startTimeUnixNano")
             .or_else(|| span.get("start_time_unix_nano")),
@@ -256,6 +319,11 @@ fn push_otel_span(
         span.get("endTimeUnixNano")
             .or_else(|| span.get("end_time_unix_nano")),
     );
+    if end_nano < start_nano {
+        return Err(TraceError::Rejected(
+            "a span ends before it starts".to_string(),
+        ));
+    }
     spans.push(Span {
         id: normalize_id(str_in(span, &["spanId", "span_id"])),
         parent: normalize_id(str_in(span, &["parentSpanId", "parent_span_id"])),
@@ -264,8 +332,28 @@ fn push_otel_span(
         start_us: start_nano / 1_000,
         duration_us: end_nano.saturating_sub(start_nano) / 1_000,
         status: otel_status(span.get("status")),
+        namespace: resource_attribute(resource, "k8s.namespace.name")?,
+        pod: resource_attribute(resource, "k8s.pod.name")?,
+        pod_uid: resource_attribute(resource, "k8s.pod.uid")?,
+        node: resource_attribute(resource, "k8s.node.name")?,
     });
     Ok(())
+}
+
+fn resource_attribute(resource: Option<&Value>, key: &'static str) -> Result<String, TraceError> {
+    let value = resource
+        .and_then(|resource| resource.get("attributes"))
+        .and_then(Value::as_array)
+        .and_then(|attrs| attrs.iter().find(|attr| str_in(attr, &["key"]) == key))
+        .map(|attr| attr_string(attr.get("value")))
+        .unwrap_or_default();
+    if value.len() > MAX_RESOURCE_IDENTITY_BYTES {
+        return Err(TraceError::ResourceIdentityTooLarge {
+            field: key,
+            bytes: value.len(),
+        });
+    }
+    Ok(value.to_string())
 }
 
 fn service_of(resource: Option<&Value>) -> String {
@@ -282,20 +370,20 @@ fn service_of(resource: Option<&Value>) -> String {
     for attr in attrs {
         let key = str_in(attr, &["key"]);
         if key == "service.name" {
-            return clip(&attr_string(attr.get("value")));
+            return clip(attr_string(attr.get("value")));
         }
     }
     String::new()
 }
 
-fn attr_string(value: Option<&Value>) -> String {
+fn attr_string(value: Option<&Value>) -> &str {
     let Some(value) = value else {
-        return String::new();
+        return "";
     };
     if let Some(text) = value.as_str() {
-        return text.to_string();
+        return text;
     }
-    str_in(value, &["stringValue", "string_value"]).to_string()
+    str_in(value, &["stringValue", "string_value"])
 }
 
 fn otel_status(status: Option<&Value>) -> String {
@@ -350,6 +438,10 @@ fn trace_from_jaeger(root: &Value) -> Result<Trace, TraceError> {
             start_us,
             duration_us: as_u64(span.get("duration")),
             status: jaeger_status(span),
+            namespace: String::new(),
+            pod: String::new(),
+            pod_uid: String::new(),
+            node: String::new(),
         });
     }
     Ok(Trace { trace_id, spans })

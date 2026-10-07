@@ -124,6 +124,10 @@ fn expected_two_spans() -> Trace {
         trace_id: "5b8efff798038103d269b633813fc700".into(),
         spans: vec![
             Span {
+                namespace: String::new(),
+                pod: String::new(),
+                pod_uid: String::new(),
+                node: String::new(),
                 id: "aaa19b7ec3c1b100".into(),
                 parent: String::new(),
                 name: "GET /api".into(),
@@ -133,6 +137,10 @@ fn expected_two_spans() -> Trace {
                 status: "ok".into(),
             },
             Span {
+                namespace: String::new(),
+                pod: String::new(),
+                pod_uid: String::new(),
+                node: String::new(),
                 id: "bbb19b7ec3c1b100".into(),
                 parent: "aaa19b7ec3c1b100".into(),
                 name: "db.query".into(),
@@ -321,6 +329,70 @@ fn an_empty_tempo_v2_document_is_an_empty_trace() {
 }
 
 #[test]
+fn a_malformed_tempo_span_container_is_not_an_empty_trace() {
+    for json in [
+        r#"{"trace":false}"#,
+        r#"{"batches":{}}"#,
+        r#"{"resourceSpans":false}"#,
+        r#"{"resourceSpans":[null]}"#,
+        r#"{"resourceSpans":[{"scopeSpans":false}]}"#,
+        r#"{"resourceSpans":[{"scopeSpans":[null]}]}"#,
+        r#"{"resourceSpans":[{"scopeSpans":[{"spans":false}]}]}"#,
+        r#"{"resourceSpans":[{"scopeSpans":[{"spans":[null]}]}]}"#,
+    ] {
+        assert_eq!(parse(json.as_bytes()), Err(TraceError::NotATrace), "{json}");
+    }
+}
+
+#[test]
+fn protojson_empty_messages_and_null_lists_keep_the_empty_trace_state() {
+    for json in [
+        r#"{"trace":null}"#,
+        r#"{"trace":{}}"#,
+        r#"{"trace":{"resourceSpans":null}}"#,
+        r#"{"resourceSpans":[{}]}"#,
+        r#"{"resourceSpans":[{"scopeSpans":null}]}"#,
+        r#"{"resourceSpans":[{"scopeSpans":[{"spans":null}]}]}"#,
+    ] {
+        let trace = parse(json.as_bytes()).unwrap();
+        assert!(
+            trace.trace_id.is_empty() && trace.spans.is_empty(),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn tempo_completion_status_is_preserved_as_a_refusal_when_partial_or_unknown() {
+    for status in [serde_json::json!("PARTIAL"), serde_json::json!(1)] {
+        let mut body: Value = serde_json::from_str(tempo_v2_json()).unwrap();
+        body["status"] = status;
+        body["message"] = serde_json::json!("the trace exceeded its server size limit");
+        assert_eq!(
+            parse(&serde_json::to_vec(&body).unwrap()),
+            Err(TraceError::Rejected(
+                "the trace exceeded its server size limit".into()
+            ))
+        );
+    }
+    for status in [serde_json::json!("COMPLETE"), serde_json::json!(0)] {
+        let mut body: Value = serde_json::from_str(tempo_v2_json()).unwrap();
+        body["status"] = status;
+        assert!(
+            !parse(&serde_json::to_vec(&body).unwrap())
+                .unwrap()
+                .spans
+                .is_empty()
+        );
+    }
+    let mut body: Value = serde_json::from_str(tempo_v2_json()).unwrap();
+    body["status"] = serde_json::json!("unknown");
+    assert!(
+        matches!(parse(&serde_json::to_vec(&body).unwrap()), Err(TraceError::Rejected(why)) if why.contains("unsupported trace completion status"))
+    );
+}
+
+#[test]
 fn one_enormous_name_is_clipped_where_it_is_carried() {
     let huge = "n".repeat(6 << 10);
     let json = format!(
@@ -370,4 +442,50 @@ fn grafana_is_not_a_trace_store() {
         Fetched::Failed { why, .. } => assert!(why.contains("Grafana"), "{why}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn kubernetes_resource_names_keep_their_complete_identity() {
+    let name = "n".repeat(MAX_RESOURCE_IDENTITY_BYTES);
+    let mut value: Value = serde_json::from_str(tempo_v2_json()).unwrap();
+    let attributes = value["trace"]["resourceSpans"][0]["resource"]["attributes"]
+        .as_array_mut()
+        .unwrap();
+    for key in ["k8s.pod.name", "k8s.node.name"] {
+        attributes.push(serde_json::json!({"key": key, "value": {"stringValue": name}}));
+    }
+    attributes
+        .push(serde_json::json!({"key": "k8s.namespace.name", "value": {"stringValue": "pilot"}}));
+    attributes.push(
+        serde_json::json!({"key": "k8s.pod.uid", "value": {"stringValue": "current-pod-uid"}}),
+    );
+    let trace = parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+    for span in &trace.spans {
+        assert_eq!(span.pod, name);
+        assert_eq!(span.node, name);
+        assert_eq!(span.namespace, "pilot");
+        assert_eq!(span.pod_uid, "current-pod-uid");
+    }
+    assert!(!format!("{trace:?}").contains("SUPERSECRET"));
+}
+
+#[test]
+fn an_oversize_resource_identity_is_refused_instead_of_matching_a_prefix() {
+    let mut value: Value = serde_json::from_str(tempo_v2_json()).unwrap();
+    value["trace"]["resourceSpans"][0]["resource"]["attributes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "key": "k8s.pod.name",
+            "value": {"stringValue": "n".repeat(MAX_RESOURCE_IDENTITY_BYTES + 1)}
+        }));
+    let error = parse(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+    assert_eq!(
+        error,
+        TraceError::ResourceIdentityTooLarge {
+            field: "k8s.pod.name",
+            bytes: MAX_RESOURCE_IDENTITY_BYTES + 1
+        }
+    );
+    assert!(error.to_string().contains("k8s.pod.name"));
 }

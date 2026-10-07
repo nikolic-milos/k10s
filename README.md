@@ -39,6 +39,10 @@ snapshots and prepared outcomes, and never waits for network I/O. The world uses
 stable slots and contiguous arrays inside ECS resources; an entity abstraction
 does not sit between the painter and each visible object.
 
+[Native observability](OBSERVABILITY.md) describes workload scope, fixed-range
+charts, supported Grafana panels, related Loki logs, Tempo traces and Collector
+inventory, with the required attributes and supported limits.
+
 An upstream integration belongs in `crates/data/src/integrations`. Keep discovery,
 bounded decoding and request construction there, scheduling in `data::read`,
 operator-facing requests and outcomes in `provider`, and conversions in

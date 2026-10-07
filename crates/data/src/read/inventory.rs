@@ -142,7 +142,7 @@ impl Reader {
     pub fn fetch_otel(&self, reply: impl FnOnce(Fetched<otel::Inventory>) + Send + 'static) {
         let client = self.client.clone();
         self.handle.spawn(async move {
-            reply(otel::fetch(&client, None).await);
+            reply(otel::fetch_inventory(&client, None).await);
         });
     }
 
@@ -205,6 +205,16 @@ async fn ecosystem_families(client: &Client) -> Vec<EcosystemFamily> {
             }
         };
     }
+    let collectors = async {
+        EcosystemFamily {
+            id: "otel",
+            answer: match otel::fetch_inventory(client, None).await {
+                Fetched::Ok(inventory) => Fetched::Ok(otel::table_page(&inventory)),
+                Fetched::Denied { what } => Fetched::Denied { what },
+                Fetched::Failed { what, why } => Fetched::Failed { what, why },
+            },
+        }
+    };
     let alertmanager = async {
         EcosystemFamily {
             id: "alertmanager",
@@ -230,7 +240,7 @@ async fn ecosystem_families(client: &Client) -> Vec<EcosystemFamily> {
         family!("velero", velero),
         family!("cnpg", cnpg),
         family!("kargo", kargo),
-        family!("otel", otel),
+        collectors,
         alertmanager,
     );
     let (

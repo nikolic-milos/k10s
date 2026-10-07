@@ -112,7 +112,7 @@ fn exhausting_the_line_cap_drops_later_streams_with_a_count() {
 
 #[test]
 fn a_line_longer_than_eight_kibibytes_is_clipped_and_the_cap_is_stated() {
-    let huge = "x".repeat(MAX_LINE_BYTES + 8);
+    let huge = "x".repeat(MAX_LINE_BYTES * 64);
     let json = streams(&format!(
         r#"[{{"stream":{{"app":"api"}},"values":[["1","{huge}"]]}}]"#
     ));
@@ -122,6 +122,10 @@ fn a_line_longer_than_eight_kibibytes_is_clipped_and_the_cap_is_stated() {
     assert_eq!(logs.dropped_lines, 0, "the line is kept, clipped");
     let line = &logs.streams[0].lines[0].line;
     assert!(line.ends_with('\u{2026}'), "clipped looks clipped");
+    assert!(
+        line.capacity() <= MAX_LINE_BYTES + '\u{2026}'.len_utf8(),
+        "clipping must release the original line allocation"
+    );
     assert!(
         line.len() <= MAX_LINE_BYTES + '\u{2026}'.len_utf8(),
         "the ellipsis is the only overshoot: {} bytes",
@@ -165,6 +169,58 @@ fn an_empty_stream_list_is_empty_not_a_failure() {
     let logs = parse(streams("[]").as_bytes()).expect("empty is a result");
     assert!(logs.streams.is_empty());
     assert!(!logs.truncated);
+}
+
+#[test]
+fn an_empty_values_array_keeps_its_valid_stream_identity() {
+    let logs = parse(streams(r#"[{"stream":{"app":"api"},"values":[]}]"#).as_bytes())
+        .expect("empty values are a result");
+    assert_eq!(logs.streams.len(), 1);
+    assert_eq!(
+        logs.streams[0].labels,
+        [("app".to_string(), "api".to_string())]
+    );
+    assert!(logs.streams[0].lines.is_empty());
+    assert!(!logs.truncated);
+}
+
+#[test]
+fn malformed_stream_members_are_named_parse_refusals() {
+    for result in [
+        r#"[{}]"#,
+        r#"[{"values":[]}]"#,
+        r#"[{"stream":null,"values":[]}]"#,
+        r#"[{"stream":[],"values":[]}]"#,
+        r#"[{"stream":"api","values":[]}]"#,
+        r#"[{"stream":false,"values":[]}]"#,
+        r#"[{"stream":10,"values":[]}]"#,
+        r#"[null]"#,
+    ] {
+        let why = parse(streams(result).as_bytes()).expect_err("malformed stream is refused");
+        assert_eq!(why, "Loki stream 0 has no object-valued stream member");
+    }
+}
+
+#[test]
+fn malformed_values_members_are_named_parse_refusals() {
+    for result in [
+        r#"[{"stream":{}}]"#,
+        r#"[{"stream":{},"values":null}]"#,
+        r#"[{"stream":{},"values":{}}]"#,
+        r#"[{"stream":{},"values":"line"}]"#,
+        r#"[{"stream":{},"values":false}]"#,
+        r#"[{"stream":{},"values":10}]"#,
+    ] {
+        let why = parse(streams(result).as_bytes()).expect_err("malformed values are refused");
+        assert_eq!(why, "Loki stream 0 has no array-valued values member");
+    }
+}
+
+#[test]
+fn a_non_string_label_is_refused_before_its_scope_can_be_dropped() {
+    let why = parse(streams(r#"[{"stream":{"namespace":10},"values":[]}]"#).as_bytes())
+        .expect_err("malformed scope is refused");
+    assert_eq!(why, "Loki stream 0 has a non-string label value");
 }
 
 #[test]

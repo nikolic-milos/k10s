@@ -8,7 +8,7 @@
 //! the trait; `to_any` hands back the renderable view, and a caller that
 //! needs the concrete type gets it by downcasting, exactly as Zed does.
 
-use gpui::{AnyView, App, Entity, EntityId, FocusHandle, Render, SharedString};
+use gpui::{AnyView, App, Context, Entity, EntityId, FocusHandle, Render, SharedString};
 
 /// What a hosted view must answer for the workspace chrome: a tab title and
 /// where focus lands when the tab activates. Implementing this is the entire
@@ -16,6 +16,11 @@ use gpui::{AnyView, App, Entity, EntityId, FocusHandle, Render, SharedString};
 pub trait Item: Render {
     fn title(&self) -> SharedString;
     fn focus_handle(&self) -> FocusHandle;
+    fn visibility_changed(&mut self, _: bool, _: &mut Context<Self>)
+    where
+        Self: Sized,
+    {
+    }
 
     /// Whether this item holds work that closing would throw away. The
     /// workspace asks before it removes a tab, so an item that can lose
@@ -33,6 +38,7 @@ pub trait ItemHandle {
     fn is_dirty(&self, cx: &App) -> bool;
     fn item_id(&self) -> EntityId;
     fn to_any(&self) -> AnyView;
+    fn set_visible(&self, visible: bool, cx: &mut App);
 }
 
 impl<T: Item> ItemHandle for Entity<T> {
@@ -50,6 +56,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn item_id(&self) -> EntityId {
         self.entity_id()
+    }
+
+    fn set_visible(&self, visible: bool, cx: &mut App) {
+        self.update(cx, |view, cx| view.visibility_changed(visible, cx));
     }
 
     fn to_any(&self) -> AnyView {

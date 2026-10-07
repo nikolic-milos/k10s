@@ -12,6 +12,8 @@
 //! Crossing a cap is [`Logs::truncated`] plus a count of what did not fit; a
 //! silent drop would look like the cluster had fewer logs. An oversize body is
 //! refused whole, because half a JSON document is not a query result.
+//! Each stream requires a string-valued label object and a values array;
+//! malformed members are refused rather than presented as a quiet window.
 
 use kube::Client;
 use serde::Deserialize;
@@ -49,6 +51,7 @@ pub struct InstantQuery {
 pub struct LogLine {
     pub ts_ns: u64,
     pub line: String,
+    pub metadata: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +70,8 @@ pub struct Logs {
     pub dropped_streams: usize,
     pub dropped_lines: usize,
     pub clipped_lines: usize,
+    pub limit_reached: bool,
+    pub source: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -89,12 +94,22 @@ struct WireData {
     result: Value,
 }
 
-/// POST the range on a proxy bind (LogQL is often too long for a URL), GET
-/// otherwise: [`crate::reach::tool_post`] is proxy-only, and a settings URL
-/// still has to work.
+/// GET the documented Loki range route with a server-side line limit.
 pub async fn query_range(client: &Client, bound: &Bound, query: &RangeQuery) -> Fetched<Logs> {
     match range_form(query) {
-        Ok(form) => fetch_parsed(client, bound, QUERY_RANGE, &form).await,
+        Ok(form) => {
+            let mut fetched = fetch_parsed(client, bound, QUERY_RANGE, &form).await;
+            if let Fetched::Ok(logs) = &mut fetched {
+                logs.limit_reached = logs
+                    .streams
+                    .iter()
+                    .map(|stream| stream.lines.len())
+                    .sum::<usize>()
+                    >= effective_limit(query.limit);
+                logs.source = bound.source();
+            }
+            fetched
+        }
         Err(why) => Fetched::Failed { what: "loki", why },
     }
 }
@@ -190,22 +205,7 @@ pub(crate) fn finish(fetched: Fetched<Vec<u8>>) -> Fetched<Logs> {
 }
 
 async fn speak(client: &Client, bound: &Bound, path: &str, form: &str) -> Fetched<Vec<u8>> {
-    match &bound.transport {
-        reach::Transport::Proxy { .. } => {
-            reach::tool_post(
-                client,
-                bound,
-                path,
-                "application/x-www-form-urlencoded",
-                form.as_bytes().to_vec(),
-            )
-            .await
-        }
-        _ => {
-            let rest = format!("{path}?{form}");
-            reach::tool_get(client, bound, &rest).await
-        }
-    }
+    reach::tool_get(client, bound, &format!("{path}?{form}")).await
 }
 
 /// Parse Loki's query JSON. Caps are applied here so a caller that already
@@ -218,7 +218,7 @@ pub fn parse(bytes: &[u8]) -> Result<Logs, String> {
     }
     let envelope: WireEnvelope = serde_json::from_slice(bytes)
         .map_err(|error| format!("Loki's answer is not query JSON: {error}"))?;
-    if !envelope.status.is_empty() && envelope.status != "success" {
+    if envelope.status != "success" {
         let why = if !envelope.error.is_empty() {
             envelope.error
         } else if !envelope.error_type.is_empty() {
@@ -229,77 +229,78 @@ pub fn parse(bytes: &[u8]) -> Result<Logs, String> {
         return Err(why);
     }
     let result_type = envelope.data.result_type.to_ascii_lowercase();
-    if !result_type.is_empty() && result_type != "streams" {
+    if result_type != "streams" {
         return Err(format!(
             "this LogQL produced {result_type}, not log streams; metric LogQL is not shown here"
         ));
     }
     let Some(items) = envelope.data.result.as_array() else {
-        if matches!(envelope.data.result, Value::Null) {
-            return Ok(Logs::default());
-        }
         return Err("Loki's result is not a stream list".to_string());
     };
-    Ok(collect(items))
+    collect(items)
 }
 
-fn collect(items: &[Value]) -> Logs {
+fn collect(items: &[Value]) -> Result<Logs, String> {
     let mut logs = Logs::default();
     let mut total_lines = 0usize;
-    for item in items {
-        let values = item.get("values").and_then(Value::as_array);
-        let raw_len = values.map(Vec::len).unwrap_or(0);
+    for (index, item) in items.iter().enumerate() {
+        let Some(labels) = item.get("stream").and_then(Value::as_object) else {
+            return Err(format!(
+                "Loki stream {index} has no object-valued stream member"
+            ));
+        };
+        if labels.values().any(|value| !value.is_string()) {
+            return Err(format!("Loki stream {index} has a non-string label value"));
+        }
+        let Some(values) = item.get("values").and_then(Value::as_array) else {
+            return Err(format!(
+                "Loki stream {index} has no array-valued values member"
+            ));
+        };
         // A stream that would start with no room left is dropped whole. A
         // stream that fills the last of the line budget is kept, and the
         // next iteration hits this branch.
         if logs.streams.len() >= MAX_STREAMS || total_lines >= MAX_LINES {
             logs.dropped_streams += 1;
-            logs.dropped_lines += raw_len;
+            logs.dropped_lines += values.len();
             logs.truncated = true;
             continue;
         }
         let mut lines = Vec::new();
-        if let Some(values) = values {
-            for (i, value) in values.iter().enumerate() {
-                if total_lines >= MAX_LINES {
-                    logs.dropped_lines += values.len() - i;
+        for (i, value) in values.iter().enumerate() {
+            if total_lines >= MAX_LINES {
+                logs.dropped_lines += values.len() - i;
+                logs.truncated = true;
+                break;
+            }
+            match line_of(value) {
+                None => {
+                    logs.dropped_lines += 1;
                     logs.truncated = true;
-                    break;
                 }
-                match line_of(value) {
-                    None => {
-                        logs.dropped_lines += 1;
+                Some(mut line) => {
+                    if clip_line(&mut line) {
+                        logs.clipped_lines += 1;
                         logs.truncated = true;
                     }
-                    Some(mut line) => {
-                        if clip_line(&mut line) {
-                            logs.clipped_lines += 1;
-                            logs.truncated = true;
-                        }
-                        lines.push(line);
-                        total_lines += 1;
-                    }
+                    lines.push(line);
+                    total_lines += 1;
                 }
             }
         }
-        logs.streams.push(LogStream {
-            labels: labels_of(item),
-            lines,
-        });
+        let mut labels: Vec<_> = labels
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    value.as_str().expect("label type was checked").to_string(),
+                )
+            })
+            .collect();
+        labels.sort_by(|a, b| a.0.cmp(&b.0));
+        logs.streams.push(LogStream { labels, lines });
     }
-    logs
-}
-
-fn labels_of(item: &Value) -> Vec<(String, String)> {
-    let Some(obj) = item.get("stream").and_then(Value::as_object) else {
-        return Vec::new();
-    };
-    let mut labels: Vec<(String, String)> = obj
-        .iter()
-        .filter_map(|(key, value)| value.as_str().map(|text| (key.clone(), text.to_string())))
-        .collect();
-    labels.sort_by(|a, b| a.0.cmp(&b.0));
-    labels
+    Ok(logs)
 }
 
 fn line_of(value: &Value) -> Option<LogLine> {
@@ -310,6 +311,32 @@ fn line_of(value: &Value) -> Option<LogLine> {
     Some(LogLine {
         ts_ns,
         line: line.to_string(),
+        metadata: arr
+            .get(2)
+            .and_then(Value::as_object)
+            .map(|metadata| {
+                metadata
+                    .iter()
+                    .filter(|(key, _)| {
+                        matches!(
+                            key.as_str(),
+                            "trace_id"
+                                | "span_id"
+                                | "k8s_namespace_name"
+                                | "k8s_pod_name"
+                                | "k8s_pod_uid"
+                                | "k8s_node_name"
+                        )
+                    })
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .filter(|value| value.len() <= 256)
+                            .map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -323,6 +350,7 @@ fn clip_line(line: &mut LogLine) -> bool {
     }
     line.line.truncate(cut);
     line.line.push('\u{2026}');
+    line.line.shrink_to_fit();
     true
 }
 

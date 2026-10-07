@@ -330,6 +330,21 @@ fn join_and_split_http_cover_the_localhost_client() {
     ));
 }
 
+#[test]
+fn completed_http_url_statuses_preserve_the_public_transport_outcome() {
+    for (code, reason) in [(404, "Not Found"), (500, "Internal Server Error")] {
+        let raw = format!("HTTP/1.1 {code} {reason}\r\n\r\nserver sentence");
+        let (status, outcome) = split_http_body_with_status(raw.as_bytes());
+        assert_eq!(status.map(|status| status.as_u16()), Some(code));
+        assert_eq!(outcome, split_http_body(raw.as_bytes()));
+    }
+    let mut raw = b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec();
+    raw.resize(raw.len() + MAX_BODY_BYTES + 1, b'x');
+    let (status, outcome) = split_http_body_with_status(&raw);
+    assert_eq!(status, None, "an oversize body does not authorize fallback");
+    assert_eq!(outcome, split_http_body(&raw));
+}
+
 #[tokio::test]
 async fn a_settings_url_dripping_bytes_is_cut_off_at_one_total_deadline() {
     use std::io::{Read as _, Write as _};
@@ -360,6 +375,7 @@ async fn a_settings_url_dripping_bytes_is_cut_off_at_one_total_deadline() {
         "",
         &ToolAuth::Anonymous,
         deadline,
+        &mut None,
     )
     .await;
     match fetched {

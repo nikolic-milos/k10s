@@ -2,8 +2,8 @@
 //!
 //! `frame::walk` is the one traversal, shared by the window painter and every
 //! headless sink through `FrameSink`; in debug builds each painted frame is
-//! re-derived by the `k10s-atlas` cull oracle and must agree counter for
-//! counter. Painting is damage-driven -- zero paints at idle under
+//! re-derived by independent atlas and map admission walks and must agree
+//! counter for counter. Painting is damage-driven -- zero paints at idle under
 //! `--churn 0` is a gated invariant -- and the paint path must not allocate
 //! per frame at steady state: labels come from a bounded shaped-text cache
 //! that only serves settled frames, and the `bench-alloc` ratchet holds the
@@ -22,6 +22,7 @@ mod pick;
 mod present;
 mod primitive;
 mod selection;
+mod status;
 mod text;
 mod view;
 

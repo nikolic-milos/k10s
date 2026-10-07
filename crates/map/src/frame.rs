@@ -10,7 +10,10 @@ use k10s_core::{
 };
 
 use crate::hex;
-use crate::primitive::{ISLAND_DETAIL_MIN_PX, Projection, card, pod, region as region_primitive};
+use crate::primitive::{
+    ISLAND_DETAIL_MIN_PX, POD_DETAIL_MIN_WIDTH, POD_MARK_MIN, Projection, STATUS_GAP, TEXT_PAD,
+    card, region as region_primitive, workload_presentation,
+};
 #[cfg(test)]
 use crate::primitive::{SAT_ICON_MAX_PX, WL_ICON_MAX_PX, WL_MEDALLION_MIN_PX, island_radii};
 use k10s_theme::{HeatRamp, MapTheme, MapType, mix, quantize, scale_alpha};
@@ -82,17 +85,18 @@ pub struct LabelJob {
     pub size_px: f32,
     pub color: gpui::Rgba,
     pub face: LabelFace,
-    /// The width of that box, in screen pixels. Zero means "set it left at `x`
-    /// and let it run", which is what a pod cell wants; anything else centres
-    /// the line in the box and clips it to it, so a forty-character workload
-    /// name stops at the edge of its own card instead of crossing the next one.
+    /// The exact row box confines shaped glyphs to their owning surface.
     pub width: f32,
+    pub height: f32,
+    /// A suffix of the canonical metadata name. Identity never uses this offset.
+    pub text_start: usize,
 }
 
 pub enum IconJob {
     Wl(KindId, crate::MarkPrimitive),
     ToolId(ToolId, crate::MarkPrimitive),
     Sat(KindId, crate::MarkPrimitive),
+    Status(Severity, crate::MarkPrimitive),
 }
 
 pub trait FrameSink {
@@ -314,6 +318,16 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                     .clamp(self.type_.region_min, self.type_.region_max),
             );
             let line = size_px * self.type_.line_height;
+            let label_bounds = Bounds {
+                origin: point(
+                    px(self.origin.0 + x),
+                    px(self.origin.1 + y + (band - line).max(0.0) * 0.5),
+                ),
+                size: size(px(width), px(line)),
+            };
+            if band < line || !self.projection().label_visible(label_bounds, self.type_) {
+                return;
+            }
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::from(&region.label),
                 x: self.origin.0 + x,
@@ -322,6 +336,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 color: self.region_label,
                 face: LabelFace::Display,
                 width,
+                height: line,
+                text_start: 0,
             });
         }
     }
@@ -370,12 +386,14 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         let presentation = if self.skip_blocks {
             WorkloadPresentation::Hidden
         } else {
-            self.policy
-                .workload_presentation(block.inner.w, self.zoom, self.stage)
+            workload_presentation(self.policy, block.inner, self.zoom, self.stage, self.type_)
         };
-        let header_height = self.card_header.min(block.inner.h * 0.5);
         let chrome = presentation == WorkloadPresentation::Detailed
             && self.policy.block_chrome_shown(block.inner.w, self.zoom);
+        let heading = (presentation.card_shown()
+            && crate::primitive::workload_label_shown(self.policy, block.inner.w, self.zoom))
+        .then(|| self.projection().name_band(block.inner, self.type_))
+        .flatten();
         if presentation != WorkloadPresentation::Hidden {
             self.stats.drawn_blocks += 1;
         }
@@ -395,23 +413,17 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             self.stats.quads += 1;
 
             if chrome {
-                // The header keeps the card's top corners and squares off where
-                // the pod grid begins, so it reads as part of the card rather
-                // than a rectangle laid over one.
-                let header = Rect::new(block.inner.x, block.inner.y, block.inner.w, header_height);
-                self.sink.fg_quad(quad(
-                    self.screen_bounds(&header),
-                    Corners {
-                        top_left: radius,
-                        top_right: radius,
-                        bottom_right: px(0.0),
-                        bottom_left: px(0.0),
-                    },
-                    self.header_fill,
-                    px(0.0),
-                    gpui::transparent_black(),
-                    Default::default(),
-                ));
+                if let Some(header) = heading {
+                    self.sink.fg_quad(quad(
+                        header.bounds,
+                        header.corners,
+                        self.header_fill,
+                        px(0.0),
+                        gpui::transparent_black(),
+                        Default::default(),
+                    ));
+                    self.stats.quads += 1;
+                }
                 // The severity reading moved from a floating bar inside the
                 // header to the card's own bottom edge, where it underlines the
                 // whole workload, cannot collide with the glyph or the grid, and
@@ -436,7 +448,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                     gpui::transparent_black(),
                     Default::default(),
                 ));
-                self.stats.quads += 2;
+                self.stats.quads += 1;
             }
         }
 
@@ -446,7 +458,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                     Some(self.projection().medallion(block.rect, block.inner))
                 }
                 WorkloadPresentation::Detailed => {
-                    Some(self.projection().header_icon(block.inner, header_height))
+                    heading.map(|heading| self.projection().band_icon(heading, 0, self.type_))
                 }
                 WorkloadPresentation::Hidden | WorkloadPresentation::Card => None,
             };
@@ -461,32 +473,47 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             }
         }
 
-        if presentation.card_shown() && self.policy.block_label_shown(block.inner.w, self.zoom) {
-            let card_w = block.inner.w * self.zoom;
-            let header_px = header_height * self.zoom;
-            let (x, y) = self.camera.w2s(
-                block.inner.x,
-                block.inner.y,
-                self.viewport.0,
-                self.viewport.1,
-            );
-            // The name takes the header minus the square the glyph occupies
-            // on its left, and is centred and clipped inside what is left,
-            // so a forty-character name stops at its own card.
-            let inset = if chrome { header_px } else { 0.0 };
-            let width = (card_w - inset - header_px * 0.25).max(1.0);
+        if let Some(heading) = heading {
+            let icon = self.projection().band_icon(heading, 1, self.type_);
+            let inset = TEXT_PAD + f32::from(icon.bounds.size.width) + STATUS_GAP;
+            let width = f32::from(heading.bounds.size.width) - inset - TEXT_PAD;
             let size_px = self.type_.workload;
+            let line = size_px * self.type_.line_height;
+            let x = f32::from(heading.bounds.origin.x) + inset;
+            let y = f32::from(heading.bounds.origin.y) + TEXT_PAD;
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::from(&block.label),
-                x: self.origin.0 + x + inset,
-                y: self.origin.1
-                    + y
-                    + (header_px - size_px * self.type_.line_height).max(0.0) * 0.5,
+                x,
+                y,
                 size_px,
                 color: self.workload_label,
                 face: LabelFace::Ui,
                 width,
+                height: line,
+                text_start: 0,
             });
+            push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
+                text: SharedString::new_static(crate::status::workload_label(
+                    block.children.len(),
+                    block.ext.rollup,
+                )),
+                x,
+                y: y + line,
+                size_px,
+                color: self.workload_label,
+                face: LabelFace::Ui,
+                width,
+                height: line,
+                text_start: 0,
+            });
+            if self.policy.sat_icon_shown() {
+                push_icon(&mut self.stats, self.policy, self.sink, || {
+                    IconJob::Status(
+                        crate::status::workload_severity(block.children.len(), block.ext.rollup),
+                        icon,
+                    )
+                });
+            }
         }
 
         if self.stage < 2 {
@@ -531,13 +558,24 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 (block.inner.w - inset * 2.0).max(1.0),
                 (block.inner.h - header - inset * 2.0).max(1.0),
             );
-            self.sink.fg_quad(fill(
-                self.screen_bounds(&aggregate),
-                self.pod_paint[severity_index(block.ext.rollup)],
-            ));
+            let mut bounds = self.screen_bounds(&aggregate);
+            if let Some(heading) = heading {
+                let bottom = bounds.bottom();
+                bounds.origin.y = bounds
+                    .origin
+                    .y
+                    .max(heading.bounds.bottom() + px(crate::primitive::HEADING_CLEARANCE));
+                bounds.size.height = (bottom - bounds.origin.y).max(px(0.0));
+            }
+            if bounds.size.height > px(0.0) {
+                self.sink.fg_quad(fill(
+                    bounds,
+                    self.pod_paint[severity_index(block.ext.rollup)],
+                ));
+                self.stats.quads += 1;
+            }
             self.stats.aggregated_blocks += 1;
             self.stats.aggregated_cells += cells;
-            self.stats.quads += 1;
             return;
         }
 
@@ -545,18 +583,18 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             let visible = self.visible;
             if scene.block_cell_index_is_selective(block_index, &visible) {
                 scene.for_each_block_cell_candidate(block_index, &visible, |_, cell| {
-                    self.cell(cell, block_inside);
+                    self.cell(cell, block_inside, &block.label, heading);
                 });
             } else {
                 for cell in &scene.cells[block.children.start as usize..block.children.end as usize]
                 {
-                    self.cell(cell, block_inside);
+                    self.cell(cell, block_inside, &block.label, heading);
                 }
             }
         } else {
             let visible = self.visible;
             scene.for_each_block_cell_candidate(block_index, &visible, |_, cell| {
-                self.cell(cell, block_inside);
+                self.cell(cell, block_inside, &block.label, heading);
             });
         }
     }
@@ -619,6 +657,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 color: self.sat_label,
                 face: LabelFace::Ui,
                 width,
+                height: name * self.type_.line_height,
+                text_start: 0,
             });
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::from(&satellite.ext.detail),
@@ -628,6 +668,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 color: self.sat_detail_label,
                 face: LabelFace::Ui,
                 width,
+                height: detail * self.type_.line_height,
+                text_start: 0,
             });
         }
 
@@ -643,13 +685,24 @@ impl<S: FrameSink> FrameWalk<'_, S> {
     }
 
     #[inline(always)]
-    fn cell(&mut self, cell: &PodNode, block_inside: bool) {
+    fn cell(
+        &mut self,
+        cell: &PodNode,
+        block_inside: bool,
+        owner: &str,
+        heading: Option<crate::MarkPrimitive>,
+    ) {
         if !(block_inside || cell.rect.intersects(&self.visible)) {
             return;
         }
+        let Some(primitive) = self
+            .projection()
+            .cell(cell.rect, self.stage, self.type_, heading)
+        else {
+            return;
+        };
         self.stats.drawn_cells += 1;
         let severity = severity_index(cell.ext.state.severity);
-        let primitive = pod(self.screen_bounds(&cell.rect));
         if cell.ext.state.reason == ReasonId::TERMINATING {
             // A pod inside its termination grace period is still there and still
             // counted, and it is on its way out. Drawn hollow it says both, in
@@ -676,22 +729,78 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         }
         self.stats.quads += 1;
 
-        if self.stage >= 3 && self.policy.cell_label_shown(cell.rect.w, self.zoom) {
-            let (x, y) = self.camera.w2s(
-                cell.rect.x,
-                cell.rect.y + cell.rect.h,
-                self.viewport.0,
-                self.viewport.1,
+        let width = f32::from(primitive.bounds.size.width);
+        let height = f32::from(primitive.bounds.size.height);
+        let detailed = self.stage >= 3
+            && width >= POD_DETAIL_MIN_WIDTH
+            && self.policy.cell_label_shown(cell.rect.w, self.zoom);
+        if self.policy.sat_icon_shown() && width >= POD_MARK_MIN && height >= POD_MARK_MIN {
+            let side = quantize(
+                self.type_
+                    .pod
+                    .max(16.0)
+                    .min(width - TEXT_PAD)
+                    .min(height - TEXT_PAD),
             );
+            let line = self.type_.pod * self.type_.line_height;
+            let center = primitive.bounds.center();
+            let icon = crate::MarkPrimitive {
+                bounds: Bounds {
+                    origin: if detailed {
+                        point(
+                            primitive.bounds.origin.x + px(TEXT_PAD),
+                            primitive.bounds.origin.y + px(TEXT_PAD + line + (line - side) * 0.5),
+                        )
+                    } else {
+                        point(center.x - px(side * 0.5), center.y - px(side * 0.5))
+                    },
+                    size: size(px(side), px(side)),
+                },
+                corners: Corners::all(px(0.0)),
+            };
+            push_icon(&mut self.stats, self.policy, self.sink, || {
+                IconJob::Status(cell.ext.state.severity, icon)
+            });
+        }
+        if detailed {
             let size_px = self.type_.pod;
+            let line = size_px * self.type_.line_height;
+            let x = f32::from(primitive.bounds.origin.x) + TEXT_PAD;
+            let y = f32::from(primitive.bounds.origin.y) + TEXT_PAD;
+            let label_bounds = Bounds {
+                origin: point(px(x), px(y)),
+                size: size(px(width - TEXT_PAD * 2.0), px(line * 2.0)),
+            };
+            if !self.projection().label_visible(label_bounds, self.type_) {
+                return;
+            }
+            let text_start = cell
+                .label
+                .strip_prefix(owner)
+                .filter(|suffix| suffix.starts_with('-') && suffix.len() > 1)
+                .map_or(0, |_| owner.len() + 1);
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::from(&cell.label),
-                x: self.origin.0 + x,
-                y: self.origin.1 + y + 2.0,
+                x,
+                y,
                 size_px,
                 color: self.pod_label,
                 face: LabelFace::Ui,
-                width: 0.0,
+                width: width - TEXT_PAD * 2.0,
+                height: line,
+                text_start,
+            });
+            let inset = quantize(size_px.max(16.0)) + STATUS_GAP;
+            push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
+                text: SharedString::new_static(crate::status::reason_label(cell.ext.state.reason)),
+                x: x + inset,
+                y: y + line,
+                size_px,
+                color: self.pod_label,
+                face: LabelFace::Ui,
+                width: width - TEXT_PAD * 2.0 - inset,
+                height: line,
+                text_start: 0,
             });
         }
     }
@@ -857,7 +966,7 @@ pub fn walk<S: FrameSink>(
         pod_label: scale_alpha(rgb(opts.theme.pod_label), blend.stage_alpha(3)),
         workload_paint,
         pod_paint: SEVERITIES
-            .map(|severity| scale_alpha(opts.theme.pod_color(severity), cell_alpha).into()),
+            .map(|severity| scale_alpha(opts.theme.workload_colors(severity).0, cell_alpha).into()),
         strip_paint: SEVERITIES
             .map(|severity| scale_alpha(opts.theme.pod_color(severity), block_alpha).into()),
         sink,

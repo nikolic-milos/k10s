@@ -7,6 +7,75 @@
 use super::*;
 
 #[test]
+fn log_trace_links_use_structured_metadata_and_indexed_labels() {
+    use k10s_data::integrations::loki::{LogLine, LogStream, Logs};
+    use k10s_provider::LokiOutcome;
+    const TRACE: &str = "20EC76BBC3F0628BCCADB4D44DA6BD8A";
+    for (label_trace, metadata_trace, expected) in [
+        (Some(TRACE), None, Some(TRACE.to_ascii_lowercase())),
+        (None, Some(TRACE), Some(TRACE.to_ascii_lowercase())),
+        (Some(TRACE), Some("invalid"), None),
+        (None, None, None),
+    ] {
+        let mut labels = vec![("k8s_pod_uid".into(), "current-uid".into())];
+        if let Some(trace) = label_trace {
+            labels.push(("trace_id".into(), trace.into()));
+        }
+        let metadata = metadata_trace
+            .map(|trace| vec![("trace_id".into(), trace.into())])
+            .unwrap_or_default();
+        let outcome = loki_outcome(Fetched::Ok(Some(Logs {
+            streams: vec![LogStream {
+                labels,
+                lines: vec![LogLine {
+                    ts_ns: 1_791_237_376_351_862_530,
+                    line: "pilot.complete".into(),
+                    metadata,
+                }],
+            }],
+            ..Default::default()
+        })));
+        let LokiOutcome::Logs { entries, .. } = outcome else {
+            panic!("log entries must cross the provider: {outcome:?}");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].trace_id, expected);
+        assert_eq!(entries[0].attribute("k8s_pod_uid"), Some("current-uid"));
+    }
+}
+
+#[test]
+fn a_failed_observe_probe_stays_blocked_and_keeps_its_sentence() {
+    let reach = observe_reach(Fetched::Failed {
+        what: "telemetry",
+        why: "telemetry is busy".into(),
+    });
+    assert_eq!(reach.error.as_deref(), Some("telemetry is busy"));
+    assert_eq!(reach.prometheus, k10s_provider::ToolPresence::Blocked);
+    assert_eq!(reach.loki, k10s_provider::ToolPresence::Blocked);
+    assert_eq!(reach.traces, k10s_provider::ToolPresence::Blocked);
+}
+
+#[test]
+fn an_individual_observe_probe_failure_does_not_hide_healthy_tools() {
+    use k10s_data::read::{ObserveTools, Seen};
+    use k10s_provider::ToolPresence;
+    let reach = observe_reach(Fetched::Ok(ObserveTools {
+        prometheus: Seen::Unbound,
+        loki: Seen::Bound,
+        traces: Seen::Absent,
+        errors: vec!["Prometheus: storage unavailable".into()],
+    }));
+    assert_eq!(reach.prometheus, ToolPresence::Blocked);
+    assert_eq!(reach.loki, ToolPresence::Ready);
+    assert_eq!(reach.traces, ToolPresence::Missing);
+    assert_eq!(
+        reach.error.as_deref(),
+        Some("Prometheus: storage unavailable")
+    );
+}
+
+#[test]
 fn a_describe_maps_its_document_and_keeps_denial_and_failure_labels() {
     let doc = describe_outcome(Fetched::Ok(k10s_data::describe::Described {
         title: "pod api-1".to_string(),
@@ -552,7 +621,9 @@ fn policy_harbor_and_mesh_absence_hide_the_pane() {
             extra_hits: Vec::new(),
             truncated: false,
             browser_base: None,
+            browser_service: None,
             served: false,
+            errors: Vec::new(),
         })),
         k10s_provider::GrafanaOutcome::Absent
     ));
@@ -626,6 +697,7 @@ fn a_rollback_names_the_document_that_may_have_landed_and_the_ones_not_sent() {
 #[test]
 fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
     let catalog = k10s_data::read::GrafanaCatalog {
+        errors: Vec::new(),
         dashboards: vec![k10s_data::integrations::grafana::Dashboard {
             uid: "node".to_string(),
             title: "Node".to_string(),
@@ -633,11 +705,17 @@ fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
                 id: 2,
                 title: "CPU".to_string(),
                 kind: k10s_data::integrations::grafana::PanelKind::Timeseries,
+                unit: String::new(),
+                reducer: "lastNotNull".into(),
+                min_interval: String::new(),
+                unsupported: None,
                 queries: vec![k10s_data::integrations::grafana::PanelQuery {
                     ref_id: "A".to_string(),
                     expr: "rate(cpu[1m])".to_string(),
                     dialect: k10s_data::integrations::grafana::QueryDialect::PromQL,
                     datasource: None,
+                    min_step: String::new(),
+                    unsupported: None,
                 }],
                 transformed: false,
             }],
@@ -646,6 +724,7 @@ fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
         extra_hits: Vec::new(),
         truncated: false,
         browser_base: Some("http://grafana.mon.svc:3000".to_string()),
+        browser_service: None,
         served: true,
     };
     match grafana_outcome(Fetched::Ok(catalog)) {
@@ -658,6 +737,50 @@ fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn grafana_catalog_failures_survive_projection_instead_of_appearing_absent() {
+    let errors = vec!["Provisioned dashboards: configmaps temporarily unavailable".to_string()];
+    for served in [false, true] {
+        let catalog = k10s_data::read::GrafanaCatalog {
+            dashboards: Vec::new(),
+            extra_hits: Vec::new(),
+            truncated: false,
+            browser_base: None,
+            browser_service: None,
+            served,
+            errors: errors.clone(),
+        };
+        match grafana_outcome(Fetched::Ok(catalog)) {
+            k10s_provider::GrafanaOutcome::Catalog {
+                panels, notices, ..
+            } => {
+                assert!(panels.is_empty());
+                assert_eq!(notices, errors);
+            }
+            other => panic!("a named catalog source failed: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn an_empty_trace_reply_remains_distinct_from_an_absent_store() {
+    let trace = k10s_data::integrations::traces::Trace {
+        trace_id: String::new(),
+        spans: Vec::new(),
+    };
+    assert!(matches!(
+        trace_outcome(Fetched::Ok(Some(trace))),
+        k10s_provider::TraceOutcome::Empty
+    ));
+    let trace = k10s_data::integrations::traces::Trace {
+        trace_id: "returned-id".into(),
+        spans: Vec::new(),
+    };
+    assert!(
+        matches!(trace_outcome(Fetched::Ok(Some(trace))), k10s_provider::TraceOutcome::Trace { trace_id, spans } if trace_id=="returned-id" && spans.is_empty())
+    );
 }
 
 #[test]
