@@ -234,9 +234,10 @@ impl Projection {
         card(self.bounds(rect))
     }
 
-    /// Zero or one observed Pod keeps its published hub and child center, so
-    /// compact chrome does not move relationship anchors. Multiple Pods keep
-    /// their layout chrome and placement.
+    /// Empty workloads use compact geometry at every card presentation. A
+    /// single observed Pod compacts only at detail. Both retain the published
+    /// hub and any child center so chrome does not move relationship anchors.
+    /// Multiple Pods keep their layout chrome and placement.
     #[inline]
     pub(crate) fn workload<R, B, C, S>(
         self,
@@ -247,7 +248,7 @@ impl Projection {
     ) -> WorkloadPrimitive {
         let block = &scene.blocks[block_index];
         let mut body = self.card(block.inner);
-        let compact = stage >= 3 && block.children.len() <= 1;
+        let compact = block.children.is_empty() || (stage >= 3 && block.children.len() == 1);
         let heading = if compact {
             let (x, y) = block.inner.center();
             let hub = self.bounds(Rect::new(x, y, 0.0, 0.0));
@@ -269,7 +270,15 @@ impl Projection {
                 }
                 .intersect(&body.bounds),
             );
-            self.name_band_bounds(body.bounds.inset(px(TEXT_PAD)), type_)
+            let mut band = body.bounds.inset(px(TEXT_PAD));
+            let heading = self.name_band_bounds(band, type_);
+            if heading.is_some() || !block.children.is_empty() {
+                heading
+            } else {
+                band.origin.x = body.bounds.origin.x;
+                band.size.width = body.bounds.size.width;
+                self.name_band_bounds(band, type_)
+            }
         } else {
             self.name_band(block.inner, type_)
         };
@@ -646,6 +655,104 @@ mod tests {
     }
 
     #[test]
+    fn empty_cards_keep_name_admission_at_body_and_viewport_thresholds() {
+        let mut scene = one_pod_scene();
+        scene.blocks[0].children = 0..0;
+        let viewport = (600.0, 420.0);
+        for (stage, inner) in [
+            (1, Rect::new(40.0, 40.0, 400.0, 400.0)),
+            (2, Rect::new(40.0, 40.0, 30.0, 42.0)),
+            (2, Rect::new(40.0, 40.0, 30.0, 56.0)),
+        ] {
+            scene.blocks[0].inner = inner;
+            let (cx, cy) = inner.center();
+            for (font, max_width, height) in [
+                (8.0, 168.0, 68.0),
+                (14.0, 168.0, 74.0),
+                (32.0, 364.0, 123.0),
+            ] {
+                let type_ = MapType {
+                    workload: font,
+                    pod: font,
+                    ..Default::default()
+                };
+                let minimum = name_min_width(type_).ceil();
+                for (width, edge) in [
+                    (minimum, 0),
+                    (minimum + 0.5, 0),
+                    (minimum + 8.0, 0),
+                    (minimum + 16.0, 0),
+                    (minimum + 16.0, -1),
+                    (minimum + 16.0, 1),
+                ] {
+                    let zoom = width / inner.w;
+                    let center_x = match edge {
+                        -1 => width * 0.5 - 5.0,
+                        1 => viewport.0 + 5.0 - width * 0.5,
+                        _ => viewport.0 * 0.5,
+                    };
+                    let camera = Camera {
+                        cx: cx - (center_x - viewport.0 * 0.5) / zoom,
+                        cy,
+                        zoom,
+                    };
+                    for origin in [(0.0, 0.0), (17.25, 23.5)] {
+                        let projection = Projection::new(camera, viewport, origin);
+                        assert!(projection.name_band(inner, type_).is_some());
+                        let geometry = projection.workload(&scene, 0, stage, type_);
+                        let heading = geometry.heading.expect("the admitted name stays visible");
+                        let envelope = projection.bounds(inner);
+                        let hub = projection.bounds(Rect::new(cx, cy, 0.0, 0.0)).origin;
+                        assert!(
+                            geometry.body.bounds.origin.x >= envelope.origin.x
+                                && geometry.body.bounds.origin.y >= envelope.origin.y
+                                && geometry.body.bounds.right() <= envelope.right()
+                                && geometry.body.bounds.bottom() <= envelope.bottom(),
+                            "stage={stage}, font={font}, width={width}, edge={edge}, origin={origin:?}, body={:?}, envelope={envelope:?}",
+                            geometry.body.bounds,
+                        );
+                        assert!(geometry.body.contains(hub));
+                        assert!(f32::from(geometry.body.bounds.size.width) <= max_width + 0.001);
+                        assert!(
+                            (f32::from(geometry.body.bounds.size.height) - height).abs() < 0.001
+                        );
+                        assert!(
+                            heading.bounds.origin.x >= geometry.body.bounds.origin.x
+                                && heading.bounds.origin.y >= geometry.body.bounds.origin.y
+                                && heading.bounds.right() <= geometry.body.bounds.right()
+                                && heading.bounds.bottom() <= geometry.body.bounds.bottom()
+                        );
+                        assert!(f32::from(heading.bounds.size.width) >= name_min_width(type_));
+                        assert!(heading.bounds.origin.x >= px(origin.0 + TEXT_PAD));
+                        assert!(heading.bounds.right() <= px(origin.0 + viewport.0 - TEXT_PAD));
+                    }
+                }
+                let zoom = (minimum + 16.0) / inner.w;
+                for center_y in [
+                    top_clearance(type_, viewport) + name_band_height(type_) - 0.5,
+                    viewport.1 - bottom_clearance(type_) + HEADING_CLEARANCE + 0.5,
+                ] {
+                    let projection = Projection::new(
+                        Camera {
+                            cx,
+                            cy: cy - (center_y - viewport.1 * 0.5) / zoom,
+                            zoom,
+                        },
+                        viewport,
+                        (0.0, 0.0),
+                    );
+                    assert!(
+                        projection
+                            .workload(&scene, 0, stage, type_)
+                            .heading
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sparse_membership_and_removal_choose_actual_child_geometry() {
         let mut scene = one_pod_scene();
         let projection = Projection::new(
@@ -695,9 +802,11 @@ mod tests {
             heading: projection.name_band(scene.blocks[0].inner, type_),
         };
         assert_eq!(projection.workload(&scene, 0, 2, type_), original);
-        scene.blocks[0].children = 0..2048;
-        scene.cells.resize(2048, scene.cells[0].clone());
-        assert_eq!(projection.workload(&scene, 0, 3, type_), original);
+        for pods in [2, 2048] {
+            scene.blocks[0].children = 0..pods;
+            scene.cells.resize(pods as usize, scene.cells[0].clone());
+            assert_eq!(projection.workload(&scene, 0, 3, type_), original);
+        }
         scene.blocks[0].children = 0..1;
         scene.cells[0].rect = Rect::new(40.0, 40.0, 10.0, 10.0);
         let geometry = projection.workload(&scene, 0, 3, type_);

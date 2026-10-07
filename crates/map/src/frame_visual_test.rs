@@ -351,42 +351,13 @@ fn removing_the_only_pod_keeps_observed_truth_and_a_bounded_workload_target() {
     let ids = Arc::make_mut(&mut scene.ids);
     ids.cells[2] = Arc::from("");
     scene.identity_rev += 1;
-    scene.rebuild_spatial_index();
-    let camera = Camera {
-        cx: 55.0,
-        cy: 68.0,
-        zoom: crate::lod::STAGE_POD_LABEL,
-    };
-    let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
-    let geometry = projection.workload(&scene, 0, 3, MapType::default());
-    let sink = walk_at(&scene, camera);
-    assert_eq!(geometry.body.bounds.size, size(px(168.0), px(74.0)));
-    assert!(
-        sink.fg
-            .iter()
-            .any(|quad| quad.bounds == geometry.body.bounds)
-    );
-    assert!(sink.labels.iter().any(|job| job.text == "0 observed pods"));
-    assert!(
-        !sink
-            .labels
-            .iter()
-            .any(|job| job.text == "Healthy" || job.text == scene.cells[2].label.as_ref())
-    );
-    let point = geometry.heading.unwrap().bounds.center();
     let pol = policy(Knobs::default());
-    let picked = crate::pick::pick(
-        &scene,
-        &camera,
-        &pol,
-        StageBlend::settled(3),
-        VW,
-        VH,
-        f32::from(point.x),
-        f32::from(point.y),
-    )
-    .unwrap();
-    assert_eq!((picked.block, picked.cell), (Some(0), None));
+    let block_path = crate::PickPath {
+        region: 0,
+        block: Some(0),
+        cell: None,
+        sat: None,
+    };
     let overlay = crate::OverlayFrame {
         kind: Some(crate::OverlayKind::Policy),
         marks: vec![crate::OverlayMark {
@@ -396,11 +367,142 @@ fn removing_the_only_pod_keeps_observed_truth_and_a_bounded_workload_target() {
             label: None,
         }],
     };
-    assert!(
-        overlay
-            .visible_stamps(&scene, camera, &pol, StageBlend::settled(3), VW, VH)
-            .is_empty()
-    );
+    for (stage, zoom, inner) in [
+        (0, 0.5, Rect::new(40.0, 40.0, 30.0, 56.0)),
+        (1, 0.5, Rect::new(40.0, 40.0, 30.0, 56.0)),
+        (1, 1.0, Rect::new(40.0, 40.0, 400.0, 400.0)),
+        (2, 8.0, Rect::new(40.0, 40.0, 30.0, 42.0)),
+        (2, 8.0, Rect::new(40.0, 40.0, 30.0, 56.0)),
+        (
+            3,
+            crate::lod::STAGE_POD_LABEL,
+            Rect::new(40.0, 40.0, 30.0, 56.0),
+        ),
+    ] {
+        scene.blocks[0].inner = inner;
+        scene.blocks[0].rect = inner.inflate(20.0);
+        scene.blocks[0].sats = 0..0;
+        scene.regions[0].rect = inner.inflate(400.0);
+        scene.bounds = scene.regions[0].rect;
+        scene.rebuild_spatial_index();
+        let (cx, cy) = inner.center();
+        let camera = Camera { cx, cy, zoom };
+        let blend = StageBlend::settled(stage);
+        let type_ = MapType::default();
+        let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
+        let presentation = workload_presentation(&pol, inner, zoom, stage, type_);
+        for theme in [&k10s_theme::K10S_DARK.map, &k10s_theme::K10S_LIGHT.map] {
+            let opts = FrameOpts {
+                theme,
+                policy: &pol,
+                type_,
+                edges_on: false,
+                skip_blocks: false,
+                hex: false,
+            };
+            let mut sink = Collect::default();
+            let stats = walk(viewport(), &scene, camera, blend, opts, &mut sink);
+            assert_eq!(
+                stats,
+                crate::lod::cull(&scene, &camera, blend, VW, VH, opts)
+            );
+            assert_eq!(stats.drawn_cells, 0);
+            assert!(
+                !sink
+                    .labels
+                    .iter()
+                    .any(|job| job.text == "Healthy" || job.text == scene.cells[2].label.as_ref())
+            );
+            let mark = crate::primitive::mark_primitive_typed(
+                &scene,
+                block_path,
+                camera,
+                &pol,
+                stage,
+                (VW, VH),
+                (0.0, 0.0),
+                type_,
+            );
+            if presentation == k10s_atlas::WorkloadPresentation::Hidden {
+                assert!(mark.is_none());
+                assert!(!sink.labels.iter().any(|job| job.text == "0 observed pods"));
+            } else if presentation == k10s_atlas::WorkloadPresentation::Medallion {
+                let medallion = projection.medallion(scene.blocks[0].rect, inner);
+                assert_eq!(mark, Some(medallion));
+                assert!(
+                    sink.icons
+                        .iter()
+                        .any(|job| icon_bounds(job) == medallion.bounds)
+                );
+                let point = medallion.bounds.center();
+                let picked = crate::pick::pick(
+                    &scene,
+                    &camera,
+                    &pol,
+                    blend,
+                    VW,
+                    VH,
+                    f32::from(point.x),
+                    f32::from(point.y),
+                )
+                .unwrap();
+                assert_eq!(picked, block_path);
+            } else {
+                let geometry = projection.workload(&scene, 0, stage, type_);
+                assert_eq!(geometry.body.bounds.size, size(px(168.0), px(74.0)));
+                assert_eq!(mark, Some(geometry.body));
+                assert!(
+                    sink.fg
+                        .iter()
+                        .any(|quad| quad.bounds == geometry.body.bounds)
+                );
+                assert!(sink.labels.iter().any(|job| job.text == "0 observed pods"));
+                let heading = geometry.heading.unwrap();
+                let hub = projection.bounds(Rect::new(cx, cy, 0.0, 0.0)).origin;
+                for point in [heading.bounds.center(), hub] {
+                    let picked = crate::pick::pick(
+                        &scene,
+                        &camera,
+                        &pol,
+                        blend,
+                        VW,
+                        VH,
+                        f32::from(point.x),
+                        f32::from(point.y),
+                    )
+                    .unwrap();
+                    assert_eq!(picked, block_path);
+                }
+                let original = projection.card(inner);
+                let gap = point(
+                    original.bounds.center().x,
+                    original.bounds.bottom() - px(1.0),
+                );
+                assert!(original.contains(gap));
+                assert!(!geometry.body.contains(gap));
+                let picked = crate::pick::pick(
+                    &scene,
+                    &camera,
+                    &pol,
+                    blend,
+                    VW,
+                    VH,
+                    f32::from(gap.x),
+                    f32::from(gap.y),
+                )
+                .unwrap();
+                assert_eq!(
+                    (picked.region, picked.block, picked.cell, picked.sat),
+                    (0, None, None, None)
+                );
+            }
+            assert!(
+                overlay
+                    .visible_stamps(&scene, camera, &pol, blend, VW, VH)
+                    .is_empty()
+            );
+        }
+    }
 }
 
 #[test]

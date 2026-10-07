@@ -334,10 +334,10 @@ mod tests {
             cy: 81.0,
             zoom: crate::lod::STAGE_POD_LABEL,
         };
-        let blend = StageBlend::settled(3);
         let type_ = k10s_theme::MapType::default();
         for sparse in [false, true] {
-            for pods in [0, 1] {
+            for (pods, stage) in [(0, 1), (0, 2), (0, 3), (1, 3)] {
+                let blend = StageBlend::settled(stage);
                 let mut s = scene(SceneSpec::uniform(1, 128));
                 s.regions[0].rect = Rect::new(-10000.0, -10000.0, 20000.0, 20000.0);
                 s.blocks[0].inner = Rect::new(40.0, 40.0, 30.0, 56.0);
@@ -369,7 +369,7 @@ mod tests {
                 };
                 s.rebuild_spatial_index();
                 let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
-                let geometry = projection.workload(&s, 0, 3, type_);
+                let geometry = projection.workload(&s, 0, stage, type_);
                 let original = projection.card(s.blocks[0].inner);
                 let padding = point(
                     original.bounds.origin.x + px(20.0),
@@ -385,7 +385,7 @@ mod tests {
                 ];
                 if pods == 1 {
                     let pod = projection
-                        .cell(s.cells[cell_index].rect, 3, type_, geometry.heading)
+                        .cell(s.cells[cell_index].rect, stage, type_, geometry.heading)
                         .unwrap();
                     probes.push((pod.bounds.center(), Level::Cell, Some(cell_index as u32)));
                 }
