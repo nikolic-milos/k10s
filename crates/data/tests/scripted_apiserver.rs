@@ -15,6 +15,8 @@
 //! suite pins request shapes and which client a request took, never the
 //! bound; `connect_test.rs` proves the bound and the retry split against a
 //! listener. A suite that asserts routing gives each client its own Script.
+//! Watches match only prefixes explicitly naming `watch=true`; a collection
+//! prefix belongs to ordinary reads, including reads issued after the sync.
 
 #[path = "scripted_apiserver/alertmanager.rs"]
 mod alertmanager;
@@ -353,6 +355,7 @@ impl Service<http::Request<Body>> for Script {
                 !r.used
                     && r.method == method
                     && routable.starts_with(&r.matches)
+                    && (!path.contains("watch=true") || r.matches.contains("watch=true"))
                     && r.accept_contains.is_none_or(|want| accept.contains(want))
             });
             let answer = match hit {

@@ -403,7 +403,10 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             self.stats.drawn_blocks += 1;
         }
         if let Some(geometry) = geometry {
-            let severity = severity_index(block.ext.rollup);
+            let severity = severity_index(crate::status::workload_severity(
+                block.children.len(),
+                block.ext.rollup,
+            ));
             let (fill_color, border) = self.workload_paint[severity];
             let primitive = geometry.body;
             self.sink.fg_quad(quad(

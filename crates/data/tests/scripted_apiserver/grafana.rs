@@ -8,6 +8,93 @@ use k10s_data::integrations::grafana::{
 use k10s_data::reach::{Bound, ToolAuth, ToolKind, Transport};
 use k10s_data::read::Fetched;
 
+#[test]
+fn watches_keep_catalog_list_routes_and_explicit_watch_routes_separate() {
+    use futures::FutureExt;
+    use kube::api::{ListParams, WatchParams};
+    use kube::core::Request;
+
+    for (path, metadata) in [("/api/v1/configmaps", true), ("/api/v1/services", false)] {
+        for explicit in [false, true] {
+            let script = Script::default();
+            let list_route = format!("{path}?");
+            let watch_route = format!("{path}?watch=true");
+            script.route("GET", &list_route, 200, "{}");
+            if explicit {
+                script.route("GET", &watch_route, 204, "");
+            }
+            let request = Request::new(path.to_string());
+            let watch = if metadata {
+                request.watch_metadata(&WatchParams::default(), "1000")
+            } else {
+                request.watch(&WatchParams::default(), "1000")
+            }
+            .expect("fixed watch parameters")
+            .map(Body::from);
+            let mut server = script.clone();
+            let response = server.call(watch).now_or_never();
+            assert_eq!(response.is_some(), explicit, "{path}, explicit {explicit}");
+            if let Some(response) = response {
+                assert_eq!(response.expect("scripted watch").status(), 204);
+            }
+            assert_eq!(script.answered("GET", &list_route), (1, 0));
+            if explicit {
+                assert_eq!(script.answered("GET", &watch_route), (1, 1));
+            }
+
+            let mut params = ListParams::default().limit(200);
+            if metadata {
+                params = params.labels("grafana_dashboard in (1,true)");
+            }
+            let list = request
+                .list(&params)
+                .expect("fixed list parameters")
+                .map(Body::from);
+            let response = server
+                .call(list)
+                .now_or_never()
+                .expect("the list answers without waiting")
+                .expect("scripted list");
+            assert_eq!(response.status(), 200);
+            assert_eq!(script.answered("GET", &list_route), (1, 1));
+            let seen = script.seen();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(
+                seen[0].path,
+                format!(
+                    "{path}?&watch=true&timeoutSeconds=290&allowWatchBookmarks=true&resourceVersion=1000"
+                )
+            );
+            assert_eq!(
+                seen[0].accept,
+                if metadata {
+                    "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+                } else {
+                    ""
+                },
+            );
+            assert_eq!(
+                seen[0].content_type,
+                if metadata { "application/json" } else { "" }
+            );
+            assert_eq!(
+                seen[1].path,
+                if metadata {
+                    "/api/v1/configmaps?&labelSelector=grafana_dashboard+in+%281%2Ctrue%29&limit=200"
+                } else {
+                    "/api/v1/services?&limit=200"
+                },
+            );
+            assert_eq!(seen[1].accept, "");
+            assert_eq!(seen[1].content_type, "");
+            for request in seen {
+                assert_eq!(request.method, "GET");
+                assert!(request.body.is_empty());
+            }
+        }
+    }
+}
+
 fn proxy_bound() -> Bound {
     Bound {
         kind: ToolKind::Grafana,
@@ -747,8 +834,12 @@ fn partial_provisioning_errors_survive_the_catalog_projection() {
         200,
         r#"{"apiVersion":"v1","kind":"ServiceList","items":[]}"#,
     );
-    let Fetched::Ok(catalog) = catalog_reply(&sync) else {
-        panic!("partial provisioning remains available with its error");
+    let answer = catalog_reply(&sync);
+    let Fetched::Ok(catalog) = answer else {
+        panic!(
+            "partial provisioning remains available with its error: {answer:?}; requests: {:?}",
+            script.seen(),
+        );
     };
     assert_eq!(catalog.dashboards[0].uid, "healthy");
     assert!(catalog.truncated);

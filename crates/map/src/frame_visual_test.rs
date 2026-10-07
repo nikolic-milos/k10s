@@ -403,6 +403,113 @@ fn removing_the_only_pod_keeps_observed_truth_and_a_bounded_workload_target() {
     );
 }
 
+#[test]
+fn workload_card_colors_and_status_use_observed_pods() {
+    let pol = policy(Knobs::default());
+    let type_ = MapType::default();
+    for observed in [0usize, 1] {
+        for rollup in [
+            Severity::Ok,
+            Severity::Warn,
+            Severity::Err,
+            Severity::Unknown,
+        ] {
+            let mut scene = small_workload(State::OK, false);
+            scene.blocks[0].ext.rollup = rollup;
+            if observed == 0 {
+                scene.blocks[0].children = 0..0;
+                scene.cells.clear();
+                Arc::make_mut(&mut scene.ids).cells.clear();
+                scene.rebuild_spatial_index();
+            }
+            let expected = if observed == 0 {
+                Severity::Unknown
+            } else {
+                rollup
+            };
+            let expected_label = if observed == 0 {
+                "0 observed pods"
+            } else {
+                crate::status::label(rollup)
+            };
+            let inner = scene.blocks[0].inner;
+            for (stage, zoom) in [
+                (2, (pol.block_chrome_min_px + TEXT_PAD * 2.0) / inner.w),
+                (3, pol.stage_cell_label),
+            ] {
+                assert_eq!(pol.stage_for_zoom(zoom), stage);
+                let camera = Camera {
+                    cx: inner.center().0,
+                    cy: inner.center().1,
+                    zoom,
+                };
+                let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
+                let geometry = projection.workload(&scene, 0, stage, type_);
+                let heading = geometry
+                    .heading
+                    .expect("the observed workload has a heading");
+                let footer = geometry.body.severity_strip();
+                let status_bounds = projection.band_icon(heading, 1, type_).bounds;
+                for (theme_name, theme) in [
+                    ("dark", &k10s_theme::K10S_DARK.map),
+                    ("light", &k10s_theme::K10S_LIGHT.map),
+                ] {
+                    let opts = FrameOpts {
+                        theme,
+                        policy: &pol,
+                        type_,
+                        edges_on: false,
+                        skip_blocks: false,
+                        hex: false,
+                    };
+                    let blend = StageBlend::settled(stage);
+                    let mut sink = Collect::default();
+                    let stats = walk(viewport(), &scene, camera, blend, opts, &mut sink);
+                    assert_eq!(
+                        stats,
+                        crate::lod::cull(&scene, &camera, blend, VW, VH, opts)
+                    );
+                    let body = sink
+                        .fg
+                        .iter()
+                        .find(|quad| quad.bounds == geometry.body.bounds)
+                        .expect("the workload emits its card body");
+                    let strip = sink
+                        .fg
+                        .iter()
+                        .find(|quad| quad.bounds == footer.bounds)
+                        .expect("the workload emits its severity strip");
+                    let (fill, border) = theme.workload_colors(expected);
+                    let border: gpui::Hsla = border.into();
+                    let strip_color: Background = theme.pod_color(expected).into();
+                    assert_eq!(
+                        body.background,
+                        shade(fill, rgb(theme.bg), CARD_SHADE),
+                        "{theme_name}, stage {stage}, {observed} observed, {rollup:?} rollup: card fill",
+                    );
+                    assert_eq!(
+                        body.border_color, border,
+                        "{theme_name}, stage {stage}, {observed} observed, {rollup:?} rollup: card border",
+                    );
+                    assert_eq!(
+                        strip.background, strip_color,
+                        "{theme_name}, stage {stage}, {observed} observed, {rollup:?} rollup: severity strip",
+                    );
+                    assert!(
+                        sink.icons.iter().any(|job| matches!(job, IconJob::Status(severity, primitive) if *severity == expected && primitive.bounds == status_bounds)),
+                        "{theme_name}, stage {stage}, {observed} observed, {rollup:?} rollup: workload status icon",
+                    );
+                    assert!(
+                        sink.labels.iter().any(|label| label.text == expected_label
+                            && heading.bounds.contains(&point(px(label.x), px(label.y)))),
+                        "{theme_name}, stage {stage}, {observed} observed, {rollup:?} rollup: workload status label",
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn cameras() -> Vec<Camera> {
     // Across every stage the map has, including both sides of the chrome
     // threshold, because that is where the glyph changes what it is doing.

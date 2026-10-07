@@ -14,7 +14,7 @@
 
 use crate::pane::Pane;
 use crate::settings::Settings;
-use crate::ui::{DockSizes, MAX_DOCK_SIZE, MIN_DOCK_SIZE, STATUS_BAR_HEIGHT, Viewport};
+use crate::ui::{DockSizes, MAX_DOCK_SIZE, MIN_DOCK_SIZE, Viewport};
 
 /// Which edge of the window a dock sits on. The same three names settings
 /// uses for the sizes a drag writes.
@@ -135,6 +135,7 @@ pub fn dragged_dock_sizes(
     position_x: f32,
     position_y: f32,
     viewport: Viewport,
+    status_height: f32,
 ) -> DockSizes {
     match edge {
         DockEdge::Left => sizes.left = position_x.clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE),
@@ -145,7 +146,7 @@ pub fn dragged_dock_sizes(
             // The bottom dock is measured from the top of the status bar, not
             // from the bottom of the window: the bar is below it and does not
             // move.
-            let body_bottom = viewport.height - STATUS_BAR_HEIGHT;
+            let body_bottom = viewport.height - status_height;
             sizes.bottom = (body_bottom - position_y).clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
         }
     }
@@ -290,6 +291,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bottom_drag_ends_at_the_resolved_status_bar() {
+        let sizes = dragged_dock_sizes(
+            DockSizes {
+                left: 300.0,
+                right: 300.0,
+                bottom: 200.0,
+            },
+            DockEdge::Bottom,
+            0.0,
+            700.0,
+            Viewport {
+                width: 1600.0,
+                height: 1000.0,
+            },
+            50.0,
+        );
+        assert_eq!(sizes.bottom, 250.0);
+        assert_eq!(700.0 + sizes.bottom, 950.0);
+    }
+
+    #[test]
     fn a_dragged_dock_edge_stops_at_its_bounds() {
         let viewport = Viewport {
             width: 1600.0,
@@ -301,7 +323,14 @@ mod tests {
             bottom: 200.0,
         };
 
-        let left = dragged_dock_sizes(start, DockEdge::Left, 420.0, 0.0, viewport);
+        let left = dragged_dock_sizes(
+            start,
+            DockEdge::Left,
+            420.0,
+            0.0,
+            viewport,
+            STATUS_BAR_HEIGHT,
+        );
         assert_eq!(left.left, 420.0);
         assert_eq!(
             (left.right, left.bottom),
@@ -309,10 +338,24 @@ mod tests {
             "dragging one edge moves one edge"
         );
 
-        let right = dragged_dock_sizes(start, DockEdge::Right, 1200.0, 0.0, viewport);
+        let right = dragged_dock_sizes(
+            start,
+            DockEdge::Right,
+            1200.0,
+            0.0,
+            viewport,
+            STATUS_BAR_HEIGHT,
+        );
         assert_eq!(right.right, 400.0);
 
-        let bottom = dragged_dock_sizes(start, DockEdge::Bottom, 0.0, 700.0, viewport);
+        let bottom = dragged_dock_sizes(
+            start,
+            DockEdge::Bottom,
+            0.0,
+            700.0,
+            viewport,
+            STATUS_BAR_HEIGHT,
+        );
         assert_eq!(bottom.bottom, 1000.0 - STATUS_BAR_HEIGHT - 700.0);
 
         for (edge, x, y) in [
@@ -320,7 +363,7 @@ mod tests {
             (DockEdge::Right, 9000.0, 0.0),
             (DockEdge::Bottom, 0.0, 9000.0),
         ] {
-            let squashed = dragged_dock_sizes(start, edge, x, y, viewport);
+            let squashed = dragged_dock_sizes(start, edge, x, y, viewport, STATUS_BAR_HEIGHT);
             let measured = match edge {
                 DockEdge::Left => squashed.left,
                 DockEdge::Right => squashed.right,
@@ -336,7 +379,7 @@ mod tests {
             (DockEdge::Right, -9000.0, 0.0),
             (DockEdge::Bottom, 0.0, -9000.0),
         ] {
-            let stretched = dragged_dock_sizes(start, edge, x, y, viewport);
+            let stretched = dragged_dock_sizes(start, edge, x, y, viewport, STATUS_BAR_HEIGHT);
             let measured = match edge {
                 DockEdge::Left => stretched.left,
                 DockEdge::Right => stretched.right,

@@ -518,15 +518,18 @@ impl Workspace {
     pub(crate) fn resize_dock(
         &mut self,
         event: &DragMoveEvent<DraggedDockResize>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         let edge = event.drag(cx).0;
+        let (_, status_height) = ui::status_bar_geometry(k10s_theme::typography(cx), window);
         let sizes = dock::dragged_dock_sizes(
             self.requested_dock_sizes(cx),
             edge,
             f32::from(event.event.position.x),
             f32::from(event.event.position.y),
             self.viewport,
+            status_height,
         );
         let mut next = settings::active(cx).clone();
         dock::apply_dock_size(&mut next, sizes, edge);

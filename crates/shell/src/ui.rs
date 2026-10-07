@@ -5,11 +5,12 @@
 //! kind of header. The values mirror the default density in the pinned Zed
 //! revision: a 16 px rem, 32 px tabs, a 34 px platform title bar. Type sizes
 //! are *not* here -- they moved to `k10s_theme::Typography`, because a person
-//! scales their interface and the whole ladder has to move with it.
+//! scales their interface and the whole ladder has to move with it. The status
+//! bar keeps its default floor and grows to contain its text and key hint.
 
 use gpui::{
-    Context, Div, IntoElement, ParentElement, Render, SharedString, Stateful, Styled, Window, div,
-    prelude::*, px, rgb, svg,
+    Context, DefiniteLength, Div, IntoElement, ParentElement, Render, SharedString, Stateful,
+    Styled, Window, div, prelude::*, px, rgb, svg,
 };
 use k10s_theme::{Appearance, Theme, Typography};
 
@@ -18,6 +19,9 @@ pub const TAB_HEIGHT: f32 = 32.0;
 pub const PANEL_HEADER_HEIGHT: f32 = 32.0;
 pub const TOOLBAR_HEIGHT: f32 = 36.0;
 pub const STATUS_BAR_HEIGHT: f32 = 30.0;
+pub(crate) const STATUS_BAR_BORDER: f32 = 1.0;
+const KEY_HINT_PADDING_Y: f32 = 1.0;
+const KEY_HINT_BORDER: f32 = 1.0;
 pub const ACTIVITY_BAR_WIDTH: f32 = 40.0;
 pub const PANEL_FOOTER_HEIGHT: f32 = 24.0;
 
@@ -113,6 +117,7 @@ impl DockSizes {
         left_open: bool,
         right_open: bool,
         bottom_open: bool,
+        status_height: f32,
     ) -> DockSizes {
         let mut left = left_open.then_some(requested.left.max(0.0)).unwrap_or(0.0);
         let mut right = right_open
@@ -126,7 +131,7 @@ impl DockSizes {
             right *= scale;
         }
 
-        let vertical_chrome = TITLE_BAR_HEIGHT + TAB_HEIGHT + STATUS_BAR_HEIGHT;
+        let vertical_chrome = TITLE_BAR_HEIGHT + TAB_HEIGHT + status_height;
         let bottom_budget = (viewport.height - vertical_chrome - MIN_CENTER_HEIGHT).max(0.0);
         let bottom = if bottom_open {
             requested.bottom.max(0.0).min(bottom_budget)
@@ -147,6 +152,24 @@ fn capacity(available: f32, reserved: f32, unit: f32, cap: usize) -> usize {
         return 1;
     }
     (((available - reserved).max(0.0) / unit).floor() as usize).clamp(1, cap.max(1))
+}
+
+/// The status owner and its children share one line height, so larger type
+/// cannot escape the bar while the dock still reserves its old height.
+pub(crate) fn status_bar_geometry(fonts: &Typography, window: &Window) -> (DefiniteLength, f32) {
+    let line_height = gpui::phi();
+    let line = |font_size| {
+        f32::from(window.pixel_snap(line_height.to_pixels(px(font_size).into(), window.rem_size())))
+    };
+    (
+        line_height,
+        status_bar_height(line(fonts.small()), line(fonts.xsmall())),
+    )
+}
+
+fn status_bar_height(text_line: f32, key_line: f32) -> f32 {
+    let key_height = key_line + (KEY_HINT_PADDING_Y + KEY_HINT_BORDER) * 2.0;
+    STATUS_BAR_HEIGHT.max(text_line.max(key_height) + STATUS_BAR_BORDER)
 }
 
 /// Zed's platform title bar height: a 1.75 rem floor that never drops below
@@ -352,10 +375,10 @@ pub fn key_hint(
         .child(
             div()
                 .px(px(4.0))
-                .py(px(1.0))
+                .py(px(KEY_HINT_PADDING_Y))
                 .rounded(px(3.0))
                 .bg(rgb(theme.shell.element_background))
-                .border_1()
+                .border(px(KEY_HINT_BORDER))
                 .border_color(rgb(theme.shell.border_variant))
                 .text_size(px(fonts.xsmall()))
                 .text_color(rgb(theme.shell.text_muted))
@@ -420,6 +443,7 @@ mod tests {
             true,
             true,
             true,
+            STATUS_BAR_HEIGHT,
         );
         assert!((sizes.left + sizes.right - 480.0).abs() < 0.001);
         assert_eq!(sizes.bottom, 300.0);
@@ -433,8 +457,74 @@ mod tests {
             true,
             true,
             true,
+            STATUS_BAR_HEIGHT,
         );
         assert_eq!(tiny.left + tiny.right, 0.0);
         assert_eq!(tiny.bottom, 0.0);
+    }
+
+    fn default_text_line(font_size: f32, scale: f32) -> f32 {
+        let style = gpui::TextStyle {
+            font_size: px(font_size).into(),
+            ..Default::default()
+        };
+        let line = f32::from(style.line_height.to_pixels(style.font_size, px(16.0)));
+        (line * scale).round() / scale
+    }
+
+    #[test]
+    fn status_children_fit_across_supported_type_sizes_and_scales() {
+        for half_pixels in 16..=64 {
+            let fonts = Typography {
+                ui_size: half_pixels as f32 * 0.5,
+                ..Default::default()
+            };
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let text_line = default_text_line(fonts.small(), scale);
+                let key_line = default_text_line(fonts.xsmall(), scale);
+                let height = status_bar_height(text_line, key_line);
+                assert!((30.0..=51.0).contains(&height));
+                let content = height - 1.0;
+                for child in [text_line, key_line + 4.0] {
+                    let top = (content - child) * 0.5;
+                    let bottom = top + child;
+                    assert!(top >= 0.0 && bottom <= content);
+                }
+                if fonts.ui_size <= 14.0 {
+                    assert_eq!(height, 30.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_type_reserves_the_observed_status_owner_and_dock_space() {
+        let fonts = Typography {
+            ui_size: 32.0,
+            ..Default::default()
+        };
+        let status_height = status_bar_height(
+            default_text_line(fonts.small(), 1.0),
+            default_text_line(fonts.xsmall(), 1.0),
+        );
+        assert_eq!(status_height, 50.0);
+        let sizes = DockSizes::resolve(
+            Viewport {
+                width: 800.0,
+                height: 400.0,
+            },
+            DockSizes {
+                left: 0.0,
+                right: 0.0,
+                bottom: 800.0,
+            },
+            false,
+            false,
+            true,
+            status_height,
+        );
+        assert_eq!(sizes.bottom, 124.0);
+        let center_height = 400.0 - 34.0 - 32.0 - status_height - sizes.bottom;
+        assert_eq!(center_height, 160.0);
     }
 }

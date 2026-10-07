@@ -18,7 +18,10 @@ use crate::finder::PickerMode;
 use crate::hosting::ConfigFile;
 use crate::selection::{LogTarget, Selection};
 use crate::tag::ItemTag;
-use crate::ui::{ACTIVITY_BAR_WIDTH, DockSizes, MODAL_TOP, STATUS_BAR_HEIGHT, key_hint};
+use crate::ui::{
+    ACTIVITY_BAR_WIDTH, DockSizes, MODAL_TOP, STATUS_BAR_BORDER, STATUS_BAR_HEIGHT, key_hint,
+    status_bar_geometry,
+};
 use crate::workspace::{PickerPurpose, Workspace};
 use crate::{
     AttachSelection, ChooseCluster, ClearSelection, CloseItem, DescribeSelection, EditSelection,
@@ -34,6 +37,11 @@ impl Render for Workspace {
         let theme = k10s_theme::active(cx).clone();
         let fonts = k10s_theme::typography(cx).clone();
         let requested = self.requested_dock_sizes(cx);
+        let (status_line_height, status_height) = if self.bench {
+            (gpui::phi(), STATUS_BAR_HEIGHT)
+        } else {
+            status_bar_geometry(&fonts, window)
+        };
         let workspace = cx.entity();
         let mut layout_viewport = self.viewport;
         if !self.bench {
@@ -45,6 +53,7 @@ impl Render for Workspace {
             self.left.is_open(),
             self.inspector_open,
             self.bottom.is_open(),
+            status_height,
         );
         let map_active = self
             .center
@@ -130,7 +139,8 @@ impl Render for Workspace {
         let status = (!self.bench).then(|| {
             div()
                 .id("status-bar")
-                .h(px(STATUS_BAR_HEIGHT))
+                .h(px(status_height))
+                .line_height(status_line_height)
                 .w_full()
                 .flex_none()
                 .px(px(8.0))
@@ -140,7 +150,7 @@ impl Render for Workspace {
                 .justify_between()
                 .gap(px(8.0))
                 .bg(rgb(theme.shell.status_bar_background))
-                .border_t_1()
+                .border_t(px(STATUS_BAR_BORDER))
                 .border_color(rgb(theme.shell.border))
                 .text_size(px(fonts.small()))
                 .text_color(rgb(theme.shell.text_muted))
@@ -275,11 +285,11 @@ impl Render for Workspace {
             .text_size(px(fonts.ui_size))
             .text_color(rgb(theme.shell.text))
             .key_context("Workspace")
-            .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<DraggedDockResize>, _, cx| {
-                    this.resize_dock(event, cx);
-                }),
-            )
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DraggedDockResize>, window, cx| {
+                    this.resize_dock(event, window, cx);
+                },
+            ))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 this.toggle_palette(window, cx);
             }))
