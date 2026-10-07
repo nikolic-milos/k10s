@@ -1,54 +1,35 @@
-//! Helm values and revision manifests after the secret-reveal policy.
+//! Pure Helm payload decoders for caller-owned bytes and unavailable cluster actions.
 //!
-//! [`crate::integrations::helm`] lists releases by reading Helm's own Secrets, then throws
-//! the payload away at that boundary so an inventory has nowhere to put a
-//! password. This module is the one later step that boundary exists to force:
-//! an explicit reveal of one revision, into [`crate::reach::Scratch`] buffers
-//! that zeroize on drop and never sit on [`crate::integrations::helm::Revision`].
-//!
-//! Three fields come out, and only those three. `config` is the user values
-//! Helm stored. `chart.values` is the chart's defaults. `manifest` is the
-//! rendered multi-document YAML text. Notes and hooks stay in the JSON only
-//! long enough for serde to ignore them; they are not a field here.
-//!
-//! Diffing two revisions compares those scratch buffers and returns the diff
-//! text as an owned `String`. That string is the action's result, not an
-//! inventory field. Rollback is server-side apply of the stored manifest
-//! documents with `fieldManager=k10s`, stopping at the first document that
-//! goes unconfirmed or cannot be sent. It is not `helm rollback`: hooks do not
-//! run, and the outcome says so. Chart rendering still needs Go templates and Sprig; if a
-//! `helm` binary is on PATH this module will name its path, and if it is not
-//! the absence is labelled rather than approximated.
+//! Release Secret values are never requested. Public revision reveal and stored
+//! manifest apply refuse before network access, including when called directly.
+//! Existing decoders and pure manifest planning tests remain separate from those
+//! routes; a scratch buffer is not permission to fetch a Secret payload.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use kube::Client;
-use kube::api::{GetParams, ListParams, Request};
 use serde::Deserialize;
 
-use k10s_core::KindId;
-
-use crate::apply::{self, ApplyOutcome, ApplyRequest};
-use crate::describe::is_secret;
+use crate::apply::ApplyOutcome;
+#[cfg(test)]
+use crate::apply::{self, ApplyRequest};
 use crate::discover::KindTarget;
 use crate::integrations::helm;
 use crate::reach::Scratch;
-use crate::read::{Fetched, collection_path};
+use crate::read::Fetched;
 
-const RELEASE_TYPE: &str = "helm.sh/release.v1";
-const OWNER_SELECTOR: &str = "owner=helm";
-const PAYLOAD_KEY: &str = "release";
-const PAGE_LIMIT: u32 = 200;
 // Same decompressed cap as `helm.rs`. A reveal is not a way around it.
 const MAX_PAYLOAD_BYTES: usize = 8 << 20;
 const MAX_DIFF_LINES: usize = 1_024;
 
-/// Why this write is not `helm rollback`.
+/// Why payload-backed cluster actions are unavailable.
+pub const PAYLOAD_UNAVAILABLE: &str =
+    "Helm release payload actions are unavailable: Secret values are never fetched";
+
+/// The legacy report format retained for callers of pure payload helpers.
 pub const NOT_HELM_ROLLBACK: &str = "not helm rollback (hooks will not run)";
 
-/// One revision after an explicit reveal: identity, then the three fields
-/// that inventory refused, each in a scratch buffer.
+/// One caller-owned decoded revision, with its fields in scratch buffers.
 ///
 /// Not `Clone`. A snapshot, a log, and a saved view are all places these
 /// bytes must not go, and a clone is how they would get there.
@@ -98,10 +79,8 @@ pub enum DocumentRollback {
     },
 }
 
-/// Server-side apply of a stored revision's manifest documents.
-///
-/// [`RollbackReport::note`] is always [`NOT_HELM_ROLLBACK`]. Hooks live in a
-/// different field of the payload and are never applied here.
+/// The legacy stored-apply report shape. The public action now returns one
+/// labelled refusal and never applies documents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackReport {
     pub note: &'static str,
@@ -139,40 +118,9 @@ struct WireRevealChart {
     values: serde_json::Value,
 }
 
-#[derive(Deserialize)]
-struct WireList {
-    #[serde(default)]
-    metadata: WireListMeta,
-    #[serde(default)]
-    items: Vec<WireSecret>,
-}
-
-#[derive(Deserialize, Default)]
-struct WireListMeta {
-    #[serde(default, rename = "continue")]
-    cont: String,
-}
-
-#[derive(Deserialize)]
-struct WireSecret {
-    #[serde(default)]
-    metadata: WireSecretMeta,
-    #[serde(default)]
-    data: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize, Default)]
-struct WireSecretMeta {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    namespace: String,
-}
-
-/// Decode one already-fetched release payload into scratch buffers.
+/// Decode a caller-owned release payload into scratch buffers.
 ///
-/// The caller has already decided to reveal this revision. Inventory still
-/// goes through `helm::decode`, which cannot carry these fields.
+/// The bytes belong to the caller. No Kubernetes route invokes this decoder.
 pub fn reveal_payload(encoded: &str) -> Result<RevealedRevision, &'static str> {
     let wire: WireReveal = {
         let json = helm::decode_scratch(encoded)?;
@@ -192,64 +140,17 @@ pub fn reveal_payload(encoded: &str) -> Result<RevealedRevision, &'static str> {
     })
 }
 
-/// Fetch one stored revision and reveal it. The list is still narrowed to
-/// Helm's own Secrets; the difference from an inventory is that this decode
-/// keeps the values.
+/// Refuse a revision payload read before any network request.
 pub async fn reveal_revision(
-    client: &Client,
-    targets: &[KindTarget],
-    namespace: Option<&str>,
-    name: &str,
-    revision: u32,
+    _client: &Client,
+    _targets: &[KindTarget],
+    _namespace: Option<&str>,
+    _name: &str,
+    _revision: u32,
 ) -> Fetched<RevealedRevision> {
-    let Some(target) = targets.iter().find(|target| is_secret(target)) else {
-        return Fetched::Failed {
-            what: "helm revision",
-            why: "the cluster does not serve Secrets, so stored releases cannot be read"
-                .to_string(),
-        };
-    };
-    if !target.listable {
-        return Fetched::Failed {
-            what: "helm revision",
-            why: "the server serves Secrets without a list verb, so stored releases cannot be read"
-                .to_string(),
-        };
-    }
-    if !release_name_ok(name) {
-        return Fetched::Failed {
-            what: "helm revision",
-            why: "that is not a Helm release name".to_string(),
-        };
-    }
-    match fetch_encoded(client, target, namespace, name, revision).await {
-        Fetched::Ok(encoded) => match reveal_payload(&encoded.payload) {
-            Ok(mut revealed) => {
-                if revealed.name.is_empty() {
-                    revealed.name = if encoded.secret_name.is_empty() {
-                        name.to_string()
-                    } else {
-                        encoded.secret_name
-                    };
-                }
-                if revealed.namespace.is_empty() {
-                    revealed.namespace = if !encoded.secret_namespace.is_empty() {
-                        encoded.secret_namespace
-                    } else if let Some(namespace) = namespace {
-                        namespace.to_string()
-                    } else {
-                        String::new()
-                    };
-                }
-                Fetched::Ok(revealed)
-            }
-            Err(why) => Fetched::Failed {
-                what: "helm revision",
-                why: why.to_string(),
-            },
-        },
-        Fetched::Denied { what } => Fetched::Denied { what },
-        Fetched::Failed { what, why } => Fetched::Failed { what, why },
+    Fetched::Failed {
+        what: "helm revision",
+        why: PAYLOAD_UNAVAILABLE.to_string(),
     }
 }
 
@@ -292,70 +193,17 @@ pub fn diff_values(from: &RevealedRevision, to: &RevealedRevision) -> String {
     )
 }
 
-/// Server-side apply of the stored manifest, one document at a time, stopping
-/// at the first that goes unconfirmed or cannot be sent. Not Helm rollback:
-/// hooks will not run.
+/// Refuse stored-manifest apply, including a caller-supplied decoded payload.
 pub async fn rollback(
-    client: &Client,
-    targets: &[KindTarget],
+    _client: &Client,
+    _targets: &[KindTarget],
     revealed: &RevealedRevision,
 ) -> RollbackReport {
-    let Ok(text) = revealed.manifest.as_str() else {
-        return RollbackReport::wrap(vec![DocumentRollback::Skipped {
-            name: revealed.name.clone(),
-            kind: String::new(),
-            why: "this revision's manifest is not UTF-8".to_string(),
-        }]);
-    };
-    let planned = plan_rollback(targets, &revealed.namespace, text);
-    if planned.is_empty() {
-        return RollbackReport::wrap(vec![DocumentRollback::Skipped {
-            name: revealed.name.clone(),
-            kind: String::new(),
-            why: "this revision stored no rendered manifest".to_string(),
-        }]);
-    }
-    let mut documents = Vec::new();
-    // A document whose apply went unconfirmed may have landed. Later documents
-    // can depend on it (a namespace before its objects, a CRD before its resources, a
-    // ConfigMap before the Deployment that mounts it), so going on can turn one
-    // unknown into a run of confusing failures; a server that stopped answering
-    // would cost a deadline per document; and a rollback can be pressed again
-    // once someone has looked. So it stops there, and at a document that could
-    // not be sent, since every one after it would fail the same way. A drain
-    // goes on after an answer that is no verdict because each eviction is
-    // checked against its own pod's budget.
-    let mut stopped = None;
-    for item in planned {
-        match item {
-            Planned::Skip { name, kind, why } => {
-                documents.push(DocumentRollback::Skipped { name, kind, why });
-            }
-            Planned::Apply(request) => match stopped {
-                Some(after) => documents.push(DocumentRollback::Skipped {
-                    kind: kind_name(targets, request.kind),
-                    name: request.name,
-                    why: format!("not sent after an earlier document {after}"),
-                }),
-                None => {
-                    let name = request.name.clone();
-                    let kind = kind_name(targets, request.kind);
-                    let outcome = apply::apply(client, targets, &request).await;
-                    stopped = match outcome {
-                        ApplyOutcome::Unconfirmed { .. } => Some("went unconfirmed"),
-                        ApplyOutcome::NotSent { .. } => Some("could not be sent"),
-                        _ => None,
-                    };
-                    documents.push(DocumentRollback::Applied {
-                        name,
-                        kind,
-                        outcome,
-                    });
-                }
-            },
-        }
-    }
-    RollbackReport::wrap(documents)
+    RollbackReport::wrap(vec![DocumentRollback::Skipped {
+        name: revealed.name.clone(),
+        kind: String::new(),
+        why: PAYLOAD_UNAVAILABLE.to_string(),
+    }])
 }
 
 pub fn helm_binary() -> HelmBinary {
@@ -386,128 +234,6 @@ fn json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, &'static str> {
         bytes.push(b'\n');
     }
     Ok(bytes)
-}
-
-fn release_name_ok(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_lowercase() || first.is_ascii_digit())
-        && name.len() <= 53
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-struct Encoded {
-    payload: String,
-    secret_name: String,
-    secret_namespace: String,
-}
-
-fn encoded_of(secret: WireSecret) -> Option<Encoded> {
-    Some(Encoded {
-        payload: secret.data.get(PAYLOAD_KEY)?.clone(),
-        secret_name: secret.metadata.name,
-        secret_namespace: secret.metadata.namespace,
-    })
-}
-
-async fn fetch_encoded(
-    client: &Client,
-    target: &KindTarget,
-    namespace: Option<&str>,
-    name: &str,
-    revision: u32,
-) -> Fetched<Encoded> {
-    let path = collection_path(target, namespace);
-    let fields = format!("type={RELEASE_TYPE}");
-    let labels = format!("{OWNER_SELECTOR},name={name},version={revision}");
-    let mut token: Option<String> = None;
-    loop {
-        let mut params = ListParams::default()
-            .limit(PAGE_LIMIT)
-            .labels(&labels)
-            .fields(&fields);
-        if let Some(token) = &token {
-            params = params.continue_token(token);
-        }
-        let request = match Request::new(path.clone()).list(&params) {
-            Ok(request) => request,
-            Err(error) => {
-                return Fetched::Failed {
-                    what: "helm revision",
-                    why: error.to_string(),
-                };
-            }
-        };
-        let page = match client.request::<WireList>(request).await {
-            Ok(page) => page,
-            Err(error) => return revision_failure(&error),
-        };
-        for secret in page.items {
-            if let Some(encoded) = encoded_of(secret) {
-                return Fetched::Ok(encoded);
-            }
-        }
-        token = (!page.metadata.cont.is_empty()).then_some(page.metadata.cont);
-        if token.is_none() {
-            break;
-        }
-    }
-    if let Some(namespace) = namespace {
-        return get_conventional(client, target, namespace, name, revision).await;
-    }
-    Fetched::Failed {
-        what: "helm revision",
-        why: format!("no stored revision {revision} of {name}"),
-    }
-}
-
-async fn get_conventional(
-    client: &Client,
-    target: &KindTarget,
-    namespace: &str,
-    name: &str,
-    revision: u32,
-) -> Fetched<Encoded> {
-    let secret_name = format!("sh.helm.release.v1.{name}.v{revision}");
-    let request = match Request::new(collection_path(target, Some(namespace)))
-        .get(&secret_name, &GetParams::default())
-    {
-        Ok(request) => request,
-        Err(error) => {
-            return Fetched::Failed {
-                what: "helm revision",
-                why: error.to_string(),
-            };
-        }
-    };
-    match client.request::<WireSecret>(request).await {
-        Ok(secret) => match encoded_of(secret) {
-            Some(encoded) => Fetched::Ok(encoded),
-            None => Fetched::Failed {
-                what: "helm revision",
-                why: format!("no stored revision {revision} of {name}"),
-            },
-        },
-        Err(error) => revision_failure(&error),
-    }
-}
-
-// A revision that could not be read, in the server's words: a rollback's
-// refusal is read by the person deciding what to do next.
-fn revision_failure<T>(error: &kube::Error) -> Fetched<T> {
-    match error {
-        kube::Error::Api(status) if matches!(status.code, 401 | 403) => Fetched::Denied {
-            what: "helm revision",
-        },
-        _ => Fetched::Failed {
-            what: "helm revision",
-            why: crate::read::server_sentence(error),
-        },
-    }
 }
 
 enum Edit<'a> {
@@ -578,6 +304,7 @@ fn edits<'a>(a: &'a [&str], b: &'a [&str]) -> Vec<Edit<'a>> {
     edits
 }
 
+#[cfg(test)]
 pub(crate) enum Planned {
     Apply(ApplyRequest),
     Skip {
@@ -587,6 +314,7 @@ pub(crate) enum Planned {
     },
 }
 
+#[cfg(test)]
 pub(crate) struct ManifestDoc {
     yaml: String,
     api_version: String,
@@ -595,6 +323,7 @@ pub(crate) struct ManifestDoc {
     namespace: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn plan_rollback(
     targets: &[KindTarget],
     release_namespace: &str,
@@ -606,6 +335,7 @@ pub(crate) fn plan_rollback(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn split_manifest(text: &str) -> Vec<ManifestDoc> {
     let mut docs = Vec::new();
     let mut current = String::new();
@@ -625,6 +355,7 @@ pub(crate) fn split_manifest(text: &str) -> Vec<ManifestDoc> {
     docs
 }
 
+#[cfg(test)]
 fn take_doc(current: &mut String) -> Option<ManifestDoc> {
     if current.trim().is_empty() {
         current.clear();
@@ -641,6 +372,7 @@ fn take_doc(current: &mut String) -> Option<ManifestDoc> {
     })
 }
 
+#[cfg(test)]
 fn is_doc_start(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed == "---"
@@ -649,6 +381,7 @@ fn is_doc_start(line: &str) -> bool {
         || trimmed.starts_with("---#")
 }
 
+#[cfg(test)]
 struct Identity {
     api_version: String,
     kind: String,
@@ -656,6 +389,7 @@ struct Identity {
     namespace: Option<String>,
 }
 
+#[cfg(test)]
 fn identity(doc: &str) -> Option<Identity> {
     let mut api_version = String::new();
     let mut kind = String::new();
@@ -710,6 +444,7 @@ fn identity(doc: &str) -> Option<Identity> {
     })
 }
 
+#[cfg(test)]
 fn scalar(line: &str, key: &str) -> Option<String> {
     let trimmed = line.trim();
     let rest = trimmed.strip_prefix(key)?.strip_prefix(':')?;
@@ -720,6 +455,7 @@ fn scalar(line: &str, key: &str) -> Option<String> {
     Some(unquote(rest))
 }
 
+#[cfg(test)]
 fn unquote(s: &str) -> String {
     let s = match s.find(" #") {
         Some(at) => s[..at].trim(),
@@ -735,6 +471,7 @@ fn unquote(s: &str) -> String {
     s.to_string()
 }
 
+#[cfg(test)]
 fn plan_one(targets: &[KindTarget], release_namespace: &str, doc: ManifestDoc) -> Planned {
     let Some(target) = find_target(targets, &doc.api_version, &doc.kind) else {
         return Planned::Skip {
@@ -790,6 +527,7 @@ fn plan_one(targets: &[KindTarget], release_namespace: &str, doc: ManifestDoc) -
     })
 }
 
+#[cfg(test)]
 fn find_target<'a>(
     targets: &'a [KindTarget],
     api_version: &str,
@@ -808,19 +546,12 @@ fn find_target<'a>(
         })
 }
 
+#[cfg(test)]
 fn split_gv(api_version: &str) -> (&str, &str) {
     match api_version.rsplit_once('/') {
         Some((group, version)) => (group, version),
         None => ("", api_version),
     }
-}
-
-fn kind_name(targets: &[KindTarget], id: KindId) -> String {
-    targets
-        .iter()
-        .find(|target| target.id == id)
-        .map(|target| target.kind().to_string())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

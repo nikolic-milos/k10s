@@ -53,7 +53,7 @@ pub(crate) fn classify<T>(what: &'static str, error: &kube::Error) -> Fetched<T>
     }
     Fetched::Failed {
         what,
-        why: crate::connect::describe(error as &(dyn std::error::Error + 'static)),
+        why: server_sentence(error),
     }
 }
 
@@ -233,10 +233,13 @@ mod tests {
                 "a watch stops on {code} as forbidden: a panel must say the same thing"
             );
         }
-        assert!(matches!(
+        assert_eq!(
             classify::<()>("pods", &api_error(500)),
-            Fetched::Failed { what: "pods", .. }
-        ));
+            Fetched::Failed {
+                what: "pods",
+                why: "no".to_string(),
+            }
+        );
     }
 
     #[test]

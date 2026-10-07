@@ -1,840 +1,563 @@
-//! Helm releases read as release Secrets only, grouped newest first -- the one
-//! place the Secret rule bends, held by what the list asks the server for --
-//! and a stored revision applied back as the documents it holds, its Secret
-//! documents skipped, with that write's whole request set pinned, stopping at
-//! the first document that goes unconfirmed or cannot be sent.
+//! Strict Helm metadata requests and payload actions that send nothing.
 
 use crate::*;
+use k10s_data::integrations::{helm, helm_reveal};
+use k10s_data::read::{Fetched, Reader};
 
-// A Helm release payload as the release Secret stores it: gzip, then base64
-// twice (once by Helm, once by the Secret's data encoding).
-fn payload(name: &str, revision: u32, status: &str, manifest: &str) -> String {
-    use base64::Engine;
-    use std::io::Write;
-    let json = serde_json::json!({
-        "name": name,
-        "namespace": "prod",
-        "version": revision,
-        "info": {
-            "last_deployed": format!("2026-08-0{revision}T10:00:00Z"),
-            "status": status,
-            "description": "Upgrade complete",
-            "notes": "NOTES-SECRET",
-        },
-        "chart": {
-            "metadata": {
-                "name": name,
-                "version": format!("4.11.{revision}"),
-                "appVersion": format!("1.11.{revision}"),
-            },
-            "values": {"password": "CHART-SECRET"},
-        },
-        "config": {"adminPassword": "USER-SECRET"},
-        "manifest": manifest,
-    })
-    .to_string();
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder.write_all(json.as_bytes()).expect("gzip");
-    let engine = base64::engine::general_purpose::STANDARD;
-    engine.encode(engine.encode(encoder.finish().expect("gzip")))
+const LIST: &str = "/api/v1/namespaces/prod/secrets?&fieldSelector=type%3Dhelm.sh%2Frelease.v1&labelSelector=owner%3Dhelm&limit=200";
+const ACCEPT: &str = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1";
+
+async fn connected(script: &Script) -> (Sync, EventReceiver) {
+    connected_with(script, script.client()).await
 }
 
-fn release_secret(
-    name: &str,
-    release: &str,
-    revision: u32,
-    status: &str,
-    manifest: &str,
-) -> String {
-    format!(
-        r#"{{"metadata":{{"name":"{name}","namespace":"prod"}},
-             "type":"helm.sh/release.v1",
-             "data":{{"release":"{}"}}}}"#,
-        payload(release, revision, status, manifest)
+async fn connected_with(script: &Script, client: kube::Client) -> (Sync, EventReceiver) {
+    script_discovery_with_secret(script, api_resource("Secret", "secrets", true));
+    script_rules_review(script);
+    script_access_reviews(script, true, 32);
+    script_lists(script);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let sync = sync_from(
+        Clients {
+            sync: client.clone(),
+            interactive: client,
+        },
+        "prod",
+        &options(),
+        tx,
+        Arc::new(IngestMetrics::default()),
     )
+    .await
+    .expect("scripted cluster sync");
+    (sync, rx)
 }
 
-const SECRET_MANIFEST: &str = "kind: Secret\ndata:\n  token: MANIFEST-SECRET\n";
-
-// Helm's release state is one Secret per revision and nothing else, so an
-// inventory is a list and a decode. What this pins is the half a scripted server
-// can prove: that the *request* is narrowed to release Secrets on the wire, that
-// paging is followed, that revisions group into releases newest first, and that
-// a payload which will not decode is counted rather than dropped.
-#[test]
-fn helm_releases_are_listed_as_release_secrets_only_and_grouped_newest_first() {
-    use k10s_data::read::Fetched;
-
-    let script = Script::default();
-    script_discovery(&script);
-    script_rules_review(&script);
-    script_access_reviews(&script, true, 32);
-    script_lists(&script);
-    // Namespaced on purpose. Routes match by path prefix and are single-shot,
-    // and the initial sync lists every discovered kind -- secrets among them --
-    // cluster-wide, so a route for the cluster-wide collection would answer the
-    // sync and leave this fetch reading the page after it. The two pages below
-    // share a prefix and are answered in registration order, which is the order
-    // this fetch asks for them in.
-    script.route(
-        "GET",
-        "/api/v1/namespaces/prod/secrets?",
-        200,
-        format!(
-            r#"{{"kind":"SecretList","apiVersion":"v1",
-                 "metadata":{{"continue":"page-2"}},
-                 "items":[{},{}]}}"#,
-            release_secret(
-                "sh.helm.release.v1.ingress.v1",
-                "ingress",
-                1,
-                "superseded",
-                SECRET_MANIFEST
-            ),
-            release_secret(
-                "sh.helm.release.v1.ingress.v2",
-                "ingress",
-                2,
-                "deployed",
-                SECRET_MANIFEST
-            ),
-        ),
-    );
-    script.route(
-        "GET",
-        "/api/v1/namespaces/prod/secrets?",
-        200,
-        format!(
-            r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},
-                 "items":[{},
-                          {{"metadata":{{"name":"sh.helm.release.v1.broken.v1","namespace":"prod"}},
-                            "type":"helm.sh/release.v1","data":{{"release":"not-a-payload"}}}},
-                          {{"metadata":{{"name":"sh.helm.release.v1.empty.v1","namespace":"prod"}},
-                            "type":"helm.sh/release.v1","data":{{}}}}]}}"#,
-            release_secret(
-                "sh.helm.release.v1.api.v7",
-                "api",
-                7,
-                "failed",
-                SECRET_MANIFEST
-            ),
-        ),
-    );
-
-    let runtime = runtime();
-    let (sync, _live) = sync_on(&runtime, &script);
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader
-        .fetch_releases(Some("prod".to_string()), move |fetched| {
-            let _ = tx.send(fetched);
-        });
-    let outcome = wait(&rx);
-    let Fetched::Ok(releases) = outcome else {
-        panic!("the listing must resolve: {outcome:?}");
-    };
-
-    let names: Vec<(&str, &str)> = releases
-        .releases
-        .iter()
-        .map(|release| (release.namespace.as_str(), release.name.as_str()))
-        .collect();
-    assert_eq!(
-        names,
-        vec![("prod", "api"), ("prod", "ingress")],
-        "one release per name, whatever its Secrets are called"
-    );
-    let ingress = &releases.releases[1];
-    assert_eq!(
-        ingress
-            .revisions
-            .iter()
-            .map(|revision| revision.revision)
-            .collect::<Vec<u32>>(),
-        vec![2, 1],
-        "newest first, so the running revision is the first element"
-    );
-    assert_eq!(
-        ingress.current().expect("a current revision").status,
-        "deployed"
-    );
-    assert_eq!(ingress.revisions[0].chart_version, "4.11.2");
-    assert_eq!(
-        releases.unreadable, 2,
-        "a payload that will not decode and a Secret with none are counted, not dropped"
-    );
-    assert!(!releases.truncated);
-
-    // The narrowing is on the wire, not in this process: no Secret that is not a
-    // Helm release is ever transferred, which is what keeps this path inside the
-    // rule that the read seam does not fetch Secret values.
-    let lists = script.requests_for("/api/v1/namespaces/prod/secrets");
-    assert_eq!(lists.len(), 2, "two pages, both asked for: {lists:?}");
-    for request in &lists {
-        assert!(
-            request.path.contains("labelSelector=owner%3Dhelm"),
-            "the label Helm writes: {}",
-            request.path
-        );
-        assert!(
-            request
-                .path
-                .contains("fieldSelector=type%3Dhelm.sh%2Frelease.v1"),
-            "and its own Secret type: {}",
-            request.path
-        );
-    }
-    assert!(
-        lists[1].path.contains("continue=page-2"),
-        "the second page is asked for with the token the first one carried: {}",
-        lists[1].path
-    );
-
-    // Nothing the payload carried beyond the inventory reaches a caller.
-    let rendered = format!(
-        "{releases:?}\n{}",
-        k10s_data::integrations::helm::render(&releases).join("\n")
-    );
-    assert!(
-        !rendered.contains("SECRET"),
-        "the manifest, the values and the notes are dropped at the decode: {rendered}"
-    );
-
-    drop(runtime);
+fn revision(
+    secret: &str,
+    namespace: &str,
+    release: &str,
+    version: &str,
+    status: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata",
+        "metadata":{"name":secret,"namespace":namespace,"uid":format!("uid-{secret}"),
+            "labels":{"owner":"helm","name":release,"version":version,"status":status},
+            "annotations":{"ignored":"not retained"}}
+    })
 }
 
-// The manifest Helm stores for the rollback-probe fixture chart, copied from
-// `helm template` of it: a document per template, the Secret before the
-// ConfigMap as Helm orders kinds. A change to the chart is made here too.
-const ROLLBACK_MANIFEST: &str = "---\n# Source: rollback-probe/templates/secret.yaml\n\
-    apiVersion: v1\nkind: Secret\nmetadata:\n  name: rollback-probe-token\ntype: Opaque\n\
-    stringData:\n  canary: PLANTED-rollback-canary\n---\n\
-    # Source: rollback-probe/templates/configmap.yaml\napiVersion: v1\nkind: ConfigMap\n\
-    metadata:\n  name: rollback-probe\ndata:\n  proof: stored\n";
-
-// A stored-manifest apply is a write, so its whole request set is pinned: one
-// list for the revision and one server-side apply for each document that is
-// not a Secret. The Secret must be patchable here, or it would be skipped as
-// unpatchable and the secret-material rule would pass for the wrong reason.
-#[test]
-fn a_stored_manifest_apply_patches_each_document_and_skips_the_secret() {
-    use k10s_data::apply::ApplyOutcome;
-    use k10s_data::integrations::helm_reveal::DocumentRollback;
-    use k10s_data::read::Fetched;
-
-    let script = Script::default();
-    script_discovery_with_secret(&script, api_resource("Secret", "secrets", true));
-    script_rules_review(&script);
-    script_access_reviews(&script, true, 32);
-    script_lists(&script);
-    script.route(
-        "GET",
-        "/api/v1/namespaces/prod/secrets?",
-        200,
-        format!(
-            r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
-            release_secret(
-                "sh.helm.release.v1.rollback-probe.v1",
-                "rollback-probe",
-                1,
-                "deployed",
-                ROLLBACK_MANIFEST
-            ),
-        ),
-    );
-    script.route(
-        "PATCH",
-        "/api/v1/namespaces/prod/configmaps/rollback-probe?",
-        200,
-        r#"{"apiVersion":"v1","kind":"ConfigMap",
-            "metadata":{"name":"rollback-probe","namespace":"prod","uid":"uid-cm"},
-            "data":{"proof":"stored"}}"#,
-    );
-
-    let runtime = runtime();
-    let (sync, _live) = sync_on(&runtime, &script);
-    let before = script.seen().len();
-    let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader.rollback_helm_revision(
-        Some("prod".to_string()),
-        "rollback-probe".to_string(),
-        1,
-        move |fetched| {
-            let _ = tx.send(fetched);
-        },
-    );
-    let outcome = wait(&rx);
-    let Fetched::Ok(report) = outcome else {
-        panic!("the rollback must resolve: {outcome:?}");
-    };
-
-    // The sync's watches are opened as its lists settle and may still be
-    // arriving; they stay open and are not this write's requests.
-    let sent: Vec<_> = script.seen()[before..]
-        .iter()
-        .filter(|seen| !seen.path.contains("watch=true"))
-        .cloned()
-        .collect();
-    assert_eq!(sent.len(), 2, "one list and one apply: {sent:?}");
-    assert_eq!(sent[0].method, "GET");
-    assert_eq!(
-        sent[0].path,
-        "/api/v1/namespaces/prod/secrets?&fieldSelector=type%3Dhelm.sh%2Frelease.v1\
-         &labelSelector=owner%3Dhelm%2Cname%3Drollback-probe%2Cversion%3D1&limit=200"
-    );
-    assert_eq!(sent[0].accept, "", "kube's list sets no Accept header");
-    assert_eq!(sent[1].method, "PATCH");
-    assert_eq!(
-        sent[1].path,
-        "/api/v1/namespaces/prod/configmaps/rollback-probe?&fieldManager=k10s&fieldValidation=Strict"
-    );
-    assert_eq!(sent[1].accept, "application/json");
-    assert_eq!(sent[1].content_type, "application/apply-patch+yaml");
-    assert_eq!(
-        sent[1].body,
-        "# Source: rollback-probe/templates/configmap.yaml\napiVersion: v1\nkind: ConfigMap\n\
-         metadata:\n  name: rollback-probe\ndata:\n  proof: stored\n"
-    );
-
-    assert_eq!(report.documents.len(), 2, "{report:?}");
-    let DocumentRollback::Skipped { kind, name, why } = &report.documents[0] else {
-        panic!("the Secret is skipped: {report:?}");
-    };
-    assert_eq!(
-        (kind.as_str(), name.as_str()),
-        ("Secret", "rollback-probe-token")
-    );
-    assert!(
-        why.starts_with("a stored Secret document is not applied"),
-        "{why}"
-    );
-    let DocumentRollback::Applied {
-        kind,
-        name,
-        outcome,
-    } = &report.documents[1]
-    else {
-        panic!("the ConfigMap is applied: {report:?}");
-    };
-    assert_eq!(
-        (kind.as_str(), name.as_str()),
-        ("ConfigMap", "rollback-probe")
-    );
-    assert!(matches!(outcome, ApplyOutcome::Applied(_)), "{outcome:?}");
-    assert!(
-        !format!("{report:?}").contains("PLANTED-rollback-canary"),
-        "a skipped Secret's values never reach the report"
-    );
-
-    drop(runtime);
+fn page(items: Vec<serde_json::Value>, token: &str) -> String {
+    serde_json::json!({"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadataList",
+        "metadata":{"continue":token},"items":items})
+    .to_string()
 }
 
-// Two documents, so a stop after the first shows as the second not being sent.
-const TWO_CONFIGMAPS: &str = "---\n# Source: rollback-probe/templates/first.yaml\n\
-    apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: first\ndata:\n  proof: stored\n---\n\
-    # Source: rollback-probe/templates/second.yaml\napiVersion: v1\nkind: ConfigMap\n\
-    metadata:\n  name: second\ndata:\n  proof: stored\n";
+fn route(script: &Script, path: &str, status: u16, body: impl Into<String>) {
+    script.route_accepting("GET", &path.replacen("?&", "?", 1), ACCEPT, status, body);
+}
 
-// A document the server refused was not applied: the rollback goes on to the
-// next one, which may not depend on it. Only a document that may have landed,
-// or could not be sent, stops it.
-#[test]
-fn a_refused_document_does_not_stop_a_rollback() {
-    use k10s_data::apply::ApplyOutcome;
-    use k10s_data::integrations::helm_reveal::DocumentRollback;
-    use k10s_data::read::Fetched;
-
-    for (code, reason) in [
-        (409, "Conflict"),
-        (422, "Invalid"),
-        (413, "RequestEntityTooLarge"),
-    ] {
-        let script = Script::default();
-        script_discovery(&script);
-        script_rules_review(&script);
-        script_access_reviews(&script, true, 32);
-        script_lists(&script);
-        script.route(
-            "GET",
-            "/api/v1/namespaces/prod/secrets?",
-            200,
-            format!(
-                r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
-                release_secret(
-                    "sh.helm.release.v1.rollback-probe.v1",
-                    "rollback-probe",
-                    1,
-                    "deployed",
-                    TWO_CONFIGMAPS
-                ),
-            ),
-        );
-        script.route(
-            "PATCH",
-            "/api/v1/namespaces/prod/configmaps/first?",
-            code,
-            format!(
-                r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"refused with {code}","reason":"{reason}","code":{code}}}"#
-            ),
-        );
-        script.route(
-            "PATCH",
-            "/api/v1/namespaces/prod/configmaps/second?",
-            200,
-            r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"second","namespace":"prod","uid":"uid-second"}}"#,
-        );
-
-        let runtime = runtime();
-        let (sync, _live) = sync_on(&runtime, &script);
-        let (tx, rx) = std::sync::mpsc::channel();
-        sync.reader.rollback_helm_revision(
-            Some("prod".to_string()),
-            "rollback-probe".to_string(),
-            1,
-            move |fetched| {
-                let _ = tx.send(fetched);
-            },
-        );
-        let outcome = wait(&rx);
-        let Fetched::Ok(report) = outcome else {
-            panic!("{code}: the rollback must resolve: {outcome:?}");
-        };
-        assert_eq!(report.documents.len(), 2, "{code}: {:?}", report.documents);
-        assert!(
-            matches!(&report.documents[0], DocumentRollback::Applied { name, outcome, .. }
-                if name == "first" && !matches!(outcome, ApplyOutcome::Applied(_) | ApplyOutcome::Unconfirmed { .. })),
-            "{code}: the first is refused: {:?}",
-            report.documents[0]
-        );
-        assert!(
-            matches!(&report.documents[1], DocumentRollback::Applied { name, outcome: ApplyOutcome::Applied(_), .. }
-                if name == "second"),
-            "{code}: the second is still sent: {:?}",
-            report.documents[1]
-        );
-        assert_eq!(
-            script.requests_for("/configmaps/second?").len(),
-            1,
-            "{code}: the second document is sent once"
-        );
-        drop(runtime);
+fn assert_lists(rows: &[Seen], paths: &[&str]) {
+    assert_eq!(rows.len(), paths.len(), "{rows:?}");
+    for (row, path) in rows.iter().zip(paths) {
+        assert_eq!(row.method, "GET");
+        assert_eq!(row.path, *path);
+        assert_eq!(row.accept, ACCEPT);
+        assert_eq!(row.content_type, "application/json");
+        assert!(row.body.is_empty(), "{row:?}");
     }
 }
 
-// A document that could not be sent (its credential failed, or no connection
-// was made) means every document after it would fail the same way, so the
-// rollback stops there too, and names why it did not send the rest.
-#[test]
-fn a_rollback_stops_at_the_first_document_that_could_not_be_sent() {
-    use k10s_data::apply::ApplyOutcome;
-    use k10s_data::integrations::helm_reveal::DocumentRollback;
-    use k10s_data::read::Fetched;
-
-    let script = Script::default();
-    script_discovery(&script);
-    script_rules_review(&script);
-    script_access_reviews(&script, true, 32);
-    script_lists(&script);
-    script.route(
-        "GET",
-        "/api/v1/namespaces/prod/secrets?",
-        200,
-        format!(
-            r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
-            release_secret(
-                "sh.helm.release.v1.rollback-probe.v1",
-                "rollback-probe",
-                1,
-                "deployed",
-                TWO_CONFIGMAPS
-            ),
-        ),
-    );
-    script.route_unsent("PATCH", "/api/v1/namespaces/prod/configmaps/first?");
-
-    let runtime = runtime();
-    let (sync, _live) = sync_on(&runtime, &script);
-    let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader.rollback_helm_revision(
-        Some("prod".to_string()),
-        "rollback-probe".to_string(),
-        1,
-        move |fetched| {
-            let _ = tx.send(fetched);
-        },
-    );
-    let outcome = wait(&rx);
-    let Fetched::Ok(report) = outcome else {
-        panic!("the rollback must resolve: {outcome:?}");
-    };
-    assert_eq!(report.documents.len(), 2, "{:?}", report.documents);
-    assert!(
-        matches!(&report.documents[0], DocumentRollback::Applied { name, outcome: ApplyOutcome::NotSent { .. }, .. }
-            if name == "first"),
-        "{:?}",
-        report.documents[0]
-    );
-    assert_eq!(
-        report.documents[1],
-        DocumentRollback::Skipped {
-            name: "second".to_string(),
-            kind: "ConfigMap".to_string(),
-            why: "not sent after an earlier document could not be sent".to_string(),
-        }
-    );
-    assert!(
-        script
-            .requests_for("/api/v1/namespaces/prod/configmaps/second")
-            .is_empty(),
-        "the second is never asked for"
-    );
-    drop(runtime);
+async fn fetch(reader: &Reader, namespace: Option<&str>) -> Fetched<helm::Releases> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    reader.fetch_releases(namespace.map(str::to_string), move |answer| {
+        let _ = tx.send(answer);
+    });
+    rx.await.expect("inventory callback")
 }
 
-// A document answered with a 5xx may have landed, so the rollback stops there:
-// the documents after it would go on top of a write nobody can see, and a
-// server that stopped answering would be asked once per document. The 500 is
-// the lab's answer for a write it stored (C1/lab/after-storage). The second
-// ConfigMap has no route, so sending it would show as a third request.
-#[test]
-fn a_rollback_stops_at_the_first_document_that_may_have_landed() {
-    use k10s_data::apply::ApplyOutcome;
-    use k10s_data::integrations::helm_reveal::DocumentRollback;
-    use k10s_data::read::Fetched;
+fn failed(answer: Fetched<helm::Releases>) -> String {
+    let Fetched::Failed { what, why } = answer else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(what, "helm releases");
+    why
+}
 
-    for (code, message, reason) in [
-        (
-            504,
-            "Timeout: request did not complete within requested timeout",
-            r#","reason":"Timeout""#,
+#[tokio::test(start_paused = true)]
+async fn release_inventory_uses_only_metadata_and_actual_labels_on_every_page() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    let second = format!("{LIST}&continue=page-2%2F%2B%3D");
+    route(
+        &script,
+        LIST,
+        200,
+        page(
+            vec![
+                revision("unrelated-spelling", "prod", "ingress", "1", "superseded"),
+                revision("also-unrelated", "prod", "ingress", "2", "deployed"),
+            ],
+            "page-2/+=",
         ),
-        (
-            500,
-            "conversion webhook for closeout.k10s.test/v1, Kind=Widget failed: this webhook refuses every conversion to v2",
+    );
+    route(
+        &script,
+        &second,
+        200,
+        page(
+            vec![
+                revision("third", "prod", "api", "7", "future-status"),
+                revision("broken", "prod", "broken", "not-a-version", "deployed"),
+                serde_json::json!({"metadata":{"name":"missing-labels","namespace":"prod"}}),
+            ],
             "",
         ),
-        (302, "answered with status 302 and no Location", ""),
-        (303, "answered with status 303 and no Location", ""),
-        (307, "answered with status 307 and no Location", ""),
+    );
+    let before = script.seen().len();
+    let answer = fetch(&sync.reader, Some("prod")).await;
+    let Fetched::Ok(releases) = answer else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(
+        releases
+            .releases
+            .iter()
+            .map(|r| (r.namespace.as_str(), r.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("prod", "api"), ("prod", "ingress")]
+    );
+    assert_eq!(
+        releases.releases[1]
+            .revisions
+            .iter()
+            .map(|r| r.revision)
+            .collect::<Vec<_>>(),
+        [2, 1]
+    );
+    assert_eq!(
+        releases.releases[1]
+            .current()
+            .expect("recorded deployed revision")
+            .revision,
+        2
+    );
+    assert_eq!(releases.releases[0].revisions[0].status, "future-status");
+    assert_eq!(releases.unreadable, 2);
+    assert!(!releases.truncated);
+    for release in &releases.releases {
+        for revision in &release.revisions {
+            for field in [
+                &revision.chart,
+                &revision.chart_version,
+                &revision.app_version,
+                &revision.updated,
+                &revision.description,
+            ] {
+                assert!(field.is_empty(), "payload-only fields stay unavailable");
+            }
+        }
+    }
+    let table = helm::table_page(&releases);
+    assert!(
+        table
+            .rows
+            .iter()
+            .filter(|row| row.namespace.is_some())
+            .all(|row| row.cells[4] == "unavailable (metadata only)")
+    );
+    assert!(!format!("{releases:?}").contains("not retained"));
+    assert_lists(&after_sync(&script, before), &[LIST, &second]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cluster_inventory_keeps_complete_names_and_separates_namespaces() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    let path = LIST.replace("/namespaces/prod", "");
+    let name = "r".repeat(63);
+    let namespace = "n".repeat(63);
+    route(
+        &script,
+        &path,
+        200,
+        page(
+            vec![
+                revision(&"s".repeat(253), &namespace, &name, "1", "deployed"),
+                revision("another", "prod", &name, "2", "failed"),
+            ],
+            "",
+        ),
+    );
+    let before = script.seen().len();
+    let answer = fetch(&sync.reader, None).await;
+    let Fetched::Ok(releases) = answer else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(releases.releases.len(), 2);
+    assert_eq!(releases.unreadable, 0);
+    let table = helm::table_page(&releases);
+    for row in &table.rows {
+        assert_eq!(row.name, name);
+        assert_eq!(
+            row.uid,
+            format!("{}/{}", row.namespace.as_deref().expect("namespace"), name)
+        );
+    }
+    assert!(
+        table
+            .rows
+            .iter()
+            .any(|row| row.namespace.as_deref() == Some(namespace.as_str()))
+    );
+    assert_lists(&after_sync(&script, before), &[&path]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_denials_and_failures_keep_their_state_and_never_retry_full_secrets() {
+    for status in [401, 403, 406, 500] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        route(
+            &script,
+            LIST,
+            status,
+            r#"{"message":"release metadata cannot be served"}"#,
+        );
+        script.route("GET", &LIST.replacen("?&", "?", 1), 200,
+            r#"{"kind":"SecretList","apiVersion":"v1","items":[{"data":{"release":"PLANTED-full-secret-retry"}}]}"#);
+        let before = script.seen().len();
+        let answer = fetch(&sync.reader, Some("prod")).await;
+        if matches!(status, 401 | 403) {
+            assert_eq!(
+                answer,
+                Fetched::Denied {
+                    what: "helm releases"
+                }
+            );
+        } else {
+            assert_eq!(failed(answer), "release metadata cannot be served");
+        }
+        assert_lists(&after_sync(&script, before), &[LIST]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsupported_metadata_or_full_object_responses_refuse_without_fallback() {
+    for body in [
+        r#"{"apiVersion":"v1","kind":"SecretList","items":[]}"#,
+        r#"{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadataList"}"#,
+        r#"{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadataList","items":{}}"#,
+        r#"{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadataList","items":[{"metadata":{},"data":{"release":"PLANTED-full-body"}}]}"#,
+        r#"{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadataList","items":[{"metadata":{"labels":{"name":12}}}]}"#,
     ] {
         let script = Script::default();
-        script_discovery(&script);
-        script_rules_review(&script);
-        script_access_reviews(&script, true, 32);
-        script_lists(&script);
-        script.route(
-            "GET",
-            "/api/v1/namespaces/prod/secrets?",
+        let (sync, _events) = connected(&script).await;
+        route(&script, LIST, 200, body);
+        route(&script, LIST, 200, page(Vec::new(), ""));
+        let before = script.seen().len();
+        let why = failed(fetch(&sync.reader, Some("prod")).await);
+        assert!(why.contains("no full Secret inventory is used"), "{why}");
+        assert!(!why.contains("PLANTED"));
+        assert_lists(&after_sync(&script, before), &[LIST]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn empty_arrays_and_null_metadata_items_are_successful_empty_inventories() {
+    for items in ["[]", "null"] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        route(
+            &script,
+            LIST,
             200,
             format!(
-                r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
-                release_secret(
-                    "sh.helm.release.v1.rollback-probe.v1",
-                    "rollback-probe",
-                    1,
-                    "deployed",
-                    TWO_CONFIGMAPS
-                ),
+                r#"{{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadataList","items":{items}}}"#
             ),
         );
-        script.route(
-            "PATCH",
-            "/api/v1/namespaces/prod/configmaps/first?",
-            code,
-            if (300..400).contains(&code) {
-                String::new()
-            } else {
-                format!(
-                    r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"{message}"{reason},"code":{code}}}"#
-                )
-            },
-        );
-
-        let runtime = runtime();
-        let (sync, _live) = sync_on(&runtime, &script);
         let before = script.seen().len();
-        let (tx, rx) = std::sync::mpsc::channel();
-        sync.reader.rollback_helm_revision(
-            Some("prod".to_string()),
-            "rollback-probe".to_string(),
-            1,
-            move |fetched| {
-                let _ = tx.send(fetched);
-            },
-        );
-        let outcome = wait(&rx);
-        let Fetched::Ok(report) = outcome else {
-            panic!("the rollback must resolve: {outcome:?}");
-        };
-
-        let sent: Vec<_> = script.seen()[before..]
-            .iter()
-            .filter(|seen| !seen.path.contains("watch=true"))
-            .cloned()
-            .collect();
-        assert_eq!(sent.len(), 2, "one list and one apply: {sent:?}");
-        assert_eq!(sent[0].method, "GET");
-        assert!(sent[0].path.starts_with("/api/v1/namespaces/prod/secrets?"));
-        assert_eq!(sent[1].method, "PATCH");
         assert_eq!(
-            sent[1].path,
-            "/api/v1/namespaces/prod/configmaps/first?&fieldManager=k10s&fieldValidation=Strict"
+            fetch(&sync.reader, Some("prod")).await,
+            Fetched::Ok(helm::Releases::default())
         );
-        assert_eq!(sent[1].accept, "application/json");
-        assert_eq!(sent[1].content_type, "application/apply-patch+yaml");
-        assert_eq!(
-            sent[1].body,
-            "# Source: rollback-probe/templates/first.yaml\napiVersion: v1\nkind: ConfigMap\n\
-         metadata:\n  name: first\ndata:\n  proof: stored\n"
-        );
-        assert_eq!(
-            report.documents,
-            vec![
-                DocumentRollback::Applied {
-                    name: "first".to_string(),
-                    kind: "ConfigMap".to_string(),
-                    outcome: ApplyOutcome::Unconfirmed {
-                        why: message.to_string()
-                    },
-                },
-                DocumentRollback::Skipped {
-                    name: "second".to_string(),
-                    kind: "ConfigMap".to_string(),
-                    why: "not sent after an earlier document went unconfirmed".to_string(),
-                },
-            ]
-        );
-
-        drop(runtime);
+        assert_lists(&after_sync(&script, before), &[LIST]);
     }
 }
 
-// The other arm of the apply's classification: a connection lost after the
-// first document was sent stops the rollback the same way a 5xx does.
-#[test]
-fn a_rollback_stops_at_a_document_whose_connection_is_lost() {
-    use k10s_data::apply::ApplyOutcome;
-    use k10s_data::integrations::helm_reveal::DocumentRollback;
-    use k10s_data::read::Fetched;
-
+#[tokio::test(start_paused = true)]
+async fn unreadable_metadata_entries_also_exhaust_the_inventory_ceiling() {
     let script = Script::default();
-    script_discovery(&script);
-    script_rules_review(&script);
-    script_access_reviews(&script, true, 32);
-    script_lists(&script);
-    script.route(
-        "GET",
-        "/api/v1/namespaces/prod/secrets?",
+    let (sync, _events) = connected(&script).await;
+    route(
+        &script,
+        LIST,
         200,
-        format!(
-            r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
-            release_secret(
-                "sh.helm.release.v1.rollback-probe.v1",
-                "rollback-probe",
-                1,
-                "deployed",
-                TWO_CONFIGMAPS
-            ),
-        ),
+        page(vec![serde_json::json!({"metadata":{}}); 2_001], "unused"),
     );
-    script.route_lost("PATCH", "/api/v1/namespaces/prod/configmaps/first?");
-
-    let runtime = runtime();
-    let (sync, _live) = sync_on(&runtime, &script);
     let before = script.seen().len();
-    let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader.rollback_helm_revision(
-        Some("prod".to_string()),
-        "rollback-probe".to_string(),
-        1,
-        move |fetched| {
-            let _ = tx.send(fetched);
-        },
-    );
-    let outcome = wait(&rx);
-    let Fetched::Ok(report) = outcome else {
-        panic!("the rollback must resolve: {outcome:?}");
-    };
-    let patches: Vec<_> = script.seen()[before..]
-        .iter()
-        .filter(|seen| seen.method == "PATCH")
-        .cloned()
-        .collect();
-    assert_eq!(patches.len(), 1, "{patches:?}");
-    let [
-        DocumentRollback::Applied {
-            name,
-            outcome: ApplyOutcome::Unconfirmed { why },
-            ..
-        },
-        DocumentRollback::Skipped {
-            name: skipped,
-            why: not_sent,
-            ..
-        },
-    ] = report.documents.as_slice()
-    else {
-        panic!("the first document is unconfirmed and the second not sent: {report:?}");
-    };
-    assert_eq!(name, "first");
-    assert!(why.contains("the scripted connection was lost"), "{why}");
-    assert_eq!(skipped, "second");
+    let answer = fetch(&sync.reader, Some("prod")).await;
     assert_eq!(
-        not_sent,
-        "not sent after an earlier document went unconfirmed"
+        answer,
+        Fetched::Ok(helm::Releases {
+            releases: Vec::new(),
+            truncated: true,
+            unreadable: 2_000
+        })
     );
-
-    drop(runtime);
+    assert_lists(&after_sync(&script, before), &[LIST]);
 }
 
-// The stored-manifest apply, its reveal included, takes the interactive
-// client: the reveal decides what is written.
-#[test]
-fn a_stored_manifest_apply_takes_the_interactive_client_with_its_reveal() {
-    use k10s_data::read::Fetched;
-
-    let sync = Script::default();
-    script_discovery_with_secret(&sync, api_resource("Secret", "secrets", true));
-    script_rules_review(&sync);
-    script_access_reviews(&sync, true, 32);
-    script_lists(&sync);
-    let interactive = Script::default();
-    interactive.route(
-        "GET",
-        "/api/v1/namespaces/prod/secrets?",
-        200,
-        format!(
-            r#"{{"kind":"SecretList","apiVersion":"v1","metadata":{{}},"items":[{}]}}"#,
-            release_secret(
-                "sh.helm.release.v1.rollback-probe.v1",
-                "rollback-probe",
-                1,
-                "deployed",
-                ROLLBACK_MANIFEST
-            ),
-        ),
-    );
-    interactive.route(
-        "PATCH",
-        "/api/v1/namespaces/prod/configmaps/rollback-probe?",
-        200,
-        r#"{"apiVersion":"v1","kind":"ConfigMap",
-            "metadata":{"name":"rollback-probe","namespace":"prod","uid":"uid-cm"},
-            "data":{"proof":"stored"}}"#,
-    );
-
-    let runtime = runtime();
-    let (data, _live) = sync_on_split(&runtime, &sync, &interactive);
-    let before = sync.seen().len();
-    let (tx, rx) = std::sync::mpsc::channel();
-    data.reader.rollback_helm_revision(
-        Some("prod".to_string()),
-        "rollback-probe".to_string(),
-        1,
-        move |fetched| {
-            let _ = tx.send(fetched);
-        },
-    );
-    let outcome = wait(&rx);
-    assert!(matches!(outcome, Fetched::Ok(_)), "{outcome:?}");
-    let sent: Vec<_> = interactive
-        .seen()
-        .into_iter()
-        .map(|seen| seen.method)
+#[tokio::test(start_paused = true)]
+async fn empty_pages_cannot_continue_past_the_metadata_page_ceiling() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    let paths: Vec<_> = (0..11)
+        .map(|i| {
+            if i == 0 {
+                LIST.to_string()
+            } else {
+                format!("{LIST}&continue=page-{i}")
+            }
+        })
         .collect();
-    assert_eq!(sent, ["GET", "PATCH"]);
-    let stray = after_sync(&sync, before);
-    assert!(stray.is_empty(), "nothing on the sync client: {stray:?}");
-    drop(runtime);
+    for (i, path) in paths.iter().enumerate() {
+        route(
+            &script,
+            path,
+            200,
+            page(Vec::new(), &format!("page-{}", i + 1)),
+        );
+    }
+    let before = script.seen().len();
+    assert_eq!(
+        failed(fetch(&sync.reader, Some("prod")).await),
+        "Helm releases exceed 10 metadata pages; incomplete inventory is refused"
+    );
+    assert_lists(
+        &after_sync(&script, before),
+        &paths[..10].iter().map(String::as_str).collect::<Vec<_>>(),
+    );
 }
 
-// The reveal decides what is applied, so a reveal that fails applies
-// nothing, and the answer says so.
-#[test]
-fn a_failed_reveal_says_nothing_was_applied() {
-    use k10s_data::read::Fetched;
-
-    for (code, body, words) in [
-        (
-            503,
-            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":503,"message":"the server is currently unable to handle the request"}"#,
-            "the server is currently unable to handle the request",
-        ),
-        (
-            500,
-            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":500,"message":""}"#,
-            "answered with status 500 and no message",
-        ),
-    ] {
+#[tokio::test(start_paused = true)]
+async fn repeated_or_oversized_continuation_tokens_refuse_before_another_read() {
+    for repeated in [false, true] {
         let script = Script::default();
-        script_discovery_with_secret(&script, api_resource("Secret", "secrets", true));
-        script_rules_review(&script);
-        script_access_reviews(&script, true, 32);
-        script_lists(&script);
-        script.route("GET", "/api/v1/namespaces/prod/secrets?", code, body);
-
-        let runtime = runtime();
-        let (sync, _live) = sync_on(&runtime, &script);
+        let (sync, _events) = connected(&script).await;
+        let token = if repeated {
+            "next".to_string()
+        } else {
+            "x".repeat((16 << 10) + 1)
+        };
+        route(&script, LIST, 200, page(Vec::new(), &token));
+        let second = format!("{LIST}&continue=next");
+        if repeated {
+            route(&script, &second, 200, page(Vec::new(), &token));
+        }
         let before = script.seen().len();
-        let (tx, rx) = std::sync::mpsc::channel();
-        sync.reader.rollback_helm_revision(
-            Some("prod".to_string()),
-            "rollback-probe".to_string(),
+        assert_eq!(
+            failed(fetch(&sync.reader, Some("prod")).await),
+            "Helm release metadata have an oversized or repeated continuation token; incomplete inventory is refused"
+        );
+        let expected = if repeated {
+            vec![LIST, second.as_str()]
+        } else {
+            vec![LIST]
+        };
+        assert_lists(&after_sync(&script, before), &expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn nonconsecutive_continuation_tokens_refuse_before_repeating_a_page() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    let second = format!("{LIST}&continue=A");
+    let third = format!("{LIST}&continue=B");
+    route(&script, LIST, 200, page(Vec::new(), "A"));
+    route(&script, &second, 200, page(Vec::new(), "B"));
+    route(&script, &third, 200, page(Vec::new(), "A"));
+    let before = script.seen().len();
+    assert_eq!(
+        failed(fetch(&sync.reader, Some("prod")).await),
+        "Helm release metadata have an oversized or repeated continuation token; incomplete inventory is refused"
+    );
+    assert_lists(&after_sync(&script, before), &[LIST, &second, &third]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_pages_share_the_reply_byte_budget() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    let mut first = page(Vec::new(), "next");
+    first.push_str(&" ".repeat((4 << 20) - first.len()));
+    route(&script, LIST, 200, first);
+    let second = format!("{LIST}&continue=next");
+    route(&script, &second, 200, " ".repeat((4 << 20) + 1));
+    let before = script.seen().len();
+    let why = failed(fetch(&sync.reader, Some("prod")).await);
+    assert_eq!(
+        why,
+        "helm releases answered with more than 4194304 bytes; the body is refused"
+    );
+    assert_lists(&after_sync(&script, before), &[LIST, &second]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn oversized_metadata_and_error_bodies_are_refused_on_the_first_read() {
+    for (status, bytes) in [(200, (8 << 20) + 1), (500, (32 << 10) + 1)] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        route(&script, LIST, status, "x".repeat(bytes));
+        let before = script.seen().len();
+        let why = failed(fetch(&sync.reader, Some("prod")).await);
+        assert!(why.contains("bytes; the body is refused"), "{why}");
+        assert_lists(&after_sync(&script, before), &[LIST]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_metadata_header_or_body_stall_obeys_one_exchange_deadline() {
+    use futures::StreamExt as _;
+    for body_stall in [false, true] {
+        let script = Script::default();
+        let server = script.clone();
+        let client = kube::Client::new(
+            tower::service_fn(move |request: http::Request<Body>| {
+                let stall = body_stall
+                    && request
+                        .uri()
+                        .query()
+                        .is_some_and(|query| query.contains("fieldSelector=type"));
+                let mut server = server.clone();
+                async move {
+                    let (parts, body) = server.call(request).await?.into_parts();
+                    let tail = futures::stream::poll_fn(move |_| {
+                        if stall {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(None)
+                        }
+                    });
+                    let body = http_body_util::StreamBody::new(
+                        http_body_util::BodyStream::new(body).chain(tail),
+                    );
+                    Ok::<_, tower::BoxError>(http::Response::from_parts(parts, body))
+                }
+            }),
+            "prod",
+        );
+        let (sync, _events) = connected_with(&script, client).await;
+        if body_stall {
+            route(&script, LIST, 200, page(Vec::new(), ""));
+        } else {
+            script.route_hanging("GET", &LIST.replacen("?&", "?", 1));
+        }
+        let before = script.seen().len();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            failed(fetch(&sync.reader, Some("prod")).await),
+            "helm releases did not answer within 4 seconds"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+        assert_lists(&after_sync(&script, before), &[LIST]);
+    }
+}
+
+fn assert_refusal<T>(answer: Fetched<T>, apply: bool) {
+    let Fetched::Failed { what, why } = answer else {
+        panic!("payload action must report an explicit policy refusal");
+    };
+    assert_eq!(what, "helm revision");
+    assert_eq!(
+        why,
+        if apply {
+            format!("nothing was applied: {}", helm_reveal::PAYLOAD_UNAVAILABLE)
+        } else {
+            helm_reveal::PAYLOAD_UNAVAILABLE.to_string()
+        }
+    );
+}
+
+fn payload_targets() -> Vec<k10s_data::discover::KindTarget> {
+    let mut catalog = k10s_core::Catalog::new();
+    [("Secret", "secrets"), ("ConfigMap", "configmaps")]
+        .into_iter()
+        .map(|(kind, plural)| {
+            k10s_data::discover::intern(
+                &mut catalog,
+                kube::discovery::ApiResource {
+                    group: String::new(),
+                    version: "v1".into(),
+                    api_version: "v1".into(),
+                    kind: kind.into(),
+                    plural: plural.into(),
+                },
+                &kube::discovery::ApiCapabilities {
+                    scope: kube::discovery::Scope::Namespaced,
+                    subresources: Vec::new(),
+                    operations: vec!["get".into(), "list".into(), "patch".into()],
+                },
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn reader_and_public_payload_actions_refuse_before_any_read_or_write() {
+    use base64::Engine as _;
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    let before = script.seen().len();
+    let targets = payload_targets();
+    for namespace in [None, Some("prod")] {
+        assert_refusal(
+            helm_reveal::reveal_revision(&script.client(), &targets, namespace, "api", 1).await,
+            false,
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sync.reader.reveal_helm_revision(
+            namespace.map(str::to_string),
+            "api".into(),
             1,
-            move |fetched| {
-                let _ = tx.send(fetched);
+            move |answer| {
+                let _ = tx.send(answer);
             },
         );
-        let Fetched::Failed { why, .. } = wait(&rx) else {
-            panic!("{code}: a failed reveal is a failure");
-        };
-        assert_eq!(
-            why,
-            format!("nothing was applied: {words}"),
-            "the server's own sentence, or its code when it has none, not kube's rendering"
+        assert_refusal(rx.await.expect("reveal callback"), false);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sync.reader.diff_helm_revisions(
+            namespace.map(str::to_string),
+            "api".into(),
+            1,
+            2,
+            move |answer| {
+                let _ = tx.send(answer);
+            },
         );
-        let patches = script.seen()[before..]
-            .iter()
-            .filter(|seen| seen.method == "PATCH")
-            .count();
-        assert_eq!(patches, 0);
-        drop(runtime);
+        assert_refusal(rx.await.expect("diff callback"), false);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sync.reader.rollback_helm_revision(
+            namespace.map(str::to_string),
+            "api".into(),
+            1,
+            move |answer| {
+                let _ = tx.send(answer);
+            },
+        );
+        assert_refusal(rx.await.expect("apply callback"), true);
     }
-
-    // A reveal this account may not make is a denial, named as one, and nothing
-    // is applied.
-    let script = Script::default();
-    script_discovery_with_secret(&script, api_resource("Secret", "secrets", true));
-    script_rules_review(&script);
-    script_access_reviews(&script, true, 32);
-    script_lists(&script);
-    script.route(
-        "GET",
-        "/api/v1/namespaces/prod/secrets?",
-        403,
-        r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"secrets is forbidden"}"#,
-    );
-    let runtime = runtime();
-    let (sync, _live) = sync_on(&runtime, &script);
-    let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader.rollback_helm_revision(
-        Some("prod".to_string()),
-        "rollback-probe".to_string(),
-        1,
-        move |fetched| {
-            let _ = tx.send(fetched);
-        },
-    );
-    let outcome = wait(&rx);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(r#"{"name":"api","namespace":"prod","version":1,"manifest":"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: api\ndata:\n  proof: caller-owned\n"}"#);
+    let owned = helm_reveal::reveal_payload(&encoded).expect("caller-owned pure payload");
+    let report = helm_reveal::rollback(&script.client(), &targets, &owned).await;
     assert!(
-        matches!(
-            outcome,
-            Fetched::Denied {
-                what: "helm revision"
-            }
-        ),
-        "{outcome:?}"
+        matches!(&report.documents[..], [helm_reveal::DocumentRollback::Skipped {name,why,..}] if name == "api" && why == helm_reveal::PAYLOAD_UNAVAILABLE),
+        "{report:?}"
     );
-    assert!(script.seen().iter().all(|seen| seen.method != "PATCH"));
-    drop(runtime);
+    assert!(
+        after_sync(&script, before).is_empty(),
+        "no action read or write: {:?}",
+        after_sync(&script, before)
+    );
 }

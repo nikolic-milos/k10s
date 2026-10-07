@@ -425,10 +425,11 @@ impl ObserveView {
                                 return;
                             }
                             this.scope_label = format!(
-                                "{}/{}: {} current pods",
+                                "{}/{}: {} current {}",
                                 scope.namespace,
                                 scope.request.name,
-                                scope.pods.len()
+                                scope.pods.len(),
+                                if scope.pods.len() == 1 { "pod" } else { "pods" },
                             )
                             .into();
                             this.scope = Some(scope);

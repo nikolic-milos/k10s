@@ -94,9 +94,8 @@ impl ToolKind {
 
 /// How this process is allowed to authenticate *to the tool*.
 ///
-/// A Secret is not a variant. Reading one is [`crate::integrations::helm`]'s exception and
-/// an explicit reveal; this enum has nowhere to put a cluster Secret name
-/// that was never shown to a person.
+/// Cluster Secrets are metadata only. Credentials here come from the user's
+/// tool settings; this enum has no route to a cluster Secret payload.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ToolAuth {
     #[default]

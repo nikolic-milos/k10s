@@ -29,6 +29,26 @@ fn response() -> serde_json::Value {
     }]}]}]}})
 }
 
+fn jaeger_response(trace_id: &str) -> serde_json::Value {
+    serde_json::json!({"data":[{"traceID":trace_id,"spans":[
+        {"traceID":trace_id,"spanID":"0123456789abcdef","startTime":1,"duration":1},
+        {"traceID":trace_id,"spanID":"fedcba9876543210","startTime":2,"duration":1,
+         "references":[{"refType":"CHILD_OF","traceID":trace_id,"spanID":"0123456789abcdef"}]}
+    ]}]})
+}
+
+fn jaeger_bound() -> Bound {
+    Bound {
+        kind: ToolKind::Jaeger,
+        transport: Transport::Proxy {
+            namespace: "observe".into(),
+            service: "jaeger".into(),
+            port: 16686,
+        },
+        ..bound()
+    }
+}
+
 fn assert_gets(script: &Script, paths: &[&str]) {
     let requests = script.seen();
     assert_eq!(requests.len(), paths.len(), "{requests:?}");
@@ -102,6 +122,298 @@ fn malformed_and_protobuf_bodies_are_refused_without_compatibility_reads() {
             runtime().block_on(async { traces::lookup(&script.client(), &bound(), ID).await });
         assert!(matches!(answer, Fetched::Failed { .. }));
         assert_gets(&script, &[V2]);
+    }
+}
+
+#[test]
+fn malformed_tempo_timestamps_are_named_without_a_compatibility_read() {
+    for field in ["startTimeUnixNano", "endTimeUnixNano"] {
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!("invalid"),
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+            serde_json::json!("18446744073709551616"),
+        ] {
+            let script = Script::default();
+            let mut body = response();
+            body["trace"]["resourceSpans"][0]["scopeSpans"][0]["spans"][0][field] = value;
+            script.route("GET", V2, 200, body.to_string());
+            script.route("GET", V1, 200, response().to_string());
+            let answer =
+                runtime().block_on(async { traces::lookup(&script.client(), &bound(), ID).await });
+            assert!(
+                matches!(answer, Fetched::Failed { what:"tempo", why } if why.contains(field) && why.contains("unsigned 64-bit"))
+            );
+            assert_gets(&script, &[V2]);
+        }
+    }
+}
+
+#[test]
+fn invalid_first_span_ids_refuse_the_whole_trace_without_compatibility_reads() {
+    for field in ["traceId", "spanId", "parentSpanId"] {
+        for invalid in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(7)),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("aa")),
+            Some(serde_json::json!("0".repeat(if field == "traceId" {
+                32
+            } else {
+                16
+            }))),
+        ] {
+            if field == "parentSpanId"
+                && (invalid.as_ref().is_none_or(|value| value.is_null())
+                    || invalid
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| id.is_empty() || id == "0000000000000000"))
+            {
+                continue;
+            }
+            let script = Script::default();
+            let mut body = response();
+            let spans = body["trace"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                .as_array_mut()
+                .unwrap();
+            spans.push(spans[0].clone());
+            spans[1]["spanId"] = serde_json::json!("fedcba9876543210");
+            spans[0].as_object_mut().unwrap().remove(field);
+            if let Some(invalid) = invalid {
+                spans[0][field] = invalid;
+            }
+            script.route("GET", V2, 200, body.to_string());
+            script.route("GET", V1, 200, response().to_string());
+            let answer =
+                runtime().block_on(async { traces::lookup(&script.client(), &bound(), ID).await });
+            assert!(
+                matches!(&answer, Fetched::Failed {what:"tempo",why} if why.contains(field) && why.contains("identifier")),
+                "{answer:?}"
+            );
+            assert_gets(&script, &[V2]);
+        }
+    }
+}
+
+#[test]
+fn protojson_default_zero_timestamps_still_need_only_one_trace_read() {
+    let script = Script::default();
+    let mut body = response();
+    let span = body["trace"]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        .as_object_mut()
+        .unwrap();
+    span.remove("startTimeUnixNano");
+    span.insert("endTimeUnixNano".into(), serde_json::Value::Null);
+    script.route("GET", V2, 200, body.to_string());
+    let answer = runtime().block_on(async { traces::lookup(&script.client(), &bound(), ID).await });
+    assert!(matches!(answer, Fetched::Ok(trace) if trace.trace_id == ID
+        && trace.spans.len() == 1 && trace.spans[0].start_us == 0 && trace.spans[0].duration_us == 0));
+    assert_gets(&script, &[V2]);
+}
+
+#[test]
+fn malformed_and_foreign_jaeger_spans_do_not_become_a_successful_requested_trace() {
+    let path = "/api/v1/namespaces/observe/services/jaeger:16686/proxy/api/traces/0123456789abcdef0123456789abcdef";
+    let mut bound = bound();
+    bound.kind = ToolKind::Jaeger;
+    let Transport::Proxy { service, port, .. } = &mut bound.transport else {
+        unreachable!()
+    };
+    *service = "jaeger".into();
+    *port = 16686;
+    for (spans, named) in [
+        (serde_json::Value::Null, "Jaeger spans"),
+        (serde_json::json!([null]), "Jaeger span"),
+        (serde_json::json!([{}]), "Jaeger span traceID"),
+        (
+            serde_json::json!([{
+                "traceID":ID,"spanID":"0123456789abcdef","startTime":-1,"duration":1
+            }]),
+            "Jaeger startTime",
+        ),
+        (
+            serde_json::json!([{
+                "traceID":ID,"spanID":"0123456789abcdef","startTime":1,"duration":"1"
+            }]),
+            "Jaeger duration",
+        ),
+        (
+            serde_json::json!([
+                {"traceID":ID,"spanID":"0123456789abcdef","startTime":1,"duration":1},
+                {"traceID":"ffffffffffffffffffffffffffffffff","spanID":"fedcba9876543210","startTime":1,"duration":1}
+            ]),
+            "Jaeger span traceID",
+        ),
+    ] {
+        let script = Script::default();
+        script.route(
+            "GET",
+            path,
+            200,
+            serde_json::json!({"data":[{
+                "traceID":ID,"spans":spans
+            }]})
+            .to_string(),
+        );
+        let answer =
+            runtime().block_on(async { traces::lookup(&script.client(), &bound, ID).await });
+        assert!(matches!(answer, Fetched::Failed { what:"jaeger", why } if why.contains(named)));
+        assert_gets(&script, &[path]);
+    }
+}
+
+#[test]
+fn jaeger_both_trace_widths_keep_only_hierarchical_parents_on_one_exact_get() {
+    for trace_id in ["0123456789abcdef", ID] {
+        for parent_kind in ["CHILD_OF", "FOLLOWS_FROM", "direct"] {
+            let script = Script::default();
+            let path = format!(
+                "/api/v1/namespaces/observe/services/jaeger:16686/proxy/api/traces/{trace_id}"
+            );
+            let mut body = jaeger_response(trace_id);
+            let span = &mut body["data"][0]["spans"][1];
+            if parent_kind == "direct" {
+                span["references"] = serde_json::json!([]);
+                span["parentSpanID"] = serde_json::json!("0123456789ABCDEF");
+            } else {
+                span["references"][0]["refType"] = serde_json::json!(parent_kind);
+            }
+            script.route("GET", &path, 200, body.to_string());
+            let answer = runtime().block_on(async {
+                traces::lookup(&script.client(), &jaeger_bound(), trace_id).await
+            });
+            let expected_parent = if parent_kind == "FOLLOWS_FROM" {
+                ""
+            } else {
+                "0123456789abcdef"
+            };
+            assert!(
+                matches!(&answer, Fetched::Ok(trace) if trace.trace_id == trace_id
+                    && trace.spans.len() == 2 && trace.spans[1].parent == expected_parent
+                    && trace.source.is_empty()),
+                "{trace_id} {parent_kind}: {answer:?}"
+            );
+            assert_gets(&script, &[&path]);
+        }
+    }
+}
+
+#[test]
+fn invalid_jaeger_ids_and_parent_references_refuse_after_one_exact_get() {
+    let path = "/api/v1/namespaces/observe/services/jaeger:16686/proxy/api/traces/0123456789abcdef0123456789abcdef";
+    for (target, key, invalid, named) in [
+        (
+            "trace",
+            "traceID",
+            serde_json::json!("0".repeat(32)),
+            "Jaeger traceID",
+        ),
+        (
+            "span",
+            "traceID",
+            serde_json::json!("0".repeat(16)),
+            "Jaeger span traceID",
+        ),
+        (
+            "span",
+            "traceID",
+            serde_json::json!("abc"),
+            "Jaeger span traceID",
+        ),
+        (
+            "span",
+            "spanID",
+            serde_json::json!("0".repeat(16)),
+            "Jaeger spanID",
+        ),
+        ("span", "spanID", serde_json::json!(ID), "Jaeger spanID"),
+        (
+            "span",
+            "spanID",
+            serde_json::json!("qqGbfsPBsQA="),
+            "Jaeger spanID",
+        ),
+        (
+            "span",
+            "parentSpanID",
+            serde_json::json!("0".repeat(16)),
+            "Jaeger parentSpanID",
+        ),
+        (
+            "reference",
+            "spanID",
+            serde_json::Value::Null,
+            "Jaeger CHILD_OF spanID",
+        ),
+        (
+            "reference",
+            "spanID",
+            serde_json::json!(7),
+            "Jaeger CHILD_OF spanID",
+        ),
+        (
+            "reference",
+            "spanID",
+            serde_json::json!("abc"),
+            "Jaeger CHILD_OF spanID",
+        ),
+        (
+            "reference",
+            "spanID",
+            serde_json::json!("0".repeat(16)),
+            "Jaeger CHILD_OF spanID",
+        ),
+        (
+            "reference",
+            "spanID",
+            serde_json::json!("a".repeat(201)),
+            "Jaeger CHILD_OF spanID",
+        ),
+        (
+            "reference",
+            "traceID",
+            serde_json::json!("0".repeat(32)),
+            "Jaeger CHILD_OF traceID",
+        ),
+        (
+            "reference",
+            "traceID",
+            serde_json::json!("ffffffffffffffffffffffffffffffff"),
+            "cross-trace parents are not supported",
+        ),
+        (
+            "reference",
+            "refType",
+            serde_json::Value::Null,
+            "Jaeger reference refType",
+        ),
+        (
+            "span",
+            "references",
+            serde_json::json!({}),
+            "Jaeger references",
+        ),
+    ] {
+        let mut body = jaeger_response(ID);
+        let target = match target {
+            "trace" => &mut body["data"][0],
+            "span" => &mut body["data"][0]["spans"][0],
+            "reference" => &mut body["data"][0]["spans"][1]["references"][0],
+            _ => unreachable!(),
+        };
+        target[key] = invalid;
+        let script = Script::default();
+        script.route("GET", path, 200, body.to_string());
+        let answer = runtime()
+            .block_on(async { traces::lookup(&script.client(), &jaeger_bound(), ID).await });
+        assert!(
+            matches!(&answer, Fetched::Failed { what:"jaeger", why } if why.contains(named)),
+            "{key}: {answer:?}"
+        );
+        assert_gets(&script, &[path]);
     }
 }
 

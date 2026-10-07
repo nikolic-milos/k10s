@@ -10,16 +10,14 @@
 //! ```
 //!
 //! `--test-threads=1` is required: the day-2 tests share a throwaway
-//! Deployment that a parallel scale races, and the stored-manifest apply
-//! tests share one Helm release, which two upgrades at once cannot change.
+//! Deployment that a parallel scale races. Grafana lock fixtures also need
+//! exclusive access to the shared database.
 //!
-//! Helm reads the Secrets Helm already wrote: k3s's Traefik release, and the
-//! rollback-probe release `live_fixtures.sh` installs. The stored-manifest
-//! apply tests change only rollback-probe and upgrade it back with that
-//! chart's values, so `helm` must be on PATH. Argo and Flux are pinned as absence
-//! when the groups are not served, and as a table when they are -- never as
-//! an error. Day-2 mutates only `day2-probe` in `K10S_LIVE_NAMESPACE`. It
-//! does not scale `web`, and it does not cordon or drain the node.
+//! Helm inventory reads release Secret metadata only. Payload reveal, diff and
+//! stored-revision apply refuse without reading or modifying a release. Argo
+//! and Flux are pinned as absence when their groups are not served and as a
+//! table when served. Day-2 mutates only `day2-probe` in K10S_LIVE_NAMESPACE;
+//! it does not scale `web` or cordon or drain the node.
 //!
 //! The decode-failure proof needs the lab's permissive CNPG fixture CRD. It
 //! creates one generated Cluster with an invalid instances field and removes
@@ -253,7 +251,7 @@ fn helm_lists_stored_releases_and_never_a_secret_value() {
     );
     assert_eq!(
         releases.unreadable, 0,
-        "a stored release that will not decode is not an empty inventory"
+        "unusable release metadata must not become an empty inventory"
     );
 
     let names: Vec<_> = releases
@@ -281,6 +279,30 @@ fn helm_lists_stored_releases_and_never_a_secret_value() {
         );
     }
 
+    assert!(
+        releases
+            .releases
+            .iter()
+            .any(|release| release.namespace == "kube-system" && release.name == "traefik"),
+        "the current lab's recorded Traefik release must be visible"
+    );
+    for release in &releases.releases {
+        for revision in &release.revisions {
+            for field in [
+                &revision.chart,
+                &revision.chart_version,
+                &revision.app_version,
+                &revision.updated,
+                &revision.description,
+            ] {
+                assert!(
+                    field.is_empty(),
+                    "payload-only release fields are unavailable"
+                );
+            }
+        }
+    }
+
     let page = helm::table_page(&releases);
     assert_eq!(
         page.columns
@@ -292,6 +314,7 @@ fn helm_lists_stored_releases_and_never_a_secret_value() {
     assert_eq!(page.rows.len(), releases.releases.len());
     for row in &page.rows {
         assert_eq!(row.cells.len(), 5, "{row:?}");
+        assert_eq!(row.cells[4], "unavailable (metadata only)");
         for cell in &row.cells {
             assert!(
                 !cell.contains("apiVersion:") && !cell.contains("kind:"),
@@ -304,72 +327,14 @@ fn helm_lists_stored_releases_and_never_a_secret_value() {
         }
         assert!(
             row.cells[2].chars().all(|c| c.is_ascii_digit()),
-            "Revision is the running number, not a payload: {:?}",
+            "Revision is Helm's recorded number: {:?}",
             row.cells[2]
         );
     }
 }
 
 const ROLLBACK_RELEASE: &str = "rollback-probe";
-const ROLLBACK_SECRET: &str = "rollback-probe-token";
 const ROLLBACK_CANARY: &str = "PLANTED-rollback-canary";
-
-// Upgrades the rollback-probe release with the fixture chart and its values,
-// as live_fixtures.sh does, adding `extra` to helm's arguments. Without
-// --reset-values an upgrade given no values keeps the last revision's.
-fn upgrade_release(extra: &[&str]) -> std::io::Result<std::process::ExitStatus> {
-    let chart = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/helm/rollback-probe"
-    );
-    std::process::Command::new("helm")
-        .args(["upgrade", "--install", ROLLBACK_RELEASE, chart])
-        .args(["--reset-values", "--wait"])
-        .args(["--namespace", &namespace()])
-        .args(extra)
-        .stdout(std::process::Stdio::null())
-        .status()
-}
-
-// Upgrades the rollback-probe release with the chart's own values whether the
-// test that changed it passed or panicked; helm's three-way merge puts a
-// drifted value back. The release history gains a revision, and a ConfigMap
-// the test recreated keeps its new uid and its k10s field owner. A restore
-// that fails after a passing test fails that test: the lab is not what it
-// claims.
-struct RestoreRelease;
-
-impl RestoreRelease {
-    // Checked before a test changes anything: without helm the guard could
-    // not put back what the test is about to change.
-    fn armed() -> Self {
-        let helm = std::process::Command::new("helm")
-            .arg("version")
-            .stdout(std::process::Stdio::null())
-            .status();
-        assert!(
-            matches!(helm, Ok(status) if status.success()),
-            "helm must be on PATH: {helm:?}"
-        );
-        RestoreRelease
-    }
-}
-
-impl Drop for RestoreRelease {
-    fn drop(&mut self) {
-        let restored = upgrade_release(&[]);
-        if matches!(restored, Ok(status) if status.success()) {
-            return;
-        }
-        let why =
-            format!("restoring {ROLLBACK_RELEASE} failed ({restored:?}); rerun live_fixtures.sh");
-        if std::thread::panicking() {
-            eprintln!("{why}");
-        } else {
-            panic!("{why}");
-        }
-    }
-}
 
 fn admin_request(request: http::Request<Vec<u8>>) -> Result<serde_json::Value, kube::Error> {
     kube_runtime().block_on(async {
@@ -378,225 +343,139 @@ fn admin_request(request: http::Request<Vec<u8>>) -> Result<serde_json::Value, k
     })
 }
 
-// None only when the server says the ConfigMap does not exist: a read that
-// failed for any other reason proves nothing about absence.
-fn configmap(name: &str) -> Option<serde_json::Value> {
-    let path = format!("/api/v1/namespaces/{}/configmaps", namespace());
-    let request = kube::api::Request::new(path)
-        .get(name, &kube::api::GetParams::default())
-        .expect("a get request");
-    match admin_request(request) {
-        Ok(object) => Some(object),
-        Err(kube::Error::Api(status)) if status.code == 404 => None,
-        Err(error) => panic!("reading the ConfigMap {name}: {error}"),
-    }
-}
-
-fn delete_configmap(name: &str) {
-    let path = format!("/api/v1/namespaces/{}/configmaps", namespace());
-    let request = kube::api::Request::new(path)
-        .delete(name, &kube::api::DeleteParams::default())
-        .expect("a delete request");
-    admin_request(request).expect("the ConfigMap is deleted");
-}
-
-// A Secret's identity and field owners, read as metadata so its values never
-// reach this process.
-fn secret_metadata(name: &str) -> (String, serde_json::Value) {
-    let path = format!("/api/v1/namespaces/{}/secrets", namespace());
-    let request = kube::api::Request::new(path)
-        .get_metadata(name, &kube::api::GetParams::default())
-        .expect("a get request");
-    let object = admin_request(request).expect("the Secret's metadata");
-    (
-        object["metadata"]["resourceVersion"]
-            .as_str()
-            .expect("a resourceVersion")
-            .to_string(),
-        object["metadata"]["managedFields"].clone(),
-    )
-}
-
-// Changes the Secret's canary; the server answers with metadata only, so the
-// Secret it stores never comes back into this process.
-fn drift_secret(name: &str) {
-    let path = format!("/api/v1/namespaces/{}/secrets", namespace());
-    let request = kube::api::Request::new(path)
-        .patch_metadata(
-            name,
-            &kube::api::PatchParams::default(),
-            &kube::api::Patch::Merge(serde_json::json!({"stringData": {"canary": "drifted"}})),
-        )
-        .expect("a patch request");
-    admin_request(request).expect("the Secret drifts");
-}
-
-fn current_rollback_revision(sync: &Sync) -> u32 {
-    let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader
-        .fetch_releases(Some(namespace()), move |fetched| {
-            let _ = tx.send(fetched);
-        });
-    let Fetched::Ok(releases) = wait(&rx) else {
-        panic!("the Helm inventory resolves");
+fn assert_payload_refusal<T>(answer: Fetched<T>, applied: bool) {
+    let Fetched::Failed { what, why } = answer else {
+        panic!("Helm payload actions require an explicit policy refusal");
     };
-    releases
-        .releases
-        .iter()
-        .find(|release| release.name == ROLLBACK_RELEASE)
-        .and_then(|release| release.current())
-        .map(|revision| revision.revision)
-        .expect("live_fixtures.sh installs the rollback-probe release")
+    assert_eq!(what, "helm revision");
+    assert_eq!(
+        why,
+        if applied {
+            format!(
+                "nothing was applied: {}",
+                k10s_data::integrations::helm_reveal::PAYLOAD_UNAVAILABLE
+            )
+        } else {
+            k10s_data::integrations::helm_reveal::PAYLOAD_UNAVAILABLE.to_string()
+        }
+    );
 }
 
-fn roll_back(sync: &Sync, revision: u32) -> k10s_data::integrations::helm_reveal::RollbackReport {
+fn assert_reader_payload_refusals(context: Option<&str>) {
+    let (_plane, sync) = connect(context);
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.reveal_helm_revision(
+        Some(namespace()),
+        ROLLBACK_RELEASE.into(),
+        1,
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
+    assert_payload_refusal(wait(&rx), false);
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.diff_helm_revisions(
+        Some(namespace()),
+        ROLLBACK_RELEASE.into(),
+        1,
+        2,
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
+    assert_payload_refusal(wait(&rx), false);
     let (tx, rx) = std::sync::mpsc::channel();
     sync.reader.rollback_helm_revision(
         Some(namespace()),
-        ROLLBACK_RELEASE.to_string(),
-        revision,
-        move |fetched| {
-            let _ = tx.send(fetched);
+        ROLLBACK_RELEASE.into(),
+        1,
+        move |answer| {
+            let _ = tx.send(answer);
         },
     );
-    // This fixture has one applyable ConfigMap and one skipped Secret:
-    // a list, an optional fallback GET and one apply.
-    match wait_interactive(&rx, 3) {
-        Fetched::Ok(report) => report,
-        other => panic!("the stored-manifest apply resolves to a report: {other:?}"),
-    }
-}
-
-fn assert_secret_skipped(report: &k10s_data::integrations::helm_reveal::RollbackReport) {
-    use k10s_data::integrations::helm_reveal::DocumentRollback;
-    assert!(
-        report.documents.iter().any(|document| matches!(
-            document,
-            DocumentRollback::Skipped { kind, name, why }
-                if kind == "Secret" && name == ROLLBACK_SECRET
-                    && why.starts_with("a stored Secret document is not applied")
-        )),
-        "the Secret document is skipped for its secret material: {report:?}"
-    );
-    assert!(
-        !format!("{report:?}").contains(ROLLBACK_CANARY),
-        "a skipped Secret's values never reach the report"
-    );
+    assert_payload_refusal(wait(&rx), true);
 }
 
 #[test]
-#[ignore = "needs a live cluster; see the module comment"]
-fn a_stored_manifest_apply_recreates_the_configmap_and_leaves_the_secret() {
-    use k10s_data::integrations::helm_reveal::{DocumentRollback, NOT_HELM_ROLLBACK};
-    let _restore = RestoreRelease::armed();
-    let (_plane, sync) = connect(None);
-    let revision = current_rollback_revision(&sync);
-    delete_configmap(ROLLBACK_RELEASE);
-    drift_secret(ROLLBACK_SECRET);
-    let drifted = secret_metadata(ROLLBACK_SECRET);
-
-    let report = roll_back(&sync, revision);
-    assert_eq!(report.note, NOT_HELM_ROLLBACK);
-    assert_secret_skipped(&report);
+#[ignore = "needs the live lab; payload routes must send no requests"]
+fn public_helm_payload_actions_send_no_requests_on_a_real_client() {
+    use base64::Engine as _;
+    use k10s_data::integrations::helm_reveal;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     assert!(
-        report.documents.iter().any(|document| matches!(
-            document,
-            DocumentRollback::Applied { kind, name, outcome: ApplyOutcome::Applied(_) }
-                if kind == "ConfigMap" && name == ROLLBACK_RELEASE
-        )),
-        "the ConfigMap is applied: {report:?}"
+        std::env::var_os("KUBECONFIG").is_some(),
+        "KUBECONFIG must name the live lab"
     );
-
-    let recreated = configmap(ROLLBACK_RELEASE).expect("the ConfigMap exists again");
-    assert_eq!(recreated["data"]["proof"], "stored");
-    let managers = recreated["metadata"]["managedFields"].to_string();
-    assert!(
-        managers.contains(r#""manager":"k10s""#),
-        "the stored manifest is applied under k10s: {managers}"
-    );
-    assert_eq!(
-        secret_metadata(ROLLBACK_SECRET),
-        drifted,
-        "the Secret is not written: same resourceVersion and field owners"
-    );
-}
-
-#[test]
-#[ignore = "needs a live cluster; see the module comment"]
-fn a_reader_cannot_apply_a_stored_manifest_and_nothing_is_created() {
-    use k10s_data::integrations::helm_reveal::DocumentRollback;
-    let _restore = RestoreRelease::armed();
-    let (_admin_plane, admin) = connect(None);
-    let revision = current_rollback_revision(&admin);
-    delete_configmap(ROLLBACK_RELEASE);
-    let untouched = secret_metadata(ROLLBACK_SECRET);
-
-    let (_plane, sync) = connect(Some(&reader_context()));
-    let report = roll_back(&sync, revision);
-    assert_secret_skipped(&report);
-    let denied = report.documents.iter().find_map(|document| match document {
-        DocumentRollback::Applied {
-            kind,
-            name,
-            outcome: ApplyOutcome::Denied { why, .. },
-        } if kind == "ConfigMap" && name == ROLLBACK_RELEASE => Some(why.clone()),
-        _ => None,
+    let runtime = kube_runtime();
+    runtime.block_on(async {
+        let actual = kube::Client::try_default()
+            .await
+            .expect("the current lab account");
+        let mut catalog = k10s_core::Catalog::new();
+        let discovered = k10s_data::discover::discover(&actual, &mut catalog)
+            .await
+            .expect("current lab discovery");
+        assert!(discovered.targets.iter().any(|target| {
+            target.kind() == "Secret" && target.listable
+        }));
+        assert!(discovered.targets.iter().any(|target| {
+            target.kind() == "ConfigMap" && target.patchable
+        }));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let guarded = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let actual = actual.clone();
+            let seen = seen.clone();
+            let unsafe_secret = request.uri().path().contains("/secrets")
+                && !request.headers().get(http::header::ACCEPT)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|accept| accept.contains("PartialObjectMetadata"));
+            let refused = request.method() != http::Method::GET || unsafe_secret;
+            async move {
+                seen.fetch_add(1, Ordering::Relaxed);
+                if refused {
+                    return Err(kube::Error::Service(std::io::Error::other(
+                        "unexpected Helm payload request refused before transport",
+                    ).into()));
+                }
+                actual.send(request).await
+            }
+        });
+        let client = kube::Client::new(guarded, namespace());
+        for ns in [None, Some(namespace())] {
+            let answer = helm_reveal::reveal_revision(
+                &client, &discovered.targets, ns.as_deref(), ROLLBACK_RELEASE, 1,
+            ).await;
+            assert_payload_refusal(answer, false);
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            r#"{"name":"rollback-probe","namespace":"g2","version":1,"manifest":"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: rollback-probe\ndata:\n  proof: caller-owned\n"}"#,
+        );
+        let owned = helm_reveal::reveal_payload(&encoded)
+            .expect("caller-owned pure decoder fixture");
+        let report = helm_reveal::rollback(&client, &discovered.targets, &owned).await;
+        assert!(matches!(&report.documents[..],
+            [helm_reveal::DocumentRollback::Skipped {why,..}]
+                if why == helm_reveal::PAYLOAD_UNAVAILABLE), "{report:?}");
+        assert_eq!(requests.load(Ordering::Relaxed), 0,
+            "payload actions dispatch no reads or writes");
+        println!("Helm public payload actions dispatched zero requests; discovery confirmed Secret LIST and ConfigMap PATCH are served");
     });
-    let why =
-        denied.unwrap_or_else(|| panic!("the reader's apply is a labelled denial: {report:?}"));
-    assert!(
-        why.contains("forbidden"),
-        "the server's own sentence: {why}"
-    );
-    assert!(
-        configmap(ROLLBACK_RELEASE).is_none(),
-        "a denied apply creates nothing"
-    );
-    assert_eq!(secret_metadata(ROLLBACK_SECRET), untouched);
 }
 
-// The case a rollback exists for, pinned as the limitation it is: the release
-// was upgraded since the revision applied back, so Helm owns the field that
-// revision would set, and the server refuses the apply as a conflict naming
-// Helm and the field. Nothing changes. Taking such a value back would need a
-// forced apply, which this path does not offer.
 #[test]
-#[ignore = "needs a live cluster; see the module comment"]
-fn a_stored_manifest_apply_of_an_older_revision_conflicts_with_helm() {
-    use k10s_data::apply::Conflicted;
-    use k10s_data::integrations::helm_reveal::DocumentRollback;
-    let _restore = RestoreRelease::armed();
-    let (_plane, sync) = connect(None);
-    let revision = current_rollback_revision(&sync);
-    let upgraded = upgrade_release(&["--set", "proof=changed"]);
-    assert!(
-        matches!(upgraded, Ok(status) if status.success()),
-        "helm upgrades the release: {upgraded:?}"
-    );
-    let untouched = secret_metadata(ROLLBACK_SECRET);
+#[ignore = "needs the live lab; release payloads remain unavailable for administrators"]
+fn administrator_helm_payload_actions_report_the_metadata_only_refusal() {
+    assert_reader_payload_refusals(None);
+}
 
-    let report = roll_back(&sync, revision);
-    assert_secret_skipped(&report);
-    let causes = report.documents.iter().find_map(|document| match document {
-        DocumentRollback::Applied {
-            kind,
-            name,
-            outcome: ApplyOutcome::Conflict { causes, .. },
-        } if kind == "ConfigMap" && name == ROLLBACK_RELEASE => Some(causes.clone()),
-        _ => None,
-    });
-    let causes =
-        causes.unwrap_or_else(|| panic!("the older revision's apply conflicts: {report:?}"));
-    assert!(
-        causes.contains(&Conflicted {
-            field: ".data.proof".to_string(),
-            manager: "helm".to_string(),
-        }),
-        "the conflict names Helm and the field: {causes:?}"
-    );
-    let current = configmap(ROLLBACK_RELEASE).expect("the ConfigMap");
-    assert_eq!(current["data"]["proof"], "changed", "nothing is applied");
-    assert_eq!(secret_metadata(ROLLBACK_SECRET), untouched);
+#[test]
+#[ignore = "needs reader@k10s-lab; release payloads remain unavailable for restricted accounts"]
+fn restricted_helm_payload_actions_report_the_metadata_only_refusal() {
+    assert_reader_payload_refusals(Some(&reader_context()));
 }
 
 #[test]

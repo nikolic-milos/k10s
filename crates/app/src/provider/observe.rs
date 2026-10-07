@@ -466,10 +466,13 @@ pub(super) fn trace_outcome(
     match fetched {
         Fetched::Ok(None) => k10s_provider::TraceOutcome::Absent,
         Fetched::Ok(Some(trace)) if trace.spans.is_empty() && trace.trace_id.is_empty() => {
-            k10s_provider::TraceOutcome::Empty
+            k10s_provider::TraceOutcome::Empty {
+                source: trace.source,
+            }
         }
         Fetched::Ok(Some(trace)) => k10s_provider::TraceOutcome::Trace {
             trace_id: trace.trace_id,
+            source: trace.source,
             spans: trace
                 .spans
                 .into_iter()

@@ -12,6 +12,8 @@
 //! and the request requires PartialObjectMetadataList without a full-object fallback.
 //! Group discovery is capped at 64 KiB. Metadata pages share an eight-MiB
 //! budget and sixteen LIST exchanges; each exchange has a four-second deadline.
+//! Legal names retain their full identity. Only table display cells are clipped;
+//! oversized names or namespaces count as unreadable objects.
 //!
 //! Health is a GET of a well-known extension path on a [`crate::reach::Bound`]
 //! `OtelCollector`. zpages (55679) and the health_check extension (13133)
@@ -32,6 +34,8 @@ use crate::served::ListErr;
 
 pub const MAX_COLLECTORS: usize = 2_000;
 pub const MAX_FIELD_CHARS: usize = 200;
+const MAX_NAME_BYTES: usize = 253;
+const MAX_NAMESPACE_BYTES: usize = 63;
 
 pub const HEALTH_PORT: u16 = 13133;
 pub const ZPAGES_PORT: u16 = 55679;
@@ -51,10 +55,10 @@ const HEALTH_WHAT: &str = "otel-collector";
 pub struct Collector {
     pub name: String,
     pub namespace: String,
-    /// `deployment`, `daemonset`, `statefulset`, or `sidecar`, as the CR spelled it.
+    /// Metadata only; inventory does not read configuration or status.
     pub mode: String,
     pub replicas: Option<i32>,
-    /// The Ready (or Available) condition's `status`, as the object spelled it.
+    /// Not fetched; metadata does not include readiness.
     pub ready: String,
     pub image: String,
 }
@@ -185,12 +189,15 @@ fn clip(text: &str) -> String {
 }
 
 fn from_wire(wire: WireObject) -> Option<Collector> {
-    if wire.metadata.name.is_empty() {
+    if wire.metadata.name.is_empty()
+        || wire.metadata.name.len() > MAX_NAME_BYTES
+        || wire.metadata.namespace.len() > MAX_NAMESPACE_BYTES
+    {
         return None;
     }
     Some(Collector {
-        name: clip(&wire.metadata.name),
-        namespace: clip(&wire.metadata.namespace),
+        name: wire.metadata.name,
+        namespace: wire.metadata.namespace,
         mode: "Metadata only".into(),
         replicas: None,
         ready: "Not fetched".into(),
@@ -525,8 +532,8 @@ pub fn table_page(inventory: &Inventory) -> Option<TablePage> {
                 let uid = format!("{}/{}", item.namespace, item.name);
                 rows.push(TableRow {
                     cells: vec![
-                        item.name.clone(),
-                        item.namespace.clone(),
+                        clip(&item.name),
+                        clip(&item.namespace),
                         item.mode.clone(),
                         item.replicas
                             .map(|n| n.to_string())
@@ -570,8 +577,8 @@ pub fn table_page(inventory: &Inventory) -> Option<TablePage> {
         namespace: Some(service.namespace.clone()),
         uid: format!("service:{}/{}", service.namespace, service.name),
         cells: vec![
-            service.name.clone(),
-            service.namespace.clone(),
+            clip(&service.name),
+            clip(&service.namespace),
             "Service".into(),
             service.port.to_string(),
             service.health.clone(),

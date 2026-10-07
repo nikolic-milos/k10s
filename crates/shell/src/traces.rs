@@ -54,6 +54,7 @@ pub struct TracesView {
     probe_stop: Option<RequestStop>,
     scope: Option<ObserveScope>,
     linked_id: Option<String>,
+    source: SharedString,
     association: SharedString,
     spans: Vec<SpanView>,
     timeline: Vec<TimelineRow>,
@@ -87,6 +88,7 @@ impl TracesView {
             probe_stop: None,
             scope: None,
             linked_id: None,
+            source: SharedString::default(),
             association: "No Kubernetes association requested".into(),
             spans: Vec::new(),
             timeline: Vec::new(),
@@ -170,6 +172,8 @@ impl TracesView {
         self.stop = None;
         self.generation += 1;
         self.loading = false;
+        self.source = SharedString::default();
+        self.association = "Kubernetes UID association was not checked".into();
         self.spans.clear();
         self.timeline.clear();
         self.table.set_page(TablePage::default());
@@ -207,7 +211,7 @@ impl TracesView {
             }),
         ));
         cx.spawn(async move |this, cx| {
-            if let Ok(outcome) = rx.await {
+            if let Ok(mut outcome) = rx.await {
                 let _ = this.update(cx, |this, cx| {
                     if this.generation != generation
                         || !this.visible
@@ -217,8 +221,10 @@ impl TracesView {
                     }
                     this.loading = false;
                     this.stop = None;
+                    this.source = take_trace_source(&mut outcome, &trace_id);
+                    this.association = "Kubernetes UID association is unproven".into();
                     match outcome {
-                        TraceOutcome::Empty => {
+                        TraceOutcome::Empty { .. } => {
                             let (association, status) = empty_trace(
                                 &trace_id,
                                 &mut this.query,
@@ -232,6 +238,7 @@ impl TracesView {
                         TraceOutcome::Trace {
                             trace_id: returned_id,
                             spans,
+                            ..
                         } => {
                             if !returned_id.eq_ignore_ascii_case(&trace_id) {
                                 this.association = "Kubernetes UID association is unproven".into();
@@ -265,6 +272,8 @@ impl TracesView {
                             this.status = Some(why.into());
                         }
                     }
+                    this.association =
+                        association_with_source(&this.source, this.association.clone());
                     cx.notify();
                 });
             }
@@ -347,6 +356,7 @@ impl crate::item::Item for TracesView {
             self.generation += 1;
             self.probe_generation += 1;
             if self.stop.is_some() {
+                self.source = SharedString::default();
                 self.status =
                     Some("Request cancelled while this pane is hidden; refresh to retry".into());
                 self.association = "Kubernetes UID association was not checked".into();
@@ -684,6 +694,25 @@ fn empty_trace(
     )
 }
 
+fn take_trace_source(outcome: &mut TraceOutcome, requested_id: &str) -> SharedString {
+    let source = match outcome {
+        TraceOutcome::Trace {
+            trace_id, source, ..
+        } if trace_id.eq_ignore_ascii_case(requested_id) => std::mem::take(source),
+        TraceOutcome::Empty { source } => std::mem::take(source),
+        _ => String::new(),
+    };
+    source.into()
+}
+
+fn association_with_source(source: &str, association: SharedString) -> SharedString {
+    if source.is_empty() {
+        association
+    } else {
+        format!("{source}  |  {association}").into()
+    }
+}
+
 fn spans_page(trace_id: &str, spans: &[SpanView]) -> TablePage {
     let columns = ["Span", "Parent", "Name", "Service", "Duration", "Status"]
         .iter()
@@ -794,6 +823,62 @@ mod tests {
         assert!(spans.is_empty());
         assert_eq!(association, "Kubernetes UID association is unproven");
         assert_eq!(status, "No spans returned for this trace");
+    }
+
+    #[test]
+    fn trace_provenance_follows_only_matching_success_and_empty_results() {
+        let requested = "0123456789abcdef0123456789abcdef";
+        let mut displayed_source: SharedString = "previous source".into();
+        assert_eq!(displayed_source.as_ref(), "previous source");
+        for (mut outcome, expected) in [
+            (
+                TraceOutcome::Trace {
+                    trace_id: requested.to_ascii_uppercase(),
+                    source: "Tempo / prod/tempo:3200".into(),
+                    spans: vec![span(0, 1, "current")],
+                },
+                "Tempo / prod/tempo:3200",
+            ),
+            (
+                TraceOutcome::Empty {
+                    source: "Jaeger / prod/jaeger:16686".into(),
+                },
+                "Jaeger / prod/jaeger:16686",
+            ),
+            (
+                TraceOutcome::Failed("the server could not read this trace".into()),
+                "",
+            ),
+            (TraceOutcome::Denied("tempo"), ""),
+            (TraceOutcome::Absent, ""),
+            (
+                TraceOutcome::Trace {
+                    trace_id: "ffffffffffffffffffffffffffffffff".into(),
+                    source: "wrong source".into(),
+                    spans: vec![span(0, 1, "current")],
+                },
+                "",
+            ),
+        ] {
+            displayed_source = take_trace_source(&mut outcome, requested);
+            assert_eq!(displayed_source.as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn source_caption_preserves_the_endpoint_and_empty_association() {
+        let association: SharedString = "Kubernetes UID association is unproven".into();
+        assert_eq!(
+            association_with_source("", association.clone()),
+            association
+        );
+        assert_eq!(
+            association_with_source("Tempo / prod/tempo:3200", association.clone()).as_ref(),
+            "Tempo / prod/tempo:3200  |  Kubernetes UID association is unproven"
+        );
+        let source = SharedString::from("Jaeger / prod/jaeger:16686");
+        let displayed = association_with_source(&source, association);
+        assert!(displayed.contains("Jaeger / prod/jaeger:16686"));
     }
 
     #[test]

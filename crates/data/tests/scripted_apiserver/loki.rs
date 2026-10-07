@@ -123,3 +123,73 @@ fn valid_empty_arrays_are_successful_after_one_exact_get() {
         assert_get(&script);
     }
 }
+
+#[test]
+fn invalid_entry_identity_is_refused_after_one_exact_get_without_label_fallback() {
+    for key in [
+        "trace_id",
+        "span_id",
+        "k8s_namespace_name",
+        "k8s_pod_name",
+        "k8s_pod_uid",
+        "k8s_node_name",
+    ] {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(10),
+            serde_json::json!("x".repeat(257)),
+        ] {
+            let string = value.is_string();
+            let metadata =
+                serde_json::Value::Object(serde_json::Map::from_iter([(key.into(), value)]));
+            let result = serde_json::json!([{
+                "stream": {
+                    "k8s_namespace_name": "prod", "k8s_pod_name": "api", "k8s_pod_uid": "current",
+                    "trace_id": "0123456789abcdef0123456789abcdef",
+                },
+                "values": [["1", "healthy earlier line"], ["2", "invalid identity line", metadata]],
+            }])
+            .to_string();
+            let (script, fetched) = reply(&result);
+            let why = if string {
+                format!("Loki entry metadata {key} exceeds 256 bytes; its identity is refused")
+            } else {
+                format!("Loki entry metadata {key} has a non-string identity value")
+            };
+            assert_eq!(fetched, Fetched::Failed { what: "loki", why });
+            assert_get(&script);
+        }
+    }
+}
+
+#[test]
+fn valid_bounded_and_empty_entry_identity_survive_the_exact_get() {
+    let boundary = format!("{}x", "界".repeat(85));
+    assert_eq!(boundary.len(), 256);
+    for metadata in [
+        serde_json::json!({}),
+        serde_json::json!({"k8s_pod_uid": ""}),
+        serde_json::json!({"k8s_pod_uid": "retired"}),
+        serde_json::json!({"k8s_pod_name": boundary}),
+    ] {
+        let result = serde_json::json!([{
+            "stream": {"k8s_namespace_name": "prod", "k8s_pod_name": "api", "k8s_pod_uid": "current"},
+            "values": [["1", "actual line", metadata]],
+        }]).to_string();
+        let (script, fetched) = reply(&result);
+        let Fetched::Ok(logs) = fetched else {
+            panic!("{fetched:?}");
+        };
+        assert_eq!(
+            logs.streams[0].lines[0].metadata,
+            metadata
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap().to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert!(!logs.truncated);
+        assert_get(&script);
+    }
+}

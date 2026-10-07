@@ -1,49 +1,15 @@
-//! Helm releases, read out of the Secrets Helm itself writes.
+//! Helm release inventory from strict Secret metadata, never release payloads.
 //!
-//! This is the ecosystem thesis in its smallest honest form. Helm's release
-//! state is not in an API of Helm's: it is one Secret per revision, of type
-//! `helm.sh/release.v1`, labelled `owner=helm`, holding a gzipped JSON document
-//! Helm's own client wrote. So a release inventory costs nothing but a list and
-//! a decode -- no operator, no CRD, no `helm` binary, nothing installed, and
-//! nothing reimplemented. §1's second rule is that we drive the ecosystem's
-//! tools rather than rebuild them, and this is the read half of driving Helm.
+//! The server selects `type=helm.sh/release.v1` and `owner=helm` and returns
+//! only PartialObjectMetadataList. Namespace and Helm's name, version and
+//! status labels identify stored revisions. Chart details, deployment times,
+//! descriptions, values and manifests are unavailable through this inventory.
+//! A refusal never retries for a full Secret. Replies share an eight MiB cap,
+//! at most ten pages and two thousand examined entries; malformed metadata is
+//! counted and repeated continuation tokens refuse an incomplete inventory.
 //!
-//! What this deliberately does **not** do is template. `helm template` needs Go
-//! `text/template` plus Sprig, and a Rust approximation of those diverges
-//! silently and produces wrong manifests -- §5.3 marks it `rebuild` for exactly
-//! that reason. Stored state is read natively; rendering charts is not our
-//! business.
-//!
-//! **The Secret rule, and the one place the read path bends it.** Everywhere
-//! else, a Secret is fetched as `PartialObjectMetadata` and its values cannot
-//! reach a document because they were never fetched. A release payload *is* the
-//! Secret's value, so this path has to read one. Three things keep that narrow:
-//!
-//! 1. The list asks the server for `type=helm.sh/release.v1` and
-//!    `owner=helm` -- a field selector and a label selector -- so no other
-//!    Secret's data is ever transferred, let alone parsed.
-//! 2. The payload is reduced at this boundary to the fields an inventory shows:
-//!    identity, revision, status, chart, and the sentence Helm wrote about the
-//!    release. The rendered manifest, the user's values, the chart's default
-//!    values and the hooks are **not carried into any type this module returns**,
-//!    so nothing downstream can leak what nothing downstream holds. That is
-//!    structural, not a convention: [`Revision`] has nowhere to put them.
-//! 3. Which is why the values and manifest views of §5.3's later rows are not
-//!    here. They need §5.8's reveal policy -- explicit, per field, into a
-//!    scratch buffer that never enters a snapshot -- and a release manifest is
-//!    multi-document YAML text rather than a JSON object, so it cannot be
-//!    structurally stripped the way [`crate::manifest`] strips one object. That
-//!    is a design problem to solve deliberately, not a line to add here.
-//!
-//! Three bounds exist because every side of this is attacker-shaped data. A
-//! gzip member expands without limit unless something says otherwise, so the
-//! decompressed payload is read through a cap and refused rather than
-//! truncated; the listing is paged with a ceiling on how many revisions it will
-//! hold, reported rather than silently applied; and every field a payload
-//! contributes is clipped on its own, because the payload cap is not a field cap
-//! -- an eight-mebibyte `status` fits inside it, and [`render`] pads every
-//! revision of a release to the widest status in it, so one field would multiply
-//! by the revision count into a document nothing downstream bounds.
+//! Pure legacy payload decoders remain for caller-owned bytes and their tests.
+//! They are not connected to a Kubernetes read route.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -56,16 +22,13 @@ use serde::Deserialize;
 use crate::browse::{TableColumn, TablePage, TableRow};
 use crate::describe::is_secret;
 use crate::discover::KindTarget;
-use crate::read::{Fetched, classify, collection_path};
+use crate::read::{Fetched, collection_path};
 
 // Helm's own type and label. Both are asked for on the wire rather than
 // filtered here, so the transfer itself is narrowed to release Secrets.
 const RELEASE_TYPE: &str = "helm.sh/release.v1";
 const OWNER_SELECTOR: &str = "owner=helm";
-const PAYLOAD_KEY: &str = "release";
-// Helm's own word for the revision that is serving. Every other status --
-// superseded, failed, pending-upgrade, pending-install, pending-rollback,
-// uninstalling -- describes a revision that is not.
+// This is Helm's recorded deployment status, not a workload health check.
 const DEPLOYED: &str = "deployed";
 
 const PAGE_LIMIT: u32 = 200;
@@ -73,6 +36,9 @@ const PAGE_LIMIT: u32 = 200;
 // releases; this is a ceiling on the whole listing, and reaching it is stated
 // rather than hidden.
 const MAX_REVISIONS: usize = 2_000;
+const MAX_PAGES: usize = 10;
+const MAX_TOKEN_BYTES: usize = 16 << 10;
+const METADATA_ONLY: &str = "unavailable (metadata only)";
 // A gzip member expands without bound unless a reader bounds it. A release
 // payload is a rendered manifest and some values; one larger than this is not
 // something an inventory can show anyway.
@@ -83,13 +49,10 @@ const MAX_PAYLOAD_BYTES: usize = 8 << 20;
 // field multiplies by the revision count. `describe` bounds its lines for the
 // same reason and this is the same document. Chars rather than bytes: the cut has
 // to land on a character.
+#[cfg(test)]
 const MAX_FIELD_CHARS: usize = 200;
 
-/// One stored revision of a release, reduced to what an inventory shows.
-///
-/// There is deliberately nowhere here for the rendered manifest, the values, or
-/// the hooks: see this module's contract. Adding a field for any of them is a
-/// decision about secret exposure, not a convenience.
+/// One stored revision. Payload-only fields are empty in metadata inventories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revision {
     pub revision: u32,
@@ -97,11 +60,9 @@ pub struct Revision {
     // pending-upgrade. Carried as text rather than mapped onto an enum, because
     // a status this build has never heard of is still the status.
     pub status: String,
-    // `info.last_deployed`, as the payload spells it. Not parsed into a time
-    // type: nothing here does arithmetic on it, and reformatting somebody's
-    // timestamp is a way to be subtly wrong about a time zone.
+    // Payload-only fields remain for caller-owned decoder compatibility.
+    // Metadata fetches leave them empty rather than infer them from labels.
     pub updated: String,
-    // The sentence Helm wrote about this revision ("Upgrade complete").
     pub description: String,
     pub chart: String,
     pub chart_version: String,
@@ -123,11 +84,8 @@ impl Release {
         self.revisions.first()
     }
 
-    /// The revision the cluster is actually running: the newest one Helm marked
-    /// `deployed`. An interrupted `helm upgrade` leaves a `pending-upgrade`
-    /// revision on top of the one still serving traffic, so the highest stored
-    /// revision answers the wrong question. `None` means this release has never
-    /// deployed -- a state to show, never a reason to drop the row.
+    /// The newest stored revision labelled `deployed`. This is Helm's recorded
+    /// state, not evidence of current workload health.
     pub fn current(&self) -> Option<&Revision> {
         self.revisions
             .iter()
@@ -141,15 +99,13 @@ pub struct Releases {
     /// The listing stopped at its ceiling, so this is some of the releases
     /// rather than all of them.
     pub truncated: bool,
-    /// Release Secrets whose payload would not decode. Counted, never dropped
-    /// silently: a release that cannot be read is not a release that is not
-    /// there, and the difference matters to whoever is looking for it.
+    /// Selected entries without usable identity or revision labels. They were
+    /// seen, so a malformed inventory must not claim no releases exist.
     pub unreadable: usize,
 }
 
-// Exactly the fields above, and no others. serde ignores the rest of the
-// payload, which is how the manifest and the values stay out of this process's
-// long-lived memory rather than being carried and then not shown.
+// The legacy decoder is exercised with caller-owned fixture bytes only.
+#[cfg(test)]
 #[derive(Deserialize)]
 struct WireRelease {
     #[serde(default)]
@@ -164,6 +120,7 @@ struct WireRelease {
     chart: WireChart,
 }
 
+#[cfg(test)]
 #[derive(Deserialize, Default)]
 struct WireInfo {
     #[serde(default)]
@@ -174,12 +131,14 @@ struct WireInfo {
     description: String,
 }
 
+#[cfg(test)]
 #[derive(Deserialize, Default)]
 struct WireChart {
     #[serde(default)]
     metadata: WireChartMeta,
 }
 
+#[cfg(test)]
 #[derive(Deserialize, Default)]
 struct WireChartMeta {
     #[serde(default)]
@@ -191,10 +150,14 @@ struct WireChartMeta {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireList {
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    kind: String,
     #[serde(default)]
     metadata: WireListMeta,
-    #[serde(default)]
+    #[serde(deserialize_with = "metadata_items")]
     items: Vec<WireSecret>,
 }
 
@@ -205,11 +168,13 @@ struct WireListMeta {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireSecret {
+    #[serde(rename = "apiVersion")]
+    api_version: Option<String>,
+    kind: Option<String>,
     #[serde(default)]
     metadata: WireSecretMeta,
-    #[serde(default)]
-    data: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -218,9 +183,113 @@ struct WireSecretMeta {
     name: String,
     #[serde(default)]
     namespace: String,
+    #[serde(default)]
+    labels: WireLabels,
+}
+
+#[derive(Deserialize, Default)]
+struct WireLabels {
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    status: String,
+}
+
+fn metadata_items<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<WireSecret>, D::Error> {
+    struct Items;
+    impl<'de> serde::de::Visitor<'de> for Items {
+        type Value = Vec<WireSecret>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a metadata array or null")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut items = Vec::new();
+            while items.len() <= MAX_REVISIONS {
+                let Some(item) = sequence.next_element()? else {
+                    return Ok(items);
+                };
+                items.push(item);
+            }
+            while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(items)
+        }
+    }
+    deserializer.deserialize_option(Items)
+}
+
+impl WireSecret {
+    fn revision(self) -> Option<(String, String, Revision)> {
+        if self
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind != "PartialObjectMetadata")
+            || self
+                .api_version
+                .as_deref()
+                .is_some_and(|version| version != "meta.k8s.io/v1")
+        {
+            return None;
+        }
+        let meta = self.metadata;
+        let labels = meta.labels;
+        if meta.name.is_empty()
+            || meta.name.len() > 253
+            || meta.namespace.is_empty()
+            || meta.namespace.len() > 63
+            || labels.owner != "helm"
+            || labels.name.is_empty()
+            || labels.name.len() > 63
+            || labels.status.is_empty()
+            || labels.status.len() > 63
+            || labels.version.len() > 10
+        {
+            return None;
+        }
+        let revision = labels
+            .version
+            .parse::<u32>()
+            .ok()
+            .filter(|version| *version > 0)?;
+        Some((
+            meta.namespace,
+            labels.name,
+            Revision {
+                revision,
+                status: labels.status,
+                updated: String::new(),
+                description: String::new(),
+                chart: String::new(),
+                chart_version: String::new(),
+                app_version: String::new(),
+            },
+        ))
+    }
 }
 
 /// A decoded payload: which release it belongs to, and the revision it is.
+#[cfg(test)]
 pub(crate) struct Stored {
     pub(crate) name: String,
     pub(crate) namespace: String,
@@ -235,6 +304,7 @@ pub(crate) struct Stored {
 /// by trusting the caller to know: gzip announces itself with two magic bytes,
 /// and JSON with a brace. A version of Helm that stopped compressing is
 /// therefore read by the same function.
+#[cfg(test)]
 pub(crate) fn decode(encoded: &str) -> Result<Stored, &'static str> {
     let json = payload(encoded)?;
     let wire: WireRelease = serde_json::from_slice(&json)
@@ -254,15 +324,14 @@ pub(crate) fn decode(encoded: &str) -> Result<Stored, &'static str> {
     })
 }
 
-/// The same gzip/base64 layers [`decode`] reads, returned as a scratch buffer
-/// rather than reduced to an inventory. [`Revision`] still has nowhere to put
-/// the values; this is the reveal path's entrance, and the only other one.
+/// Decode caller-owned bytes into a scratch buffer. No cluster read uses this.
 pub(crate) fn decode_scratch(encoded: &str) -> Result<crate::reach::Scratch, &'static str> {
     Ok(crate::reach::Scratch::from_bytes(payload(encoded)?))
 }
 
 // One field, at a length a line can hold. Truncated with the ellipsis
 // `describe` uses, so a clipped value looks clipped rather than merely short.
+#[cfg(test)]
 fn clipped(text: String) -> String {
     if text.chars().count() <= MAX_FIELD_CHARS {
         return text;
@@ -348,19 +417,31 @@ pub(crate) async fn fetch_releases(
     let path = collection_path(target, namespace);
     let fields = format!("type={RELEASE_TYPE}");
     let mut stored: BTreeMap<(String, String), Vec<Revision>> = BTreeMap::new();
-    let mut token: Option<String> = None;
+    let mut tokens: Vec<String> = Vec::new();
     let mut held = 0usize;
     let mut unreadable = 0usize;
     let mut truncated = false;
+    let mut bytes = 0usize;
+    let mut pages = 0usize;
     loop {
+        if pages == MAX_PAGES {
+            return metadata_failure(
+                "Helm releases exceed 10 metadata pages; incomplete inventory is refused",
+            );
+        }
+        if bytes == crate::reach::MAX_BODY_BYTES {
+            return metadata_failure(
+                "Helm release metadata exceed 8 MiB; incomplete inventory is refused",
+            );
+        }
         let mut params = ListParams::default()
             .limit(PAGE_LIMIT)
             .labels(OWNER_SELECTOR)
             .fields(&fields);
-        if let Some(token) = &token {
+        if let Some(token) = tokens.last() {
             params = params.continue_token(token);
         }
-        let request = match Request::new(path.clone()).list(&params) {
+        let request = match Request::new(path.clone()).list_metadata(&params) {
             Ok(request) => request,
             Err(error) => {
                 return Fetched::Failed {
@@ -369,55 +450,64 @@ pub(crate) async fn fetch_releases(
                 };
             }
         };
-        let page = match client.request::<WireList>(request).await {
-            Ok(page) => page,
-            Err(error) => return classify("helm releases", &error),
+        let response = match crate::reach::bounded_request_with_status(
+            client,
+            "helm releases",
+            request,
+            crate::reach::MAX_BODY_BYTES - bytes,
+        )
+        .await
+        .1
+        {
+            Fetched::Ok(response) => response,
+            Fetched::Denied { what } => return Fetched::Denied { what },
+            Fetched::Failed { what, why } => return Fetched::Failed { what, why },
         };
+        bytes += response.len();
+        pages += 1;
+        let page: WireList = match serde_json::from_slice(&response) {
+            Ok(page) => page,
+            Err(_) => {
+                return metadata_failure(
+                    "Helm releases returned an unsupported metadata response; no full Secret inventory is used",
+                );
+            }
+        };
+        if page.kind != "PartialObjectMetadataList" || page.api_version != "meta.k8s.io/v1" {
+            return metadata_failure(
+                "Helm releases did not return PartialObjectMetadataList; no full Secret inventory is used",
+            );
+        }
         for secret in page.items {
             if held == MAX_REVISIONS {
                 truncated = true;
                 break;
             }
-            let Some(encoded) = secret.data.get(PAYLOAD_KEY) else {
+            held += 1;
+            let Some((namespace, name, revision)) = secret.revision() else {
                 unreadable += 1;
                 continue;
             };
-            match decode(encoded) {
-                Ok(found) => {
-                    held += 1;
-                    // The payload's own identity first: it is what Helm wrote,
-                    // where the Secret's name is a convention about spelling it.
-                    // The Secret's namespace stands in when the payload has
-                    // none, since that is where the release is stored.
-                    let name = if found.name.is_empty() {
-                        secret.metadata.name.clone()
-                    } else {
-                        found.name
-                    };
-                    let namespace = if found.namespace.is_empty() {
-                        secret.metadata.namespace.clone()
-                    } else {
-                        found.namespace
-                    };
-                    stored
-                        .entry((namespace, name))
-                        .or_default()
-                        .push(found.revision);
-                }
-                Err(_) => unreadable += 1,
-            }
+            stored.entry((namespace, name)).or_default().push(revision);
         }
-        token = (!page.metadata.cont.is_empty() && !truncated).then_some(page.metadata.cont);
-        if token.is_none() {
+        if !page.metadata.cont.is_empty() && held == MAX_REVISIONS {
+            truncated = true;
+        }
+        if !truncated
+            && (page.metadata.cont.len() > MAX_TOKEN_BYTES || tokens.contains(&page.metadata.cont))
+        {
+            return metadata_failure(
+                "Helm release metadata have an oversized or repeated continuation token; incomplete inventory is refused",
+            );
+        }
+        if page.metadata.cont.is_empty() || truncated {
             break;
         }
+        tokens.push(page.metadata.cont);
     }
     let releases = stored
         .into_iter()
         .map(|((namespace, name), mut revisions)| {
-            // Newest first, which is the order a person reads a history in, and
-            // it makes the running revision the first element rather than a
-            // search.
             revisions.sort_by_key(|revision| std::cmp::Reverse(revision.revision));
             Release {
                 name,
@@ -433,7 +523,14 @@ pub(crate) async fn fetch_releases(
     })
 }
 
-/// One row per release, using the running revision. History stays on
+fn metadata_failure(why: &str) -> Fetched<Releases> {
+    Fetched::Failed {
+        what: "helm releases",
+        why: why.to_string(),
+    }
+}
+
+/// One row per release, preferring the revision labelled deployed. History stays on
 /// [`Release::revisions`]; a table is not a document, so it does not pad every
 /// stored revision onto the screen. Cells are the inventory fields only:
 /// [`Revision`] still has nowhere for values or manifests.
@@ -445,7 +542,7 @@ pub fn table_page(releases: &Releases) -> TablePage {
             wide: false,
         })
         .collect();
-    let rows = crate::browse::unreadable_row("Helm release Secret", releases.unreadable, 5, 3)
+    let rows = crate::browse::unreadable_row("Helm release metadata", releases.unreadable, 5, 3)
         .into_iter()
         .chain(releases.releases.iter().filter_map(|release| {
             let latest = release.latest()?;
@@ -472,11 +569,8 @@ pub fn table_page(releases: &Releases) -> TablePage {
     }
 }
 
-/// What the row says about the release's state. When the newest stored revision
-/// is the one running, that is the whole answer. When it is not, both facts are
-/// named: an interrupted upgrade leaves a revision Helm will not roll forward
-/// past, and a row that printed only one of the two would be reporting either a
-/// revision that is not serving or a release that looks unremarkable.
+/// Preserve both the recorded deployed revision and any newer pending or failed
+/// revision. A latest-only row would hide Helm's unfinished operation.
 fn status_label(running: &Revision, latest: &Revision) -> String {
     if running.revision == latest.revision {
         return running.status.clone();
@@ -489,7 +583,7 @@ fn status_label(running: &Revision, latest: &Revision) -> String {
 
 fn chart_label(revision: &Revision) -> String {
     match (revision.chart.as_str(), revision.chart_version.as_str()) {
-        ("", "") => "chart unnamed".to_string(),
+        ("", "") => METADATA_ONLY.to_string(),
         (name, "") => name.to_string(),
         (name, version) => format!("{name}-{version}"),
     }
@@ -502,12 +596,12 @@ fn chart_label(revision: &Revision) -> String {
 pub fn render(releases: &Releases) -> Vec<String> {
     let mut lines = Vec::new();
     if releases.releases.is_empty() && releases.unreadable == 0 {
-        lines.push("no Helm releases are stored in this cluster".to_string());
+        lines.push("no Helm release metadata is visible to this account".to_string());
         lines.push(String::new());
         lines.push(
-            "this reads the Secrets Helm itself writes (type helm.sh/release.v1, label \
-             owner=helm); nothing is installed to find them, so a cluster that uses the ConfigMap \
-             storage driver, or a namespace this account cannot list, shows as empty here"
+            "this reads Secret metadata only (type helm.sh/release.v1, label \
+             owner=helm); releases using the ConfigMap storage driver or namespaces outside \
+             this account's access are not covered"
                 .to_string(),
         );
     } else if releases.releases.is_empty() {
@@ -515,8 +609,8 @@ pub fn render(releases: &Releases) -> Vec<String> {
         // cluster is empty here would contradict the very field that counted
         // them, and it is the loudest line in the document.
         lines.push(
-            "no Helm release could be read here, though some are stored: every release Secret \
-             this account can see failed to decode"
+            "no Helm release identity could be read here, though some are stored: every selected \
+             entry has unusable release metadata"
                 .to_string(),
         );
     } else {
@@ -542,7 +636,7 @@ pub fn render(releases: &Releases) -> Vec<String> {
     }
     if releases.unreadable > 0 {
         lines.push(format!(
-            "{} release {} could not be decoded and {} not shown",
+            "{} release {} have unusable metadata and {} not shown",
             releases.unreadable,
             plural(releases.unreadable, "secret"),
             if releases.unreadable == 1 {
@@ -582,9 +676,8 @@ pub fn render(releases: &Releases) -> Vec<String> {
     if !releases.releases.is_empty() {
         lines.push(String::new());
         lines.push(
-            "values and rendered manifests are not shown here: a release payload can carry secret \
-             material, and revealing it needs an explicit per-field policy rather than a view that \
-             prints everything it decoded"
+            "chart, app version, deployment time, description, values and rendered manifests \
+             are unavailable: release Secret payloads are never fetched"
                 .to_string(),
         );
     }

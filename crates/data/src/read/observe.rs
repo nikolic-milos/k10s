@@ -301,8 +301,8 @@ impl Reader {
         });
     }
 
-    /// Trace id lookup against Tempo, then Jaeger. [`Fetched::Ok`]`None` is
-    /// absence of both stores.
+    /// Trace lookup uses Jaeger only when Tempo is absent. Binding failures
+    /// retain their own reason; [`Fetched::Ok`]`None` is absence of both stores.
     pub fn lookup_trace(
         &self,
         trace_id: String,
@@ -503,21 +503,17 @@ async fn probe_observe_tools(client: &Client) -> ObserveTools {
         reach::service_candidates(ToolKind::Tempo, &services),
     )
     .await;
-    let trace = if seen_of(&tempo) == Seen::Bound {
-        tempo
-    } else {
-        let jaeger = reach::bind_candidates(
-            client,
-            ToolKind::Jaeger,
-            settings.for_kind(ToolKind::Jaeger),
-            reach::service_candidates(ToolKind::Jaeger, &services),
-        )
-        .await;
-        match (&tempo, &jaeger) {
-            (_, ToolReach::Bound(_)) => jaeger,
-            (ToolReach::Unbound(_), _) => tempo,
-            _ => jaeger,
+    let trace = match tempo {
+        ToolReach::Absent { .. } => {
+            reach::bind_candidates(
+                client,
+                ToolKind::Jaeger,
+                settings.for_kind(ToolKind::Jaeger),
+                reach::service_candidates(ToolKind::Jaeger, &services),
+            )
+            .await
         }
+        tempo => tempo,
     };
     observe_tools(prometheus, loki, trace)
 }
@@ -614,28 +610,30 @@ async fn lookup_trace_optional(
 ) -> Fetched<Option<traces::Trace>> {
     let bound = match bind_observe_source(client, sources, ToolKind::Tempo).await {
         ToolReach::Bound(bound) => bound,
-        tempo => match (
-            tempo,
-            bind_observe_source(client, sources, ToolKind::Jaeger).await,
-        ) {
-            (_, ToolReach::Bound(bound)) => bound,
-            (ToolReach::Unbound(unbound), _) => {
-                return Fetched::Failed {
-                    what: "tempo",
-                    why: unbound_why(&unbound),
-                };
+        ToolReach::Unbound(unbound) => {
+            return Fetched::Failed {
+                what: "tempo",
+                why: unbound_why(&unbound),
+            };
+        }
+        ToolReach::Absent { .. } => {
+            match bind_observe_source(client, sources, ToolKind::Jaeger).await {
+                ToolReach::Bound(bound) => bound,
+                ToolReach::Unbound(unbound) => {
+                    return Fetched::Failed {
+                        what: "jaeger",
+                        why: unbound_why(&unbound),
+                    };
+                }
+                ToolReach::Absent { .. } => return Fetched::Ok(None),
             }
-            (_, ToolReach::Unbound(unbound)) => {
-                return Fetched::Failed {
-                    what: "jaeger",
-                    why: unbound_why(&unbound),
-                };
-            }
-            (_, ToolReach::Absent { .. }) => return Fetched::Ok(None),
-        },
+        }
     };
     match traces::lookup(client, &bound, trace_id).await {
-        Fetched::Ok(trace) => Fetched::Ok(Some(trace)),
+        Fetched::Ok(mut trace) => {
+            trace.source = format!("{} / {}", bound.kind.as_str(), bound.source());
+            Fetched::Ok(Some(trace))
+        }
         Fetched::Denied { what } => Fetched::Denied { what },
         Fetched::Failed { what, why } => Fetched::Failed { what, why },
     }

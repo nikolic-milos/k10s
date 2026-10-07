@@ -1,7 +1,7 @@
 //! Native source reuse, identity verification and cancellation on the wire.
 
 use crate::*;
-use k10s_data::integrations::{grafana, loki, prom};
+use k10s_data::integrations::{grafana, loki, prom, traces};
 use k10s_data::read::{Fetched, ObserveTools, Reader};
 use k10s_data::telemetry::{RequestMetrics, request_metrics};
 
@@ -11,6 +11,13 @@ const SOURCE_PROBE: &str = "/api/v1/namespaces/observe/services/prometheus:9090/
 const QUERY: &str = "/api/v1/namespaces/observe/services/prometheus:9090/proxy/api/v1/query_range?";
 const METADATA: &str = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1";
 const RESULT: &str = r#"{"status":"success","data":{"resultType":"matrix","result":[]}}"#;
+const TRACE_ID: &str = "0123456789abcdef0123456789abcdef";
+const TEMPO_GET: &str = "/api/v1/namespaces/observe/services/tempo";
+const TEMPO_READY: &str = "/api/v1/namespaces/observe/services/tempo:3200/proxy/ready";
+const TEMPO_TRACE: &str = "/api/v1/namespaces/observe/services/tempo:3200/proxy/api/v2/traces/0123456789abcdef0123456789abcdef";
+const JAEGER_GET: &str = "/api/v1/namespaces/observe/services/jaeger";
+const JAEGER_READY: &str = "/api/v1/namespaces/observe/services/jaeger:16686/proxy/";
+const JAEGER_TRACE: &str = "/api/v1/namespaces/observe/services/jaeger:16686/proxy/api/traces/0123456789abcdef0123456789abcdef";
 
 async fn connected(script: &Script) -> (Sync, EventReceiver) {
     script_discovery(script);
@@ -106,6 +113,401 @@ fn failure(answer: Fetched<Option<prom::QueryResult>>) -> String {
         panic!("source failure must be labelled: {answer:?}");
     };
     why
+}
+
+fn trace_services() -> Vec<serde_json::Value> {
+    vec![
+        service("tempo", "tempo-uid", "10", 3200),
+        service("jaeger", "jaeger-uid", "20", 16686),
+    ]
+}
+
+fn healthy_jaeger(script: &Script) {
+    script.route("GET", JAEGER_READY, 200, "ready");
+    script.route_accepting(
+        "GET", JAEGER_GET, METADATA, 200,
+        r#"{"metadata":{"name":"jaeger","namespace":"observe","uid":"jaeger-uid","resourceVersion":"20"}}"#,
+    );
+    script.route(
+        "GET",
+        JAEGER_TRACE,
+        200,
+        serde_json::json!({"data":[{"traceID":TRACE_ID,"spans":[{
+            "traceID":TRACE_ID,"spanID":"0123456789abcdef","operationName":"request",
+            "startTime":1,"duration":1
+        }],"processes":{}}]})
+        .to_string(),
+    );
+}
+
+fn tempo_trace(script: &Script, empty: bool) {
+    script.route(
+        "GET",
+        TEMPO_TRACE,
+        200,
+        if empty {
+            r#"{"trace":{}}"#.to_string()
+        } else {
+            serde_json::json!({"resourceSpans":[{"scopeSpans":[{"spans":[{
+                "traceId":TRACE_ID,"spanId":"0123456789abcdef","name":"request",
+                "startTimeUnixNano":"1000","endTimeUnixNano":"2000"
+            }]}]}]})
+            .to_string()
+        },
+    );
+}
+
+fn verified_tempo(script: &Script) {
+    script.route_accepting(
+        "GET", TEMPO_GET, METADATA, 200,
+        r#"{"metadata":{"name":"tempo","namespace":"observe","uid":"tempo-uid","resourceVersion":"10"}}"#,
+    );
+}
+
+async fn trace_reply(reader: &Reader, legacy: bool) -> Fetched<Option<traces::Trace>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let stop = if legacy {
+        reader.lookup_trace(TRACE_ID.into(), move |answer| {
+            let _ = tx.send(answer);
+        });
+        None
+    } else {
+        Some(reader.observe_trace(TRACE_ID.into(), move |answer| {
+            let _ = tx.send(answer);
+        }))
+    };
+    let reply = rx.await.expect("trace callback");
+    drop(stop);
+    reply
+}
+
+fn assert_trace_gets(rows: &[Seen], expected: &[(&str, &str)]) {
+    assert_eq!(rows.len(), expected.len(), "{rows:?}");
+    for (row, (path, accept)) in rows.iter().zip(expected) {
+        assert_eq!(
+            row.path,
+            if *path == SOURCE_LIST {
+                "/api/v1/services?&limit=200"
+            } else {
+                *path
+            }
+        );
+        assert_get(row, accept);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn healthy_tempo_and_empty_success_keep_the_actual_source_without_jaeger_reads() {
+    for empty in [false, true] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        healthy_jaeger(&script);
+        listed(&script, trace_services());
+        script.route("GET", TEMPO_READY, 200, "ready");
+        verified_tempo(&script);
+        let before = script.seen().len();
+        for _ in 0..2 {
+            tempo_trace(&script, empty);
+            let answer = trace_reply(&sync.reader, false).await;
+            let Fetched::Ok(Some(trace)) = answer else {
+                panic!("{answer:?}");
+            };
+            assert_eq!(trace.source, "Tempo / observe/tempo:3200");
+            assert_eq!(trace.spans.is_empty(), empty);
+            assert_eq!(trace.trace_id, if empty { "" } else { TRACE_ID });
+        }
+        let rows = after_sync(&script, before);
+        assert_trace_gets(
+            &rows,
+            &[
+                (SOURCE_LIST, ""),
+                (TEMPO_READY, "application/json"),
+                (TEMPO_TRACE, "application/json"),
+                (TEMPO_GET, METADATA),
+                (TEMPO_TRACE, "application/json"),
+            ],
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn absent_tempo_still_uses_the_verified_jaeger_source() {
+    for legacy in [false, true] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        healthy_jaeger(&script);
+        listed(&script, vec![service("jaeger", "jaeger-uid", "20", 16686)]);
+        if legacy {
+            listed(&script, vec![service("jaeger", "jaeger-uid", "20", 16686)]);
+        }
+        let before = script.seen().len();
+        let answer = trace_reply(&sync.reader, legacy).await;
+        let Fetched::Ok(Some(trace)) = answer else {
+            panic!("{answer:?}");
+        };
+        assert_eq!(trace.source, "Jaeger / observe/jaeger:16686");
+        assert_eq!(trace.trace_id, TRACE_ID);
+        assert_eq!(trace.spans.len(), 1);
+        let rows = after_sync(&script, before);
+        if legacy {
+            assert_trace_gets(
+                &rows,
+                &[
+                    (SOURCE_LIST, ""),
+                    (SOURCE_LIST, ""),
+                    (JAEGER_READY, "application/json"),
+                    (JAEGER_TRACE, "application/json"),
+                ],
+            );
+        } else {
+            assert_trace_gets(
+                &rows,
+                &[
+                    (SOURCE_LIST, ""),
+                    (JAEGER_GET, METADATA),
+                    (JAEGER_READY, "application/json"),
+                    (JAEGER_TRACE, "application/json"),
+                ],
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_tempo_binding_cannot_be_hidden_by_a_healthy_jaeger() {
+    for legacy in [false, true] {
+        for status in [0, 403, 500] {
+            let script = Script::default();
+            let (sync, _events) = connected(&script).await;
+            healthy_jaeger(&script);
+            let mut services = trace_services();
+            if status == 0 {
+                services.push(service("other-tempo", "other-uid", "30", 3200));
+            } else {
+                script.route(
+                    "GET",
+                    TEMPO_READY,
+                    status,
+                    r#"{"message":"Tempo storage is unavailable"}"#,
+                );
+            }
+            listed(&script, services);
+            let before = script.seen().len();
+            let answer = trace_reply(&sync.reader, legacy).await;
+            let Fetched::Failed { what, why } = answer else {
+                panic!("{answer:?}");
+            };
+            assert_eq!(what, "tempo");
+            if status == 500 {
+                assert_eq!(why, "Tempo storage is unavailable");
+            }
+            if status == 403 {
+                assert!(
+                    why.starts_with("Tempo proxy: tempo access denied for this account"),
+                    "{why}"
+                );
+            }
+            if status == 0 {
+                assert!(why.contains("matches 2 routed Services"), "{why}");
+            }
+            let expected = if status == 0 {
+                vec![(SOURCE_LIST, "")]
+            } else {
+                vec![(SOURCE_LIST, ""), (TEMPO_READY, "application/json")]
+            };
+            assert_trace_gets(&after_sync(&script, before), &expected);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn tempo_ambiguity_and_probe_failures_never_probe_the_healthy_jaeger() {
+    for legacy in [false, true] {
+        for status in [0, 403, 500] {
+            let script = Script::default();
+            let (sync, _events) = connected(&script).await;
+            healthy_jaeger(&script);
+            let mut services = trace_services();
+            if status == 0 {
+                services.push(service("other-tempo", "other-uid", "30", 3200));
+            } else {
+                script.route(
+                    "GET",
+                    TEMPO_READY,
+                    status,
+                    r#"{"message":"Tempo storage is unavailable"}"#,
+                );
+            }
+            listed(&script, services);
+            let before = script.seen().len();
+            let tools = if legacy {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                sync.reader.probe_observe_tools(move |tools| {
+                    let _ = tx.send(tools);
+                });
+                rx.await.expect("legacy source probe")
+            } else {
+                probe(&sync.reader).await
+            };
+            assert_eq!(tools.traces, k10s_data::read::Seen::Unbound, "{tools:?}");
+            assert_eq!(tools.errors.len(), 1, "{tools:?}");
+            assert!(tools.errors[0].starts_with("Tempo:"), "{tools:?}");
+            if status == 0 {
+                assert!(tools.errors[0].contains("matches 2 routed Services"));
+            }
+            if status == 500 {
+                assert!(tools.errors[0].contains("Tempo storage is unavailable"));
+            }
+            if status == 403 {
+                assert!(tools.errors[0].contains("tempo access denied for this account"));
+            }
+            let rows = after_sync(&script, before);
+            let expected = if status == 0 {
+                vec![(SOURCE_LIST, "")]
+            } else {
+                vec![(SOURCE_LIST, ""), (TEMPO_READY, "application/json")]
+            };
+            assert_trace_gets(&rows, &expected);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_changed_tempo_uid_or_metadata_failure_stops_before_any_jaeger_read() {
+    for status in [200, 403, 500] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        healthy_jaeger(&script);
+        listed(&script, trace_services());
+        script.route("GET", TEMPO_READY, 200, "ready");
+        tempo_trace(&script, false);
+        let warm = trace_reply(&sync.reader, false).await;
+        assert!(
+            matches!(
+                &warm,
+                Fetched::Ok(Some(trace)) if trace.source == "Tempo / observe/tempo:3200"
+            ),
+            "warm Tempo lookup: {warm:?}"
+        );
+        let before = script.seen().len();
+        if status == 200 {
+            script.route_accepting("GET", TEMPO_GET, METADATA, 200,
+                r#"{"metadata":{"name":"tempo","namespace":"observe","uid":"replacement-uid","resourceVersion":"11"}}"#);
+        } else {
+            script.route_accepting(
+                "GET",
+                TEMPO_GET,
+                METADATA,
+                status,
+                r#"{"message":"Tempo Service cannot be read"}"#,
+            );
+            if status == 403 {
+                script.route(
+                    "GET",
+                    SOURCE_LIST,
+                    403,
+                    r#"{"message":"services are forbidden"}"#,
+                );
+            }
+        }
+        let answer = trace_reply(&sync.reader, false).await;
+        let Fetched::Failed { what, why } = answer else {
+            panic!("{answer:?}");
+        };
+        assert_eq!(what, "tempo");
+        if status == 200 {
+            assert_eq!(
+                why,
+                "Tempo source Service observe/tempo was recreated or changed; refresh sources before querying"
+            );
+        }
+        if status == 500 {
+            assert_eq!(why, "Tempo Service cannot be read");
+        }
+        if status == 403 {
+            assert_eq!(why, "services: access denied for this account");
+        }
+        let rows = after_sync(&script, before);
+        let expected = if status == 403 {
+            vec![(TEMPO_GET, METADATA), (SOURCE_LIST, "")]
+        } else {
+            vec![(TEMPO_GET, METADATA)]
+        };
+        assert_trace_gets(&rows, &expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn tempo_query_errors_keep_their_state_and_get_denial_keeps_list_authority() {
+    for status in [0, 403, 500] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        healthy_jaeger(&script);
+        listed(&script, trace_services());
+        script.route("GET", TEMPO_READY, 200, "ready");
+        tempo_trace(&script, false);
+        let warm = trace_reply(&sync.reader, false).await;
+        assert!(
+            matches!(
+                &warm,
+                Fetched::Ok(Some(trace)) if trace.source == "Tempo / observe/tempo:3200"
+            ),
+            "warm Tempo lookup: {warm:?}"
+        );
+        let before = script.seen().len();
+        if status == 0 {
+            script.route_accepting(
+                "GET",
+                TEMPO_GET,
+                METADATA,
+                403,
+                r#"{"message":"get is not granted"}"#,
+            );
+            listed(&script, trace_services());
+            script.route("GET", TEMPO_READY, 200, "ready");
+            tempo_trace(&script, false);
+        } else {
+            verified_tempo(&script);
+            script.route(
+                "GET",
+                TEMPO_TRACE,
+                status,
+                r#"{"message":"trace storage is unavailable"}"#,
+            );
+        }
+        let answer = trace_reply(&sync.reader, false).await;
+        if status == 0 {
+            let Fetched::Ok(Some(trace)) = answer else {
+                panic!("authorized LIST and proxy access remain usable: {answer:?}");
+            };
+            assert_eq!(trace.source, "Tempo / observe/tempo:3200");
+            assert_trace_gets(
+                &after_sync(&script, before),
+                &[
+                    (TEMPO_GET, METADATA),
+                    (SOURCE_LIST, ""),
+                    (TEMPO_READY, "application/json"),
+                    (TEMPO_TRACE, "application/json"),
+                ],
+            );
+        } else {
+            assert_eq!(
+                answer,
+                if status == 403 {
+                    Fetched::Denied { what: "tempo" }
+                } else {
+                    Fetched::Failed {
+                        what: "tempo",
+                        why: "trace storage is unavailable".into(),
+                    }
+                }
+            );
+            assert_trace_gets(
+                &after_sync(&script, before),
+                &[(TEMPO_GET, METADATA), (TEMPO_TRACE, "application/json")],
+            );
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]

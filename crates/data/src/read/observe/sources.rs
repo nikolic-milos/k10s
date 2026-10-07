@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
-use super::{ObserveTools, observe_tools, seen_of};
+use super::{ObserveTools, observe_tools};
 use crate::reach::{
     self, Bound, FoundService, ToolAuth, ToolKind, ToolOverride, ToolReach, Transport, Unbound,
 };
@@ -277,15 +277,9 @@ impl Sources {
         let prometheus = snapshot.bind(client, ToolKind::Prometheus).await;
         let loki = snapshot.bind(client, ToolKind::Loki).await;
         let tempo = snapshot.bind(client, ToolKind::Tempo).await;
-        let trace = if seen_of(&tempo) == super::Seen::Bound {
-            tempo
-        } else {
-            let jaeger = snapshot.bind(client, ToolKind::Jaeger).await;
-            match (&tempo, &jaeger) {
-                (_, ToolReach::Bound(_)) => jaeger,
-                (ToolReach::Unbound(_), _) => tempo,
-                _ => jaeger,
-            }
+        let trace = match tempo {
+            ToolReach::Absent { .. } => snapshot.bind(client, ToolKind::Jaeger).await,
+            tempo => tempo,
         };
         *state = Some(snapshot);
         observe_tools(prometheus, loki, trace)

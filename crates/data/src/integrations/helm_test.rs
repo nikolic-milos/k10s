@@ -1,7 +1,4 @@
-//! Decoding a `helm.sh/release.v1` Secret through both of its layers, and the
-//! reduction that makes the rest of the payload unreachable: nothing a release
-//! carries beyond its inventory survives, and a compression bomb is refused
-//! rather than expanded.
+//! Metadata inventory limits and legacy pure decoders for caller-owned bytes.
 
 use super::*;
 use std::io::Write;
@@ -106,7 +103,7 @@ fn nothing_a_release_carries_beyond_its_inventory_survives_the_decode() {
 }
 
 #[test]
-fn the_table_is_one_row_per_release_from_the_running_revision() {
+fn the_table_is_one_row_per_release_from_the_recorded_deployed_revision() {
     let json = release_json("ingress-nginx", 4, "deployed");
     let stored = decode(&as_the_api_server_sends_it(&json)).expect("decodes");
     let older = Revision {
@@ -249,7 +246,7 @@ fn an_inventory_that_could_not_read_anything_does_not_claim_there_is_nothing() {
     );
     assert!(lines[0].contains("though some are stored"), "{text}");
     assert!(
-        text.contains("3 release secrets could not be decoded"),
+        text.contains("3 release secrets have unusable metadata"),
         "{text}"
     );
 }
@@ -257,7 +254,10 @@ fn an_inventory_that_could_not_read_anything_does_not_claim_there_is_nothing() {
 #[test]
 fn an_empty_inventory_says_what_it_looked_at_rather_than_nothing() {
     let lines = render(&Releases::default());
-    assert_eq!(lines[0], "no Helm releases are stored in this cluster");
+    assert_eq!(
+        lines[0],
+        "no Helm release metadata is visible to this account"
+    );
     let text = lines.join("\n");
     assert!(text.contains("helm.sh/release.v1"), "{text}");
     assert!(
@@ -335,17 +335,121 @@ fn a_history_renders_newest_first_with_its_chart_and_status() {
     );
     assert!(text.contains("stopped at"), "a cap is stated: {text}");
     assert!(
-        text.contains("2 release secrets could not be decoded and are not shown"),
-        "and so is a payload that would not read: {text}"
+        text.contains("2 release secrets have unusable metadata and are not shown"),
+        "and so is metadata that would not read: {text}"
     );
     assert!(
-        text.contains("values and rendered manifests are not shown"),
+        text.contains("values and rendered manifests are unavailable"),
         "and the reason the obvious next thing is missing: {text}"
     );
 }
 
+fn metadata_revision(
+    name: &str,
+    namespace: &str,
+    release: &str,
+    status: &str,
+    version: &str,
+) -> WireSecret {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata",
+        "metadata":{"name":name,"namespace":namespace,"labels":{
+            "owner":"helm","name":release,"version":version,"status":status
+        }}
+    }))
+    .expect("metadata fixture")
+}
+
 #[test]
-fn a_pending_revision_does_not_present_as_the_running_release() {
+fn metadata_keeps_complete_identity_and_never_invents_payload_fields() {
+    let secret_name = "s".repeat(253);
+    let namespace = "n".repeat(63);
+    let release_name = "r".repeat(63);
+    let (ns, name, revision) = metadata_revision(
+        &secret_name,
+        &namespace,
+        &release_name,
+        "future-status",
+        "4294967295",
+    )
+    .revision()
+    .expect("legal metadata identity is retained");
+    assert_eq!(ns, namespace);
+    assert_eq!(name, release_name);
+    assert_eq!(revision.revision, u32::MAX);
+    assert_eq!(revision.status, "future-status");
+    for field in [
+        &revision.updated,
+        &revision.description,
+        &revision.chart,
+        &revision.chart_version,
+        &revision.app_version,
+    ] {
+        assert!(field.is_empty(), "metadata cannot identify a payload field");
+    }
+    let page = table_page(&Releases {
+        releases: vec![Release {
+            name: name.clone(),
+            namespace: ns.clone(),
+            revisions: vec![revision],
+        }],
+        ..Releases::default()
+    });
+    assert_eq!(page.rows[0].name, name);
+    assert_eq!(page.rows[0].namespace.as_deref(), Some(ns.as_str()));
+    assert_eq!(page.rows[0].uid, format!("{ns}/{name}"));
+    assert_eq!(page.rows[0].cells[4], "unavailable (metadata only)");
+}
+
+#[test]
+fn metadata_decode_retains_only_a_bounded_prefix_and_one_overflow_entry() {
+    let body = serde_json::json!({
+        "apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadataList",
+        "items":vec![serde_json::json!({"metadata":{}}); MAX_REVISIONS + 100]
+    })
+    .to_string();
+    let page: WireList = serde_json::from_str(&body).expect("bounded metadata prefix");
+    assert_eq!(page.items.len(), MAX_REVISIONS + 1);
+}
+
+#[test]
+fn unusable_release_metadata_is_not_replaced_with_a_guessed_identity() {
+    for (name, namespace, release, status, version) in [
+        ("", "prod", "api", "deployed", "1"),
+        ("secret", "", "api", "deployed", "1"),
+        ("secret", "prod", "", "deployed", "1"),
+        ("secret", "prod", "api", "", "1"),
+        ("secret", "prod", "api", "deployed", "0"),
+        ("secret", "prod", "api", "deployed", "4294967296"),
+        ("secret", "prod", "api", "deployed", "not-a-version"),
+    ] {
+        assert!(
+            metadata_revision(name, namespace, release, status, version)
+                .revision()
+                .is_none()
+        );
+    }
+    for field in ["name", "namespace"] {
+        let mut wire = metadata_revision("secret", "prod", "api", "deployed", "1");
+        match field {
+            "name" => wire.metadata.name = "n".repeat(254),
+            _ => wire.metadata.namespace = "n".repeat(64),
+        }
+        assert!(wire.revision().is_none());
+    }
+    for field in ["owner", "name", "status"] {
+        let mut wire = metadata_revision("secret", "prod", "api", "deployed", "1");
+        match field {
+            "owner" => wire.metadata.labels.owner = "another-owner".into(),
+            "name" => wire.metadata.labels.name = "n".repeat(64),
+            _ => wire.metadata.labels.status = "s".repeat(64),
+        }
+        assert!(wire.revision().is_none());
+    }
+}
+
+#[test]
+fn a_pending_revision_does_not_replace_the_recorded_deployed_revision() {
     let json = release_json("ingress-nginx", 4, "deployed");
     let stored = decode(&as_the_api_server_sends_it(&json)).expect("decodes");
     let interrupted = Revision {
@@ -365,9 +469,12 @@ fn a_pending_revision_does_not_present_as_the_running_release() {
         "the newest stored revision is still the top of the stack"
     );
     assert_eq!(
-        release.current().expect("a running revision").revision,
+        release
+            .current()
+            .expect("a recorded deployed revision")
+            .revision,
         4,
-        "an interrupted upgrade leaves revision 4 serving traffic"
+        "the deployed marker remains on revision 4"
     );
 
     let page = table_page(&Releases {
@@ -375,7 +482,10 @@ fn a_pending_revision_does_not_present_as_the_running_release() {
         truncated: false,
         unreadable: 0,
     });
-    assert_eq!(page.rows[0].cells[2], "4", "the row is what is running");
+    assert_eq!(
+        page.rows[0].cells[2], "4",
+        "the row follows the deployed marker"
+    );
     assert_eq!(
         page.rows[0].cells[3], "deployed (revision 5 pending-upgrade)",
         "and it still names the revision Helm has not finished"

@@ -117,7 +117,7 @@ fn helm_keeps_release_decode_failures() {
             unreadable: count,
             ..Default::default()
         };
-        check_unreadable(helm::table_page(&releases), "Helm release Secret", count);
+        check_unreadable(helm::table_page(&releases), "Helm release metadata", count);
     }
 }
 

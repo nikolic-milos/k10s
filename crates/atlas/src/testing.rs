@@ -475,4 +475,65 @@ mod tests {
         assert_eq!(s.blocks.len(), 2000);
         assert_eq!(s.regions[0].children, 0..2000);
     }
+
+    #[test]
+    fn fitted_workload_overview_and_first_cell_stage_keep_distinct_budget_proofs() {
+        const VW: f32 = 1600.0;
+        const VH: f32 = 1000.0;
+        let policy = lod_policy();
+        for degree in [policy.max_cells_per_block, 2048, 5000, 10_000] {
+            let s = scene(SceneSpec {
+                regions: 1,
+                blocks_per_region: 4,
+                cells_per_block: degree,
+                sats_per_block: 2,
+                edges_per_region: 0,
+            });
+            let mut fitted = crate::Camera::default();
+            fitted.fit(s.blocks[0].inner, VW, VH);
+            let overview = crate::cull(
+                &s,
+                &fitted,
+                &policy,
+                crate::StageBlend::settled(policy.stage_for_zoom(fitted.zoom)),
+                VW,
+                VH,
+                true,
+                false,
+            );
+            assert_eq!(overview.stage, 1, "degree {degree}");
+            assert!(overview.drawn_blocks > 0);
+            assert_eq!(overview.drawn_cells, 0);
+            assert_eq!(overview.drawn_sats, 0);
+            assert_eq!(overview.curves, 0);
+            assert_eq!(overview.aggregated_blocks, 0);
+            assert_eq!(overview.aggregated_cells, 0);
+
+            let first_cell = crate::Camera {
+                zoom: policy.stage_cell,
+                ..fitted
+            };
+            let detail = crate::cull(
+                &s,
+                &first_cell,
+                &policy,
+                crate::StageBlend::settled(policy.stage_for_zoom(first_cell.zoom)),
+                VW,
+                VH,
+                true,
+                false,
+            );
+            assert_eq!(detail.stage, 2, "degree {degree}");
+            assert!(detail.drawn_cells <= policy.max_cells_per_block);
+            if degree > policy.max_cells_per_block {
+                assert_eq!(detail.aggregated_blocks, 1, "degree {degree}");
+                assert_eq!(detail.aggregated_cells, degree, "degree {degree}");
+                assert_eq!(detail.drawn_cells, 0);
+            } else {
+                assert_eq!(detail.aggregated_blocks, 0);
+                assert_eq!(detail.aggregated_cells, 0);
+                assert!(detail.drawn_cells > 0);
+            }
+        }
+    }
 }

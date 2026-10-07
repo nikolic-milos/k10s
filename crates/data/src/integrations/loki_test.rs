@@ -60,6 +60,109 @@ fn structured_metadata_on_a_value_is_ignored_and_the_line_is_kept() {
     assert_eq!(logs.dropped_lines, 0);
 }
 
+fn identity_metadata(metadata: Value) -> String {
+    streams(
+        &serde_json::json!([{
+            "stream": {
+                "k8s_namespace_name": "prod", "k8s_pod_name": "api", "k8s_pod_uid": "current",
+                "trace_id": "0123456789abcdef0123456789abcdef",
+            },
+            "values": [["1", "actual line", metadata]],
+        }])
+        .to_string(),
+    )
+}
+
+#[test]
+fn malformed_entry_identity_never_inherits_current_stream_labels() {
+    for key in [
+        "trace_id",
+        "span_id",
+        "k8s_namespace_name",
+        "k8s_pod_name",
+        "k8s_pod_uid",
+        "k8s_node_name",
+    ] {
+        for value in [
+            Value::Null,
+            serde_json::json!(10),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({"PLANTED": "not retained"}),
+        ] {
+            let metadata = Value::Object(serde_json::Map::from_iter([(key.into(), value)]));
+            let why = parse(identity_metadata(metadata).as_bytes())
+                .expect_err("invalid identity is refused");
+            assert_eq!(
+                why,
+                format!("Loki entry metadata {key} has a non-string identity value")
+            );
+            assert!(!why.contains("PLANTED"));
+        }
+    }
+}
+
+#[test]
+fn entry_identity_byte_boundaries_preserve_complete_utf8_or_refuse() {
+    for key in [
+        "trace_id",
+        "span_id",
+        "k8s_namespace_name",
+        "k8s_pod_name",
+        "k8s_pod_uid",
+        "k8s_node_name",
+    ] {
+        for text in [
+            "x".repeat(MAX_METADATA_VALUE_BYTES),
+            format!("{}x", "界".repeat(85)),
+        ] {
+            assert_eq!(text.len(), MAX_METADATA_VALUE_BYTES);
+            let metadata = Value::Object(serde_json::Map::from_iter([(
+                key.into(),
+                Value::String(text.clone()),
+            )]));
+            let logs =
+                parse(identity_metadata(metadata).as_bytes()).expect("the exact bound is retained");
+            assert!(!logs.truncated);
+            assert_eq!(
+                logs.streams[0].lines[0].metadata,
+                [(key.to_string(), text.clone())]
+            );
+            let metadata = Value::Object(serde_json::Map::from_iter([(
+                key.into(),
+                Value::String(format!("{text}x")),
+            )]));
+            assert_eq!(
+                parse(identity_metadata(metadata).as_bytes()).unwrap_err(),
+                format!("Loki entry metadata {key} exceeds 256 bytes; its identity is refused")
+            );
+        }
+    }
+}
+
+#[test]
+fn absent_empty_and_conflicting_entry_identity_remain_distinct() {
+    for metadata in [
+        Value::Null,
+        serde_json::json!({}),
+        serde_json::json!({"unrelated": {"not": "identity"}}),
+    ] {
+        let logs =
+            parse(identity_metadata(metadata).as_bytes()).expect("no entry identity is valid");
+        assert!(!logs.truncated);
+        assert!(logs.streams[0].lines[0].metadata.is_empty());
+    }
+    for uid in ["", "retired"] {
+        let logs =
+            parse(identity_metadata(serde_json::json!({"k8s_pod_uid": uid})).as_bytes()).unwrap();
+        assert!(!logs.truncated);
+        assert_eq!(
+            logs.streams[0].lines[0].metadata,
+            [("k8s_pod_uid".into(), uid.into())]
+        );
+    }
+}
+
 #[test]
 fn streams_past_sixteen_are_counted_not_silently_dropped() {
     let items: Vec<String> = (0..=MAX_STREAMS)

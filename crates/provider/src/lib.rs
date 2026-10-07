@@ -105,8 +105,8 @@ cluster_provider! {
     fn fetch_table(&self, kind: KindId, continue_token: Option<String>, reply: Reply<TableOutcome>);
     fn fetch_node_table(&self, reply: Reply<TableOutcome>);
     fn fetch_describe(&self, request: &DescribeRequest, reply: Reply<DocOutcome>);
-    /// Helm's stored releases as a table. Values and manifests never cross:
-    /// the far side reduces a release to inventory columns before it answers.
+    /// Helm release labels as a metadata-only inventory. Stored Secret payloads
+    /// are never fetched; fields absent from metadata remain unavailable.
     fn fetch_releases(&self, reply: Reply<TableOutcome>);
     /// Argo Applications. [`TableOutcome::Absent`] means the group is not
     /// served, so the view stays invisible rather than opening an empty pane.
@@ -189,8 +189,8 @@ cluster_provider! {
     /// Discover the endpoint once so the silence review names its destination.
     fn bind_alertmanager(&self, reply: Reply<AlertmanagerOutcome>);
     fn create_silence(&self, request: &SilenceRequest, confirm: bool, reply: Reply<SilenceOutcome>);
-    /// Explicit reveal of one Helm revision. The answer is for a scratch
-    /// editor, never a table page.
+    /// Stored payload operations report their metadata-only policy refusal
+    /// before transport. The outcome API also serves disconnected providers.
     fn reveal_helm(
         &self,
         namespace: Option<String>,

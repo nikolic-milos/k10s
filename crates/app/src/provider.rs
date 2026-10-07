@@ -129,9 +129,7 @@ impl k10s_provider::ClusterProvider for PlaneProvider {
             .fetch_describe(request, move |fetched| reply(describe_outcome(fetched)));
     }
 
-    // Helm's release inventory as a table. The shell never holds a release
-    // payload: columns are identity, revision, status, chart, and nothing
-    // that could carry values or a manifest.
+    // Inventory uses release labels; payload-only fields remain unavailable.
     fn fetch_releases(&self, reply: k10s_provider::Reply<k10s_provider::TableOutcome>) {
         self.reader
             .fetch_releases(None, move |fetched| reply(releases_outcome(fetched)));

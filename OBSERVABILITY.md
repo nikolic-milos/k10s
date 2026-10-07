@@ -17,8 +17,9 @@ Add repeatable `--namespace NS` when the account needs namespace-scoped
 discovery. A context identifies a cluster, user and optional namespace.
 [Kubernetes kubeconfig reference](https://kubernetes.io/docs/concepts/configuration/organize-cluster-access-kubeconfig/).
 
-From the map, `/` searches cluster objects. Select the namespace/object, then
-Shift+G for **Observe** and `i` for the inspector. Check context and selection.
+From the map, `/` searches cluster objects. Confirming an object selects its
+current UID, reveals it and opens the inspector. Shift+G opens **Observe**;
+`i` toggles the inspector. Check context and selection.
 
 Observe has these default shortcuts when neither query nor filter input is
 active. Enter/Escape leaves input mode. Its named actions also appear under
@@ -81,6 +82,8 @@ Prometheus datasource UID. The resolved expression/source/unit remain visible.
 Stat supports `lastNotNull` (default), `min`, `max`, `mean` and `sum` over finite
 samples. Missing stays missing. `percentunit` displays as percent; other unit IDs
 do not imply Grafana's full formatting.
+Broken provisioned dashboard files carry their ConfigMap and filename beside
+healthy catalog rows. Invalid panel arrays produce a named failure.
 [Grafana datasource API](https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/data_source/),
 [calculation types](https://grafana.com/docs/grafana/latest/visualizations/panels-visualizations/query-transform-data/calculation-types/).
 
@@ -117,6 +120,8 @@ matching entries in that source/range.
 Loki normalizes dots to underscores. Attributes can be indexed labels or
 per-entry structured metadata; native correlation checks both, without assuming
 UID placement.
+Per-entry attributes take precedence over stream labels. Malformed or oversized
+correlation attributes fail the result instead of inheriting a stream-level match.
 [Loki OTel ingestion](https://grafana.com/docs/loki/latest/send-data/otel/),
 [OTel Kubernetes resource attributes](https://opentelemetry.io/docs/specs/semconv/resource/k8s/).
 
@@ -124,7 +129,12 @@ Select a real trace ID and **Open selected trace**, or Enter with log-table focu
 Traces verifies returned ID, then span namespace/Pod/UID against captured scope.
 Time/name/trace-ID links alone do not prove Kubernetes identity. The pane labels
 full, partial or unproven association. Empty success keeps requested ID, clears
-spans and names the empty result; partial/malformed Tempo replies fail.
+spans and names the empty result. Partial Tempo envelopes and invalid span
+containers, IDs or timing fields fail with a named reason.
+Times accept unsigned JSON integers and exactly validated quoted integer forms.
+Unquoted decimal or exponent number encodings are unsupported and are refused.
+Successful and empty lookups retain the actual backend and source. Jaeger is
+used only when Tempo is absent; a Tempo binding failure keeps its own reason.
 [Tempo lookup API](https://grafana.com/docs/tempo/latest/api_docs/).
 
 Shift+T opens Traces; `q` edits its ID and Enter runs it. Different IDs or selection
@@ -143,6 +153,11 @@ metric/log/trace records with intended identity at the destinations. Components
 must be enabled in service pipelines. k10s installs no instrumentation/backends.
 [Collector configuration](https://opentelemetry.io/docs/collector/configuration/),
 [Collector 0.160.0 health extension](https://raw.githubusercontent.com/open-telemetry/opentelemetry-collector-contrib/v0.160.0/extension/healthcheckextension/README.md).
+
+Helm release inventory uses Secret metadata labels for name, revision and status.
+Stored chart details, deployment timestamps, values and manifests are not read.
+Reveal, revision diff and stored-revision apply report this limitation before
+any request. Use the existing Helm tool when an operation requires its payloads.
 
 ## Current limits
 

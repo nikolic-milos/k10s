@@ -45,6 +45,49 @@ fn log_trace_links_use_structured_metadata_and_indexed_labels() {
 }
 
 #[test]
+fn refused_log_identity_reaches_the_provider_as_a_failure_without_entries() {
+    for metadata in [
+        serde_json::json!({"k8s_pod_uid": 10}),
+        serde_json::json!({"k8s_pod_name": "x".repeat(257)}),
+        serde_json::json!({"trace_id": null}),
+    ] {
+        let body = serde_json::json!({"status":"success","data":{"resultType":"streams","result":[{
+            "stream":{"k8s_namespace_name":"prod","k8s_pod_name":"api","k8s_pod_uid":"current-uid","trace_id":"0123456789abcdef0123456789abcdef"},
+            "values":[["1","actual line", metadata]]
+        }]}}).to_string();
+        let why = k10s_data::integrations::loki::parse(body.as_bytes())
+            .expect_err("malformed identity must not become an entry");
+        assert!(why.starts_with("Loki entry metadata"));
+        assert_eq!(
+            loki_outcome(Fetched::Failed {
+                what: "loki",
+                why: why.clone()
+            }),
+            k10s_provider::LokiOutcome::Failed(why)
+        );
+    }
+}
+
+#[test]
+fn bounded_entry_identity_shadows_stream_identity_even_when_empty() {
+    for uid in ["", "retired-uid"] {
+        let body = serde_json::json!({"status":"success","data":{"resultType":"streams","result":[{
+            "stream":{"k8s_namespace_name":"prod","k8s_pod_name":"api","k8s_pod_uid":"current-uid"},
+            "values":[["1","actual line", {"k8s_pod_uid":uid}]]
+        }]}})
+        .to_string();
+        let logs = k10s_data::integrations::loki::parse(body.as_bytes()).expect("bounded metadata");
+        let k10s_provider::LokiOutcome::Logs { entries, .. } =
+            loki_outcome(Fetched::Ok(Some(logs)))
+        else {
+            panic!("valid log data");
+        };
+        assert_eq!(entries[0].attribute("k8s_pod_uid"), Some(uid));
+        assert_ne!(entries[0].attribute("k8s_pod_uid"), Some("current-uid"));
+    }
+}
+
+#[test]
 fn a_failed_observe_probe_stays_blocked_and_keeps_its_sentence() {
     let reach = observe_reach(Fetched::Failed {
         what: "telemetry",
@@ -768,18 +811,64 @@ fn grafana_catalog_failures_survive_projection_instead_of_appearing_absent() {
 fn an_empty_trace_reply_remains_distinct_from_an_absent_store() {
     let trace = k10s_data::integrations::traces::Trace {
         trace_id: String::new(),
+        source: "Tempo / observe/tempo:3200".into(),
         spans: Vec::new(),
     };
-    assert!(matches!(
+    assert_eq!(
         trace_outcome(Fetched::Ok(Some(trace))),
-        k10s_provider::TraceOutcome::Empty
-    ));
+        k10s_provider::TraceOutcome::Empty {
+            source: "Tempo / observe/tempo:3200".into()
+        }
+    );
     let trace = k10s_data::integrations::traces::Trace {
         trace_id: "returned-id".into(),
+        source: "Jaeger / observe/jaeger:16686".into(),
         spans: Vec::new(),
     };
     assert!(
-        matches!(trace_outcome(Fetched::Ok(Some(trace))), k10s_provider::TraceOutcome::Trace { trace_id, spans } if trace_id=="returned-id" && spans.is_empty())
+        matches!(trace_outcome(Fetched::Ok(Some(trace))), k10s_provider::TraceOutcome::Trace { trace_id, source, spans } if trace_id=="returned-id" && source=="Jaeger / observe/jaeger:16686" && spans.is_empty())
+    );
+}
+
+#[test]
+fn successful_trace_projection_keeps_its_backend_source_and_span_identity() {
+    let mut trace = k10s_data::integrations::traces::parse(br#"{
+        "resourceSpans":[{"resource":{"attributes":[{"key":"k8s.pod.uid","value":{"stringValue":"current-uid"}}]},
+        "scopeSpans":[{"spans":[{"traceId":"0123456789abcdef0123456789abcdef","spanId":"0123456789abcdef",
+        "startTimeUnixNano":"1000","endTimeUnixNano":"2000"}]}]}]
+    }"#).expect("a decoded trace");
+    trace.source = "Tempo / observe/tempo:3200".into();
+    let k10s_provider::TraceOutcome::Trace {
+        trace_id,
+        source,
+        spans,
+    } = trace_outcome(Fetched::Ok(Some(trace)))
+    else {
+        panic!("successful trace data crosses the provider");
+    };
+    assert_eq!(trace_id, "0123456789abcdef0123456789abcdef");
+    assert_eq!(source, "Tempo / observe/tempo:3200");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].pod_uid, "current-uid");
+    assert_eq!((spans[0].start_us, spans[0].duration_us), (1, 1));
+}
+
+#[test]
+fn failed_denied_and_absent_traces_keep_their_state_without_a_success_source() {
+    assert_eq!(
+        trace_outcome(Fetched::Failed {
+            what: "tempo",
+            why: "trace storage is unavailable".into()
+        }),
+        k10s_provider::TraceOutcome::Failed("trace storage is unavailable".into())
+    );
+    assert_eq!(
+        trace_outcome(Fetched::Denied { what: "tempo" }),
+        k10s_provider::TraceOutcome::Denied("tempo")
+    );
+    assert_eq!(
+        trace_outcome(Fetched::Ok(None)),
+        k10s_provider::TraceOutcome::Absent
     );
 }
 

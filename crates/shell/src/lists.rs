@@ -2,16 +2,10 @@
 //!
 //! These adapters already fetch on the data plane. This view is the same
 //! [`TableState`] machine browse and nodes use, over pages those fetches
-//! already produce. Helm is always a pane: a cluster without release Secrets
-//! is an empty list, not absence. Values stay off this table: a key on a
-//! Helm row starts a reveal. Adapters that are not served emit
-//! [`InventoryEvent::NotServed`] so the workspace can take the pane down
-//! rather than leave an empty broken one. A 403 stays a labelled status.
-//!
-//! A Helm stored-manifest apply is armed by the first `u` and sent by the
-//! second, once: the `Latch` refuses every press while it is out, for as
-//! long as this view lives, and the workspace keeps the write's record so a
-//! Releases tab reopened meanwhile refuses too and shows the answer.
+//! already produce. Helm shows recorded release labels from Secret metadata;
+//! payload reveal, diff and stored apply report unavailable without emitting
+//! an action. A denial stays labelled. Other unserved adapters emit
+//! [`InventoryEvent::NotServed`] so the workspace can remove their panes.
 
 use std::rc::Rc;
 
@@ -21,7 +15,7 @@ use gpui::{
     prelude::*, px, rgb,
 };
 
-use crate::confirm::{Latch, Press, Slot, StatusText, nothing_listed};
+use crate::confirm::{Latch, Slot, StatusText, nothing_listed};
 use crate::table::TableState;
 use crate::tag::ItemTag;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header, status_slot};
@@ -68,7 +62,7 @@ impl InventoryKind {
 
     fn empty_hint(self) -> &'static str {
         match self {
-            InventoryKind::Helm => "no Helm releases are stored in this cluster",
+            InventoryKind::Helm => "no Helm release metadata is visible to this account",
             InventoryKind::Argo => "no Argo CD Applications are in this cluster",
             InventoryKind::Flux => "no Flux objects are stored in this cluster",
             InventoryKind::Policy => "no policy reports are in this cluster",
@@ -269,61 +263,12 @@ impl InventoryView {
         Some((row.namespace.clone(), row.name.clone(), revision))
     }
 
-    fn emit_reveal(&mut self, cx: &mut Context<Self>) {
-        let Some((namespace, name, revision)) = self.selected_release() else {
+    fn refuse_payload_action(&mut self, cx: &mut Context<Self>) {
+        let Some(why) = helm_payload_notice(self.kind) else {
             return;
         };
         self.latch.disarm();
-        cx.emit(InventoryEvent::RevealRelease {
-            namespace,
-            name,
-            revision,
-        });
-    }
-
-    fn emit_diff(&mut self, cx: &mut Context<Self>) {
-        let Some((namespace, name, revision)) = self.selected_release() else {
-            return;
-        };
-        self.latch.disarm();
-        if revision <= 1 {
-            self.status =
-                Some(format!("{name} revision {revision} has no previous revision to diff").into());
-            cx.notify();
-            return;
-        }
-        cx.emit(InventoryEvent::DiffRelease {
-            namespace,
-            name,
-            from: revision - 1,
-            to: revision,
-        });
-    }
-
-    // Nothing to ask the server first, so the first `u` arms and forms both
-    // lines, and the second sends the stored triple once.
-    fn emit_rollback(&mut self, cx: &mut Context<Self>) {
-        let Some((namespace, name, revision)) = self.selected_release() else {
-            return;
-        };
-        let subject = rollback_subject(namespace.as_deref(), &name, revision);
-        match self.latch.press(&subject) {
-            Press::Ask => {
-                let (armed, sent) = rollback_lines(&name, revision);
-                self.status = None;
-                self.latch
-                    .arm(subject, (namespace, name, revision), armed, sent);
-            }
-            Press::Go((namespace, name, revision)) => {
-                self.status = None;
-                cx.emit(InventoryEvent::RollbackRelease {
-                    namespace,
-                    name,
-                    revision,
-                });
-            }
-            Press::Refused => {}
-        }
+        self.status = Some(why.into());
         cx.notify();
     }
 
@@ -349,7 +294,9 @@ impl InventoryView {
 
     fn hint(&self) -> &'static str {
         match self.kind {
-            InventoryKind::Helm => "v reveal · shift-v diff · u rollback · / filter · r refresh",
+            InventoryKind::Helm => {
+                "metadata only · payload actions unavailable · / filter · r refresh"
+            }
             _ => "/ filter · r refresh · esc close filter",
         }
     }
@@ -362,6 +309,11 @@ impl InventoryView {
         self.table.set_viewport(rows);
         cx.notify();
     }
+}
+
+fn helm_payload_notice(kind: InventoryKind) -> Option<&'static str> {
+    (kind == InventoryKind::Helm)
+        .then_some("Helm release payload actions are unavailable: Secret values are never fetched")
 }
 
 /// Which stored-manifest apply a press is about, in the latch's terms.
@@ -461,16 +413,16 @@ impl Render for InventoryView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenRow, _, cx| {
-                this.emit_reveal(cx);
+                this.refuse_payload_action(cx);
             }))
             .on_action(cx.listener(|this, _: &RevealHelm, _, cx| {
-                this.emit_reveal(cx);
+                this.refuse_payload_action(cx);
             }))
             .on_action(cx.listener(|this, _: &HelmDiff, _, cx| {
-                this.emit_diff(cx);
+                this.refuse_payload_action(cx);
             }))
             .on_action(cx.listener(|this, _: &HelmRollback, _, cx| {
-                this.emit_rollback(cx);
+                this.refuse_payload_action(cx);
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 this.fetch(cx);
@@ -639,7 +591,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_stored_manifest_apply_is_asked_and_sent_in_these_words() {
+    fn helm_payload_keys_report_unavailable_without_offering_a_write() {
+        assert_eq!(
+            helm_payload_notice(InventoryKind::Helm),
+            Some("Helm release payload actions are unavailable: Secret values are never fetched")
+        );
+        for kind in [
+            InventoryKind::Argo,
+            InventoryKind::Flux,
+            InventoryKind::Policy,
+            InventoryKind::Harbor,
+            InventoryKind::Mesh,
+        ] {
+            assert_eq!(helm_payload_notice(kind), None);
+        }
+        assert_eq!(
+            InventoryKind::Helm.empty_hint(),
+            "no Helm release metadata is visible to this account"
+        );
+    }
+
+    #[test]
+    fn legacy_resumed_apply_labels_retain_their_scope_and_revision() {
         assert_eq!(rollback_subject(Some("prod"), "web", 3), "prod/web/3");
         assert_eq!(rollback_subject(None, "web", 3), "/web/3");
         let (armed, sent) = rollback_lines("web", 3);

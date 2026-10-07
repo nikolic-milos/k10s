@@ -129,6 +129,76 @@ fn a_different_or_missing_dashboard_uid_is_refused_after_one_get() {
 }
 
 #[test]
+fn a_matching_dashboard_uid_with_malformed_panels_is_refused_after_one_get() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/namespaces/monitoring/services/grafana:3000/proxy/api/dashboards/uid/k8s",
+        200,
+        r#"{"dashboard":{"uid":"k8s","title":"Cluster","panels":{}}}"#,
+    );
+    assert!(matches!(
+        runtime().block_on(async {
+            fetch_dashboard(&script.client(), &proxy_bound(), "k8s").await
+        }),
+        Fetched::Failed { what: "grafana", why } if why == "Grafana panels member is not an array",
+    ));
+    assert_eq!(script.seen().len(), 1);
+    assert_proxy_get(&script, "api/dashboards/uid/k8s");
+}
+
+#[test]
+fn a_broken_provisioned_file_keeps_healthy_catalog_rows_and_its_named_failure() {
+    let script = Script::default();
+    let runtime = runtime();
+    let (sync, _live) = catalog_connection(&runtime, &script);
+    script.route(
+        "GET",
+        "/api/v1/configmaps?",
+        200,
+        serde_json::json!({
+            "apiVersion":"v1", "kind":"ConfigMapList", "metadata":{},
+            "items":[{
+                "metadata":{"name":"cluster-dash","namespace":"monitoring"},
+                "data":{
+                    "broken.json": "{",
+                    "good.json": r#"{"uid":"healthy","title":"Healthy","panels":[]}"#,
+                    "notes": "not a dashboard"
+                }
+            }]
+        })
+        .to_string(),
+    );
+    catalog_source(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/monitoring/services/grafana:3000/proxy/api/search",
+        200,
+        "[]",
+    );
+    let Fetched::Ok(catalog) = catalog_reply(&sync) else {
+        panic!("healthy dashboard rows must survive a broken sibling file");
+    };
+    assert_eq!(catalog.dashboards.len(), 1);
+    assert_eq!(catalog.dashboards[0].uid, "healthy");
+    assert_eq!(catalog.errors.len(), 1);
+    assert!(catalog.errors[0].starts_with(
+        "provisioned dashboards: ConfigMap monitoring/cluster-dash key \"broken.json\": dashboard JSON did not parse:",
+    ));
+    assert!(!catalog.truncated);
+    assert_configmap_lists(&script, 1);
+    assert_proxy_get(&script, "api/search?type=dash-db&limit=100");
+    assert!(script.requests_for("/proxy/api/dashboards/uid/").is_empty());
+    for request in script.requests_for("/secrets") {
+        assert!(
+            request.accept.contains("as=PartialObjectMetadata"),
+            "{request:?}",
+        );
+        assert!(request.body.is_empty());
+    }
+}
+
+#[test]
 fn provisioned_dashboards_come_from_labelled_configmaps_never_secrets() {
     let script = Script::default();
     script.route(
@@ -459,6 +529,62 @@ fn provisioning_continuations_cannot_loop_or_exceed_the_page_ceiling() {
 }
 
 #[test]
+fn nonconsecutive_provisioning_tokens_refuse_before_repeating_a_page() {
+    const LIST: &str =
+        "/api/v1/configmaps?&labelSelector=grafana_dashboard+in+%281%2Ctrue%29&limit=200";
+    for healthy in [false, true] {
+        let script = Script::default();
+        for (uid, token) in [
+            (healthy.then_some("healthy"), "A"),
+            (None, "B"),
+            (None, "A"),
+            (None, ""),
+        ] {
+            script.route(
+                "GET",
+                "/api/v1/configmaps?",
+                200,
+                configmap_page(uid, token),
+            );
+        }
+        let answer =
+            runtime().block_on(async { fetch_provisioned_from_configmaps(&script.client()).await });
+        let why = "provisioned dashboards repeated a continuation token";
+        if healthy {
+            let Fetched::Ok(provisioned) = answer else {
+                panic!("healthy earlier pages remain available with their failure");
+            };
+            assert_eq!(provisioned.dashboards.len(), 1);
+            assert_eq!(provisioned.dashboards[0].uid, "healthy");
+            assert_eq!(provisioned.errors, [why]);
+            assert!(provisioned.truncated);
+        } else {
+            assert_eq!(
+                answer,
+                Fetched::Failed {
+                    what: "grafana",
+                    why: why.to_string(),
+                }
+            );
+        }
+        assert_configmap_lists(&script, 3);
+        let paths: Vec<_> = script
+            .requests_for("/api/v1/configmaps?")
+            .into_iter()
+            .map(|request| request.path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                LIST.to_string(),
+                format!("{LIST}&continue=A"),
+                format!("{LIST}&continue=B"),
+            ]
+        );
+    }
+}
+
+#[test]
 fn provisioning_pages_share_their_response_body_budget() {
     let script = Script::default();
     let mut first = configmap_page(None, "next");
@@ -669,6 +795,91 @@ fn named_live_dashboard_failures_keep_other_live_and_provisioned_rows() {
     assert_proxy_get(&script, "api/search?type=dash-db&limit=100");
     assert_proxy_get(&script, "api/dashboards/uid/broken");
     assert_proxy_get(&script, "api/dashboards/uid/healthy");
+}
+
+#[test]
+fn broken_file_diagnostics_survive_a_later_provisioning_failure_and_healthy_live_rows() {
+    let script = Script::default();
+    let runtime = runtime();
+    let (sync, _live) = catalog_connection(&runtime, &script);
+    script.route(
+        "GET",
+        "/api/v1/configmaps?",
+        200,
+        serde_json::json!({
+            "kind":"ConfigMapList","apiVersion":"v1","metadata":{"continue":"next"},
+            "items":[{"metadata":{"name":"cluster-dash","namespace":"monitoring"},
+                "data":{"broken.json":"{"}}]
+        })
+        .to_string(),
+    );
+    script.route(
+        "GET",
+        "/api/v1/configmaps?",
+        500,
+        r#"{"message":"provisioning store unavailable"}"#,
+    );
+    catalog_source(&script);
+    script.route(
+        "GET",
+        "/api/v1/namespaces/monitoring/services/grafana:3000/proxy/api/search",
+        200,
+        r#"[{"uid":"healthy","title":"Healthy","type":"dash-db"}]"#,
+    );
+    script.route(
+        "GET",
+        "/api/v1/namespaces/monitoring/services/grafana:3000/proxy/api/dashboards/uid/healthy",
+        200,
+        r#"{"uid":"healthy","title":"Healthy","panels":[]}"#,
+    );
+    let before = script.seen().len();
+    let answer = catalog_reply(&sync);
+    let Fetched::Ok(catalog) = answer else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(catalog.dashboards.len(), 1);
+    assert_eq!(catalog.dashboards[0].uid, "healthy");
+    assert!(catalog.truncated);
+    assert_eq!(catalog.errors.len(), 2);
+    assert!(catalog.errors[0].starts_with(
+        "provisioned dashboards: ConfigMap monitoring/cluster-dash key \"broken.json\": dashboard JSON did not parse:"
+    ));
+    assert_eq!(
+        catalog.errors[1],
+        "provisioned dashboards: provisioning store unavailable"
+    );
+    let rows = after_sync(&script, before);
+    let expected = [
+        (
+            "/api/v1/configmaps?&labelSelector=grafana_dashboard+in+%281%2Ctrue%29&limit=200",
+            "",
+        ),
+        (
+            "/api/v1/configmaps?&labelSelector=grafana_dashboard+in+%281%2Ctrue%29&limit=200&continue=next",
+            "",
+        ),
+        ("/api/v1/services?&limit=200", ""),
+        (
+            "/api/v1/namespaces/monitoring/services/grafana:http/proxy/api/health",
+            "application/json",
+        ),
+        (
+            "/api/v1/namespaces/monitoring/services/grafana:3000/proxy/api/search?type=dash-db&limit=100",
+            "application/json",
+        ),
+        (
+            "/api/v1/namespaces/monitoring/services/grafana:3000/proxy/api/dashboards/uid/healthy",
+            "application/json",
+        ),
+    ];
+    assert_eq!(rows.len(), expected.len(), "{rows:?}");
+    for (row, (path, accept)) in rows.iter().zip(expected) {
+        assert_eq!(row.method, "GET");
+        assert_eq!(row.path, path);
+        assert_eq!(row.accept, accept);
+        assert_eq!(row.content_type, "");
+        assert!(row.body.is_empty(), "{row:?}");
+    }
 }
 
 #[test]

@@ -133,20 +133,62 @@ fn config_bytes_never_appear_in_debug() {
 }
 
 #[test]
-fn a_long_image_is_clipped_where_it_is_carried() {
-    let huge = "x".repeat(MAX_FIELD_CHARS + 40);
-    let value = serde_json::json!({
-        "metadata": { "name": huge, "namespace": huge },
-        "spec": { "mode": huge, "image": huge }
-    });
-    let collector = parse_collector(&value).expect("clipped");
-    for field in [&collector.name, &collector.namespace] {
+fn legal_collector_names_keep_distinct_row_keys_beyond_the_display_prefix() {
+    let prefix = format!("{}.{}.{}.", "a".repeat(63), "b".repeat(63), "c".repeat(63));
+    let names = [
+        format!("{prefix}{}x", "d".repeat(60)),
+        format!("{prefix}{}y", "d".repeat(60)),
+    ];
+    let namespace = "n".repeat(MAX_NAMESPACE_BYTES);
+    let items: Vec<_> = names
+        .iter()
+        .map(|name| {
+            assert_eq!(name.len(), MAX_NAME_BYTES);
+            parse_collector(&serde_json::json!({
+                "metadata": {"name":name, "namespace":namespace},
+                "spec": {"config":{"token":CONFIG_TOKEN}}
+            }))
+            .expect("legal full name")
+        })
+        .collect();
+    for (item, name) in items.iter().zip(&names) {
+        assert_eq!(item.name, *name);
+        assert_eq!(item.namespace, namespace);
+    }
+    let page = table_page(&Inventory {
+        collectors: KindSet::Served {
+            items,
+            truncated: false,
+            unreadable: 0,
+        },
+        ..Inventory::default()
+    })
+    .unwrap();
+    assert_eq!(page.rows.len(), 2);
+    for (row, name) in page.rows.iter().zip(&names) {
+        assert_eq!(row.name, *name);
+        assert_eq!(row.namespace.as_deref(), Some(namespace.as_str()));
+        assert_eq!(row.uid, format!("{namespace}/{name}"));
+        assert_eq!(row.cells[0].chars().count(), MAX_FIELD_CHARS + 1);
+        assert!(row.cells[0].ends_with('\u{2026}'));
+    }
+    assert_eq!(page.rows[0].cells[0], page.rows[1].cells[0]);
+    assert_ne!(page.rows[0].uid, page.rows[1].uid);
+    assert!(!format!("{page:?}").contains(CONFIG_TOKEN));
+}
+
+#[test]
+fn oversized_collector_identities_are_unreadable_instead_of_clipped() {
+    for (name, namespace) in [
+        ("n".repeat(MAX_NAME_BYTES + 1), "pilot".into()),
+        ("collector".into(), "n".repeat(MAX_NAMESPACE_BYTES + 1)),
+    ] {
         assert!(
-            field.chars().count() <= MAX_FIELD_CHARS + 1,
-            "clipped where carried: {} chars",
-            field.chars().count()
+            parse_collector(&serde_json::json!({
+                "metadata": {"name":name, "namespace":namespace}
+            }))
+            .is_none()
         );
-        assert!(field.ends_with('\u{2026}'));
     }
 }
 

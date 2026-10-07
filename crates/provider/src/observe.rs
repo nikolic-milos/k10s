@@ -216,9 +216,12 @@ pub struct SpanView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceOutcome {
-    Empty,
+    Empty {
+        source: String,
+    },
     Trace {
         trace_id: String,
+        source: String,
         spans: Vec<SpanView>,
     },
     Absent,

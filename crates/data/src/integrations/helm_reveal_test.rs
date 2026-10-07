@@ -1,5 +1,5 @@
-//! Revealing one revision's values and manifest into scratch buffers, and
-//! the inventory type that still has nowhere to put them.
+//! Pure decoders and manifest planners use caller-owned fixture bytes only.
+//! No Kubernetes payload read or stored-manifest apply is enabled by these tests.
 
 use super::*;
 use std::io::Write;
@@ -90,7 +90,7 @@ fn target(
 }
 
 #[test]
-fn revealing_a_revision_does_not_put_values_on_a_helm_revision() {
+fn decoding_caller_owned_bytes_does_not_put_values_on_a_helm_revision() {
     let json = secret_fixture();
     assert!(
         json.contains("SUPERSECRET"),

@@ -16,7 +16,8 @@
 //! truncating one: a missing panel is visible, a silent drop is not.
 //! Provisioned lists share an eight-MiB body budget and sixteen pages, with
 //! four seconds per exchange. A failed later page keeps healthy dashboards
-//! with a named error; denial remains an explicit denied result.
+//! with a named error; denial remains an explicit denied result. Broken dashboard
+//! files retain named errors alongside healthy files, rather than appearing empty.
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::Client;
@@ -44,6 +45,7 @@ pub const MAX_NAMED_FROM_SEARCH: usize = 16;
 const PAGE_LIMIT: u32 = 200;
 const MAX_CONFIGMAPS: usize = 2_000;
 const MAX_PROVISIONED_PAGES: usize = 16;
+const MAX_ERROR_FIELD_CHARS: usize = 256;
 /// kube-prometheus-stack's sidecar default, and the boolean spelling some
 /// charts use instead.
 const DASHBOARD_SELECTOR: &str = "grafana_dashboard in (1,true)";
@@ -109,6 +111,7 @@ pub enum DashboardError {
     TooLarge { bytes: usize },
     NotJson(String),
     NotADashboard,
+    InvalidPanels,
 }
 
 impl std::fmt::Display for DashboardError {
@@ -121,6 +124,9 @@ impl std::fmt::Display for DashboardError {
             DashboardError::NotJson(why) => write!(f, "dashboard JSON did not parse: {why}"),
             DashboardError::NotADashboard => {
                 write!(f, "JSON is not a Grafana dashboard (no title, no panels)")
+            }
+            DashboardError::InvalidPanels => {
+                write!(f, "Grafana panels member is not an array")
             }
         }
     }
@@ -150,7 +156,12 @@ pub fn parse_dashboard(bytes: &[u8]) -> Result<Dashboard, DashboardError> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let Some(panels) = dashboard.get("panels").and_then(Value::as_array) else {
+    let panels = match dashboard.get("panels") {
+        Some(Value::Array(panels)) => Some(panels),
+        Some(_) => return Err(DashboardError::InvalidPanels),
+        None => None,
+    };
+    let Some(panels) = panels else {
         if title.is_empty() && uid.is_empty() {
             return Err(DashboardError::NotADashboard);
         }
@@ -164,7 +175,7 @@ pub fn parse_dashboard(bytes: &[u8]) -> Result<Dashboard, DashboardError> {
 
     let mut out = Vec::new();
     let mut truncated = false;
-    walk_panels(panels, &mut out, &mut truncated);
+    walk_panels(panels, &mut out, &mut truncated)?;
     Ok(Dashboard {
         uid,
         title,
@@ -173,21 +184,28 @@ pub fn parse_dashboard(bytes: &[u8]) -> Result<Dashboard, DashboardError> {
     })
 }
 
-fn walk_panels(panels: &[Value], out: &mut Vec<Panel>, truncated: &mut bool) {
+fn walk_panels(
+    panels: &[Value],
+    out: &mut Vec<Panel>,
+    truncated: &mut bool,
+) -> Result<(), DashboardError> {
     for panel in panels {
         if out.len() >= MAX_PANELS {
             *truncated = true;
-            return;
+            return Ok(());
         }
         let kind_name = panel.get("type").and_then(Value::as_str).unwrap_or("");
         if kind_name == "row" {
-            if let Some(nested) = panel.get("panels").and_then(Value::as_array) {
-                walk_panels(nested, out, truncated);
+            match panel.get("panels") {
+                Some(Value::Array(nested)) => walk_panels(nested, out, truncated)?,
+                Some(_) => return Err(DashboardError::InvalidPanels),
+                None => {}
             }
             continue;
         }
         out.push(read_panel(panel, out.len() as i64 + 1));
     }
+    Ok(())
 }
 
 fn read_panel(panel: &Value, fallback_id: i64) -> Panel {
@@ -625,7 +643,7 @@ pub struct Provisioned {
 
 impl Provisioned {
     fn failed(mut self, why: String) -> Fetched<Self> {
-        if self.dashboards.is_empty() {
+        if self.dashboards.is_empty() && self.errors.is_empty() {
             return Fetched::Failed {
                 what: "grafana",
                 why,
@@ -643,8 +661,9 @@ impl Provisioned {
 pub async fn fetch_provisioned_from_configmaps(client: &Client) -> Fetched<Provisioned> {
     let mut provisioned = Provisioned::default();
     let mut scanned = 0usize;
+    let mut scanned_keys = 0usize;
     let mut body_bytes = 0usize;
-    let mut token: Option<String> = None;
+    let mut tokens: Vec<String> = Vec::new();
     for _ in 0..MAX_PROVISIONED_PAGES {
         if body_bytes == crate::reach::MAX_BODY_BYTES {
             return provisioned.failed("provisioned dashboards exceed 8 MiB".to_string());
@@ -652,7 +671,7 @@ pub async fn fetch_provisioned_from_configmaps(client: &Client) -> Fetched<Provi
         let mut params = ListParams::default()
             .limit(PAGE_LIMIT)
             .labels(DASHBOARD_SELECTOR);
-        if let Some(token) = token.as_deref() {
+        if let Some(token) = tokens.last() {
             params = params.continue_token(token);
         }
         let request = Request::new("/api/v1/configmaps".to_string())
@@ -686,41 +705,59 @@ pub async fn fetch_provisioned_from_configmaps(client: &Client) -> Fetched<Provi
                 provisioned.truncated = true;
                 break;
             }
-            collect_from_configmap(&cm, &mut provisioned.dashboards, &mut provisioned.truncated);
+            collect_from_configmap(&cm, &mut provisioned, &mut scanned_keys);
             if provisioned.truncated {
                 break;
             }
         }
-        let next = page.metadata.continue_.filter(|s| !s.is_empty());
-        if next.is_none() || provisioned.truncated {
+        let next = page.metadata.continue_.unwrap_or_default();
+        if next.is_empty() || provisioned.truncated {
             return Fetched::Ok(provisioned);
         }
         if scanned == MAX_CONFIGMAPS || provisioned.dashboards.len() == MAX_PROVISIONED {
             provisioned.truncated = true;
             return Fetched::Ok(provisioned);
         }
-        if next == token {
+        if tokens.contains(&next) {
             return provisioned
                 .failed("provisioned dashboards repeated a continuation token".to_string());
         }
-        token = next;
+        tokens.push(next);
     }
     provisioned.failed(format!(
         "provisioned dashboards exceed {MAX_PROVISIONED_PAGES} pages"
     ))
 }
 
-fn collect_from_configmap(cm: &ConfigMap, dashboards: &mut Vec<Dashboard>, truncated: &mut bool) {
+fn collect_from_configmap(cm: &ConfigMap, provisioned: &mut Provisioned, scanned_keys: &mut usize) {
     let Some(data) = &cm.data else {
         return;
     };
-    for value in data.values() {
-        if dashboards.len() >= MAX_PROVISIONED {
-            *truncated = true;
+    for (key, value) in data {
+        if *scanned_keys >= MAX_PROVISIONED {
+            provisioned.truncated = true;
             return;
         }
-        if let Ok(dashboard) = parse_dashboard(value.as_bytes()) {
-            dashboards.push(dashboard);
+        *scanned_keys += 1;
+        match parse_dashboard(value.as_bytes()) {
+            Ok(dashboard) => provisioned.dashboards.push(dashboard),
+            Err(error)
+                if key.ends_with(".json") || matches!(error, DashboardError::InvalidPanels) =>
+            {
+                provisioned.errors.push(format!(
+                    "ConfigMap {}/{} key {:?}: {error}",
+                    clip(
+                        cm.metadata.namespace.as_deref().unwrap_or(""),
+                        MAX_ERROR_FIELD_CHARS,
+                    ),
+                    clip(
+                        cm.metadata.name.as_deref().unwrap_or(""),
+                        MAX_ERROR_FIELD_CHARS,
+                    ),
+                    clip(key, MAX_ERROR_FIELD_CHARS),
+                ));
+            }
+            Err(_) => {}
         }
     }
 }

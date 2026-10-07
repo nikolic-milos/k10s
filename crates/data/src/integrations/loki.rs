@@ -14,6 +14,8 @@
 //! refused whole, because half a JSON document is not a query result.
 //! Each stream requires a string-valued label object and a values array;
 //! malformed members are refused rather than presented as a quiet window.
+//! Retained per-entry identity metadata requires bounded strings; invalid
+//! values refuse the answer instead of inheriting a stream's identity.
 
 use kube::Client;
 use serde::Deserialize;
@@ -26,6 +28,7 @@ pub const MAX_STREAMS: usize = 16;
 pub const MAX_LINES: usize = 2_000;
 pub const MAX_LINE_BYTES: usize = 8 << 10;
 pub const MAX_QUERY_BYTES: usize = 8 << 10;
+const MAX_METADATA_VALUE_BYTES: usize = 256;
 
 const QUERY_RANGE: &str = "loki/api/v1/query_range";
 const QUERY: &str = "loki/api/v1/query";
@@ -273,7 +276,7 @@ fn collect(items: &[Value]) -> Result<Logs, String> {
                 logs.truncated = true;
                 break;
             }
-            match line_of(value) {
+            match line_of(value)? {
                 None => {
                     logs.dropped_lines += 1;
                     logs.truncated = true;
@@ -303,41 +306,45 @@ fn collect(items: &[Value]) -> Result<Logs, String> {
     Ok(logs)
 }
 
-fn line_of(value: &Value) -> Option<LogLine> {
-    let arr = value.as_array()?;
-    let ts = arr.first()?.as_str()?;
-    let line = arr.get(1)?.as_str()?;
-    let ts_ns = ts.parse::<u64>().ok()?;
-    Some(LogLine {
+fn line_of(value: &Value) -> Result<Option<LogLine>, String> {
+    let parsed = (|| {
+        let arr = value.as_array()?;
+        let ts = arr.first()?.as_str()?.parse::<u64>().ok()?;
+        Some((arr, ts, arr.get(1)?.as_str()?))
+    })();
+    let Some((arr, ts_ns, line)) = parsed else {
+        return Ok(None);
+    };
+    let mut retained = Vec::new();
+    if let Some(metadata) = arr.get(2).and_then(Value::as_object) {
+        for (key, value) in metadata {
+            if !matches!(
+                key.as_str(),
+                "trace_id"
+                    | "span_id"
+                    | "k8s_namespace_name"
+                    | "k8s_pod_name"
+                    | "k8s_pod_uid"
+                    | "k8s_node_name"
+            ) {
+                continue;
+            }
+            let text = value.as_str().ok_or_else(|| {
+                format!("Loki entry metadata {key} has a non-string identity value")
+            })?;
+            if text.len() > MAX_METADATA_VALUE_BYTES {
+                return Err(format!(
+                    "Loki entry metadata {key} exceeds {MAX_METADATA_VALUE_BYTES} bytes; its identity is refused"
+                ));
+            }
+            retained.push((key.clone(), text.to_string()));
+        }
+    }
+    Ok(Some(LogLine {
         ts_ns,
         line: line.to_string(),
-        metadata: arr
-            .get(2)
-            .and_then(Value::as_object)
-            .map(|metadata| {
-                metadata
-                    .iter()
-                    .filter(|(key, _)| {
-                        matches!(
-                            key.as_str(),
-                            "trace_id"
-                                | "span_id"
-                                | "k8s_namespace_name"
-                                | "k8s_pod_name"
-                                | "k8s_pod_uid"
-                                | "k8s_node_name"
-                        )
-                    })
-                    .filter_map(|(key, value)| {
-                        value
-                            .as_str()
-                            .filter(|value| value.len() <= 256)
-                            .map(|value| (key.clone(), value.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
+        metadata: retained,
+    }))
 }
 
 fn clip_line(line: &mut LogLine) -> bool {

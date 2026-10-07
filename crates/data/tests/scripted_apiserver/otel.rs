@@ -534,6 +534,63 @@ fn collectors_are_listed_from_the_crs_and_config_stays_off_the_row() {
 }
 
 #[test]
+fn metadata_inventory_retains_long_collector_row_identities_and_labels_oversized_names() {
+    let script = Script::default();
+    script.route("GET", GROUP_PATH, 200, otel_group());
+    let prefix = format!("{}.{}.{}.", "a".repeat(63), "b".repeat(63), "c".repeat(63));
+    let names = [
+        format!("{prefix}{}x", "d".repeat(60)),
+        format!("{prefix}{}y", "d".repeat(60)),
+    ];
+    let mut items: Vec<_> = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "kind":"PartialObjectMetadata", "metadata":{"name":name,"namespace":"observe"}
+            })
+        })
+        .collect();
+    items.push(serde_json::json!({
+        "kind":"PartialObjectMetadata", "metadata":{"name":"n".repeat(254),"namespace":"observe"}
+    }));
+    items.push(serde_json::json!({
+        "kind":"PartialObjectMetadata", "metadata":{"name":"collector","namespace":"n".repeat(64)}
+    }));
+    script.route(
+        "GET",
+        LIST_PATH,
+        200,
+        serde_json::json!({
+            "kind":"PartialObjectMetadataList", "items":items
+        })
+        .to_string(),
+    );
+    let fetched = runtime().block_on(async { otel::fetch(&script.client(), None).await });
+    let Fetched::Ok(inventory) = fetched else {
+        panic!("a served metadata inventory: {fetched:?}");
+    };
+    assert!(matches!(inventory.collectors, KindSet::Served {
+        ref items, truncated:false, unreadable:2
+    } if items.len() == 2));
+    let table = otel::table_page(&inventory).unwrap();
+    assert_eq!(table.rows.len(), 3);
+    for (row, name) in table.rows.iter().zip(&names) {
+        assert_eq!(row.name, *name);
+        assert_eq!(row.uid, format!("observe/{name}"));
+        assert_eq!(row.namespace.as_deref(), Some("observe"));
+        assert!(row.cells[0].ends_with('\u{2026}'));
+    }
+    assert_eq!(table.rows[0].cells[0], table.rows[1].cells[0]);
+    assert_ne!(table.rows[0].uid, table.rows[1].uid);
+    assert!(table.rows[2].cells[4].contains("2 collectors could not be decoded"));
+    let requests = script.seen();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, GROUP_PATH);
+    assert_eq!(requests[1].path, format!("{LIST_PATH}&limit=200"));
+    assert_inventory_requests(&script);
+}
+
+#[test]
 fn an_undecodable_item_is_a_labelled_table_row_not_a_silent_gap() {
     let script = Script::default();
     script.route("GET", "/apis/opentelemetry.io", 200, otel_group());

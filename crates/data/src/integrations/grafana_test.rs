@@ -201,12 +201,14 @@ fn a_configmap_data_value_is_parsed_and_junk_keys_are_skipped() {
         data: Some(data),
         ..ConfigMap::default()
     };
-    let mut dashboards = Vec::new();
-    let mut truncated = false;
-    collect_from_configmap(&cm, &mut dashboards, &mut truncated);
-    assert_eq!(dashboards.len(), 1);
-    assert_eq!(dashboards[0].uid, "k8s-resources");
-    assert!(!truncated);
+    let mut provisioned = Provisioned::default();
+    let mut scanned_keys = 0;
+    collect_from_configmap(&cm, &mut provisioned, &mut scanned_keys);
+    assert_eq!(provisioned.dashboards.len(), 1);
+    assert_eq!(provisioned.dashboards[0].uid, "k8s-resources");
+    assert_eq!(scanned_keys, 2);
+    assert!(provisioned.errors.is_empty());
+    assert!(!provisioned.truncated);
 }
 
 #[test]
@@ -223,10 +225,12 @@ fn binary_data_is_not_read_as_a_dashboard() {
         )])),
         ..ConfigMap::default()
     };
-    let mut dashboards = Vec::new();
-    let mut truncated = false;
-    collect_from_configmap(&cm, &mut dashboards, &mut truncated);
-    assert!(dashboards.is_empty());
+    let mut provisioned = Provisioned::default();
+    let mut scanned_keys = 0;
+    collect_from_configmap(&cm, &mut provisioned, &mut scanned_keys);
+    assert!(provisioned.dashboards.is_empty());
+    assert_eq!(scanned_keys, 0);
+    assert!(provisioned.errors.is_empty());
 }
 
 fn dash_with(panels: &str) -> Dashboard {
@@ -339,11 +343,94 @@ fn provisioned_caps_are_stated_not_silent() {
         data: Some(data),
         ..ConfigMap::default()
     };
-    let mut dashboards = Vec::new();
-    let mut truncated = false;
-    collect_from_configmap(&cm, &mut dashboards, &mut truncated);
-    assert_eq!(dashboards.len(), MAX_PROVISIONED);
-    assert!(truncated);
+    let mut provisioned = Provisioned::default();
+    let mut scanned_keys = 0;
+    collect_from_configmap(&cm, &mut provisioned, &mut scanned_keys);
+    assert_eq!(provisioned.dashboards.len(), MAX_PROVISIONED);
+    assert_eq!(scanned_keys, MAX_PROVISIONED);
+    assert!(provisioned.truncated);
+}
+
+#[test]
+fn malformed_panel_arrays_cannot_impersonate_empty_dashboards() {
+    for panels in ["null", "{}", "true", "1", "\"panels\""] {
+        for document in [
+            format!(r#"{{"uid":"d","title":"d","panels":{panels}}}"#),
+            format!(r#"{{"uid":"d","title":"d","panels":[{{"type":"row","panels":{panels}}}]}}"#),
+        ] {
+            assert_eq!(
+                parse_dashboard(document.as_bytes()),
+                Err(DashboardError::InvalidPanels),
+                "{document}",
+            );
+        }
+    }
+    for document in [
+        br#"{"uid":"d","title":"d"}"#.as_slice(),
+        br#"{"uid":"d","title":"d","panels":[]}"#.as_slice(),
+        br#"{"uid":"d","title":"d","panels":[{"type":"row"}]}"#.as_slice(),
+    ] {
+        assert!(parse_dashboard(document).unwrap().panels.is_empty());
+    }
+}
+
+#[test]
+fn broken_provisioned_files_are_named_without_losing_healthy_files() {
+    use k8s_openapi::api::core::v1::ConfigMap;
+    use std::collections::BTreeMap;
+
+    let cm = ConfigMap {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            namespace: Some("monitoring".into()),
+            name: Some("cluster-dash".into()),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([
+            ("broken.json".into(), "{".into()),
+            ("good.json".into(), dashboard_json().into()),
+            ("notes".into(), "not a dashboard".into()),
+        ])),
+        ..Default::default()
+    };
+    let mut provisioned = Provisioned::default();
+    let mut scanned_keys = 0;
+    collect_from_configmap(&cm, &mut provisioned, &mut scanned_keys);
+    assert_eq!(provisioned.dashboards[0].uid, "k8s-resources");
+    assert_eq!(provisioned.errors.len(), 1);
+    assert!(provisioned.errors[0].starts_with(
+        "ConfigMap monitoring/cluster-dash key \"broken.json\": dashboard JSON did not parse:",
+    ));
+    assert_eq!(scanned_keys, 3);
+    assert!(!provisioned.truncated);
+}
+
+#[test]
+fn failed_and_unrelated_provisioning_keys_consume_the_shared_scan_limit() {
+    use k8s_openapi::api::core::v1::ConfigMap;
+    use std::collections::BTreeMap;
+
+    for suffix in ["json", "notes"] {
+        let cm = ConfigMap {
+            data: Some(
+                (0..MAX_PROVISIONED)
+                    .map(|i| (format!("{i:04}.{suffix}"), "{".into()))
+                    .collect::<BTreeMap<_, _>>(),
+            ),
+            ..Default::default()
+        };
+        let mut provisioned = Provisioned::default();
+        let mut scanned_keys = 0;
+        collect_from_configmap(&cm, &mut provisioned, &mut scanned_keys);
+        assert_eq!(scanned_keys, MAX_PROVISIONED);
+        assert_eq!(
+            provisioned.errors.len(),
+            if suffix == "json" { MAX_PROVISIONED } else { 0 }
+        );
+        assert!(!provisioned.truncated);
+        collect_from_configmap(&cm, &mut provisioned, &mut scanned_keys);
+        assert!(provisioned.truncated);
+        assert!(provisioned.dashboards.is_empty());
+    }
 }
 
 #[test]

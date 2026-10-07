@@ -219,6 +219,7 @@ fn drawn_work(st: &CullStats) -> [usize; 11] {
 enum WorkExpectation {
     Variable,
     Constant,
+    FittedOverview,
     AggregateAboveLimit,
 }
 
@@ -277,7 +278,7 @@ fn cross_fan_spec(_degree: usize) -> SceneSpec {
     }
 }
 
-fn sweeps() -> Vec<Sweep> {
+fn sweeps(policy: &LodPolicy) -> Vec<Sweep> {
     vec![
         Sweep {
             name: "A namespace fan-out, fixed camera, drawn work constant",
@@ -361,6 +362,20 @@ fn sweeps() -> Vec<Sweep> {
             camera: fit_block_camera,
             unit_bytes: size_of::<CellNode>(),
             padded_bytes: size_of::<CellNode<PodPad>>(),
+            expected_work: WorkExpectation::FittedOverview,
+        },
+        Sweep {
+            name: "F workload fan-out, first useful cell stage, aggregate above limit",
+            child: "cell",
+            zoom: policy.stage_cell,
+            degrees: &DEGREES,
+            exts: PADDED_ONLY,
+            spec: cell_fan_spec,
+            cross_scene: false,
+            flat_edge_control: false,
+            camera: block_camera,
+            unit_bytes: size_of::<CellNode>(),
+            padded_bytes: size_of::<CellNode<PodPad>>(),
             expected_work: WorkExpectation::AggregateAboveLimit,
         },
     ]
@@ -368,10 +383,14 @@ fn sweeps() -> Vec<Sweep> {
 
 fn main() {
     let json = std::env::args().any(|a| a == "--json");
+    let cell_stage = std::env::args().any(|a| a == "--cell-stage");
     let policy = lod_policy();
     let mut cases = Vec::new();
 
-    for sweep in sweeps() {
+    for sweep in sweeps(&policy) {
+        if matches!(sweep.expected_work, WorkExpectation::AggregateAboveLimit) != cell_stage {
+            continue;
+        }
         for &ext in sweep.exts {
             let mut baseline: Option<[usize; 11]> = None;
             for &degree in sweep.degrees {
@@ -396,6 +415,9 @@ fn main() {
                 let p99 = samples.percentile(0.99);
                 let work = drawn_work(&stats);
                 let constant = *baseline.get_or_insert(work) == work;
+                if matches!(sweep.expected_work, WorkExpectation::AggregateAboveLimit) {
+                    assert_eq!(stats.stage, 2, "{} missed the first cell stage", sweep.name);
+                }
                 match sweep.expected_work {
                     WorkExpectation::Constant => {
                         assert!(
@@ -405,7 +427,16 @@ fn main() {
                         );
                         assert_eq!(stats.aggregated_blocks, 0, "{} aggregated", sweep.name);
                     }
-                    WorkExpectation::AggregateAboveLimit if degree > policy.max_cells_per_block => {
+                    WorkExpectation::FittedOverview if stats.stage < 2 => {
+                        assert_eq!(stats.drawn_cells, 0, "{} drew cells", sweep.name);
+                        assert_eq!(stats.drawn_sats, 0, "{} drew satellites", sweep.name);
+                        assert_eq!(stats.curves, 0, "{} drew curves", sweep.name);
+                        assert_eq!(stats.aggregated_blocks, 0, "{} aggregated", sweep.name);
+                        assert_eq!(stats.aggregated_cells, 0, "{} aggregated cells", sweep.name);
+                    }
+                    WorkExpectation::FittedOverview | WorkExpectation::AggregateAboveLimit
+                        if degree > policy.max_cells_per_block =>
+                    {
                         assert!(
                             stats.aggregated_blocks > 0,
                             "{} did not aggregate degree {degree}",
@@ -424,12 +455,13 @@ fn main() {
                             stats.drawn_cells
                         );
                     }
-                    WorkExpectation::AggregateAboveLimit => {
+                    WorkExpectation::FittedOverview | WorkExpectation::AggregateAboveLimit => {
                         assert_eq!(
                             stats.aggregated_blocks, 0,
                             "{} aggregated early",
                             sweep.name
                         );
+                        assert_eq!(stats.aggregated_cells, 0, "{} aggregated cells", sweep.name);
                     }
                     WorkExpectation::Variable => {}
                 }
