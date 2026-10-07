@@ -24,13 +24,61 @@ use crate::selection::Mark;
 use crate::text::TextCache;
 use crate::{BenchMeta, OverlayFrame, PickPath, chrome, overlay, path_rect};
 
-// A click resolved against the snapshot that was on screen when it landed.
+// A selection resolved against the snapshot that was on screen when it landed.
 // The snapshot rides along so the consumer names slots from the exact scene
-// the user saw, immune to a publish racing the mouse.
+// the user saw, immune to a publish racing a click or confirmed UID jump.
 pub struct Picked {
     pub snapshot: std::sync::Arc<SceneSnapshot>,
     pub path: PickPath,
     mark: Mark,
+}
+
+impl Picked {
+    /// Resolve a confirmed identity and its ancestry from one published snapshot.
+    pub fn from_uid(snapshot: std::sync::Arc<SceneSnapshot>, uid: &str) -> Option<Self> {
+        let found = snapshot.locate(uid)?;
+        let slot = found.slot as u32;
+        let block = match found.level {
+            k10s_core::Level::Region => None,
+            k10s_core::Level::Block => Some(slot),
+            k10s_core::Level::Cell | k10s_core::Level::Sat => {
+                let block = (0..snapshot.blocks.len()).find(|&block| {
+                    let mut children = if found.level == k10s_core::Level::Cell {
+                        snapshot.block_cell_indices(block)
+                    } else {
+                        snapshot.block_sat_indices(block)
+                    };
+                    children.any(|child| child == found.slot)
+                })?;
+                Some(block as u32)
+            }
+        };
+        let region = match block {
+            Some(block) => {
+                let region = snapshot.blocks[block as usize].ext.ns;
+                if !snapshot
+                    .region_block_indices(region as usize)
+                    .any(|child| child == block as usize)
+                {
+                    return None;
+                }
+                region
+            }
+            None => slot,
+        };
+        let path = PickPath {
+            region,
+            block,
+            cell: (found.level == k10s_core::Level::Cell).then_some(slot),
+            sat: (found.level == k10s_core::Level::Sat).then_some(slot),
+        };
+        let mark = Mark::new(&snapshot, path)?;
+        Some(Self {
+            snapshot,
+            path,
+            mark,
+        })
+    }
 }
 
 impl gpui::EventEmitter<Picked> for MapView {}
@@ -149,9 +197,9 @@ fn reveal_camera(
     let mut target = camera.reveal(rect, viewport.0, viewport.1);
     target.zoom = target.zoom.min(lod::MAX_USEFUL_ZOOM);
     if cell {
-        target.zoom = target
-            .zoom
+        target.zoom = lod::STAGE_POD_LABEL
             .max(crate::primitive::detail_min_width(type_) / rect.w)
+            .max(crate::primitive::POD_DETAIL_MIN_HEIGHT / rect.h)
             .min(lod::MAX_USEFUL_ZOOM);
         let projection = crate::primitive::Projection::new(target, viewport, (0.0, 0.0));
         let height = projection
@@ -359,26 +407,29 @@ impl MapView {
         cx.notify();
     }
 
-    /// Fly to the object with this uid, if the published scene has one.
+    /// Select and fly to this UID through the same event as a pointer pick.
     ///
     /// Answers whether it went, because "that object is not on the map" and "the
     /// map is now going there" are different sentences and the caller is the one
     /// with somewhere to say them. A uid the snapshot does not carry is the
     /// ordinary case rather than an error: a search can outlive the object it
     /// matched, and a cluster the window has since left has none of them.
-    pub fn reveal(&mut self, uid: &str, window: &Window, cx: &mut Context<Self>) -> bool {
-        let scene = self.scene.load();
-        let Some(found) = scene.locate(uid) else {
+    pub fn select_and_reveal(
+        &mut self,
+        uid: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let snapshot = self.scene.load_full();
+        let Some(picked) = Picked::from_uid(snapshot, uid) else {
             return false;
         };
+        let rect = path_rect(&picked.snapshot, &picked.path)
+            .expect("a resolved pick has a live rectangle");
+        let pod = picked.path.level() == k10s_core::Level::Cell;
+        cx.emit(picked);
         let (_, vw, vh) = self.map_viewport(window);
-        let target = reveal_camera(
-            self.camera,
-            found.rect,
-            (vw, vh),
-            self.type_,
-            found.level == k10s_core::Level::Cell,
-        );
+        let target = reveal_camera(self.camera, rect, (vw, vh), self.type_, pod);
         if self.bench.is_some() {
             self.camera = target;
             self.fly = None;

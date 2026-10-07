@@ -571,8 +571,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.map.read(cx).snapshot();
-        let found = crate::alerts::pod_uid(&snapshot, namespace, pod)
-            .is_some_and(|uid| self.map.update(cx, |map, cx| map.reveal(&uid, window, cx)));
+        let found = crate::alerts::pod_uid(&snapshot, namespace, pod).is_some_and(|uid| {
+            self.map
+                .update(cx, |map, cx| map.select_and_reveal(&uid, window, cx))
+        });
         if found {
             self.activate_center(0, window, cx);
             self.status_note = None;

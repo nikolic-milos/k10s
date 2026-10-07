@@ -1,8 +1,8 @@
 //! What the user has selected, named well enough to ask the cluster about it.
 //!
-//! A [`Selection`] is derived from the exact snapshot that was on screen when
-//! the click landed, by a pure function, so a panel can never disagree with the
-//! frame the user was looking at. The uid is what keys identity across
+//! A [`Selection`] is derived from the exact snapshot that resolved a click or
+//! confirmed UID jump, by a pure function, so a panel can never disagree with
+//! that frame. The uid is what keys identity across
 //! publishes -- slots are reused, and after a delete-and-add the same slot names
 //! a different pod with nothing but the uid to say so. The kind id names the API
 //! resource a describe needs rather than a display string, and the ancestry is
@@ -177,6 +177,69 @@ mod tests {
             .find(|(_, label)| label.as_ref() == name)
             .map(|(slot, _)| slot as u32)
             .expect("the fixture names exist")
+    }
+
+    #[test]
+    fn a_confirmed_uid_uses_the_same_selection_and_request_as_a_pointer_pick() {
+        let initial = replay::initial_sync();
+        let bench = PublishBench::new(&initial.events, LayoutMode::Spread);
+        let snapshot = bench.snapshot();
+        for (uid, kind, name, namespace, owner) in [
+            ("pod-1", KindId::POD, "pod-1", Some("prod"), Some("api")),
+            ("wl-api", KindId::DEPLOYMENT, "api", Some("prod"), None),
+            ("ns-prod", KindId::NAMESPACE, "prod", None, None),
+        ] {
+            let picked = k10s_map::Picked::from_uid(snapshot.clone(), uid)
+                .expect("the confirmed UID exists in the published snapshot");
+            let selection = Selection::from_pick(&picked.snapshot, picked.path)
+                .expect("the UID pick carries live ancestry");
+            assert_eq!(selection.owner.as_deref(), owner);
+            assert_eq!(
+                selection.describe_request(),
+                DescribeRequest {
+                    kind,
+                    namespace: namespace.map(str::to_string),
+                    name: name.into(),
+                    uid: uid.into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_confirmed_uid_refuses_a_recreated_pod_even_when_the_name_is_unchanged() {
+        let initial = replay::initial_sync();
+        let mut bench = PublishBench::new(&initial.events, LayoutMode::Spread);
+        let before = bench.snapshot();
+        let picked = k10s_map::Picked::from_uid(before, "pod-1").expect("original UID");
+        let mut recreated =
+            replay::instance("pod-recreated", "prod", "wl-api", State::OK, Op::Added);
+        let k10s_core::IngestEvent::Resource(resource) = &mut recreated else {
+            panic!("the fixture instance is a resource event");
+        };
+        resource.name = "pod-1".into();
+        bench.apply_events(&[
+            replay::instance("pod-1", "prod", "wl-api", State::OK, Op::Deleted),
+            recreated,
+        ]);
+        bench.run_publish();
+        let current = bench.snapshot();
+
+        assert!(k10s_map::Picked::from_uid(current.clone(), "pod-1").is_none());
+        let confirmed = k10s_map::Picked::from_uid(current, "pod-recreated").expect("new UID");
+        let selection =
+            Selection::from_pick(&confirmed.snapshot, confirmed.path).expect("current hierarchy");
+        assert_eq!(selection.name.as_ref(), "pod-1");
+        assert_eq!(selection.namespace.as_deref(), Some("prod"));
+        assert_eq!(selection.owner.as_deref(), Some("api"));
+        assert_eq!(selection.describe_request().uid, "pod-recreated");
+        assert_eq!(
+            Selection::from_pick(&picked.snapshot, picked.path)
+                .expect("the old snapshot is retained")
+                .describe_request()
+                .uid,
+            "pod-1"
+        );
     }
 
     #[test]

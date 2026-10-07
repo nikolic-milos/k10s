@@ -25,7 +25,7 @@ pub(crate) const POD_MARK_MIN: f32 = 24.0;
 pub(crate) const POD_DETAIL_MIN_WIDTH: f32 = 144.0;
 pub(crate) const POD_DETAIL_MAX_WIDTH: f32 = 224.0;
 const POD_MARK_MAX: f32 = 96.0;
-const POD_DETAIL_MIN_HEIGHT: f32 = 64.0;
+pub(crate) const POD_DETAIL_MIN_HEIGHT: f32 = 64.0;
 const POD_DETAIL_MAX_HEIGHT: f32 = 104.0;
 pub(crate) const TEXT_PAD: f32 = 8.0;
 pub(crate) const STATUS_GAP: f32 = 6.0;
@@ -95,6 +95,26 @@ pub struct MarkPrimitive {
 }
 
 impl MarkPrimitive {
+    /// The footer stays between the lower corner centers so a thin quad cannot
+    /// paint outside the card's curved edges.
+    #[inline]
+    pub(crate) fn severity_strip(self) -> Self {
+        let body_height = f32::from(self.bounds.size.height);
+        let height = (body_height * 0.05).clamp(1.5, 4.0).min(body_height);
+        let left = self.corners.bottom_left;
+        let right = self.corners.bottom_right;
+        Self {
+            bounds: Bounds {
+                origin: point(
+                    self.bounds.origin.x + left,
+                    self.bounds.bottom() - px(height),
+                ),
+                size: size(self.bounds.size.width - left - right, px(height)),
+            },
+            corners: Corners::all(px(0.0)),
+        }
+    }
+
     #[inline]
     pub fn outset(self, inset: f32) -> Self {
         let grow = |radius: Pixels| px(f32::from(radius) + inset);

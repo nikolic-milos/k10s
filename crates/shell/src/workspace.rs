@@ -740,10 +740,14 @@ impl Workspace {
                 ClusterFinderEvent::Confirmed(uid) => {
                     let uid = uid.clone();
                     this.close_cluster_finder(window, cx);
-                    let found = this.map.update(cx, |map, cx| map.reveal(&uid, window, cx));
+                    let found = this
+                        .map
+                        .update(cx, |map, cx| map.select_and_reveal(&uid, window, cx));
                     if !found {
                         this.status_note = Some("that object is not on the map".to_string());
                         cx.notify();
+                    } else {
+                        this.status_note = None;
                     }
                 }
             },

@@ -422,6 +422,140 @@ fn a_terminating_pod_is_hollow_and_costs_the_same_quad() {
 }
 
 #[test]
+fn severity_footers_keep_screen_height_and_stay_inside_the_card_shape() {
+    for inner in [
+        Rect::new(40.0, 40.0, 30.0, 56.0),
+        Rect::new(40.0, 40.0, 120.0, 0.5),
+    ] {
+        let (cx, cy) = inner.center();
+        for zoom in [
+            0.05,
+            1.0,
+            crate::lod::STAGE_POD_LABEL,
+            crate::lod::MAX_USEFUL_ZOOM,
+            40.0,
+        ] {
+            let camera = Camera { cx, cy, zoom };
+            for origin in [(0.0, 0.0), (13.25, 27.75)] {
+                let projection = Projection::new(camera, (VW, VH), origin);
+                let body = projection.card(inner);
+                let footer = body.severity_strip();
+                let height = f32::from(footer.bounds.size.height);
+                assert!(height > 0.0 && height <= 4.0);
+                assert!(height <= f32::from(body.bounds.size.height));
+                assert!(footer.bounds.origin.x >= body.bounds.origin.x);
+                assert!(footer.bounds.origin.y >= body.bounds.origin.y);
+                assert!(footer.bounds.right() <= body.bounds.right());
+                assert_eq!(footer.bounds.bottom(), body.bounds.bottom());
+                assert_eq!(footer.corners, Corners::all(px(0.0)));
+                if f32::from(body.bounds.size.height) >= 80.0 {
+                    assert_eq!(height, 4.0);
+                }
+                for fx in [0.25, 0.5, 0.75] {
+                    for fy in [0.25, 0.5, 0.75] {
+                        let point = point(
+                            footer.bounds.origin.x + footer.bounds.size.width * fx,
+                            footer.bounds.origin.y + footer.bounds.size.height * fy,
+                        );
+                        assert!(footer.contains(point));
+                        assert!(body.contains(point));
+                    }
+                }
+                if f32::from(body.corners.bottom_left) > height {
+                    let corner = point(
+                        body.bounds.origin.x + px(0.25),
+                        body.bounds.bottom() - px(0.25),
+                    );
+                    assert!(!body.contains(corner));
+                    assert!(!footer.contains(corner));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_painted_severity_footer_picks_its_card_without_filling_the_rounded_gap() {
+    let mut scene = one_of_each(State::OK);
+    scene.blocks[0].inner = Rect::new(40.0, 40.0, 30.0, 56.0);
+    let inner = scene.blocks[0].inner;
+    let pol = policy(Knobs::default());
+    let card_zoom = (pol.block_chrome_min_px + 1.0) / inner.w;
+    for zoom in [
+        card_zoom,
+        crate::lod::STAGE_POD_LABEL,
+        crate::lod::MAX_USEFUL_ZOOM,
+        40.0,
+    ] {
+        let camera = Camera {
+            cx: inner.center().0,
+            cy: inner.max_y(),
+            zoom,
+        };
+        let blend = StageBlend::settled(pol.stage_for_zoom(zoom));
+        let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
+        let body = projection.card(inner);
+        let footer = body.severity_strip();
+        let opts = FrameOpts {
+            policy: &pol,
+            theme: &k10s_theme::K10S_DARK.map,
+            type_: k10s_theme::MapType::default(),
+            edges_on: false,
+            skip_blocks: false,
+            hex: false,
+        };
+        let mut sink = Collect::default();
+        let stats = walk(viewport(), &scene, camera, blend, opts, &mut sink);
+        assert_eq!(
+            stats,
+            crate::lod::cull(&scene, &camera, blend, VW, VH, opts)
+        );
+        let painted = sink
+            .fg
+            .iter()
+            .find(|quad| quad.bounds == footer.bounds)
+            .expect("the card emits its bounded severity footer");
+        assert_eq!(painted.bounds.size.height, px(4.0));
+        assert_eq!(painted.corner_radii, footer.corners);
+        let probe = footer.bounds.center();
+        assert!(body.contains(probe));
+        let path = crate::pick::pick(
+            &scene,
+            &camera,
+            &pol,
+            blend,
+            VW,
+            VH,
+            f32::from(probe.x),
+            f32::from(probe.y),
+        )
+        .expect("the footer belongs to the workload");
+        assert_eq!((path.block, path.cell, path.sat), (Some(0), None, None));
+
+        let gap = point(
+            body.bounds.origin.x + px(0.25),
+            body.bounds.bottom() - px(0.25),
+        );
+        assert!(body.bounds.contains(&gap));
+        assert!(!body.contains(gap));
+        assert!(!footer.contains(gap));
+        assert!(projection.region(scene.regions[0].rect).contains(gap));
+        let path = crate::pick::pick(
+            &scene,
+            &camera,
+            &pol,
+            blend,
+            VW,
+            VH,
+            f32::from(gap.x),
+            f32::from(gap.y),
+        )
+        .expect("the rounded gap belongs to the region");
+        assert_eq!((path.block, path.cell, path.sat), (None, None, None));
+    }
+}
+
+#[test]
 fn detailed_pods_keep_identity_status_and_picking_inside_the_same_body() {
     let mut scene = one_of_each(State::of(ReasonId::FAILED));
     scene.blocks[0].label = Arc::from("payments-redis-primary");

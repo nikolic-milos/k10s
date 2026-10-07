@@ -401,7 +401,6 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             let severity = severity_index(block.ext.rollup);
             let (fill_color, border) = self.workload_paint[severity];
             let primitive = card(self.screen_bounds(&block.inner));
-            let radius = primitive.corners.top_left;
             self.sink.fg_quad(quad(
                 primitive.bounds,
                 primitive.corners,
@@ -424,25 +423,10 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                     ));
                     self.stats.quads += 1;
                 }
-                // The severity reading moved from a floating bar inside the
-                // header to the card's own bottom edge, where it underlines the
-                // whole workload, cannot collide with the glyph or the grid, and
-                // is still legible on a card whose header is two pixels tall.
-                let strip_h = (block.inner.h * 0.05).clamp(1.5, 4.0);
-                let strip = Rect::new(
-                    block.inner.x,
-                    block.inner.max_y() - strip_h,
-                    block.inner.w,
-                    strip_h,
-                );
+                let strip = primitive.severity_strip();
                 self.sink.fg_quad(quad(
-                    self.screen_bounds(&strip),
-                    Corners {
-                        top_left: px(0.0),
-                        top_right: px(0.0),
-                        bottom_right: radius,
-                        bottom_left: radius,
-                    },
+                    strip.bounds,
+                    strip.corners,
                     self.strip_paint[severity],
                     px(0.0),
                     gpui::transparent_black(),
