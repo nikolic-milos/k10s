@@ -300,6 +300,7 @@ impl Workspace {
 
     /// What both doors do once the connection state behind them is settled.
     fn land_scene(&mut self, note: String, cx: &mut Context<Self>) {
+        self.observability_navigation = Default::default();
         self.chose_scene(cx);
         self.status_note = Some(note);
         self.refresh_detail(cx);

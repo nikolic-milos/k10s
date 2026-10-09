@@ -22,8 +22,8 @@ mod observe;
 
 use observe::{
     alert_pod_outcome, alertmanager_bound, alertmanager_outcome, grafana_outcome, loki_outcome,
-    observe_reach, omitted_notice_answer, optional_table_outcome, prom_outcome, silence_outcome,
-    silence_spec, trace_outcome,
+    loki_probe_outcome, observe_reach, omitted_notice_answer, optional_table_outcome, prom_outcome,
+    silence_outcome, silence_spec, trace_outcome,
 };
 
 mod inventory;
@@ -64,23 +64,28 @@ impl k10s_provider::ClusterProvider for PlaneProvider {
     fn fetch_events(
         &self,
         namespace: &str,
-        name: &str,
+        uid: &str,
         reply: k10s_provider::Reply<k10s_provider::Detail>,
-    ) {
-        self.inspector
-            .fetch_events(namespace, name, move |detail| reply(adapt(detail)));
+    ) -> k10s_provider::RequestStop {
+        let stop = self
+            .inspector
+            .fetch_events(namespace, uid, move |detail| reply(adapt(detail)));
+        k10s_provider::RequestStop::new(move || drop(stop))
     }
 
     fn fetch_log_tail(
         &self,
         namespace: &str,
         pod: &str,
+        uid: &str,
         reply: k10s_provider::Reply<k10s_provider::Detail>,
-    ) {
-        self.inspector
-            .fetch_log_tail(namespace, &Arc::from(pod), move |detail| {
+    ) -> k10s_provider::RequestStop {
+        let stop = self
+            .inspector
+            .fetch_log_tail(namespace, &Arc::from(pod), uid, move |detail| {
                 reply(adapt(detail))
             });
+        k10s_provider::RequestStop::new(move || drop(stop))
     }
 
     fn kinds(&self) -> Vec<k10s_provider::KindRow> {
@@ -373,6 +378,16 @@ impl k10s_provider::ClusterProvider for PlaneProvider {
         k10s_provider::RequestStop::new(move || drop(stop))
     }
 
+    fn probe_loki(
+        &self,
+        reply: k10s_provider::Reply<Result<k10s_provider::ToolPresence, String>>,
+    ) -> k10s_provider::RequestStop {
+        let stop = self.reader.observe_loki_probe(move |fetched| {
+            reply(loki_probe_outcome(fetched));
+        });
+        k10s_provider::RequestStop::new(move || drop(stop))
+    }
+
     fn resolve_observe_scope(
         &self,
         request: k10s_provider::DescribeRequest,
@@ -535,6 +550,16 @@ impl k10s_provider::ClusterProvider for PlaneProvider {
                     .collect(),
             )
         });
+    }
+
+    fn fetch_collectors(
+        &self,
+        reply: k10s_provider::Reply<k10s_provider::TableOutcome>,
+    ) -> k10s_provider::RequestStop {
+        let stop = self.reader.fetch_collectors(move |answer| {
+            reply(optional_table_outcome(answer));
+        });
+        k10s_provider::RequestStop::new(move || drop(stop))
     }
 
     fn fetch_alert_pod(

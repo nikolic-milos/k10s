@@ -21,19 +21,20 @@ use crate::dock::{self, Dock};
 use crate::hosting::Tab;
 use crate::selection::Selection;
 use crate::settings;
+use crate::tag::ItemTag;
 use crate::ui::{
     self, ACTIVITY_BAR_WIDTH, DockSizes, MODAL_TOP, RESIZE_HANDLE_SIZE, TAB_HEIGHT,
     TITLE_MARK_SIZE, brand_mark, icon_button, panel_header, rail_button, title_bar_height,
 };
 use crate::workspace::Workspace;
 use crate::{
-    ChooseCluster, FindCluster, LoadSavedView, OpenArgo, OpenBrowser, OpenDay2, OpenEcosystem,
-    OpenFlux, OpenForwards, OpenHarbor, OpenMesh, OpenNodes, OpenObserve, OpenPalette, OpenPolicy,
-    OpenReleases, OpenSettings, OpenTraces, Quit, ToggleBottomDock, ToggleInspector,
-    ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    ChooseCluster, FindCluster, LoadSavedView, OpenArgo, OpenBrowser, OpenCollectors, OpenDay2,
+    OpenEcosystem, OpenFlux, OpenForwards, OpenHarbor, OpenMesh, OpenNodes, OpenObserve,
+    OpenPalette, OpenPolicy, OpenReleases, OpenSettings, OpenTraces, Quit, RetainedLogsSelection,
+    ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
 use k10s_provider::{
-    Bytes, Detail, Millicores, PostureOutcome, UsageOutcome, UsageSample, UsageSource,
+    Bytes, Detail, Millicores, PostureOutcome, ToolPresence, UsageOutcome, UsageSample, UsageSource,
 };
 
 pub(crate) use crate::dock::DockEdge;
@@ -80,6 +81,7 @@ impl Workspace {
         fonts: &Typography,
         width: f32,
         selection: Option<Selection>,
+        loki: Option<ToolPresence>,
     ) -> impl IntoElement {
         let body = match selection {
             None => div()
@@ -149,10 +151,10 @@ impl Workspace {
                     body = body.child(Self::detail_section(
                         theme,
                         &fonts,
-                        "Log tail",
+                        "Kubelet logs by name · backend UID unverified",
                         self.log.as_ref(),
                         |detail| {
-                            let Detail::Log(lines, note) = detail else {
+                            let Detail::Log { lines, note, .. } = detail else {
                                 return Vec::new();
                             };
                             let mut rows: Vec<String> = note.iter().cloned().collect();
@@ -160,6 +162,40 @@ impl Workspace {
                             rows
                         },
                     ));
+                }
+                if retained_logs_available(
+                    self.connected,
+                    Some(&selection),
+                    self.log.as_ref(),
+                    loki,
+                ) {
+                    if let Some(notice) = &self.retained_loki_notice {
+                        body = body.child(
+                            div()
+                                .text_size(px(fonts.small()))
+                                .text_color(rgb(theme.shell.text))
+                                .child(notice.clone()),
+                        );
+                    }
+                    body = body.child(
+                        div()
+                            .id("retained-loki-logs")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .border_1()
+                            .border_color(rgb(theme.shell.border))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_size(px(fonts.small()))
+                            .text_color(rgb(theme.shell.text))
+                            .hover(|button| button.bg(rgb(theme.shell.element_hover)))
+                            .role(Role::Button)
+                            .aria_label("Retained logs in Loki")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(RetainedLogsSelection), cx);
+                            })
+                            .child("Retained logs in Loki"),
+                    );
                 }
                 body.child(
                     div()
@@ -262,7 +298,7 @@ impl Workspace {
             div()
                 .text_size(px(fonts.small()))
                 .text_color(rgb(theme.shell.text_muted))
-                .child("Usage"),
+                .child("Usage by name or selector · UID unverified"),
         );
         let muted = |section: gpui::Div, text: String| {
             section.child(
@@ -399,6 +435,18 @@ impl Workspace {
         let mut primary = Vec::new();
         let mut trailing = Vec::new();
         for slot in ACTIVITIES {
+            let available = match slot.id {
+                crate::activity::ActivityId::Observe => {
+                    self.observability_navigation.available(&ItemTag::Observe)
+                }
+                crate::activity::ActivityId::Collectors => self
+                    .observability_navigation
+                    .available(&ItemTag::Collectors),
+                _ => true,
+            };
+            if !available {
+                continue;
+            }
             let button = Self::activity_button(*slot, lit(slot.id, state), theme);
             match slot.group {
                 ActivityGroup::Primary => primary.push(button),
@@ -445,6 +493,7 @@ impl Workspace {
                 ActivityId::Flux => window.dispatch_action(Box::new(OpenFlux), cx),
                 ActivityId::Day2 => window.dispatch_action(Box::new(OpenDay2), cx),
                 ActivityId::Observe => window.dispatch_action(Box::new(OpenObserve), cx),
+                ActivityId::Collectors => window.dispatch_action(Box::new(OpenCollectors), cx),
                 ActivityId::Policy => window.dispatch_action(Box::new(OpenPolicy), cx),
                 ActivityId::Ecosystem => window.dispatch_action(Box::new(OpenEcosystem), cx),
                 ActivityId::Forwards => window.dispatch_action(Box::new(OpenForwards), cx),
@@ -466,6 +515,9 @@ impl Workspace {
                     ActivityId::Flux => ui::Tooltip::with_binding(label, &OpenFlux, window),
                     ActivityId::Day2 => ui::Tooltip::with_binding(label, &OpenDay2, window),
                     ActivityId::Observe => ui::Tooltip::with_binding(label, &OpenObserve, window),
+                    ActivityId::Collectors => {
+                        ui::Tooltip::with_binding(label, &OpenCollectors, window)
+                    }
                     ActivityId::Policy => ui::Tooltip::with_binding(label, &OpenPolicy, window),
                     ActivityId::Ecosystem => {
                         ui::Tooltip::with_binding(label, &OpenEcosystem, window)
@@ -894,12 +946,27 @@ impl Workspace {
                     .child(entry(7, "Argo CD", Box::new(OpenArgo)))
                     .child(entry(8, "Flux", Box::new(OpenFlux)))
                     .child(entry(9, "Day-2", Box::new(OpenDay2)))
-                    .child(entry(10, "Grafana queries", Box::new(OpenObserve)))
+                    .children(
+                        self.observability_navigation
+                            .available(&ItemTag::Observe)
+                            .then(|| entry(10, "Observe", Box::new(OpenObserve))),
+                    )
                     .child(entry(11, "Policy", Box::new(OpenPolicy)))
                     .child(entry(12, "Ecosystem", Box::new(OpenEcosystem)))
                     .child(entry(13, "Harbor", Box::new(OpenHarbor)))
                     .child(entry(14, "Mesh", Box::new(OpenMesh)))
-                    .child(entry(15, "Traces", Box::new(OpenTraces)))
+                    .children(
+                        self.observability_navigation
+                            .available(&ItemTag::Traces)
+                            .then(|| entry(15, "Traces", Box::new(OpenTraces))),
+                    )
+                    .children(
+                        self.observability_navigation
+                            .available(&ItemTag::Collectors)
+                            .then(|| {
+                                entry(21, "OpenTelemetry Collectors", Box::new(OpenCollectors))
+                            }),
+                    )
                     .child(entry(16, "Terminal", Box::new(ToggleTerminal)))
                     .child(separator())
                     .child(entry(17, "Toggle Left Dock", Box::new(ToggleLeftDock)))
@@ -1037,6 +1104,32 @@ impl Workspace {
                     .child(tab.view.title(cx))
             }))
     }
+}
+
+pub(crate) fn retained_logs_available(
+    connected: bool,
+    selection: Option<&Selection>,
+    detail: Option<&Detail>,
+    loki: Option<ToolPresence>,
+) -> bool {
+    connected
+        && matches!(loki, Some(ToolPresence::Ready | ToolPresence::Blocked))
+        && selection.is_some_and(|selection| {
+            selection.kind_id == k10s_core::KindId::POD
+                && !selection.uid.is_empty()
+                && !selection.name.is_empty()
+                && selection
+                    .namespace
+                    .as_deref()
+                    .is_some_and(|namespace| !namespace.is_empty())
+        })
+        && matches!(
+            detail,
+            Some(Detail::Log {
+                previous_unavailable: true,
+                ..
+            })
+        )
 }
 
 /// Everything the status line is about, borrowed. A value rather than a method

@@ -44,6 +44,13 @@
 
 use std::time::Duration;
 
+#[path = "live_adapters/collector_route.rs"]
+mod collector_route;
+#[path = "live_adapters/inspector.rs"]
+mod inspector;
+#[path = "live_adapters/trace_logs.rs"]
+mod trace_logs;
+
 use k10s_core::KindId;
 use k10s_data::apply::{ApplyOutcome, ApplyRequest};
 use k10s_data::day2::{Blast, Caps, Day2Call, Day2Outcome, DeleteRequest, ScaleRequest};

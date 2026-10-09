@@ -79,6 +79,10 @@ pub struct Scope {
 pub struct RequestStop(Option<tokio::task::AbortHandle>);
 
 impl RequestStop {
+    pub(crate) fn noop() -> Self {
+        Self(None)
+    }
+
     pub fn detach(mut self) {
         self.0.take();
     }
@@ -149,13 +153,34 @@ impl Scheduler {
         work: impl Future<Output = Fetched<T>> + Send + 'static,
         reply: impl FnOnce(Fetched<T>) + Send + 'static,
     ) -> RequestStop {
+        self.submit_inner(handle, None, work, reply)
+    }
+
+    /// One deadline covers queue waiting and the complete admitted exchange.
+    pub(crate) fn submit_until<T: Send + 'static>(
+        self: &Arc<Self>,
+        handle: &tokio::runtime::Handle,
+        deadline: tokio::time::Instant,
+        work: impl Future<Output = Fetched<T>> + Send + 'static,
+        reply: impl FnOnce(Fetched<T>) + Send + 'static,
+    ) -> RequestStop {
+        self.submit_inner(handle, Some(deadline), work, reply)
+    }
+
+    fn submit_inner<T: Send + 'static>(
+        self: &Arc<Self>,
+        handle: &tokio::runtime::Handle,
+        deadline: Option<tokio::time::Instant>,
+        work: impl Future<Output = Fetched<T>> + Send + 'static,
+        reply: impl FnOnce(Fetched<T>) + Send + 'static,
+    ) -> RequestStop {
         let Ok(slot) = self.slots.clone().try_acquire_owned() else {
             self.rejected.fetch_add(1, Ordering::Relaxed);
             reply(Fetched::Failed {
                 what: "telemetry",
                 why: "telemetry is busy: two requests are active and four are waiting".to_string(),
             });
-            return RequestStop(None);
+            return RequestStop::noop();
         };
         let scheduler = self.clone();
         let started = Instant::now();
@@ -166,12 +191,21 @@ impl Scheduler {
                 .peak_admitted
                 .fetch_max(admitted, Ordering::Relaxed);
             let _admitted = CountGuard(&scheduler.admitted);
-            let _active_slot = scheduler
-                .active_slots
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("request scheduler remains open");
+            let acquire = scheduler.active_slots.clone().acquire_owned();
+            let _active_slot = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, acquire).await {
+                    Ok(slot) => slot.expect("request scheduler remains open"),
+                    Err(_) => {
+                        reply(request_expired());
+                        return;
+                    }
+                },
+                None => acquire.await.expect("request scheduler remains open"),
+            };
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                reply(request_expired());
+                return;
+            }
             let queue_ns = started.elapsed().as_nanos() as u64;
             let active = scheduler.active.fetch_add(1, Ordering::Relaxed) + 1;
             scheduler.peak_active.fetch_max(active, Ordering::Relaxed);
@@ -186,12 +220,25 @@ impl Scheduler {
                         }),
                     },
                     async move {
-                        reply(work.await);
+                        let outcome = match deadline {
+                            Some(deadline) => tokio::time::timeout_at(deadline, work)
+                                .await
+                                .unwrap_or_else(|_| request_expired()),
+                            None => work.await,
+                        };
+                        reply(outcome);
                     },
                 )
                 .await;
         });
         RequestStop(Some(task.abort_handle()))
+    }
+}
+
+fn request_expired<T>() -> Fetched<T> {
+    Fetched::Failed {
+        what: "telemetry",
+        why: "the request did not finish before its deadline".to_string(),
     }
 }
 
@@ -411,6 +458,77 @@ pub async fn resolve_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_deadline_releases_admission_without_polling_its_work() {
+        let scheduler = Arc::new(Scheduler::default());
+        let mut active = Vec::new();
+        for _ in 0..MAX_ACTIVE {
+            active.push(scheduler.submit(
+                &tokio::runtime::Handle::current(),
+                std::future::pending::<Fetched<()>>(),
+                |_| panic!("cancelled active work must not reply"),
+            ));
+        }
+        for _ in 0..1_000 {
+            if scheduler.counts().active == MAX_ACTIVE {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(scheduler.counts().active, MAX_ACTIVE);
+        let polled = Arc::new(AtomicUsize::new(0));
+        let work_polled = polled.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _queued = scheduler.submit_until(
+            &tokio::runtime::Handle::current(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            async move {
+                work_polled.fetch_add(1, Ordering::Relaxed);
+                Fetched::Ok(())
+            },
+            move |answer| tx.send(answer).expect("queued deadline reply"),
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(scheduler.counts().admitted, MAX_ACTIVE + 1);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(rx.await.expect("deadline reply"), request_expired());
+        assert_eq!(polled.load(Ordering::Relaxed), 0);
+        assert_eq!(scheduler.counts().active, MAX_ACTIVE);
+        assert_eq!(scheduler.counts().admitted, MAX_ACTIVE);
+        drop(active);
+        tokio::task::yield_now().await;
+        assert_eq!(scheduler.counts().admitted, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_guard_cancels_an_admitted_deadline_before_the_runtime_polls_it() {
+        let scheduler = Arc::new(Scheduler::default());
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let stop = scheduler.submit_until(
+            &tokio::runtime::Handle::current(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(35),
+            async { panic!("cancelled work must not be polled") },
+            move |answer: Fetched<()>| tx.send(answer).expect("no cancellation reply"),
+        );
+        drop(stop);
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert_eq!(scheduler.counts().active, 0);
+        assert_eq!(scheduler.counts().admitted, 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _fresh = scheduler.submit_until(
+            &tokio::runtime::Handle::current(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(35),
+            async { Fetched::Ok(42) },
+            move |answer| tx.send(answer).expect("fresh reply"),
+        );
+        assert_eq!(rx.await.expect("fresh capacity"), Fetched::Ok(42));
+    }
+
     #[test]
     fn cancellation_releases_both_queue_and_active_capacity() {
         let runtime = tokio::runtime::Builder::new_multi_thread()

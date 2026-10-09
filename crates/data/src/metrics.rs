@@ -13,6 +13,9 @@
 //! polling because the next one may recover. No variant ever carries a zero
 //! the cluster did not report. A Secret has no pod usage and is refused as
 //! `Absent` before fetching it to resolve a workload selector.
+//! Usage is scoped by Pod name or workload selector. The request carries no
+//! selected UID, and selector membership does not prove controller ownership.
+//! Callers must not present these samples as a verified Kubernetes UID join.
 //!
 //! The kubelet reports CPU as a cumulative counter stamped with its own
 //! timestamp, so a rate needs two samples: the first fallback tick carries

@@ -17,7 +17,11 @@ pub(super) fn adapt(detail: k10s_data::inspect::InspectDetail) -> k10s_provider:
                 })
                 .collect(),
         ),
-        InspectDetail::Log(tail) => k10s_provider::Detail::Log(tail.lines, tail.note),
+        InspectDetail::Log(tail) => k10s_provider::Detail::Log {
+            lines: tail.lines,
+            note: tail.note,
+            previous_unavailable: tail.previous_unavailable,
+        },
         InspectDetail::Denied { what } => k10s_provider::Detail::Denied(what),
         InspectDetail::Failed { why, .. } => k10s_provider::Detail::Failed(why),
     }

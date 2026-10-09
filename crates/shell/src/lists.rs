@@ -1,4 +1,4 @@
-//! Helm, Argo, Flux, policy, Harbor, and declared mesh as native tables.
+//! Helm, Argo, Flux, policy, Harbor, mesh, and Collectors as native tables.
 //!
 //! These adapters already fetch on the data plane. This view is the same
 //! [`TableState`] machine browse and nodes use, over pages those fetches
@@ -6,6 +6,7 @@
 //! payload reveal, diff and stored apply report unavailable without emitting
 //! an action. A denial stays labelled. Other unserved adapters emit
 //! [`InventoryEvent::NotServed`] so the workspace can remove their panes.
+//! Collector requests stop on hide and reject replies from an older listing.
 
 use std::rc::Rc;
 
@@ -23,7 +24,7 @@ use crate::{
     CancelInput, CommitInput, DeleteInputChar, EnterFilter, HelmDiff, HelmRollback, OpenRow,
     Refresh, RevealHelm, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
 };
-use k10s_provider::{ClusterProvider, TableOutcome, TablePage};
+use k10s_provider::{ClusterProvider, RequestStop, TableOutcome, TablePage, ToolPresence};
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
 
@@ -35,6 +36,7 @@ pub enum InventoryKind {
     Policy,
     Harbor,
     Mesh,
+    Collectors,
 }
 
 impl InventoryKind {
@@ -46,6 +48,7 @@ impl InventoryKind {
             InventoryKind::Policy => ItemTag::Policy,
             InventoryKind::Harbor => ItemTag::Harbor,
             InventoryKind::Mesh => ItemTag::Mesh,
+            InventoryKind::Collectors => ItemTag::Collectors,
         }
     }
 
@@ -57,6 +60,7 @@ impl InventoryKind {
             InventoryKind::Policy => "policy",
             InventoryKind::Harbor => "harbor",
             InventoryKind::Mesh => "mesh",
+            InventoryKind::Collectors => "OpenTelemetry Collectors",
         }
     }
 
@@ -68,6 +72,7 @@ impl InventoryKind {
             InventoryKind::Policy => "no policy reports are in this cluster",
             InventoryKind::Harbor => "no Harbor projects are in this cluster",
             InventoryKind::Mesh => "no declared mesh objects are in this cluster",
+            InventoryKind::Collectors => "no OpenTelemetry Collectors are in this cluster",
         }
     }
 
@@ -79,12 +84,17 @@ impl InventoryKind {
             InventoryKind::Policy => "Policy reports",
             InventoryKind::Harbor => "Harbor",
             InventoryKind::Mesh => "Mesh",
+            InventoryKind::Collectors => "OpenTelemetry Collectors",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryEvent {
+    Presence {
+        tag: ItemTag,
+        presence: ToolPresence,
+    },
     RevealPod {
         namespace: String,
         pod: String,
@@ -126,6 +136,58 @@ pub struct InventoryView {
     status_text: StatusText,
     generation: u64,
     viewport: Viewport,
+    collector: Option<CollectorRead>,
+}
+
+struct CollectorRead {
+    generation: u64,
+    visible: bool,
+    pending: bool,
+    stop: Option<RequestStop>,
+}
+
+impl CollectorRead {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            visible: true,
+            pending: false,
+            stop: None,
+        }
+    }
+
+    fn begin(&mut self) -> Option<u64> {
+        if !self.visible {
+            return None;
+        }
+        self.stop = None;
+        self.generation += 1;
+        self.pending = true;
+        Some(self.generation)
+    }
+
+    fn land(&mut self, generation: u64) -> bool {
+        if !self.visible || !self.pending || self.generation != generation {
+            return false;
+        }
+        self.stop = None;
+        self.pending = false;
+        true
+    }
+
+    fn set_visible(&mut self, visible: bool) -> bool {
+        if self.visible == visible {
+            return false;
+        }
+        self.visible = visible;
+        if !visible {
+            self.generation += 1;
+            self.stop = None;
+            false
+        } else {
+            self.pending
+        }
+    }
 }
 
 impl EventEmitter<InventoryEvent> for InventoryView {}
@@ -155,6 +217,10 @@ impl InventoryView {
         InventoryView::open(InventoryKind::Mesh, provider, cx)
     }
 
+    pub fn collectors(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> InventoryView {
+        InventoryView::open(InventoryKind::Collectors, provider, cx)
+    }
+
     fn open(
         kind: InventoryKind,
         provider: Rc<dyn ClusterProvider>,
@@ -173,6 +239,7 @@ impl InventoryView {
             status_text: StatusText::default(),
             generation: 0,
             viewport: Viewport::default(),
+            collector: (kind == InventoryKind::Collectors).then(CollectorRead::new),
         };
         view.fetch(cx);
         view
@@ -187,8 +254,15 @@ impl InventoryView {
     }
 
     fn fetch(&mut self, cx: &mut Context<Self>) {
-        self.generation += 1;
-        let generation = self.generation;
+        let generation = if let Some(collector) = &mut self.collector {
+            let Some(generation) = collector.begin() else {
+                return;
+            };
+            generation
+        } else {
+            self.generation += 1;
+            self.generation
+        };
         self.loading = true;
         self.status = None;
         self.fetch_label = None;
@@ -204,12 +278,26 @@ impl InventoryView {
             InventoryKind::Policy => self.provider.fetch_policy(reply),
             InventoryKind::Harbor => self.provider.fetch_harbor(reply),
             InventoryKind::Mesh => self.provider.fetch_mesh(reply),
+            InventoryKind::Collectors => {
+                self.collector.as_mut().expect("Collector lifecycle").stop =
+                    Some(self.provider.fetch_collectors(reply));
+            }
         }
         cx.spawn(async move |this, cx| {
             if let Ok(outcome) = rx.await {
                 let _ = this.update(cx, |this, cx| {
-                    if this.generation != generation {
+                    let current = match &mut this.collector {
+                        Some(collector) => collector.land(generation),
+                        None => this.generation == generation,
+                    };
+                    if !current {
                         return;
+                    }
+                    if this.kind == InventoryKind::Collectors {
+                        cx.emit(InventoryEvent::Presence {
+                            tag: ItemTag::Collectors,
+                            presence: collector_presence(&outcome),
+                        });
                     }
                     this.loading = false;
                     match outcome {
@@ -316,6 +404,14 @@ fn helm_payload_notice(kind: InventoryKind) -> Option<&'static str> {
         .then_some("Helm release payload actions are unavailable: Secret values are never fetched")
 }
 
+fn collector_presence(outcome: &TableOutcome) -> ToolPresence {
+    match outcome {
+        TableOutcome::Table(_) => ToolPresence::Ready,
+        TableOutcome::Absent => ToolPresence::Missing,
+        TableOutcome::Denied(_) | TableOutcome::Failed(_) => ToolPresence::Blocked,
+    }
+}
+
 /// Which stored-manifest apply a press is about, in the latch's terms.
 fn rollback_subject(namespace: Option<&str>, name: &str, revision: u32) -> String {
     format!("{}/{name}/{revision}", namespace.unwrap_or(""))
@@ -339,6 +435,19 @@ impl crate::item::Item for InventoryView {
 
     fn focus_handle(&self) -> FocusHandle {
         InventoryView::focus_handle(self)
+    }
+
+    fn visibility_changed(&mut self, visible: bool, cx: &mut Context<Self>) {
+        let Some(collector) = &mut self.collector else {
+            return;
+        };
+        if collector.set_visible(visible) {
+            self.fetch(cx);
+            cx.notify();
+        } else if !visible && collector.pending {
+            self.loading = false;
+            self.fetch_label = Some("Collector listing cancelled while this pane is hidden".into());
+        }
     }
 }
 
@@ -602,12 +711,90 @@ mod tests {
             InventoryKind::Policy,
             InventoryKind::Harbor,
             InventoryKind::Mesh,
+            InventoryKind::Collectors,
         ] {
             assert_eq!(helm_payload_notice(kind), None);
         }
         assert_eq!(
             InventoryKind::Helm.empty_hint(),
             "no Helm release metadata is visible to this account"
+        );
+    }
+
+    #[test]
+    fn collector_refresh_and_hide_stop_requests_and_reject_delivered_old_replies() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let observed = cancelled.clone();
+        let mut read = CollectorRead::new();
+        let first = read.begin().expect("visible listing");
+        read.stop = Some(RequestStop::new(move || {
+            observed.store(true, Ordering::SeqCst)
+        }));
+        let replacement = read.begin().expect("replacement listing");
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(!read.land(first));
+        let hidden = Arc::new(AtomicBool::new(false));
+        let observed = hidden.clone();
+        read.stop = Some(RequestStop::new(move || {
+            observed.store(true, Ordering::SeqCst)
+        }));
+        assert!(!read.set_visible(true));
+        assert!(!read.set_visible(false));
+        assert!(hidden.load(Ordering::SeqCst));
+        assert!(read.pending);
+        assert!(!read.land(replacement));
+        assert!(read.begin().is_none());
+        assert!(read.set_visible(true));
+        let reopened = read.begin().expect("reopened listing");
+        assert!(!read.land(replacement));
+        assert!(read.land(reopened));
+        assert!(!read.land(reopened));
+        assert!(!read.set_visible(false));
+        assert!(!read.set_visible(true));
+    }
+
+    #[test]
+    fn retiring_a_collector_inventory_stops_its_owned_request() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let observed = cancelled.clone();
+        let mut read = CollectorRead::new();
+        assert!(read.begin().is_some());
+        read.stop = Some(RequestStop::new(move || {
+            observed.store(true, Ordering::SeqCst)
+        }));
+        drop(read);
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(InventoryKind::Collectors.tag(), ItemTag::Collectors);
+        assert!(ItemTag::Collectors.retires_on_adopt());
+    }
+
+    #[test]
+    fn collector_presence_distinguishes_an_empty_served_inventory_from_absence() {
+        assert_eq!(
+            collector_presence(&TableOutcome::Table(TablePage::default())),
+            ToolPresence::Ready,
+        );
+        assert_eq!(
+            collector_presence(&TableOutcome::Absent),
+            ToolPresence::Missing
+        );
+        assert_eq!(
+            collector_presence(&TableOutcome::Denied("OpenTelemetry Collectors")),
+            ToolPresence::Blocked,
+        );
+        assert_eq!(
+            collector_presence(&TableOutcome::Failed("server refused the listing".into())),
+            ToolPresence::Blocked,
         );
     }
 

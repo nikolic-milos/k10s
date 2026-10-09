@@ -58,6 +58,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
         // able to type.
         KeyBinding::new("shift-h", OpenReleases, workspace),
         KeyBinding::new("shift-g", OpenObserve, workspace),
+        KeyBinding::new("shift-c", OpenCollectors, workspace),
         KeyBinding::new("shift-p", OpenPolicy, workspace),
         KeyBinding::new("shift-r", OpenHarbor, workspace),
         KeyBinding::new("shift-i", OpenMesh, workspace),

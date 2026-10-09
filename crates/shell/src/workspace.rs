@@ -17,7 +17,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, Context, Entity, FocusHandle, Subscription, Window};
+use gpui::{
+    App, AppContext as _, Context, Entity, FocusHandle, SharedString, Subscription, Window,
+};
 
 use k10s_core::Level;
 use k10s_map::{MapView, OverlayFrame, OverlayKind, Picked};
@@ -40,8 +42,50 @@ use crate::tag::ItemTag;
 use crate::ui::Viewport;
 use k10s_provider::{
     ClusterProvider, Detail, LaunchProvider, LogStop, NullLaunchProvider, OverlayOutcome,
-    PostureOutcome, ProviderSlot, UsageOutcome,
+    PostureOutcome, ProviderSlot, RequestStop, ToolPresence, UsageOutcome,
 };
+
+#[derive(Default)]
+pub(crate) struct ObservabilityNavigation {
+    pub(crate) observe: Option<ToolPresence>,
+    pub(crate) traces: Option<ToolPresence>,
+    pub(crate) collectors: Option<ToolPresence>,
+}
+
+impl ObservabilityNavigation {
+    pub(crate) fn set(&mut self, tag: &ItemTag, presence: ToolPresence) {
+        match tag {
+            ItemTag::Observe => self.observe = Some(presence),
+            ItemTag::Traces => self.traces = Some(presence),
+            ItemTag::Collectors => self.collectors = Some(presence),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn available(&self, tag: &ItemTag) -> bool {
+        let presence = match tag {
+            ItemTag::Observe => self.observe,
+            ItemTag::Traces => self.traces,
+            ItemTag::Collectors => self.collectors,
+            _ => None,
+        };
+        presence != Some(ToolPresence::Missing)
+    }
+}
+
+#[derive(Default)]
+struct InspectorRequests {
+    events: Option<RequestStop>,
+    logs: Option<RequestStop>,
+}
+
+impl InspectorRequests {
+    fn reset(&mut self, connected: bool, visible: bool) -> bool {
+        self.events = None;
+        self.logs = None;
+        connected && visible
+    }
+}
 
 /// Where the user's config files live; the app resolves the platform paths and
 /// the workspace only opens what it is handed.
@@ -135,6 +179,12 @@ pub struct Workspace {
     pub(crate) scene_chosen: bool,
     pub(crate) events: Option<Detail>,
     pub(crate) log: Option<Detail>,
+    pub(crate) observability_navigation: ObservabilityNavigation,
+    inspector_requests: InspectorRequests,
+    pub(crate) retained_loki: Option<ToolPresence>,
+    pub(crate) retained_loki_notice: Option<SharedString>,
+    retained_loki_generation: u64,
+    retained_loki_stop: Option<RequestStop>,
     // Live usage for the inspected pod or workload. The value is the last
     // labelled outcome the poll delivered; the guard is the poll -- dropping
     // it ends the fetching, so usage stops costing anything the moment the
@@ -212,6 +262,12 @@ impl Workspace {
             scene_chosen: scene_chosen || connected || bench,
             events: None,
             log: None,
+            observability_navigation: ObservabilityNavigation::default(),
+            inspector_requests: InspectorRequests::default(),
+            retained_loki: None,
+            retained_loki_notice: None,
+            retained_loki_generation: 0,
+            retained_loki_stop: None,
             usage: UsageState::default(),
             usage_stop: None,
             posture: None,
@@ -269,11 +325,17 @@ impl Workspace {
             }
         }
         self.fetch_generation += 1;
+        let fetch = self
+            .inspector_requests
+            .reset(self.connected, self.inspector_open);
         self.events = None;
         self.log = None;
+        self.retained_loki = None;
+        self.retained_loki_notice = None;
+        self.retained_loki_stop = None;
         self.posture = None;
         self.sync_usage_poll(cx);
-        if !self.connected {
+        if !fetch {
             return;
         }
         let Some(selection) = self.selection.as_ref() else {
@@ -286,30 +348,43 @@ impl Workspace {
         let wants_log = selection.level == Level::Cell;
 
         let (tx, rx) = futures::channel::oneshot::channel();
-        self.slot.fetch_events(
+        self.inspector_requests.events = Some(self.slot.fetch_events(
             namespace,
-            &selection.name,
+            &selection.uid,
             Box::new(move |detail| {
                 let _ = tx.send(detail);
             }),
-        );
+        ));
         self.land_detail(
             rx,
             generation,
-            |this, detail| this.events = Some(detail),
+            |this, detail, _| {
+                this.inspector_requests.events = None;
+                this.events = Some(detail);
+            },
             cx,
         );
 
         if wants_log {
             let (tx, rx) = futures::channel::oneshot::channel();
-            self.slot.fetch_log_tail(
+            self.inspector_requests.logs = Some(self.slot.fetch_log_tail(
                 namespace,
                 &selection.name,
+                &selection.uid,
                 Box::new(move |detail| {
                     let _ = tx.send(detail);
                 }),
+            ));
+            self.land_detail(
+                rx,
+                generation,
+                |this, detail, cx| {
+                    this.inspector_requests.logs = None;
+                    this.log = Some(detail);
+                    this.probe_retained_loki(cx);
+                },
+                cx,
             );
-            self.land_detail(rx, generation, |this, detail| this.log = Some(detail), cx);
         }
 
         if wants_log {
@@ -344,6 +419,12 @@ impl Workspace {
     // because toggling the panel closed must stop the polling that only
     // existed to fill it.
     pub(crate) fn sync_usage_poll(&mut self, cx: &mut Context<Self>) {
+        if self.inspector_open {
+            self.probe_retained_loki(cx);
+        } else {
+            self.retained_loki_stop = None;
+            self.retained_loki_generation += 1;
+        }
         // Dropping the previous guard first means two polls never overlap.
         self.usage_stop = None;
         let generation = self.usage.restart();
@@ -422,20 +503,88 @@ impl Workspace {
         &self,
         reply: futures::channel::oneshot::Receiver<Detail>,
         generation: u64,
-        place: fn(&mut Self, Detail),
+        place: fn(&mut Self, Detail, &mut Context<Self>),
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
             if let Ok(detail) = reply.await {
                 let _ = this.update(cx, |this, cx| {
-                    if this.fetch_generation == generation {
-                        place(this, detail);
+                    if this.fetch_generation == generation && this.inspector_open {
+                        place(this, detail, cx);
                         cx.notify();
                     }
                 });
             }
         })
         .detach();
+    }
+
+    fn probe_retained_loki(&mut self, cx: &mut Context<Self>) {
+        if !self.connected
+            || !self.inspector_open
+            || self.retained_loki.is_some()
+            || self.retained_loki_stop.is_some()
+            || !matches!(
+                self.log,
+                Some(Detail::Log {
+                    previous_unavailable: true,
+                    ..
+                })
+            )
+        {
+            return;
+        }
+        let generation = self.fetch_generation;
+        self.retained_loki_generation += 1;
+        let probe_generation = self.retained_loki_generation;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.retained_loki_stop = Some(self.slot.probe_loki(Box::new(move |presence| {
+            let _ = tx.send(presence);
+        })));
+        cx.spawn(async move |this, cx| {
+            if let Ok(presence) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.fetch_generation != generation
+                        || this.retained_loki_generation != probe_generation
+                        || !this.inspector_open
+                    {
+                        return;
+                    }
+                    this.retained_loki_stop = None;
+                    match presence {
+                        Ok(presence) => this.retained_loki = Some(presence),
+                        Err(why) => {
+                            this.retained_loki = Some(ToolPresence::Blocked);
+                            this.retained_loki_notice =
+                                Some(crate::chart::display_message(&why).into());
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn open_retained_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::chrome::retained_logs_available(
+            self.connected,
+            self.selection.as_ref(),
+            self.log.as_ref(),
+            self.retained_loki,
+        ) {
+            return;
+        }
+        let request = self
+            .selection
+            .as_ref()
+            .expect("eligible Pod")
+            .describe_request();
+        self.open_observe_entry(
+            crate::observe::ObserveEntry::RetainedLogs(request),
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn cycle_overlay(&mut self, cx: &mut Context<Self>) {
@@ -794,6 +943,75 @@ impl Workspace {
         );
         self.palette.open(view, subscription, window, cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod inspector_tests {
+    use super::InspectorRequests;
+    use k10s_provider::RequestStop;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn hiding_replacing_and_disconnect_cancel_inspector_reads_and_reopening_admits_fresh_reads() {
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let guard = || {
+            let cancelled = cancelled.clone();
+            RequestStop::new(move || {
+                cancelled.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let mut requests = InspectorRequests::default();
+        assert!(requests.reset(true, true));
+        requests.events = Some(guard());
+        requests.logs = Some(guard());
+        assert!(!requests.reset(true, false));
+        assert_eq!(cancelled.load(Ordering::Relaxed), 2);
+        assert!(!requests.reset(true, false));
+        assert_eq!(cancelled.load(Ordering::Relaxed), 2);
+
+        assert!(requests.reset(true, true), "reopening admits fresh reads");
+        requests.events = Some(guard());
+        requests.logs = Some(guard());
+        assert!(
+            requests.reset(true, true),
+            "replacement cancels before admission"
+        );
+        assert_eq!(cancelled.load(Ordering::Relaxed), 4);
+        requests.events = Some(guard());
+        requests.logs = Some(guard());
+        assert!(!requests.reset(false, true));
+        assert_eq!(cancelled.load(Ordering::Relaxed), 6);
+    }
+}
+
+#[cfg(test)]
+mod observability_navigation_tests {
+    use super::ObservabilityNavigation;
+    use crate::tag::ItemTag;
+    use k10s_provider::ToolPresence;
+
+    #[test]
+    fn absence_is_local_to_one_tool_and_a_context_reset_discards_it() {
+        let mut navigation = ObservabilityNavigation::default();
+        for tag in [ItemTag::Observe, ItemTag::Traces, ItemTag::Collectors] {
+            assert!(navigation.available(&tag));
+            navigation.set(&tag, ToolPresence::Missing);
+            assert!(!navigation.available(&tag));
+            assert!(navigation.available(&ItemTag::Browse));
+            for presence in [ToolPresence::Blocked, ToolPresence::Ready] {
+                navigation.set(&tag, presence);
+                assert!(navigation.available(&tag));
+            }
+            navigation.set(&tag, ToolPresence::Missing);
+        }
+        navigation = ObservabilityNavigation::default();
+        for tag in [ItemTag::Observe, ItemTag::Traces, ItemTag::Collectors] {
+            assert!(navigation.available(&tag));
+        }
     }
 }
 

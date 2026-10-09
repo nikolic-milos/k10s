@@ -13,7 +13,11 @@ pub enum Detail {
     /// Tail lines, and why they are these lines: a crash tail names the
     /// container that exited, so a quiet pane is never mistaken for a quiet
     /// process.
-    Log(Vec<String>, Option<String>),
+    Log {
+        lines: Vec<String>,
+        note: Option<String>,
+        previous_unavailable: bool,
+    },
     Denied(&'static str),
     Failed(String),
 }

@@ -431,14 +431,14 @@ pub async fn sync_from(
     report.total_ms = ms(started);
 
     let snapshot = catalog.clone();
-    let inspector = inspect::Inspector::new(client.clone());
     let reader = read::Reader::new(
         client.clone(),
-        interactive,
+        interactive.clone(),
         discovered.targets.clone(),
         &verdict_list,
         &caps_list,
     );
+    let inspector = inspect::Inspector::new(interactive, reader.scheduler());
     tokio::spawn(forward_live(
         rx,
         store,

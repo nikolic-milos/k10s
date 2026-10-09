@@ -27,6 +27,7 @@ actions!(
         OpenFlux,
         OpenDay2,
         OpenObserve,
+        OpenCollectors,
         ObserveRangeFifteenMinutes,
         ObserveRangeOneHour,
         ObserveToggleResolution,
@@ -52,6 +53,7 @@ actions!(
         Quit,
         DescribeSelection,
         LogsSelection,
+        RetainedLogsSelection,
         ExecSelection,
         AttachSelection,
         NextItem,
@@ -203,6 +205,7 @@ mod tests {
         assert_eq!(OpenPalette.name(), "k10s_shell::OpenPalette");
         assert_eq!(EditorSave.name(), "k10s_shell::EditorSave");
         assert_eq!(RowDown.name(), "k10s_shell::RowDown");
+        assert_eq!(OpenCollectors.name(), "k10s_shell::OpenCollectors");
         assert_eq!(
             ToggleInspector::name_for_type(),
             "k10s_shell::ToggleInspector"

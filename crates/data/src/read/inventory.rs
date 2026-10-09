@@ -146,6 +146,28 @@ impl Reader {
         });
     }
 
+    /// The Collector document reads only safe metadata and observed process
+    /// health, with the same admission and elapsed deadline as Inspector reads.
+    pub fn fetch_collectors(
+        &self,
+        reply: impl FnOnce(Fetched<Option<TablePage>>) + Send + 'static,
+    ) -> crate::telemetry::RequestStop {
+        let client = self.interactive.clone();
+        let deadline = tokio::time::Instant::now() + crate::connect::INTERACTIVE_DEADLINE;
+        self.telemetry.submit_until(
+            &self.handle,
+            deadline,
+            async move {
+                match otel::fetch_inventory(&client, None).await {
+                    Fetched::Ok(inventory) => Fetched::Ok(otel::table_page(&inventory)),
+                    Fetched::Denied { what } => Fetched::Denied { what },
+                    Fetched::Failed { what, why } => Fetched::Failed { what, why },
+                }
+            },
+            reply,
+        )
+    }
+
     /// Every ecosystem family, fetched concurrently and reduced to its own
     /// table. A family whose answer is [`Fetched::Ok`]`(None)` is not on
     /// this cluster and stays hidden; Denied and Failed stay labelled per

@@ -26,10 +26,11 @@ use crate::workspace::{PickerPurpose, Workspace};
 use crate::{
     AttachSelection, ChooseCluster, ClearSelection, CloseItem, DescribeSelection, EditSelection,
     ExecSelection, FindCluster, FindFile, LoadSavedView, LogsSelection, NewFile, NextItem,
-    OpenArgo, OpenBrowser, OpenDay2, OpenEcosystem, OpenFile, OpenFlux, OpenFolder, OpenForwards,
-    OpenHarbor, OpenKeymap, OpenMesh, OpenNodes, OpenObserve, OpenPalette, OpenPolicy,
-    OpenReleases, OpenSettings, OpenTraces, PrevItem, Quit, ShowStarmap, SilenceSelection,
-    ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    OpenArgo, OpenBrowser, OpenCollectors, OpenDay2, OpenEcosystem, OpenFile, OpenFlux, OpenFolder,
+    OpenForwards, OpenHarbor, OpenKeymap, OpenMesh, OpenNodes, OpenObserve, OpenPalette,
+    OpenPolicy, OpenReleases, OpenSettings, OpenTraces, PrevItem, Quit, RetainedLogsSelection,
+    ShowStarmap, SilenceSelection, ToggleBottomDock, ToggleInspector, ToggleLeftDock,
+    ToggleRightDock, ToggleTerminal,
 };
 
 impl Render for Workspace {
@@ -134,8 +135,15 @@ impl Render for Workspace {
                 )
                 .child(Self::resize_handle(DockEdge::Bottom))
         });
-        let right = (!self.bench && self.inspector_open)
-            .then(|| self.inspector(&theme, &fonts, sizes.right, self.selection.clone()));
+        let right = (!self.bench && self.inspector_open).then(|| {
+            self.inspector(
+                &theme,
+                &fonts,
+                sizes.right,
+                self.selection.clone(),
+                self.retained_loki,
+            )
+        });
         let status = (!self.bench).then(|| {
             div()
                 .id("status-bar")
@@ -378,6 +386,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenObserve, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Observe, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenCollectors, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Collectors, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RetainedLogsSelection, window, cx| {
+                this.open_retained_logs(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenPolicy, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Policy, window, cx);
             }))
@@ -517,7 +531,7 @@ impl Workspace {
     // keep a usage poll alive under it.
     pub(crate) fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
         self.inspector_open = !self.inspector_open;
-        self.sync_usage_poll(cx);
+        self.refresh_detail(cx);
         cx.notify();
     }
 }

@@ -5,6 +5,123 @@
 
 use super::*;
 
+fn retained_log_pod() -> Selection {
+    Selection {
+        level: Level::Cell,
+        kind: "pod",
+        kind_id: k10s_core::KindId::POD,
+        uid: "selected-pod-uid".into(),
+        name: "api".into(),
+        namespace: Some("prod".into()),
+        owner: Some("api-workload".into()),
+    }
+}
+
+fn unavailable_previous_tail() -> Detail {
+    Detail::Log {
+        lines: vec!["current container output".into()],
+        note: Some("current container api; previous log unavailable".into()),
+        previous_unavailable: true,
+    }
+}
+
+#[test]
+fn retained_logs_require_a_known_previous_refusal_and_a_discovered_loki() {
+    let selection = retained_log_pod();
+    let detail = unavailable_previous_tail();
+    for presence in [ToolPresence::Ready, ToolPresence::Blocked] {
+        assert!(retained_logs_available(
+            true,
+            Some(&selection),
+            Some(&detail),
+            Some(presence),
+        ));
+    }
+    for presence in [None, Some(ToolPresence::Missing)] {
+        assert!(!retained_logs_available(
+            true,
+            Some(&selection),
+            Some(&detail),
+            presence,
+        ));
+    }
+    assert!(!retained_logs_available(
+        false,
+        Some(&selection),
+        Some(&detail),
+        Some(ToolPresence::Ready),
+    ));
+}
+
+#[test]
+fn a_log_note_never_substitutes_for_the_typed_previous_refusal() {
+    let selection = retained_log_pod();
+    for detail in [
+        Detail::Log {
+            lines: vec!["previous log unavailable".into()],
+            note: Some("previous log unavailable".into()),
+            previous_unavailable: false,
+        },
+        Detail::Denied("logs"),
+        Detail::Failed("previous log unavailable".into()),
+        Detail::Events(Vec::new()),
+    ] {
+        assert!(!retained_logs_available(
+            true,
+            Some(&selection),
+            Some(&detail),
+            Some(ToolPresence::Ready),
+        ));
+    }
+    assert!(!retained_logs_available(
+        true,
+        Some(&selection),
+        None,
+        Some(ToolPresence::Ready),
+    ));
+}
+
+#[test]
+fn retained_logs_require_an_exact_namespaced_pod_identity() {
+    let detail = unavailable_previous_tail();
+    let pod = retained_log_pod();
+    for selection in [
+        Selection {
+            kind_id: k10s_core::KindId::DEPLOYMENT,
+            ..pod.clone()
+        },
+        Selection {
+            uid: "".into(),
+            ..pod.clone()
+        },
+        Selection {
+            name: "".into(),
+            ..pod.clone()
+        },
+        Selection {
+            namespace: None,
+            ..pod.clone()
+        },
+        Selection {
+            namespace: Some("".into()),
+            ..pod
+        },
+    ] {
+        assert!(!retained_logs_available(
+            true,
+            Some(&selection),
+            Some(&detail),
+            Some(ToolPresence::Ready),
+        ));
+    }
+    assert!(!retained_logs_available(
+        true,
+        None,
+        Some(&detail),
+        Some(ToolPresence::Ready),
+    ));
+}
+
 #[test]
 fn the_title_bar_names_the_cluster_rather_than_the_fact_of_one() {
     assert_eq!(

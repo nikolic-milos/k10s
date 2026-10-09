@@ -34,6 +34,7 @@ pub enum ItemTag {
     Flux,
     Day2,
     Observe,
+    Collectors,
     Policy,
     Harbor,
     Mesh,
@@ -45,7 +46,7 @@ pub enum ItemTag {
     Edit(String),
     /// An editor over text the app revealed out of the cluster (Helm values,
     /// rendered manifests). Editable, but nothing in it is the user's until
-    /// they save it somewhere — so unlike [`ItemTag::Edit`] it retires with
+    /// they save it somewhere; unlike [`ItemTag::Edit`] it retires with
     /// its cluster instead of carrying revealed secrets across a switch.
     Reveal(String),
     Diff(String),
@@ -77,6 +78,7 @@ impl ItemTag {
             | ItemTag::Flux
             | ItemTag::Day2
             | ItemTag::Observe
+            | ItemTag::Collectors
             | ItemTag::Policy
             | ItemTag::Harbor
             | ItemTag::Mesh
@@ -123,6 +125,7 @@ mod tests {
             (ItemTag::Flux, OnAdopt::Retire),
             (ItemTag::Day2, OnAdopt::Retire),
             (ItemTag::Observe, OnAdopt::Retire),
+            (ItemTag::Collectors, OnAdopt::Retire),
             (ItemTag::Policy, OnAdopt::Retire),
             (ItemTag::Harbor, OnAdopt::Retire),
             (ItemTag::Mesh, OnAdopt::Retire),

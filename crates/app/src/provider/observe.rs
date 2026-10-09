@@ -156,6 +156,18 @@ pub(super) fn observe_reach(
     }
 }
 
+pub(super) fn loki_probe_outcome(
+    fetched: k10s_data::read::Fetched<k10s_data::read::Seen>,
+) -> Result<k10s_provider::ToolPresence, String> {
+    match fetched {
+        k10s_data::read::Fetched::Ok(seen) => Ok(tool_presence(seen)),
+        k10s_data::read::Fetched::Denied { what } => {
+            Err(format!("{what}: access denied for this account"))
+        }
+        k10s_data::read::Fetched::Failed { why, .. } => Err(why),
+    }
+}
+
 pub(super) fn tool_presence(seen: k10s_data::read::Seen) -> k10s_provider::ToolPresence {
     match seen {
         k10s_data::read::Seen::Bound => k10s_provider::ToolPresence::Ready,
@@ -432,7 +444,9 @@ pub(super) fn loki_outcome(
                         .find(|(key, _)| key == "trace_id")
                         .map(|(_, value)| value.as_str())
                         .filter(|value| {
-                            value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            matches!(value.len(), 16 | 32)
+                                && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                && value.bytes().any(|byte| byte != b'0')
                         })
                         .map(str::to_ascii_lowercase);
                     entries.push(LogEntry {

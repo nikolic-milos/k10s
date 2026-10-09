@@ -29,6 +29,7 @@ pub use table::{EcosystemEntry, KindRow, TableColumn, TableOutcome, TablePage, T
 
 mod observe;
 mod telemetry;
+mod trace_logs;
 pub use observe::{
     AlertMatcher, AlertPodOutcome, AlertmanagerEndpoint, AlertmanagerOutcome, GrafanaOutcome,
     GrafanaPanelKind, GrafanaPanelRow, LogEntry, LokiOutcome, ObserveReach, PromOutcome,
@@ -39,6 +40,7 @@ pub use telemetry::{
     FetchTiming, LokiRequest, ObserveScope, PodIdentity, PromRequest, QueryWindow, RequestStop,
     ScopeOutcome, exact_pattern, quote,
 };
+pub use trace_logs::SpanLogQuery;
 
 mod helm;
 pub use helm::{HelmReveal, HelmRevealOutcome, HelmRollbackOutcome};
@@ -97,8 +99,10 @@ macro_rules! cluster_provider {
 }
 
 cluster_provider! {
-    fn fetch_events(&self, namespace: &str, name: &str, reply: Reply<Detail>);
-    fn fetch_log_tail(&self, namespace: &str, pod: &str, reply: Reply<Detail>);
+    /// Events for the selected UID, including when its name has been reused.
+    fn fetch_events(&self, namespace: &str, uid: &str, reply: Reply<Detail>) -> RequestStop;
+    /// Name-addressed kubelet logs, with the selected UID checked around the tail.
+    fn fetch_log_tail(&self, namespace: &str, pod: &str, uid: &str, reply: Reply<Detail>) -> RequestStop;
     fn kinds(&self) -> Vec<KindRow>;
     /// `continue_token` is a token a previous page carried; None means the
     /// first page.
@@ -165,6 +169,7 @@ cluster_provider! {
     /// the Grafana pane.
     fn fetch_grafana(&self, reply: Reply<GrafanaOutcome>) -> RequestStop;
     fn probe_observe(&self, reply: Reply<ObserveReach>) -> RequestStop;
+    fn probe_loki(&self, reply: Reply<Result<ToolPresence, String>>) -> RequestStop;
     fn resolve_observe_scope(&self, request: DescribeRequest, reply: Reply<ScopeOutcome>) -> RequestStop;
     fn query_panel(&self, panel: GrafanaPanelRow, scope: ObserveScope, window: QueryWindow, reply: Reply<PromOutcome>) -> RequestStop;
     fn query_promql(&self, request: PromRequest, reply: Reply<PromOutcome>) -> RequestStop;
@@ -180,6 +185,8 @@ cluster_provider! {
     /// own table. Absent families stay hidden; one denied or failed family
     /// never hides the others.
     fn fetch_ecosystem(&self, reply: Reply<Vec<EcosystemEntry>>);
+    /// Collector metadata and process health without the general ecosystem aggregate.
+    fn fetch_collectors(&self, reply: Reply<TableOutcome>) -> RequestStop;
     /// Locate the pod behind a selected Alertmanager row. `uid` is the row's
     /// identity: an alert's fingerprint, whose alert is re-read so its
     /// namespace and pod labels name the join, or the identity of the row
@@ -220,12 +227,14 @@ pub struct NullProvider;
 const NO_CLUSTER: &str = "no cluster connected; this view needs one";
 
 impl ClusterProvider for NullProvider {
-    fn fetch_events(&self, _: &str, _: &str, reply: Reply<Detail>) {
+    fn fetch_events(&self, _: &str, _: &str, reply: Reply<Detail>) -> RequestStop {
         reply(Detail::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
     }
 
-    fn fetch_log_tail(&self, _: &str, _: &str, reply: Reply<Detail>) {
+    fn fetch_log_tail(&self, _: &str, _: &str, _: &str, reply: Reply<Detail>) -> RequestStop {
         reply(Detail::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
     }
 
     fn kinds(&self) -> Vec<KindRow> {
@@ -353,6 +362,11 @@ impl ClusterProvider for NullProvider {
         RequestStop::noop()
     }
 
+    fn probe_loki(&self, reply: Reply<Result<ToolPresence, String>>) -> RequestStop {
+        reply(Ok(ToolPresence::Missing));
+        RequestStop::noop()
+    }
+
     fn resolve_observe_scope(&self, _: DescribeRequest, reply: Reply<ScopeOutcome>) -> RequestStop {
         reply(ScopeOutcome::Failed(NO_CLUSTER.to_string()));
         RequestStop::noop()
@@ -397,6 +411,11 @@ impl ClusterProvider for NullProvider {
 
     fn fetch_ecosystem(&self, reply: Reply<Vec<EcosystemEntry>>) {
         reply(Vec::new());
+    }
+
+    fn fetch_collectors(&self, reply: Reply<TableOutcome>) -> RequestStop {
+        reply(TableOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
     }
 
     fn fetch_alert_pod(&self, _: String, reply: Reply<AlertPodOutcome>) {

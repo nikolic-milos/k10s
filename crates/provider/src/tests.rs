@@ -91,3 +91,20 @@ fn grafana_routes_keep_reserved_characters_inside_the_uid_segment() {
         assert!(grafana_panel_path(uid, 1).is_none());
     }
 }
+
+#[test]
+fn an_empty_slot_inspector_replies_without_owning_cluster_work() {
+    let slot = ProviderSlot::empty();
+    assert_eq!(
+        take(|reply| slot.fetch_events("prod", "selected-uid", reply)),
+        Detail::Failed(NO_CLUSTER.to_string())
+    );
+    assert_eq!(
+        take(|reply| slot.fetch_log_tail("prod", "api-1", "selected-uid", reply)),
+        Detail::Failed(NO_CLUSTER.to_string())
+    );
+    assert_eq!(
+        take(|reply| slot.fetch_collectors(reply)),
+        TableOutcome::Failed(NO_CLUSTER.to_string())
+    );
+}

@@ -60,7 +60,9 @@ Charts name source, UTC bounds, effective resolution and declared unit.
 Datasource minimum intervals can increase resolution. Observe and inspector
 share returned samples and bounds. **Pod readiness** reports readiness; separate
 inspector CPU/memory usage and requests/limits can update while Observe stays
-fixed. Observe has no automatic range refresh.
+fixed. Usage is addressed by name or selector and is labelled **UID unverified**;
+it does not establish the controlling owner or selected Pod UID. Observe has
+no automatic range refresh.
 
 Gaps remain missing. Hover names an actual sample/timestamp or no finite sample.
 Association notices distinguish current Pod UIDs from missing, foreign or older
@@ -141,11 +143,48 @@ Shift+T opens Traces; `q` edits its ID and Enter runs it. Different IDs or selec
 invalidate the old link. Hiding cancels pending requests; reopen and Refresh when
 asked to retry. Retained Observe results keep their fixed UTC bounds.
 
+Select a span and press `l` or **Logs for selected span**. The query uses that
+span's recorded namespace and Pod, its UID when present, and its trace ID. Its
+window includes one second before and after the span. The selected Kubernetes
+object does not supply missing span attributes; manual trace lookup also works
+without a current selection. Missing resource attributes or time produce a
+named refusal. **Refresh** preserves the recorded expression and UTC bounds.
+Changing selection starts a current-workload investigation. Changing range or
+resolution reruns the expression over a recent window and drops the span link.
+
+This link selects logs for the trace during the span's window. The origin span
+does not prove that each returned line belongs to that exact span. Rows distinguish
+matching recorded UID from weaker resource or trace links. Opening this focused
+log view does not start a Grafana catalogue or unrelated metrics query.
+[Grafana trace-to-logs requirements](https://grafana.com/docs/grafana/latest/datasources/tempo/configure-tempo-data-source/configure-trace-to-logs/).
+
+## Inspector and retained history
+
+Inspector events are filtered by the selected object's UID. A Pod log tail
+checks the selected UID before and after the request and withholds lines after
+name reuse. Kubelet log requests are still addressed by name; the heading states
+that the backend UID is unverified. Metadata checks alone cannot attest the
+identity of the kubelet's returned container output.
+
+Restarted containers request their previous output. An explicit missing-previous
+response or the runtime refusal naming the recorded terminated container ID
+permits a labelled current-container fallback. Other failures retain their own
+outcome and the server's sentence. Timestamped application output remains a log
+line even when its text resembles a control response.
+
+When previous output is unavailable and Loki is discovered, **Retained logs in
+Loki** opens an investigation for the selected Pod UID. Scope is verified again
+before querying. This retrieves only records already delivered to Loki with the
+required attributes; it does not recover output that was never collected.
+
 ## Collector inventory and delivery evidence
 
-Shift+E opens **Ecosystem**; Tab/Shift+Tab selects served **OpenTelemetry**.
+Shift+C opens the focused **Collectors** document. Refresh reads Collector
+metadata and observed process health without fetching other ecosystem families.
+Hiding cancels unfinished reads; reopening resumes an interrupted request.
+Shift+E also opens **Ecosystem**, where Tab/Shift+Tab selects **OpenTelemetry**.
 Collector CRs are metadata only: config/image/readiness are not fetched.
-Discovered standalone Services show health-extension results. Absence, denial,
+Discovered standalone Services show health_check or zpages endpoint results. Absence, denial,
 failure and process health stay distinct.
 
 Health proves the endpoint answered. Delivery requires actual producer
@@ -165,6 +204,13 @@ any request. Use the existing Helm tool when an operation requires its payloads.
   5,000 points each; charts draw 16, naming omissions. Histograms are refused.
 - Observe log requests ask for 200 entries. Loki decoding is bounded to 16
   streams and 8 KiB per displayed line; clipping and truncation are labelled.
+- Inspector tails request 200 lines and 64 KiB from kubelet. Successful response
+  bodies also have a local 64 KiB cap; oversized bodies are refused before lines
+  or retained-history permission appear. The SDK still buffers HTTP error bodies
+  while preserving their structured status and server sentence.
+  Inspector events and tails, and focused Collector reads, share two active
+  and four waiting requests. Their 35-second deadline covers queue time and
+  the full exchange.
 - Traces retain at most 4,096 spans; timeline shows eight rows. Use the table
   for other retained spans.
 - Labels/notices show abbreviation. Chart/catalog notices show at most eight

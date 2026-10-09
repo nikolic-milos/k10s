@@ -5,10 +5,11 @@
 //! two rules that used to be the first line of fifteen separate methods live
 //! there once -- a bench window hosts nothing but the map, and asking for a
 //! document twice activates the tab already open rather than stacking another
-//! copy of the same question. Four kinds of item do not fit that shape, because
+//! copy of the same question. Five kinds of item do not fit that shape, because
 //! reopening them means telling the view that exists something new: a diff
 //! re-compares, the forwards registry starts another forward, the file panel
-//! re-roots, and the terminal toggles. Those stay written out.
+//! re-roots, Observe installs an investigation, and the terminal toggles.
+//! Those stay written out.
 
 use gpui::{
     AppContext as _, Context, Entity, EventEmitter, FocusHandle, SharedString, Subscription, Window,
@@ -29,7 +30,7 @@ use crate::forwards::ForwardsView;
 use crate::helm_values::HelmReportView;
 use crate::item::{Item, ItemHandle};
 use crate::lists::{InventoryEvent, InventoryView};
-use crate::observe::{ObserveEvent, ObserveView};
+use crate::observe::{ObserveEntry, ObserveEvent, ObserveView};
 use crate::tag::ItemTag;
 use crate::term::TerminalView;
 use crate::text::TextView;
@@ -348,6 +349,9 @@ impl Workspace {
             ActivityId::Observe => {
                 self.toggle_center_list(ItemTag::Observe, window, cx, Self::open_observe)
             }
+            ActivityId::Collectors => {
+                self.toggle_center_list(ItemTag::Collectors, window, cx, Self::open_collectors)
+            }
             ActivityId::Policy => {
                 self.toggle_center_list(ItemTag::Policy, window, cx, Self::open_policy)
             }
@@ -398,6 +402,7 @@ impl Workspace {
             Some(ItemTag::Flux) => Some(crate::activity::CenterSlot::Flux),
             Some(ItemTag::Day2) => Some(crate::activity::CenterSlot::Day2),
             Some(ItemTag::Observe) => Some(crate::activity::CenterSlot::Observe),
+            Some(ItemTag::Collectors) => Some(crate::activity::CenterSlot::Collectors),
             Some(ItemTag::Policy) => Some(crate::activity::CenterSlot::Policy),
             Some(ItemTag::Ecosystem) => Some(crate::activity::CenterSlot::Ecosystem),
             _ => None,
@@ -431,34 +436,54 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Subscription {
+        let source = self.slot.current();
         cx.subscribe_in(
             view,
             window,
-            |this, _, event: &InventoryEvent, window, cx| match event {
-                InventoryEvent::RevealPod { namespace, pod } => {
-                    this.reveal_alert_pod(namespace, pod, window, cx);
+            move |this, _, event: &InventoryEvent, window, cx| {
+                if !std::rc::Rc::ptr_eq(&source, &this.slot.current()) {
+                    return;
                 }
-                InventoryEvent::NotServed { tag, what } => {
-                    this.close_tagged(tag, window, cx);
-                    this.status_note = Some(format!("{what} is not served by this cluster"));
-                    cx.notify();
+                match event {
+                    InventoryEvent::Presence { tag, presence } => {
+                        this.observability_navigation.set(tag, *presence);
+                        cx.notify();
+                    }
+                    InventoryEvent::RevealPod { namespace, pod } => {
+                        this.reveal_alert_pod(namespace, pod, window, cx);
+                    }
+                    InventoryEvent::NotServed { tag, what } => {
+                        this.observability_navigation
+                            .set(tag, k10s_provider::ToolPresence::Missing);
+                        this.close_tagged(tag, window, cx);
+                        this.status_note = Some(format!("{what} is not served by this cluster"));
+                        cx.notify();
+                    }
+                    InventoryEvent::RevealRelease {
+                        namespace,
+                        name,
+                        revision,
+                    } => {
+                        this.reveal_release(namespace.clone(), name.clone(), *revision, window, cx)
+                    }
+                    InventoryEvent::DiffRelease {
+                        namespace,
+                        name,
+                        from,
+                        to,
+                    } => this.diff_release(namespace.clone(), name.clone(), *from, *to, window, cx),
+                    InventoryEvent::RollbackRelease {
+                        namespace,
+                        name,
+                        revision,
+                    } => this.rollback_release(
+                        namespace.clone(),
+                        name.clone(),
+                        *revision,
+                        window,
+                        cx,
+                    ),
                 }
-                InventoryEvent::RevealRelease {
-                    namespace,
-                    name,
-                    revision,
-                } => this.reveal_release(namespace.clone(), name.clone(), *revision, window, cx),
-                InventoryEvent::DiffRelease {
-                    namespace,
-                    name,
-                    from,
-                    to,
-                } => this.diff_release(namespace.clone(), name.clone(), *from, *to, window, cx),
-                InventoryEvent::RollbackRelease {
-                    namespace,
-                    name,
-                    revision,
-                } => this.rollback_release(namespace.clone(), name.clone(), *revision, window, cx),
             },
         )
     }
@@ -522,6 +547,21 @@ impl Workspace {
             |this, window, cx| {
                 let provider = this.provider();
                 let view = cx.new(|cx| InventoryView::flux(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_collectors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Collectors,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| InventoryView::collectors(provider, cx));
                 let subscription = this.subscribe_inventory(&view, window, cx);
                 (view, Some(subscription))
             },
@@ -652,6 +692,32 @@ impl Workspace {
     }
 
     pub(crate) fn open_observe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_observe_entry(ObserveEntry::General, window, cx);
+    }
+
+    pub(crate) fn open_observe_entry(
+        &mut self,
+        entry: ObserveEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bench {
+            return;
+        }
+        if let Some(index) = self.center.find(|tab| tab.tag == ItemTag::Observe) {
+            if let Ok(view) = self
+                .center
+                .get(index)
+                .expect("found tab")
+                .view
+                .to_any()
+                .downcast::<ObserveView>()
+            {
+                view.update(cx, |view, cx| view.prepare_entry(entry, cx));
+                self.activate_center(index, window, cx);
+            }
+            return;
+        }
         self.open_item(
             ItemTag::Observe,
             Place::Center,
@@ -660,7 +726,8 @@ impl Workspace {
             |this, window, cx| {
                 let provider = this.provider();
                 let selection = this.selection.clone();
-                let view = cx.new(|cx| ObserveView::new(provider, selection.as_ref(), cx));
+                let view =
+                    cx.new(|cx| ObserveView::for_entry(provider, selection.as_ref(), entry, cx));
                 let source = this.slot.current();
                 let subscription = cx.subscribe_in(
                     &view,
@@ -670,6 +737,16 @@ impl Workspace {
                             return;
                         }
                         match event {
+                            ObserveEvent::Presence(presence) => {
+                                this.observability_navigation
+                                    .set(&ItemTag::Observe, *presence);
+                                cx.notify();
+                            }
+                            ObserveEvent::TracePresence(presence) => {
+                                this.observability_navigation
+                                    .set(&ItemTag::Traces, *presence);
+                                cx.notify();
+                            }
                             ObserveEvent::Metrics { uid, data } => {
                                 if this
                                     .selection
@@ -682,13 +759,13 @@ impl Workspace {
                                 }
                             }
                             ObserveEvent::Trace { id, scope } => {
-                                if this
-                                    .selection
-                                    .as_ref()
-                                    .map(|selection| selection.describe_request())
-                                    .as_ref()
-                                    != Some(&scope.request)
-                                {
+                                if scope.as_ref().is_some_and(|scope| {
+                                    this.selection
+                                        .as_ref()
+                                        .map(|selection| selection.describe_request())
+                                        .as_ref()
+                                        != Some(&scope.request)
+                                }) {
                                     return;
                                 }
                                 this.show_traces(window, cx);
@@ -729,6 +806,8 @@ impl Workspace {
                                 }
                             }
                             ObserveEvent::NotServed => {
+                                this.observability_navigation
+                                    .set(&ItemTag::Observe, k10s_provider::ToolPresence::Missing);
                                 this.close_tagged(&ItemTag::Observe, window, cx);
                                 this.status_note = Some(
                                     "Grafana, Prometheus and Loki are not served by this cluster"
@@ -825,7 +904,47 @@ impl Workspace {
             |this, window, cx| {
                 let provider = this.provider();
                 let view = cx.new(|cx| TracesView::new(provider, cx));
-                let subscription = this.subscribe_inventory_events(&view, window, cx);
+                let source = this.slot.current();
+                let subscription = cx.subscribe_in(
+                    &view,
+                    window,
+                    move |this, _, event: &crate::traces::TraceEvent, window, cx| {
+                        if !std::rc::Rc::ptr_eq(&source, &this.slot.current()) {
+                            return;
+                        }
+                        match event {
+                            crate::traces::TraceEvent::Presence(presence) => {
+                                this.observability_navigation
+                                    .set(&ItemTag::Traces, *presence);
+                                cx.notify();
+                            }
+                            crate::traces::TraceEvent::Logs { query, scope } => {
+                                if scope.as_ref().is_some_and(|scope| {
+                                    this.selection
+                                        .as_ref()
+                                        .map(|selection| selection.describe_request())
+                                        .as_ref()
+                                        != Some(&scope.request)
+                                }) {
+                                    return;
+                                }
+                                this.open_observe_entry(
+                                    ObserveEntry::SpanLogs(query.clone()),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            crate::traces::TraceEvent::NotServed => {
+                                this.observability_navigation
+                                    .set(&ItemTag::Traces, k10s_provider::ToolPresence::Missing);
+                                this.close_tagged(&ItemTag::Traces, window, cx);
+                                this.status_note =
+                                    Some("Tempo and Jaeger are not served by this cluster".into());
+                                cx.notify();
+                            }
+                        }
+                    },
+                );
                 (view, Some(subscription))
             },
         );

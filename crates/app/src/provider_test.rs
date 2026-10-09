@@ -7,14 +7,79 @@
 use super::*;
 
 #[test]
+fn a_loki_only_probe_preserves_missing_denied_and_failed_states() {
+    use k10s_data::read::Seen;
+    use k10s_provider::ToolPresence;
+    assert_eq!(
+        loki_probe_outcome(Fetched::Ok(Seen::Bound)),
+        Ok(ToolPresence::Ready)
+    );
+    assert_eq!(
+        loki_probe_outcome(Fetched::Ok(Seen::Absent)),
+        Ok(ToolPresence::Missing)
+    );
+    assert_eq!(
+        loki_probe_outcome(Fetched::Denied { what: "services" }),
+        Err("services: access denied for this account".into())
+    );
+    assert_eq!(
+        loki_probe_outcome(Fetched::Failed {
+            what: "Loki",
+            why: "Loki storage is unavailable".into()
+        }),
+        Err("Loki storage is unavailable".into())
+    );
+}
+
+#[test]
+fn the_typed_missing_previous_state_crosses_the_seam_without_copying_log_lines() {
+    for previous_unavailable in [false, true] {
+        let lines = vec!["actual current-container line".to_string()];
+        let allocation = lines.as_ptr();
+        let note = Some("current container producer; previous log unavailable".to_string());
+        let k10s_provider::Detail::Log {
+            lines,
+            note: mapped_note,
+            previous_unavailable: mapped_state,
+        } = adapt(k10s_data::inspect::InspectDetail::Log(
+            k10s_data::inspect::LogTail {
+                lines,
+                note: note.clone(),
+                previous_unavailable,
+            },
+        ))
+        else {
+            panic!("the kubelet log outcome");
+        };
+        assert_eq!(lines.as_ptr(), allocation);
+        assert_eq!(lines, ["actual current-container line"]);
+        assert_eq!(mapped_note, note);
+        assert_eq!(mapped_state, previous_unavailable);
+    }
+}
+
+#[test]
 fn log_trace_links_use_structured_metadata_and_indexed_labels() {
     use k10s_data::integrations::loki::{LogLine, LogStream, Logs};
     use k10s_provider::LokiOutcome;
     const TRACE: &str = "20EC76BBC3F0628BCCADB4D44DA6BD8A";
+    const SHORT_TRACE: &str = "20EC76BBC3F0628B";
     for (label_trace, metadata_trace, expected) in [
         (Some(TRACE), None, Some(TRACE.to_ascii_lowercase())),
         (None, Some(TRACE), Some(TRACE.to_ascii_lowercase())),
+        (
+            Some(SHORT_TRACE),
+            None,
+            Some(SHORT_TRACE.to_ascii_lowercase()),
+        ),
+        (
+            None,
+            Some(SHORT_TRACE),
+            Some(SHORT_TRACE.to_ascii_lowercase()),
+        ),
         (Some(TRACE), Some("invalid"), None),
+        (Some(TRACE), Some("0000000000000000"), None),
+        (Some(TRACE), Some("00000000000000000000000000000000"), None),
         (None, None, None),
     ] {
         let mut labels = vec![("k8s_pod_uid".into(), "current-uid".into())];

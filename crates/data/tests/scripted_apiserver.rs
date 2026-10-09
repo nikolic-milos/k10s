@@ -28,6 +28,8 @@ mod cilium;
 mod cilium_control;
 #[path = "scripted_apiserver/cnpg.rs"]
 mod cnpg;
+#[path = "scripted_apiserver/collector_route.rs"]
+mod collector_route;
 #[path = "scripted_apiserver/conformance.rs"]
 mod conformance;
 #[path = "scripted_apiserver/day2.rs"]
@@ -94,6 +96,8 @@ mod tables;
 mod telemetry;
 #[path = "scripted_apiserver/tetragon.rs"]
 mod tetragon;
+#[path = "scripted_apiserver/trace_logs.rs"]
+mod trace_logs;
 #[path = "scripted_apiserver/traces.rs"]
 mod traces;
 #[path = "scripted_apiserver/traefik.rs"]

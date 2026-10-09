@@ -1,9 +1,10 @@
-//! Fixed-range investigations resolve Kubernetes identity before querying.
+//! Workload investigations resolve Kubernetes identity before querying.
 //!
 //! Native plots and the inspector share samples, source and time bounds.
 //! Each request belongs to one generation and is aborted when replaced or
 //! hidden. Unsupported Grafana semantics remain labelled and raw queries
-//! remain explicit, rather than impersonating a dashboard panel.
+//! remain explicit. A span link retains its recorded identity and time range
+//! independently of current Kubernetes metadata.
 
 use crate::chart::{ChartData, ChartView, display_message, display_notice_groups};
 use crate::table::{TableState, TableText};
@@ -21,7 +22,8 @@ use gpui::{
 use k10s_provider::{
     ClusterProvider, DescribeRequest, GrafanaOutcome, GrafanaPanelKind, GrafanaPanelRow, LogEntry,
     LokiOutcome, LokiRequest, ObserveScope, PromOutcome, PromRequest, PromSeriesView, QueryDialect,
-    QueryWindow, RequestStop, ScopeOutcome, TableColumn, TablePage, TableRow, ToolPresence,
+    QueryWindow, RequestStop, ScopeOutcome, SpanLogQuery, TableColumn, TablePage, TableRow,
+    ToolPresence,
 };
 use std::{
     rc::Rc,
@@ -36,13 +38,21 @@ pub enum ObserveEvent {
     },
     Trace {
         id: String,
-        scope: ObserveScope,
+        scope: Option<ObserveScope>,
     },
     GrafanaRoute {
         request: k10s_provider::ForwardRequest,
         path: String,
     },
     NotServed,
+    Presence(ToolPresence),
+    TracePresence(ToolPresence),
+}
+
+pub(crate) enum ObserveEntry {
+    General,
+    SpanLogs(Rc<SpanLogQuery>),
+    RetainedLogs(DescribeRequest),
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +90,13 @@ enum QueryPlan {
     Prom(String),
     Loki(String),
     ScopedLogs(bool),
+    SpanLogs(Rc<SpanLogQuery>),
+}
+
+impl QueryPlan {
+    fn requires_scope(&self) -> bool {
+        matches!(self, Self::Readiness | Self::Panel(_) | Self::ScopedLogs(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +160,8 @@ pub struct ObserveView {
     loki: ToolPresence,
     catalog_pending: bool,
     probe_pending: bool,
+    catalogue_enabled: bool,
+    entry_pending: bool,
 }
 
 impl EventEmitter<ObserveEvent> for ObserveView {}
@@ -151,6 +170,15 @@ impl ObserveView {
     pub fn new(
         provider: Rc<dyn ClusterProvider>,
         selection: Option<&crate::selection::Selection>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::for_entry(provider, selection, ObserveEntry::General, cx)
+    }
+
+    pub(crate) fn for_entry(
+        provider: Rc<dyn ClusterProvider>,
+        selection: Option<&crate::selection::Selection>,
+        entry: ObserveEntry,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self {
@@ -179,7 +207,7 @@ impl ObserveView {
             reach_notice: SharedString::default(),
             catalog_notice: SharedString::default(),
             scope_label: "Select a pod or workload".into(),
-            visible: true,
+            visible: false,
             generation: 0,
             query_generation: 0,
             scope_generation: 0,
@@ -192,10 +220,12 @@ impl ObserveView {
             loki: ToolPresence::Missing,
             catalog_pending: false,
             probe_pending: false,
+            catalogue_enabled: false,
+            entry_pending: true,
         };
         view.table.set_viewport(6);
         view.log_table.set_viewport(8);
-        view.reload(cx);
+        view.prepare_entry(entry, cx);
         view
     }
 
@@ -222,7 +252,9 @@ impl ObserveView {
         self.scope_stop = None;
         self.scope_generation += 1;
         self.request = request;
+        self.window = recent_window(self.range_ms, self.window.step_ms);
         self.plan = QueryPlan::Readiness;
+        self.entry_pending = true;
         self.scope = None;
         self.scope_label = "Select a pod or workload".into();
         if self.visible {
@@ -247,17 +279,31 @@ impl ObserveView {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            self.entry_pending = true;
+            return;
+        }
+        self.entry_pending = false;
         self.cancel_query(cx);
         self.generation += 1;
         self.scope_stop = None;
         self.catalog_stop = None;
         self.probe_stop = None;
         self.scope = None;
+        self.window = match &self.plan {
+            QueryPlan::SpanLogs(query) => query.request.window,
+            _ => recent_window(self.range_ms, self.window.step_ms),
+        };
+        if !self.catalogue_enabled {
+            self.catalog_pending = false;
+            self.probe_pending = false;
+            self.reach_notice = SharedString::default();
+            self.scope_generation += 1;
+            self.resolve(cx);
+            return;
+        }
         self.reach_notice = "Checking observability sources".into();
         self.catalog_notice = "Reading Grafana panels".into();
-        self.panels.clear();
-        self.table.set_page(TablePage::default());
-        self.window = recent_window(self.range_ms, self.window.step_ms);
         let generation = self.generation;
         self.catalog_pending = true;
         self.probe_pending = true;
@@ -275,6 +321,7 @@ impl ObserveView {
                     this.probe_pending = false;
                     this.prometheus = reach.prometheus;
                     this.loki = reach.loki;
+                    cx.emit(ObserveEvent::TracePresence(reach.traces));
                     this.reach_notice = reach.error.map_or_else(SharedString::default, |why| {
                         failure_notice("Source discovery", &why)
                     });
@@ -337,6 +384,10 @@ impl ObserveView {
     }
 
     fn change_range(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.plan, QueryPlan::SpanLogs(_)) {
+            self.plan = QueryPlan::Loki(self.query.clone());
+            self.scope_label = "Kubernetes scope is not resolved".into();
+        }
         self.window = recent_window(self.range_ms, self.window.step_ms);
         self.cancel_query(cx);
         self.scope_stop = None;
@@ -377,24 +428,50 @@ impl ObserveView {
     }
 
     fn apply_absence(&self, cx: &mut Context<Self>) {
-        if !self.catalog_pending
-            && !self.probe_pending
-            && self.grafana == ToolPresence::Missing
-            && self.prometheus == ToolPresence::Missing
-            && self.loki == ToolPresence::Missing
-        {
+        let Some(presence) = surface_presence(
+            self.catalogue_enabled,
+            self.catalog_pending || self.probe_pending,
+            self.grafana,
+            self.prometheus,
+            self.loki,
+        ) else {
+            return;
+        };
+        if presence == ToolPresence::Missing {
             cx.emit(ObserveEvent::NotServed);
+        } else {
+            cx.emit(ObserveEvent::Presence(presence));
         }
     }
 
     fn resolve(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            self.entry_pending = true;
+            return;
+        }
+        self.entry_pending = false;
+        if matches!(self.plan, QueryPlan::SpanLogs(_)) {
+            self.run_plan(cx);
+            return;
+        }
+        let requires_scope = self.plan.requires_scope();
+        if !requires_scope {
+            self.run_plan(cx);
+            if !self.catalogue_enabled {
+                return;
+            }
+        }
         let Some(request) = self.request.clone() else {
-            self.status = "Select a pod or workload".into();
+            if requires_scope {
+                self.status = "Select a pod or workload".into();
+            }
             return;
         };
         let generation = self.scope_generation;
         let query_generation = self.query_generation;
-        self.status = "Resolving current pod identities".into();
+        if requires_scope {
+            self.status = "Resolving current pod identities".into();
+        }
         self.scope_label = "Resolving current pod identities".into();
         let (tx, rx) = futures::channel::oneshot::channel();
         self.scope_stop = Some(self.provider.resolve_observe_scope(
@@ -418,7 +495,7 @@ impl ObserveView {
                             if scope.request != request {
                                 this.scope_label =
                                     "Resolved metadata does not match the selected resource".into();
-                                if this.query_generation == query_generation {
+                                if requires_scope && this.query_generation == query_generation {
                                     this.status = "Scope unavailable".into();
                                 }
                                 cx.notify();
@@ -433,20 +510,20 @@ impl ObserveView {
                             )
                             .into();
                             this.scope = Some(scope);
-                            if this.query_generation == query_generation {
+                            if requires_scope && this.query_generation == query_generation {
                                 this.run_plan(cx);
                             }
                         }
                         ScopeOutcome::Denied(what) => {
                             this.scope_label =
                                 format!("{what}: access denied for this account").into();
-                            if this.query_generation == query_generation {
+                            if requires_scope && this.query_generation == query_generation {
                                 this.status = "Scope unavailable".into();
                             }
                         }
                         ScopeOutcome::Failed(why) => {
                             this.scope_label = failure_notice("Kubernetes scope failed", &why);
-                            if this.query_generation == query_generation {
+                            if requires_scope && this.query_generation == query_generation {
                                 this.status = "Scope unavailable".into();
                             }
                         }
@@ -553,6 +630,13 @@ impl ObserveView {
 
     fn run_readiness(&mut self, cx: &mut Context<Self>) {
         self.plan = QueryPlan::Readiness;
+        if self.scope.is_none() {
+            self.cancel_query(cx);
+            self.scope_stop = None;
+            self.scope_generation += 1;
+            self.resolve(cx);
+            return;
+        }
         let Some(expr) = self.scope.as_ref().and_then(ObserveScope::readiness_query) else {
             self.cancel_query(cx);
             self.status = "No current pods belong to this workload".into();
@@ -613,6 +697,7 @@ impl ObserveView {
                 self.raw_query(cx);
             }
             QueryPlan::ScopedLogs(otlp) => self.scoped_logs(otlp, cx),
+            QueryPlan::SpanLogs(_) => self.run_loki(cx),
         }
     }
 
@@ -639,8 +724,9 @@ impl ObserveView {
         }
         let Some(scope) = self.scope.clone() else {
             self.cancel_query(cx);
-            self.status = "Resolve a selected workload before running a panel".into();
-            cx.notify();
+            self.scope_stop = None;
+            self.scope_generation += 1;
+            self.resolve(cx);
             return;
         };
         let generation = self.begin_query(cx);
@@ -693,6 +779,12 @@ impl ObserveView {
             cx.notify();
             return;
         }
+        if matches!(self.plan, QueryPlan::SpanLogs(_)) {
+            self.scope_label = "Kubernetes scope is not resolved".into();
+        }
+        if self.request.is_none() {
+            self.scope_label = "No current Kubernetes selection".into();
+        }
         match self.query_kind {
             QueryKind::Prom => {
                 self.plan = QueryPlan::Prom(self.query.clone());
@@ -726,6 +818,13 @@ impl ObserveView {
 
     fn scoped_logs(&mut self, otlp: bool, cx: &mut Context<Self>) {
         self.plan = QueryPlan::ScopedLogs(otlp);
+        if self.scope.is_none() {
+            self.cancel_query(cx);
+            self.scope_stop = None;
+            self.scope_generation += 1;
+            self.resolve(cx);
+            return;
+        }
         let query = self.scope.as_ref().and_then(|scope| {
             if otlp {
                 scope.otlp_logs_query()
@@ -744,16 +843,61 @@ impl ObserveView {
         self.run_loki(cx);
     }
 
+    pub(crate) fn prepare_entry(&mut self, entry: ObserveEntry, cx: &mut Context<Self>) {
+        if matches!(&entry, ObserveEntry::General) && self.catalogue_enabled {
+            return;
+        }
+        self.cancel_query(cx);
+        self.visible = false;
+        self.entry_pending = true;
+        self.generation += 1;
+        self.scope_generation += 1;
+        self.scope_stop = None;
+        self.catalog_stop = None;
+        self.probe_stop = None;
+        if self.catalog_pending {
+            self.catalog_notice = SharedString::default();
+        }
+        self.catalog_pending = false;
+        self.probe_pending = false;
+        self.typing = false;
+        self.filtering = false;
+        self.scope = None;
+        match entry {
+            ObserveEntry::General => self.catalogue_enabled = true,
+            ObserveEntry::SpanLogs(query) => {
+                self.catalogue_enabled = false;
+                self.scope_label =
+                    format!("Recorded span resource: {}/{}", query.namespace, query.pod).into();
+                self.window = query.request.window;
+                self.query.clone_from(&query.request.query);
+                self.query_kind = QueryKind::Loki;
+                self.plan = QueryPlan::SpanLogs(query);
+            }
+            ObserveEntry::RetainedLogs(request) => {
+                self.catalogue_enabled = false;
+                self.request = Some(request);
+                self.window = recent_window(self.range_ms, self.window.step_ms);
+                self.query_kind = QueryKind::Loki;
+                self.plan = QueryPlan::ScopedLogs(true);
+            }
+        }
+    }
+
     fn run_loki(&mut self, cx: &mut Context<Self>) {
         let identity = self.begin_query(cx);
         self.table_focus = ObserveTable::Logs;
         let (tx, rx) = futures::channel::oneshot::channel();
-        self.query_stop = Some(self.provider.query_loki(
-            LokiRequest {
+        let request = match &self.plan {
+            QueryPlan::SpanLogs(query) => query.request.clone(),
+            _ => LokiRequest {
                 query: self.query.clone(),
                 window: self.window,
                 limit: 200,
             },
+        };
+        self.query_stop = Some(self.provider.query_loki(
+            request,
             Box::new(move |outcome| {
                 let _ = tx.send(outcome);
             }),
@@ -780,6 +924,10 @@ impl ObserveView {
                             limit_reached,
                             source,
                         } => {
+                            this.loki = ToolPresence::Ready;
+                            if !this.catalogue_enabled {
+                                cx.emit(ObserveEvent::Presence(ToolPresence::Ready));
+                            }
                             this.status = format!(
                                 "{}: {} lines{}{}; {dropped_streams} streams omitted, \
                                 {dropped_lines} lines omitted, {clipped_lines} lines clipped",
@@ -793,8 +941,31 @@ impl ObserveView {
                                 },
                             )
                             .into();
-                            this.log_table
-                                .set_page(logs_page(&entries, this.scope.as_ref()));
+                            if let QueryPlan::SpanLogs(query) = &this.plan {
+                                let relation = if query.pod_uid.is_empty() {
+                                    "query filters name and trace ID; Kubernetes UID unavailable"
+                                } else {
+                                    "query filters trace resource UID and trace ID"
+                                };
+                                this.status = format!(
+                                    "{}; trace {}, span {}; {relation}; {} to {} UTC",
+                                    this.status,
+                                    query.trace_id,
+                                    query.span_id,
+                                    crate::chart::clock(query.request.window.start_ms),
+                                    crate::chart::clock(query.request.window.end_ms),
+                                )
+                                .into();
+                            }
+                            let origin = match &this.plan {
+                                QueryPlan::SpanLogs(query) => Some(query.as_ref()),
+                                _ => None,
+                            };
+                            this.log_table.set_page(logs_page(
+                                &entries,
+                                this.scope.as_ref(),
+                                origin,
+                            ));
                             this.logs = entries;
                         }
                         LokiOutcome::Absent => {
@@ -802,9 +973,11 @@ impl ObserveView {
                             this.status = "Loki is not served by this cluster".into();
                         }
                         LokiOutcome::Denied(what) => {
+                            this.loki = ToolPresence::Blocked;
                             this.status = format!("{what}: access denied for this account").into();
                         }
                         LokiOutcome::Failed(why) => {
+                            this.loki = ToolPresence::Blocked;
                             this.status = failure_notice("Loki query failed", &why)
                         }
                     }
@@ -825,13 +998,13 @@ impl ObserveView {
         else {
             return;
         };
-        if let (Some(id), Some(scope)) = (&entry.trace_id, &self.scope) {
+        if let Some(id) = &entry.trace_id {
             cx.emit(ObserveEvent::Trace {
                 id: id.clone(),
-                scope: scope.clone(),
+                scope: self.scope.clone(),
             });
         } else {
-            self.status = "This line has no trace ID, or no Kubernetes selection".into();
+            self.status = "This line has no trace ID".into();
             cx.notify();
         }
     }
@@ -862,10 +1035,13 @@ impl crate::item::Item for ObserveView {
         }
         self.visible = visible;
         if visible {
-            if self.scope.is_none() || self.catalog_pending || self.probe_pending {
+            if self.entry_pending
+                || (self.catalogue_enabled && (self.catalog_pending || self.probe_pending))
+            {
                 self.reload(cx);
             }
         } else {
+            self.entry_pending |= self.scope_stop.is_some() || self.query_stop.is_some();
             self.generation += 1;
             self.scope_generation += 1;
             self.query_generation += 1;
@@ -1099,7 +1275,13 @@ impl Render for ObserveView {
                         cx.stop_propagation();
                         cx.notify();
                     }))
-                    .child(div().child("Grafana panels"))
+                    .child(
+                        div().child(if self.catalogue_enabled && !self.catalog_pending {
+                            "Grafana panels"
+                        } else {
+                            "Cached Grafana panels"
+                        }),
+                    )
                     .child(
                         div()
                             .font_family(fonts.buffer_family.clone())
@@ -1259,6 +1441,31 @@ fn observe_key_context(typing: bool, filtering: bool) -> &'static str {
     }
 }
 
+fn surface_presence(
+    catalogue_enabled: bool,
+    pending: bool,
+    grafana: ToolPresence,
+    prometheus: ToolPresence,
+    loki: ToolPresence,
+) -> Option<ToolPresence> {
+    if !catalogue_enabled || pending {
+        return None;
+    }
+    let tools = [grafana, prometheus, loki];
+    Some(
+        if tools
+            .iter()
+            .all(|presence| *presence == ToolPresence::Missing)
+        {
+            ToolPresence::Missing
+        } else if tools.contains(&ToolPresence::Ready) {
+            ToolPresence::Ready
+        } else {
+            ToolPresence::Blocked
+        },
+    )
+}
+
 fn recent_window(range_ms: i64, step_ms: u64) -> QueryWindow {
     let end_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1343,6 +1550,9 @@ fn metric_association(
     series: &[PromSeriesView],
     scoped_by_uid: bool,
 ) -> String {
+    if series.is_empty() {
+        return "No returned series to associate with a Kubernetes UID".into();
+    }
     let Some(scope) = scope else {
         return "Kubernetes UID association is unproven".into();
     };
@@ -1365,7 +1575,7 @@ fn metric_association(
                 })
         })
         .count();
-    if !series.is_empty() && matched == series.len() {
+    if matched == series.len() {
         format!("All {matched} series labels match current pod UIDs")
     } else if matched > 0 {
         format!(
@@ -1415,7 +1625,31 @@ fn log_identity(entry: &LogEntry, scope: Option<&ObserveScope>) -> &'static str 
     }
 }
 
-fn logs_page(entries: &[LogEntry], scope: Option<&ObserveScope>) -> TablePage {
+fn span_log_identity(
+    entry: &LogEntry,
+    scope: Option<&ObserveScope>,
+    origin: Option<&SpanLogQuery>,
+) -> &'static str {
+    if let Some(origin) = origin
+        && !origin.pod_uid.is_empty()
+        && entry.attribute("k8s_namespace_name") == Some(origin.namespace.as_str())
+        && entry.attribute("k8s_pod_name") == Some(origin.pod.as_str())
+        && entry.attribute("k8s_pod_uid") == Some(origin.pod_uid.as_str())
+        && entry.trace_id.as_deref() == Some(origin.trace_id.as_str())
+        && entry.timestamp_ns as u128 >= origin.request.window.start_ms as u128 * 1_000_000
+        && (entry.timestamp_ns as u128) < origin.request.window.end_ms as u128 * 1_000_000
+    {
+        "Recorded span UID"
+    } else {
+        log_identity(entry, scope)
+    }
+}
+
+fn logs_page(
+    entries: &[LogEntry],
+    scope: Option<&ObserveScope>,
+    origin: Option<&SpanLogQuery>,
+) -> TablePage {
     TablePage {
         columns: ["UTC", "Pod", "Identity", "Trace", "Line"]
             .into_iter()
@@ -1438,7 +1672,7 @@ fn logs_page(entries: &[LogEntry], scope: Option<&ObserveScope>) -> TablePage {
                         .or_else(|| entry.attribute("pod"))
                         .unwrap_or("")
                         .into(),
-                    log_identity(entry, scope).into(),
+                    span_log_identity(entry, scope, origin).into(),
                     entry.trace_id.clone().unwrap_or_default(),
                     entry.line.clone(),
                 ],
@@ -1617,6 +1851,44 @@ mod tests {
     }
 
     #[test]
+    fn focused_loki_absence_never_classifies_the_unqueried_surface_as_absent() {
+        for enabled in [false, true] {
+            for pending in [false, true] {
+                assert_eq!(
+                    surface_presence(
+                        enabled,
+                        pending,
+                        ToolPresence::Missing,
+                        ToolPresence::Missing,
+                        ToolPresence::Missing
+                    ),
+                    (enabled && !pending).then_some(ToolPresence::Missing),
+                );
+            }
+        }
+        assert_eq!(
+            surface_presence(
+                true,
+                false,
+                ToolPresence::Ready,
+                ToolPresence::Missing,
+                ToolPresence::Missing
+            ),
+            Some(ToolPresence::Ready),
+        );
+        assert_eq!(
+            surface_presence(
+                true,
+                false,
+                ToolPresence::Missing,
+                ToolPresence::Blocked,
+                ToolPresence::Missing
+            ),
+            Some(ToolPresence::Blocked),
+        );
+    }
+
+    #[test]
     fn a_query_reply_requires_the_same_generation_uid_range_resolution_and_visibility() {
         let identity = QueryIdentity {
             generation: 4,
@@ -1708,7 +1980,7 @@ mod tests {
         };
         assert_eq!(log_identity(&entry, Some(&scope)), "Selected UID");
         assert_eq!(
-            logs_page(&[entry.clone()], Some(&scope)).rows[0].cells[3],
+            logs_page(&[entry.clone()], Some(&scope), None).rows[0].cells[3],
             "1234567890abcdef1234567890abcdef"
         );
         entry
@@ -1721,6 +1993,89 @@ mod tests {
         entry.labels = Arc::from(vec![("pod".into(), "worker-pod".into())]);
         entry.metadata.clear();
         assert_eq!(log_identity(&entry, Some(&scope)), "Name only");
+    }
+
+    #[test]
+    fn a_span_log_association_uses_returned_identity_trace_and_exact_time_bounds() {
+        let trace_id = "1234567890abcdef1234567890abcdef";
+        let mut origin = k10s_provider::SpanView {
+            id: "a9a1b2c3d4e5f678".into(),
+            parent: String::new(),
+            name: "request".into(),
+            service: "producer".into(),
+            start_us: 2_000_123,
+            duration_us: 2_345,
+            status: "OK".into(),
+            namespace: "prod".into(),
+            pod: "worker-pod".into(),
+            pod_uid: "recorded-pod".into(),
+            node: String::new(),
+        }
+        .log_query(trace_id)
+        .unwrap();
+        let start = origin.request.window.start_ms as u64 * 1_000_000;
+        let end = origin.request.window.end_ms as u64 * 1_000_000;
+        let mut entry = LogEntry {
+            timestamp_ns: start,
+            line: "actual line".into(),
+            labels: Arc::from(vec![
+                ("k8s_namespace_name".into(), "prod".into()),
+                ("k8s_pod_name".into(), "worker-pod".into()),
+                ("k8s_pod_uid".into(), "recorded-pod".into()),
+            ]),
+            metadata: Vec::new(),
+            trace_id: Some(trace_id.into()),
+        };
+        for scope in [None, Some(scope())] {
+            for timestamp_ns in [start, end - 1] {
+                entry.timestamp_ns = timestamp_ns;
+                assert_eq!(
+                    span_log_identity(&entry, scope.as_ref(), Some(&origin)),
+                    "Recorded span UID"
+                );
+            }
+            for timestamp_ns in [start - 1, end, end + 1] {
+                entry.timestamp_ns = timestamp_ns;
+                assert_ne!(
+                    span_log_identity(&entry, scope.as_ref(), Some(&origin)),
+                    "Recorded span UID"
+                );
+            }
+        }
+        entry.timestamp_ns = start;
+        for key in ["k8s_namespace_name", "k8s_pod_name", "k8s_pod_uid"] {
+            entry.metadata.push((key.into(), "different".into()));
+            assert_ne!(
+                span_log_identity(&entry, None, Some(&origin)),
+                "Recorded span UID"
+            );
+            entry.metadata.clear();
+        }
+        for trace in [None, Some("00000000000000000000000000000001".into())] {
+            entry.trace_id = trace;
+            assert_ne!(
+                span_log_identity(&entry, None, Some(&origin)),
+                "Recorded span UID"
+            );
+        }
+        entry.trace_id = Some(trace_id.into());
+        origin.pod_uid.clear();
+        assert_ne!(
+            span_log_identity(&entry, None, Some(&origin)),
+            "Recorded span UID"
+        );
+    }
+
+    #[test]
+    fn empty_metrics_do_not_claim_that_returned_series_lack_identity() {
+        for scope in [None, Some(scope())] {
+            for scoped_by_uid in [false, true] {
+                assert_eq!(
+                    metric_association(scope.as_ref(), &[], scoped_by_uid),
+                    "No returned series to associate with a Kubernetes UID"
+                );
+            }
+        }
     }
 
     #[test]

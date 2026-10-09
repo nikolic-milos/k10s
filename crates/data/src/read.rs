@@ -125,6 +125,10 @@ pub struct Reader {
 }
 
 impl Reader {
+    pub(crate) fn scheduler(&self) -> Arc<crate::telemetry::Scheduler> {
+        self.telemetry.clone()
+    }
+
     fn target(&self, kind: KindId) -> Option<KindTarget> {
         self.targets.iter().find(|t| t.id == kind).cloned()
     }

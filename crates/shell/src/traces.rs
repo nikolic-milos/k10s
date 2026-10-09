@@ -2,7 +2,8 @@
 //!
 //! Tempo and Jaeger answer through [`ClusterProvider::lookup_trace`]. Absence
 //! takes the pane down. A log link retains its exact Kubernetes scope and
-//! loses that association when the selection or trace ID changes.
+//! loses that association when the selection or trace ID changes. A selected
+//! span opens retained logs by its own resource attributes and time bounds.
 
 use std::rc::Rc;
 
@@ -12,21 +13,28 @@ use gpui::{
     prelude::*, px, rgb,
 };
 
-use crate::lists::InventoryEvent;
 use crate::table::{TableState, TableText};
-use crate::tag::ItemTag;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
-    CancelInput, CommitInput, DeleteInputChar, EnterFilter, OpenRow, Refresh, RowDown, RowEnd,
-    RowHome, RowPageDown, RowPageUp, RowUp,
+    CancelInput, CommitInput, DeleteInputChar, EnterFilter, LogsRow, OpenRow, Refresh, RowDown,
+    RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
 };
 use k10s_provider::{
-    ClusterProvider, ObserveScope, RequestStop, SpanView, TableColumn, TablePage, TableRow,
-    ToolPresence, TraceOutcome,
+    ClusterProvider, ObserveScope, RequestStop, SpanLogQuery, SpanView, TableColumn, TablePage,
+    TableRow, ToolPresence, TraceOutcome,
 };
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
 const QUERY_HEIGHT: f32 = 28.0;
+
+pub(crate) enum TraceEvent {
+    Logs {
+        query: Rc<SpanLogQuery>,
+        scope: Option<ObserveScope>,
+    },
+    NotServed,
+    Presence(ToolPresence),
+}
 
 struct TimelineRow {
     name: SharedString,
@@ -49,6 +57,7 @@ pub struct TracesView {
     probe_generation: u64,
     probe_pending: bool,
     probe_notice: SharedString,
+    loki: Option<ToolPresence>,
     viewport: Viewport,
     stop: Option<RequestStop>,
     probe_stop: Option<RequestStop>,
@@ -65,7 +74,7 @@ pub struct TracesView {
     visible: bool,
 }
 
-impl EventEmitter<InventoryEvent> for TracesView {}
+impl EventEmitter<TraceEvent> for TracesView {}
 
 impl TracesView {
     pub fn new(provider: Rc<dyn ClusterProvider>, cx: &mut Context<Self>) -> TracesView {
@@ -83,6 +92,7 @@ impl TracesView {
             probe_generation: 0,
             probe_pending: false,
             probe_notice: SharedString::default(),
+            loki: None,
             viewport: Viewport::default(),
             stop: None,
             probe_stop: None,
@@ -106,6 +116,7 @@ impl TracesView {
         self.probe_stop = None;
         self.probe_generation += 1;
         self.probe_pending = true;
+        self.loki = None;
         let generation = self.probe_generation;
         let (tx, rx) = futures::channel::oneshot::channel();
         self.probe_stop = Some(self.provider.probe_observe(Box::new(move |reach| {
@@ -119,13 +130,13 @@ impl TracesView {
                     }
                     this.probe_stop = None;
                     this.probe_pending = false;
+                    this.loki = Some(reach.loki);
                     this.probe_notice = reach.error.unwrap_or_default().into();
                     cx.notify();
                     if reach.traces == ToolPresence::Missing {
-                        cx.emit(InventoryEvent::NotServed {
-                            tag: ItemTag::Traces,
-                            what: "Tempo and Jaeger",
-                        });
+                        cx.emit(TraceEvent::NotServed);
+                    } else {
+                        cx.emit(TraceEvent::Presence(reach.traces));
                     }
                 });
             }
@@ -141,10 +152,10 @@ impl TracesView {
         "Traces".into()
     }
 
-    pub fn open_link(&mut self, id: String, scope: ObserveScope, cx: &mut Context<Self>) {
+    pub fn open_link(&mut self, id: String, scope: Option<ObserveScope>, cx: &mut Context<Self>) {
         self.linked_id = Some(id.clone());
         self.query = id;
-        self.scope = Some(scope);
+        self.scope = scope;
         self.lookup(cx);
     }
 
@@ -257,10 +268,7 @@ impl TracesView {
                         }
                         TraceOutcome::Absent => {
                             this.table.set_page(TablePage::default());
-                            cx.emit(InventoryEvent::NotServed {
-                                tag: ItemTag::Traces,
-                                what: "Tempo and Jaeger",
-                            });
+                            cx.emit(TraceEvent::NotServed);
                         }
                         TraceOutcome::Denied(what) => {
                             this.table.set_page(TablePage::default());
@@ -294,6 +302,31 @@ impl TracesView {
             crumb.push_str(&format!("  id: {}", self.query));
         }
         crumb
+    }
+
+    fn open_logs(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.loki, Some(ToolPresence::Ready | ToolPresence::Blocked)) {
+            return;
+        }
+        let Some(row) = self.table.selected_row() else {
+            return;
+        };
+        let Some((trace_id, span_id)) = row.uid.split_once('/') else {
+            return;
+        };
+        let Some(span) = self.spans.iter().find(|span| span.id == span_id) else {
+            return;
+        };
+        match span.log_query(trace_id) {
+            Ok(query) => cx.emit(TraceEvent::Logs {
+                query: Rc::new(query),
+                scope: self.scope.clone(),
+            }),
+            Err(why) => {
+                self.status = Some(why.into());
+                cx.notify();
+            }
+        }
     }
 
     fn refresh_text(&mut self) {
@@ -426,6 +459,9 @@ impl Render for TracesView {
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 this.lookup(cx);
             }))
+            .on_action(cx.listener(|this, _: &LogsRow, _, cx| {
+                this.open_logs(cx);
+            }))
             .on_action(cx.listener(|this, _: &EnterFilter, _, cx| {
                 this.filtering = true;
                 this.typing = false;
@@ -485,6 +521,24 @@ impl Render for TracesView {
                 cx.notify();
             }))
             .child(panel_header(&theme, &fonts, self.breadcrumb.clone()))
+            .children(
+                (matches!(self.loki, Some(ToolPresence::Ready | ToolPresence::Blocked))
+                    && self.table.selected_row().is_some())
+                .then(|| {
+                    div().px(px(12.0)).child(
+                        div()
+                            .id("trace-span-logs")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .cursor_pointer()
+                            .role(Role::Button)
+                            .aria_label("Logs for selected span")
+                            .hover(|style| style.bg(rgb(theme.shell.element_hover)))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_logs(cx)))
+                            .child("Logs for selected span"),
+                    )
+                }),
+            )
             .child(
                 div()
                     .px(px(12.0))

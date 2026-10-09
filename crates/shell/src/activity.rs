@@ -1,9 +1,8 @@
 //! The left activity rail: which surfaces exist, and which icon is lit.
 //!
 //! The rail is a table of slots, not a pile of buttons in `render`. Adding a
-//! panel is one row; the dock still holds the panel. Brand glyphs on the map
-//! (`tools/*.svg`) stay on the map. Chrome icons come from the Zed set the
-//! window already paints.
+//! panel is one row; the dock still holds the panel. Chrome uses shipped vector
+//! icons, tinted with the active theme.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivityId {
@@ -16,6 +15,7 @@ pub(crate) enum ActivityId {
     Flux,
     Day2,
     Observe,
+    Collectors,
     Policy,
     Ecosystem,
     Forwards,
@@ -104,6 +104,13 @@ pub(crate) const ACTIVITIES: &[Activity] = &[
         group: ActivityGroup::Primary,
     },
     Activity {
+        id: ActivityId::Collectors,
+        icon: "icons/tools/opentelemetry.svg",
+        label: "OpenTelemetry Collectors",
+        element_id: "activity-collectors",
+        group: ActivityGroup::Primary,
+    },
+    Activity {
         id: ActivityId::Policy,
         icon: "icons/lock.svg",
         label: "Policy",
@@ -166,6 +173,7 @@ pub(crate) enum CenterSlot {
     Flux,
     Day2,
     Observe,
+    Collectors,
     Policy,
     Ecosystem,
 }
@@ -190,6 +198,7 @@ pub(crate) fn lit(id: ActivityId, state: RailState) -> bool {
         ActivityId::Flux => state.center == Some(CenterSlot::Flux),
         ActivityId::Day2 => state.center == Some(CenterSlot::Day2),
         ActivityId::Observe => state.center == Some(CenterSlot::Observe),
+        ActivityId::Collectors => state.center == Some(CenterSlot::Collectors),
         ActivityId::Policy => state.center == Some(CenterSlot::Policy),
         ActivityId::Ecosystem => state.center == Some(CenterSlot::Ecosystem),
         ActivityId::Forwards => state.bottom == Some(BottomSlot::Forwards),
@@ -211,7 +220,7 @@ mod tests {
         for slot in ACTIVITIES {
             assert!(
                 slot.icon.starts_with("icons/") && slot.icon.ends_with(".svg"),
-                "chrome icons are the Zed set: {}",
+                "chrome icons must be shipped vectors: {}",
                 slot.icon
             );
             assert!(!ids.contains(&slot.id), "duplicate activity {:?}", slot.id);
@@ -225,7 +234,7 @@ mod tests {
             icons.push(slot.icon);
             elements.push(slot.element_id);
         }
-        assert_eq!(ids.len(), 15);
+        assert_eq!(ids.len(), 16);
     }
 
     #[test]
@@ -256,5 +265,13 @@ mod tests {
         assert!(!lit(ActivityId::Forwards, term));
         assert!(lit(ActivityId::Inspector, term));
         assert!(!lit(ActivityId::Starmap, term));
+
+        let collectors = RailState {
+            center: Some(CenterSlot::Collectors),
+            ..RailState::default()
+        };
+        assert!(lit(ActivityId::Collectors, collectors));
+        assert!(!lit(ActivityId::Observe, collectors));
+        assert!(!lit(ActivityId::Ecosystem, collectors));
     }
 }

@@ -68,6 +68,36 @@ impl Reader {
         self.telemetry.counts()
     }
 
+    pub fn observe_loki_probe(
+        &self,
+        reply: impl FnOnce(Fetched<Seen>) + Send + 'static,
+    ) -> crate::telemetry::RequestStop {
+        let client = self.interactive.clone();
+        let sources = self.observe_sources.clone();
+        self.telemetry.submit(
+            &self.handle,
+            async move {
+                let reach = sources.bind(&client, ToolKind::Loki).await;
+                match reach {
+                    ToolReach::Unbound(unbound) => Fetched::Failed {
+                        what: "Loki",
+                        why: unbound.why,
+                    },
+                    ToolReach::Bound(bound)
+                        if matches!(bound.transport, reach::Transport::NeedsForward { .. }) =>
+                    {
+                        Fetched::Failed {
+                            what: "Loki",
+                            why: "Loki requires a service forward".into(),
+                        }
+                    }
+                    reach => Fetched::Ok(seen_of(&reach)),
+                }
+            },
+            reply,
+        )
+    }
+
     pub fn resolve_observe_scope(
         &self,
         request: crate::describe::DescribeRequest,
