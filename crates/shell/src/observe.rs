@@ -463,7 +463,9 @@ impl ObserveView {
         }
         let Some(request) = self.request.clone() else {
             if requires_scope {
+                self.scope_label = "No current Kubernetes selection".into();
                 self.status = "Select a pod or workload".into();
+                cx.notify();
             }
             return;
         };
