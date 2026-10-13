@@ -110,11 +110,15 @@ impl Painted<'_> {
     /// about where the gutter ends. A synthesised note or fold is not a line of
     /// any document, so its text sits one column past the ones that are.
     pub fn rendered(&self) -> String {
+        let mut output = String::with_capacity(
+            self.mark.len_utf8() + self.text.len() + usize::from(self.side.is_none()),
+        );
+        output.push(self.mark);
         if self.side.is_none() {
-            format!("{} {}", self.mark, self.text)
-        } else {
-            format!("{}{}", self.mark, self.text)
+            output.push(' ');
         }
+        output.push_str(&self.text);
+        output
     }
 }
 

@@ -157,9 +157,9 @@ pub(crate) fn pick_typed<R, B, C, S>(
         }
         let geometry = presentation
             .card_shown()
-            .then(|| projection.workload(scene, block_index, stage, type_));
+            .then(|| projection.workload(scene, block_index, stage, type_, presentation));
         let block_primitive = geometry.map_or_else(
-            || projection.medallion(block.rect, block.inner),
+            || projection.medallion(block.inner),
             |geometry| geometry.body,
         );
         if path.block.is_none() && block_primitive.contains(screen_point) {
@@ -272,9 +272,9 @@ mod tests {
             }
             let geometry = presentation
                 .card_shown()
-                .then(|| projection.workload(scene, block_index, stage, type_));
+                .then(|| projection.workload(scene, block_index, stage, type_, presentation));
             let block_primitive = geometry.map_or_else(
-                || projection.medallion(block.rect, block.inner),
+                || projection.medallion(block.inner),
                 |geometry| geometry.body,
             );
             if path.block.is_none() && block_primitive.contains(screen_point) {
@@ -326,6 +326,78 @@ mod tests {
     }
 
     #[test]
+    fn tiny_bare_workload_glyphs_stay_inside_the_indexed_target() {
+        let (vw, vh) = (1600.0, 1000.0);
+        let policy = crate::lod::policy(Default::default());
+        let mut s = scene(SceneSpec::uniform(1, 128));
+        s.regions[0].rect = Rect::new(-10000.0, -10000.0, 20000.0, 20000.0);
+        s.blocks[0].inner = Rect::new(40.0, 40.0, 30.0, 56.0);
+        s.blocks[0].rect = s.blocks[0].inner;
+        s.blocks[0].sats = 0..0;
+        s.rebuild_spatial_index();
+        for zoom in [0.14, 0.20, 0.25, 0.30] {
+            let camera = Camera {
+                cx: 55.0,
+                cy: 68.0,
+                zoom,
+            };
+            let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
+            let presentation =
+                workload_presentation(&policy, s.blocks[0].inner, zoom, 1, Default::default());
+            let expected = if zoom < 8.0 / s.blocks[0].inner.w {
+                WorkloadPresentation::Card
+            } else {
+                WorkloadPresentation::Medallion
+            };
+            assert_eq!(presentation, expected);
+            let glyph = if presentation == WorkloadPresentation::Card {
+                projection
+                    .workload(&s, 0, 1, Default::default(), presentation)
+                    .body
+            } else {
+                projection.medallion(s.blocks[0].inner)
+            };
+            let envelope = projection.bounds(s.blocks[0].inner);
+            assert!(
+                glyph.bounds.origin.x >= envelope.origin.x
+                    && glyph.bounds.origin.y >= envelope.origin.y
+                    && glyph.bounds.right() <= envelope.right()
+                    && glyph.bounds.bottom() <= envelope.bottom(),
+                "zoom {zoom}: {glyph:?} extends outside {envelope:?}",
+            );
+            for offset in [-0.4, 0.0, 0.4] {
+                let probe = point(
+                    glyph.bounds.center().x + glyph.bounds.size.width * offset,
+                    glyph.bounds.center().y,
+                );
+                assert!(glyph.contains(probe));
+                let (sx, sy) = (f32::from(probe.x), f32::from(probe.y));
+                let (wx, wy) = camera.s2w(sx, sy, vw, vh);
+                assert!(s.region_block_index_is_selective(0, &Rect::new(wx, wy, 1e-3, 1e-3)));
+                let indexed = pick(&s, &camera, &policy, StageBlend::settled(1), vw, vh, sx, sy);
+                assert_eq!(
+                    indexed,
+                    reference(&s, &camera, &policy, StageBlend::settled(1), vw, vh, sx, sy)
+                );
+                assert_eq!(indexed.unwrap().block, Some(0));
+            }
+            for probe in [
+                point(glyph.bounds.right() + px(0.5), glyph.bounds.center().y),
+                point(glyph.bounds.center().x, glyph.bounds.bottom() + px(0.5)),
+            ] {
+                assert!(!glyph.contains(probe));
+                let (sx, sy) = (f32::from(probe.x), f32::from(probe.y));
+                let indexed = pick(&s, &camera, &policy, StageBlend::settled(1), vw, vh, sx, sy);
+                assert_eq!(
+                    indexed,
+                    reference(&s, &camera, &policy, StageBlend::settled(1), vw, vh, sx, sy)
+                );
+                assert_eq!(indexed.unwrap().block, None);
+            }
+        }
+    }
+
+    #[test]
     fn indexed_and_flat_picking_agree_on_compact_targets_and_abandoned_padding() {
         let (vw, vh) = (1600.0, 1000.0);
         let policy = crate::lod::policy(Default::default());
@@ -369,7 +441,7 @@ mod tests {
                 };
                 s.rebuild_spatial_index();
                 let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
-                let geometry = projection.workload(&s, 0, stage, type_);
+                let geometry = projection.workload_card(&s, 0, stage, type_);
                 let original = projection.card(s.blocks[0].inner);
                 let padding = point(
                     original.bounds.origin.x + px(20.0),
@@ -463,7 +535,18 @@ mod tests {
         let type_ = k10s_theme::MapType::default();
         let card_zoom = policy
             .stage_cell
-            .max((policy.block_chrome_min_px + 1.0) / block.inner.w);
+            .max(
+                (crate::primitive::name_min_width(type_) + crate::primitive::TEXT_PAD * 2.0 + 1.0)
+                    / block.inner.w,
+            )
+            .max(
+                (crate::primitive::name_band_height(type_)
+                    + crate::primitive::TEXT_PAD
+                    + crate::primitive::HEADING_CLEARANCE
+                    + 1.0)
+                    * 2.0
+                    / block.inner.h,
+            );
         for (zoom, expected) in [
             (1.0, WorkloadPresentation::Medallion),
             (card_zoom, WorkloadPresentation::Detailed),
@@ -477,7 +560,7 @@ mod tests {
             let primitive = if presentation.card_shown() {
                 projection.card(block.inner)
             } else {
-                projection.medallion(block.rect, block.inner)
+                projection.medallion(block.inner)
             };
             let halo = projection.bounds(block.rect);
             let probe = point(
@@ -514,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mid_zoom_medallion_owns_pixels_outside_its_hidden_card() {
+    fn a_mid_zoom_medallion_picks_its_bounded_identity_and_leaves_card_padding_unused() {
         let (vw, vh) = (1251.5, 733.25);
         let policy = lod_policy();
         let s = scene(SceneSpec::uniform(4, 4));
@@ -525,19 +608,17 @@ mod tests {
             zoom: 0.20,
         };
         let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
-        let medallion = projection.medallion(block.rect, block.inner);
+        let medallion = projection.medallion(block.inner);
         let card = projection.card(block.inner);
-        assert!(
-            medallion.bounds.size.width > card.bounds.size.width,
-            "the probe must cover the pixels the old card hit box missed"
-        );
+        assert!(medallion.bounds.is_contained_within(&card.bounds));
+        assert!(medallion.bounds.size.width < card.bounds.size.width);
 
         let probe = point(
             medallion.bounds.origin.x + px(1.0),
             medallion.bounds.center().y,
         );
         assert!(medallion.contains(probe));
-        assert!(!card.contains(probe));
+        assert!(card.contains(probe));
         let path = pick(
             &s,
             &camera,
@@ -550,6 +631,21 @@ mod tests {
         )
         .expect("the displayed medallion lies inside its namespace");
         assert_eq!(path.block, Some(0));
+        let padding = point(card.bounds.origin.x + px(0.5), card.bounds.center().y);
+        assert!(card.contains(padding));
+        assert!(!medallion.contains(padding));
+        let path = pick(
+            &s,
+            &camera,
+            &policy,
+            StageBlend::settled(1),
+            vw,
+            vh,
+            f32::from(padding.x),
+            f32::from(padding.y),
+        )
+        .expect("the hidden card padding lies inside its namespace");
+        assert_eq!(path.block, None);
     }
 
     #[test]
@@ -561,9 +657,18 @@ mod tests {
         let camera = Camera {
             cx: cell.rect.center().0,
             cy: cell.rect.center().1,
-            zoom: 4.5,
+            zoom: 6.0,
         };
         let (sx, sy) = camera.w2s(cell.rect.center().0, cell.rect.center().1, vw, vh);
+        let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
+        let heading = projection
+            .workload_card(&s, 0, 2, Default::default())
+            .heading
+            .expect("the fixture admits its readable workload heading");
+        let body = projection
+            .cell(cell.rect, 2, Default::default(), Some(heading))
+            .expect("the fixture's Pod clears its heading");
+        assert!(body.contains(point(px(sx), px(sy))));
 
         let before = pick(
             &s,
@@ -596,7 +701,9 @@ mod tests {
         )
         .expect("the detailed card is displayed at the handoff");
 
+        assert_eq!(before.block, Some(0));
         assert_eq!(before.cell, None);
+        assert_eq!(after.block, Some(0));
         assert_eq!(after.cell, Some(0));
     }
 

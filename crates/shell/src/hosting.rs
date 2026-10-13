@@ -154,7 +154,11 @@ impl Workspace {
         }
         if let Some(tab) = self.center.active() {
             tab.view.set_visible(true, cx);
-            window.focus(&tab.view.focus_handle(cx), cx);
+            let focus = tab.view.focus_handle(cx);
+            self.rebase_modal_focus(&focus, cx);
+            if !self.has_modal() {
+                window.focus(&focus, cx);
+            }
         }
         cx.notify();
     }
@@ -324,6 +328,50 @@ impl Workspace {
         open(self, window, cx);
     }
 
+    pub(crate) fn open_surface(
+        &mut self,
+        id: crate::activity::ActivityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::activity::ActivityId;
+        match id {
+            ActivityId::Starmap => self.show_map(window, cx),
+            ActivityId::Resources => self.open_browse(window, cx),
+            ActivityId::Nodes => self.open_nodes(window, cx),
+            ActivityId::Find => self.open_cluster_finder(window, cx),
+            ActivityId::Releases => self.open_releases(window, cx),
+            ActivityId::Argo => self.open_argo(window, cx),
+            ActivityId::Flux => self.open_flux(window, cx),
+            ActivityId::Day2 => self.open_day2(window, cx),
+            ActivityId::Observe => {
+                if let Some(index) = self.center.find(|tab| tab.tag == ItemTag::Observe) {
+                    self.activate_center(index, window, cx);
+                } else {
+                    self.open_observe(window, cx);
+                }
+            }
+            ActivityId::Traces => self.show_traces(window, cx),
+            ActivityId::Collectors => self.open_collectors(window, cx),
+            ActivityId::Policy => self.open_policy(window, cx),
+            ActivityId::Ecosystem => self.open_ecosystem(window, cx),
+            ActivityId::Forwards => self.open_forwards(None, window, cx),
+            ActivityId::Terminal => {
+                if let Some(index) = self.bottom.find(|tab| tab.tag == ItemTag::LocalTerm) {
+                    self.activate_bottom(index, window, cx);
+                } else {
+                    self.toggle_terminal(window, cx);
+                }
+            }
+            ActivityId::Inspector => {
+                if !self.inspector_open {
+                    self.toggle_inspector(cx);
+                }
+            }
+            ActivityId::Settings => self.open_config(ConfigFile::Settings, window, cx),
+        }
+    }
+
     pub(crate) fn activate_activity(
         &mut self,
         id: crate::activity::ActivityId,
@@ -349,6 +397,7 @@ impl Workspace {
             ActivityId::Observe => {
                 self.toggle_center_list(ItemTag::Observe, window, cx, Self::open_observe)
             }
+            ActivityId::Traces => self.open_traces(window, cx),
             ActivityId::Collectors => {
                 self.toggle_center_list(ItemTag::Collectors, window, cx, Self::open_collectors)
             }
@@ -402,6 +451,7 @@ impl Workspace {
             Some(ItemTag::Flux) => Some(crate::activity::CenterSlot::Flux),
             Some(ItemTag::Day2) => Some(crate::activity::CenterSlot::Day2),
             Some(ItemTag::Observe) => Some(crate::activity::CenterSlot::Observe),
+            Some(ItemTag::Traces) => Some(crate::activity::CenterSlot::Traces),
             Some(ItemTag::Collectors) => Some(crate::activity::CenterSlot::Collectors),
             Some(ItemTag::Policy) => Some(crate::activity::CenterSlot::Policy),
             Some(ItemTag::Ecosystem) => Some(crate::activity::CenterSlot::Ecosystem),
@@ -446,15 +496,18 @@ impl Workspace {
                 }
                 match event {
                     InventoryEvent::Presence { tag, presence } => {
-                        this.observability_navigation.set(tag, *presence);
+                        this.set_observability_presence(tag, *presence, cx);
                         cx.notify();
                     }
                     InventoryEvent::RevealPod { namespace, pod } => {
                         this.reveal_alert_pod(namespace, pod, window, cx);
                     }
                     InventoryEvent::NotServed { tag, what } => {
-                        this.observability_navigation
-                            .set(tag, k10s_provider::ToolPresence::Missing);
+                        this.set_observability_presence(
+                            tag,
+                            k10s_provider::ToolPresence::Missing,
+                            cx,
+                        );
                         this.close_tagged(tag, window, cx);
                         this.status_note = Some(format!("{what} is not served by this cluster"));
                         cx.notify();
@@ -738,13 +791,11 @@ impl Workspace {
                         }
                         match event {
                             ObserveEvent::Presence(presence) => {
-                                this.observability_navigation
-                                    .set(&ItemTag::Observe, *presence);
+                                this.set_observability_presence(&ItemTag::Observe, *presence, cx);
                                 cx.notify();
                             }
                             ObserveEvent::TracePresence(presence) => {
-                                this.observability_navigation
-                                    .set(&ItemTag::Traces, *presence);
+                                this.set_observability_presence(&ItemTag::Traces, *presence, cx);
                                 cx.notify();
                             }
                             ObserveEvent::Metrics { uid, data } => {
@@ -806,8 +857,11 @@ impl Workspace {
                                 }
                             }
                             ObserveEvent::NotServed => {
-                                this.observability_navigation
-                                    .set(&ItemTag::Observe, k10s_provider::ToolPresence::Missing);
+                                this.set_observability_presence(
+                                    &ItemTag::Observe,
+                                    k10s_provider::ToolPresence::Missing,
+                                    cx,
+                                );
                                 this.close_tagged(&ItemTag::Observe, window, cx);
                                 this.status_note = Some(
                                     "Grafana, Prometheus and Loki are not served by this cluster"
@@ -914,8 +968,7 @@ impl Workspace {
                         }
                         match event {
                             crate::traces::TraceEvent::Presence(presence) => {
-                                this.observability_navigation
-                                    .set(&ItemTag::Traces, *presence);
+                                this.set_observability_presence(&ItemTag::Traces, *presence, cx);
                                 cx.notify();
                             }
                             crate::traces::TraceEvent::Logs { query, scope } => {
@@ -935,8 +988,11 @@ impl Workspace {
                                 );
                             }
                             crate::traces::TraceEvent::NotServed => {
-                                this.observability_navigation
-                                    .set(&ItemTag::Traces, k10s_provider::ToolPresence::Missing);
+                                this.set_observability_presence(
+                                    &ItemTag::Traces,
+                                    k10s_provider::ToolPresence::Missing,
+                                    cx,
+                                );
                                 this.close_tagged(&ItemTag::Traces, window, cx);
                                 this.status_note =
                                     Some("Tempo and Jaeger are not served by this cluster".into());

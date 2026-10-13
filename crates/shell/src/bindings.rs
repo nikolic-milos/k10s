@@ -44,6 +44,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
     let diff = Some("Diff");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-p", OpenPalette, workspace),
+        KeyBinding::new("ctrl-alt-p", OpenSurfaces, workspace),
         KeyBinding::new("i", ToggleInspector, workspace),
         KeyBinding::new("escape", ClearSelection, workspace),
         KeyBinding::new("b", OpenBrowser, workspace),
@@ -223,6 +224,10 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-k ctrl-c", ChooseCluster, workspace),
         KeyBinding::new("up", RowUp, Some("Palette")),
         KeyBinding::new("down", RowDown, Some("Palette")),
+        KeyBinding::new("pageup", RowPageUp, Some("Palette")),
+        KeyBinding::new("pagedown", RowPageDown, Some("Palette")),
+        KeyBinding::new("home", RowHome, Some("Palette")),
+        KeyBinding::new("end", RowEnd, Some("Palette")),
         KeyBinding::new("enter", CommitInput, Some("Palette")),
         KeyBinding::new("escape", CancelInput, Some("Palette")),
         KeyBinding::new("backspace", DeleteInputChar, Some("Palette")),

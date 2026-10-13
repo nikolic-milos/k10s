@@ -106,6 +106,13 @@ fn card_size(cols: usize, rows: usize) -> (f32, f32) {
     )
 }
 
+fn namespace_size(content: (f32, f32)) -> (f32, f32) {
+    (
+        (content.0 + 2.0 * NS_PAD).max(NS_MIN_WIDTH),
+        (content.1 + 2.0 * NS_PAD + NS_HEADER).max(NS_MIN_HEIGHT),
+    )
+}
+
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E3779B97F4A7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
@@ -430,10 +437,7 @@ fn layout_spread(spec: &ClusterInput) -> LayoutOut {
             &mut spiral_scratch,
         );
         ns_content.push(content);
-        ns_sizes.push((
-            content.w + 2.0 * NS_PAD,
-            content.h + 2.0 * NS_PAD + NS_HEADER,
-        ));
+        ns_sizes.push(namespace_size((content.w, content.h)));
     }
 
     let mut ns_origins: Vec<(f32, f32)> = Vec::with_capacity(spec.namespaces.len());
@@ -540,7 +544,7 @@ fn layout_dense(spec: &ClusterInput) -> LayoutOut {
             &mut order_scratch,
             &mut wl_offsets,
         );
-        ns_sizes.push((extent.0 + 2.0 * NS_PAD, extent.1 + 2.0 * NS_PAD + NS_HEADER));
+        ns_sizes.push(namespace_size(extent));
     }
 
     let mut ns_origins: Vec<(f32, f32)> = Vec::with_capacity(spec.namespaces.len());

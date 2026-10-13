@@ -44,6 +44,13 @@ impl<V: Overlay + 'static> ModalSlot<V> {
         self.shown.as_ref().map(|shown| &shown.view)
     }
 
+    /// A retired or hidden view cannot receive focus when this overlay closes.
+    pub(crate) fn rebase_focus(&mut self, focus: &FocusHandle) {
+        if let Some(shown) = &mut self.shown {
+            shown.previous_focus = Some(focus.clone());
+        }
+    }
+
     /// Show a view, remembering what had the keyboard so closing can hand it
     /// back. Replaces whatever was in the slot without restoring its focus --
     /// callers close the sheets they are displacing first, in the order they
@@ -76,11 +83,12 @@ impl<V: Overlay + 'static> ModalSlot<V> {
         else {
             return false;
         };
+        let had_focus = view.read(cx).focus_handle().contains_focused(window, cx);
         // The view and its subscription go before the keyboard moves, which is
         // the order the four hand-written closers had: a sheet stops listening
         // as it leaves, not after whatever it hands focus to has it.
         drop((view, subscription));
-        if let Some(previous) = previous_focus {
+        if had_focus && let Some(previous) = previous_focus {
             window.focus(&previous, cx);
         }
         true

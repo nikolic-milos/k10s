@@ -19,7 +19,7 @@ use crate::hosting::ConfigFile;
 use crate::selection::{LogTarget, Selection};
 use crate::tag::ItemTag;
 use crate::ui::{
-    ACTIVITY_BAR_WIDTH, DockSizes, MODAL_TOP, STATUS_BAR_BORDER, STATUS_BAR_HEIGHT, key_hint,
+    DockSizes, MODAL_TOP, STATUS_BAR_BORDER, STATUS_BAR_HEIGHT, activity_bar_width, key_hint,
     status_bar_geometry,
 };
 use crate::workspace::{PickerPurpose, Workspace};
@@ -28,9 +28,9 @@ use crate::{
     ExecSelection, FindCluster, FindFile, LoadSavedView, LogsSelection, NewFile, NextItem,
     OpenArgo, OpenBrowser, OpenCollectors, OpenDay2, OpenEcosystem, OpenFile, OpenFlux, OpenFolder,
     OpenForwards, OpenHarbor, OpenKeymap, OpenMesh, OpenNodes, OpenObserve, OpenPalette,
-    OpenPolicy, OpenReleases, OpenSettings, OpenTraces, PrevItem, Quit, RetainedLogsSelection,
-    ShowStarmap, SilenceSelection, ToggleBottomDock, ToggleInspector, ToggleLeftDock,
-    ToggleRightDock, ToggleTerminal,
+    OpenPolicy, OpenReleases, OpenSettings, OpenSurfaces, OpenTraces, PrevItem, Quit,
+    RetainedLogsSelection, ShowStarmap, SilenceSelection, ToggleBottomDock, ToggleInspector,
+    ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
 
 impl Render for Workspace {
@@ -46,7 +46,8 @@ impl Render for Workspace {
         let workspace = cx.entity();
         let mut layout_viewport = self.viewport;
         if !self.bench {
-            layout_viewport.width = (layout_viewport.width - ACTIVITY_BAR_WIDTH).max(0.0);
+            layout_viewport.width =
+                (layout_viewport.width - activity_bar_width(self.viewport.width)).max(0.0);
         }
         let sizes = DockSizes::resolve(
             layout_viewport,
@@ -215,12 +216,16 @@ impl Render for Workspace {
         let app_menu = (self.app_menu_open && !self.bench)
             .then(|| self.app_menu(&theme, &fonts, window, cx).into_any_element());
         let palette = self.palette.view().map(|view| {
+            let surfaces = view.read(cx).is_surface_picker();
             div()
                 .absolute()
                 .top_0()
                 .right_0()
                 .bottom_0()
                 .left_0()
+                .when(surfaces, |scrim| {
+                    scrim.flex().items_center().justify_center().p(px(24.0))
+                })
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -230,10 +235,9 @@ impl Render for Workspace {
                 )
                 .child(
                     div()
-                        .absolute()
-                        .top(px(MODAL_TOP))
-                        .left_0()
-                        .right_0()
+                        .when(!surfaces, |position| {
+                            position.absolute().top(px(MODAL_TOP)).left_0().right_0()
+                        })
                         .flex()
                         .justify_center()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -300,6 +304,9 @@ impl Render for Workspace {
             ))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 this.toggle_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSurfaces, window, cx| {
+                this.toggle_surface_picker(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ChooseCluster, window, cx| {
                 this.toggle_launch(window, cx);
@@ -502,7 +509,8 @@ impl Render for Workspace {
             .children(viewport_observer)
             .children(title_bar)
             .child({
-                let rail = (!self.bench).then(|| self.activity_rail(&theme).into_any_element());
+                let rail = (!self.bench)
+                    .then(|| self.activity_rail(&theme, &fonts, cx).into_any_element());
                 div()
                     .flex_1()
                     .min_h(px(0.0))

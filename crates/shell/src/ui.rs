@@ -22,10 +22,32 @@ pub const STATUS_BAR_HEIGHT: f32 = 30.0;
 pub(crate) const STATUS_BAR_BORDER: f32 = 1.0;
 const KEY_HINT_PADDING_Y: f32 = 1.0;
 const KEY_HINT_BORDER: f32 = 1.0;
-pub const ACTIVITY_BAR_WIDTH: f32 = 40.0;
+pub const ACTIVITY_BAR_WIDTH: f32 = 168.0;
+
+pub(crate) fn activity_bar_width(viewport_width: f32) -> f32 {
+    if viewport_width < 960.0 {
+        148.0
+    } else {
+        ACTIVITY_BAR_WIDTH
+    }
+}
 pub const PANEL_FOOTER_HEIGHT: f32 = 24.0;
 
 pub const LIST_ROW_HEIGHT: f32 = 28.0;
+
+pub(crate) fn ui_line_height(font_size: f32) -> f32 {
+    f32::from(gpui::phi().to_pixels(px(font_size).into(), px(16.0))).ceil()
+}
+
+pub(crate) fn navigation_row_height(fonts: &Typography, notice: bool) -> f32 {
+    let text = ui_line_height(fonts.small())
+        + if notice {
+            ui_line_height(fonts.xsmall())
+        } else {
+            0.0
+        };
+    (text + CONTENT_PADDING).max(if notice { 44.0 } else { 36.0 })
+}
 
 pub const CONTENT_PADDING: f32 = 8.0;
 pub const MODAL_TOP: f32 = 80.0;
@@ -147,7 +169,7 @@ impl DockSizes {
     }
 }
 
-fn capacity(available: f32, reserved: f32, unit: f32, cap: usize) -> usize {
+pub(crate) fn capacity(available: f32, reserved: f32, unit: f32, cap: usize) -> usize {
     if !available.is_finite() || !reserved.is_finite() || !unit.is_finite() || unit <= 0.0 {
         return 1;
     }
@@ -209,23 +231,26 @@ pub fn icon_button(
         })))
 }
 
-/// A rail-sized icon button: the activity bar's hit target is larger than a
-/// title-bar control so a cluster of them can be clicked without aiming.
+/// A named navigation target keeps its source state readable without hovering.
 pub fn rail_button(
     id: impl Into<gpui::ElementId>,
     icon: &'static str,
     label: &'static str,
+    notice: Option<&'static str>,
     active: bool,
     theme: &Theme,
+    fonts: &Typography,
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(32.0))
+        .w_full()
+        .h(px(navigation_row_height(fonts, notice.is_some())))
+        .px(px(8.0))
         .rounded(px(6.0))
         .flex_none()
         .flex()
         .items_center()
-        .justify_center()
+        .gap(px(8.0))
         .cursor_pointer()
         .role(gpui::Role::Button)
         .aria_label(label)
@@ -233,11 +258,39 @@ pub fn rail_button(
             button.bg(rgb(theme.shell.element_selected))
         })
         .hover(|button| button.bg(rgb(theme.shell.element_hover)))
-        .child(svg().path(icon).size(px(18.0)).text_color(rgb(if active {
-            theme.shell.text
-        } else {
-            theme.shell.text_muted
-        })))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(18.0))
+                .flex_none()
+                .text_color(rgb(if active {
+                    theme.shell.text
+                } else {
+                    theme.shell.text_muted
+                })),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .text_size(px(fonts.small()))
+                .line_height(px(ui_line_height(fonts.small())))
+                .text_color(rgb(if active {
+                    theme.shell.text
+                } else {
+                    theme.shell.text_muted
+                }))
+                .child(div().truncate().child(SharedString::new_static(label)))
+                .children(notice.map(|notice| {
+                    div()
+                        .truncate()
+                        .text_size(px(fonts.xsmall()))
+                        .line_height(px(ui_line_height(fonts.xsmall())))
+                        .child(SharedString::new_static(notice))
+                })),
+        )
 }
 
 /// The hover tooltip an icon button shows: the action's name and, when one
@@ -470,6 +523,41 @@ mod tests {
         };
         let line = f32::from(style.line_height.to_pixels(style.font_size, px(16.0)));
         (line * scale).round() / scale
+    }
+
+    #[test]
+    fn navigation_rows_contain_both_lines_across_supported_type_sizes() {
+        for half_pixels in 16..=64 {
+            let fonts = Typography {
+                ui_size: half_pixels as f32 * 0.5,
+                ..Default::default()
+            };
+            for notice in [false, true] {
+                let height = navigation_row_height(&fonts, notice);
+                assert!(height >= ui_line_height(fonts.small()) + CONTENT_PADDING);
+                if notice {
+                    assert!(
+                        height
+                            >= ui_line_height(fonts.small())
+                                + ui_line_height(fonts.xsmall())
+                                + CONTENT_PADDING
+                    );
+                }
+                assert!(height >= if notice { 44.0 } else { 36.0 });
+            }
+        }
+        let large = Typography {
+            ui_size: 32.0,
+            ..Default::default()
+        };
+        assert!(navigation_row_height(&large, true) > 90.0);
+        let rows = capacity(
+            560.0,
+            ui_line_height(large.ui_size) + 16.0 + 8.0,
+            navigation_row_height(&large, true),
+            12,
+        );
+        assert!((1..12).contains(&rows));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use k10s_core::{
 use crate::hex;
 use crate::primitive::{
     ISLAND_DETAIL_MIN_PX, POD_DETAIL_MIN_WIDTH, POD_MARK_MIN, Projection, STATUS_GAP, TEXT_PAD,
-    region as region_primitive, row_pitch, workload_presentation,
+    region as region_primitive, row_pitch, workload_presentation, workload_row_pitch,
 };
 #[cfg(test)]
 use crate::primitive::{SAT_ICON_MAX_PX, WL_ICON_MAX_PX, WL_MEDALLION_MIN_PX, island_radii};
@@ -218,12 +218,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             region.rect.h
         };
         let detailed = short >= self.island_detail_min;
-        let primitive = region_primitive(
-            region.rect,
-            self.screen_bounds(&region.rect),
-            short * self.zoom,
-            detailed,
-        );
+        let primitive = region_primitive(self.screen_bounds(&region.rect), short * self.zoom);
         let bounds = primitive.bounds;
 
         // One quad, whatever the stage. The stage decides its colours, the LOD
@@ -311,7 +306,16 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             // at forty pixels straight through the workloads underneath, which
             // is the failure a semi-transparent watermark hides and a legible
             // label cannot.
-            let band = (NS_HEADER + NS_PAD) * self.zoom;
+            let band = if region.children.is_empty() {
+                (f32::from(bounds.size.height) - TEXT_PAD * 2.0).max(0.0)
+            } else {
+                (NS_HEADER + NS_PAD) * self.zoom
+            };
+            let band_y = y + if region.children.is_empty() {
+                TEXT_PAD
+            } else {
+                0.0
+            };
             let size_px = quantize(
                 (width * 0.055)
                     .min(band * 0.8)
@@ -321,7 +325,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             let label_bounds = Bounds {
                 origin: point(
                     px(self.origin.0 + x),
-                    px(self.origin.1 + y + (band - line).max(0.0) * 0.5),
+                    px(self.origin.1 + band_y + (band - line).max(0.0) * 0.5),
                 ),
                 size: size(px(width), px(line)),
             };
@@ -331,7 +335,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::from(&region.label),
                 x: self.origin.0 + x,
-                y: self.origin.1 + y + (band - line).max(0.0) * 0.5,
+                y: self.origin.1 + band_y + (band - line).max(0.0) * 0.5,
                 size_px,
                 color: self.region_label,
                 face: LabelFace::Display,
@@ -392,7 +396,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             && self.policy.block_chrome_shown(block.inner.w, self.zoom);
         let geometry = presentation.card_shown().then(|| {
             self.projection()
-                .workload(scene, block_index, self.stage, self.type_)
+                .workload(scene, block_index, self.stage, self.type_, presentation)
         });
         let heading = geometry.and_then(|geometry| {
             crate::primitive::workload_label_shown(self.policy, block.inner.w, self.zoom)
@@ -446,9 +450,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
 
         if self.policy.block_icon_shown(block.inner.w, self.zoom) {
             let primitive = match presentation {
-                WorkloadPresentation::Medallion => {
-                    Some(self.projection().medallion(block.rect, block.inner))
-                }
+                WorkloadPresentation::Medallion => Some(self.projection().medallion(block.inner)),
                 WorkloadPresentation::Detailed => {
                     heading.map(|heading| self.projection().band_icon(heading, 0, self.type_))
                 }
@@ -471,7 +473,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             let width = f32::from(heading.bounds.size.width) - inset - TEXT_PAD;
             let size_px = self.type_.workload;
             let line = size_px * self.type_.line_height;
-            let pitch = row_pitch(size_px, self.type_.line_height);
+            let pitch = workload_row_pitch(self.type_);
             let x = f32::from(heading.bounds.origin.x) + inset;
             let y = f32::from(heading.bounds.origin.y) + TEXT_PAD + (pitch - line) * 0.5;
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {

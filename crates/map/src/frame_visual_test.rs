@@ -94,6 +94,295 @@ fn small_workload(pod_state: State, sparse: bool) -> SceneSnapshot {
     scene
 }
 
+fn live_attachment_snapshots() -> (Arc<SceneSnapshot>, Arc<SceneSnapshot>, usize) {
+    use k10s_core::{IngestEvent, Op, Payload, ResourceEvent, replay};
+    use k10s_world::{LayoutMode, PublishBench};
+
+    let mut events = vec![replay::scope("ns-prod", "prod", Op::Added)];
+    for index in 0..128 {
+        let owner = format!("wl-{index:03}");
+        events.push(replay::owner(
+            &owner,
+            "prod",
+            &owner,
+            KindId::DEPLOYMENT,
+            Op::Added,
+        ));
+        events.push(replay::instance(
+            &format!("pod-{index:03}"),
+            "prod",
+            &owner,
+            State::OK,
+            Op::Added,
+        ));
+    }
+    let mut bench = PublishBench::new(&events, LayoutMode::Spread);
+    let bare = bench.snapshot();
+    bench.apply_events(&[IngestEvent::Resource(ResourceEvent {
+        kind: KindId::SERVICE,
+        uid: "svc-api".into(),
+        namespace: "prod".into(),
+        name: "svc-api".into(),
+        resource_version: 0,
+        parent: Some("wl-000".into()),
+        op: Op::Added,
+        payload: Payload::Attached {
+            kind: KindId::SERVICE,
+            detail: "ClusterIP".into(),
+        },
+    })]);
+    bench.run_publish();
+    let attached = bench.snapshot();
+    let index = attached
+        .ids
+        .blocks
+        .iter()
+        .position(|uid| uid.as_ref() == "wl-000")
+        .expect("the live workload is published");
+    assert_eq!(attached.blocks[index].inner, bare.blocks[index].inner);
+    let halo = attached.blocks[index].rect;
+    let inner = attached.blocks[index].inner;
+    assert_eq!((inner.w, inner.h), (30.0, 56.0));
+    assert_eq!((halo.x, halo.y, halo.h), (inner.x, inner.y, inner.h));
+    assert!(halo.w > inner.w);
+    assert!(halo.contains(&attached.sats[0].rect));
+    (bare, attached, index)
+}
+
+#[test]
+fn live_asymmetric_halos_keep_identity_paint_pick_marks_overlays_and_culling_bounded() {
+    use crate::overlay::{OverlayFrame, OverlayKind, OverlayMark, StampCache};
+
+    let (bare, scene, index) = live_attachment_snapshots();
+    let pol = policy(Knobs::default());
+    let (vw, vh) = (64.0, 48.0);
+    let type_ = MapType::default();
+    let block = &scene.blocks[index];
+    let path = crate::PickPath {
+        region: block.ext.ns,
+        block: Some(index as u32),
+        cell: None,
+        sat: None,
+    };
+    let overlay = OverlayFrame {
+        kind: Some(OverlayKind::Policy),
+        marks: vec![OverlayMark {
+            uid: "wl-000".into(),
+            tint: Some(Severity::Warn),
+            sparkline: None,
+            label: None,
+        }],
+    };
+    for zoom in [0.14, 0.20, 0.25, 0.30, 0.50, 1.0] {
+        let camera = Camera {
+            cx: block.inner.center().0,
+            cy: block.inner.center().1,
+            zoom,
+        };
+        let blend = StageBlend::settled(1);
+        let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
+        let presentation = workload_presentation(&pol, block.inner, zoom, 1, type_);
+        let target = crate::primitive::mark_primitive_typed(
+            &scene,
+            path,
+            camera,
+            &pol,
+            1,
+            (vw, vh),
+            (0.0, 0.0),
+            type_,
+        )
+        .expect("the workload is drawn");
+        assert_eq!(
+            Some(target),
+            crate::primitive::mark_primitive_typed(
+                &bare,
+                path,
+                camera,
+                &pol,
+                1,
+                (vw, vh),
+                (0.0, 0.0),
+                type_,
+            ),
+            "an attachment cannot enlarge the workload target at zoom {zoom}",
+        );
+        let envelope = projection.bounds(block.inner);
+        assert!(
+            target.bounds.origin.x >= envelope.origin.x
+                && target.bounds.origin.y >= envelope.origin.y
+                && target.bounds.right() <= envelope.right()
+                && target.bounds.bottom() <= envelope.bottom(),
+            "zoom {zoom}: {target:?} extends outside {envelope:?}",
+        );
+        assert!(
+            scene.region_block_index_is_selective(
+                path.region as usize,
+                &camera.visible_world(vw, vh),
+            )
+        );
+        if presentation == k10s_atlas::WorkloadPresentation::Medallion {
+            assert!(k10s_theme::SIZE_STEPS.contains(&f32::from(target.bounds.size.width)));
+        }
+        let stamps = overlay.visible_stamps_typed(
+            &mut StampCache::default(),
+            &scene,
+            camera,
+            &pol,
+            blend,
+            vw,
+            vh,
+            type_,
+        );
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(
+            stamps[0].screen,
+            Rect::new(
+                f32::from(target.bounds.origin.x),
+                f32::from(target.bounds.origin.y),
+                f32::from(target.bounds.size.width),
+                f32::from(target.bounds.size.height),
+            )
+        );
+        for theme in [&k10s_theme::K10S_DARK.map, &k10s_theme::K10S_LIGHT.map] {
+            let opts = FrameOpts {
+                policy: &pol,
+                theme,
+                type_,
+                edges_on: false,
+                skip_blocks: false,
+                hex: false,
+            };
+            let mut painted = Collect::default();
+            let stats = walk(
+                Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(vw), px(vh)),
+                },
+                &scene,
+                camera,
+                blend,
+                opts,
+                &mut painted,
+            );
+            assert_eq!(
+                stats,
+                crate::lod::cull(&scene, &camera, blend, vw, vh, opts)
+            );
+            assert_eq!(stats.drawn_cells, 0);
+            let glyphs = painted
+                .icons
+                .iter()
+                .filter(|job| {
+                    matches!(job, IconJob::Wl(_, primitive) if primitive.bounds == target.bounds)
+                })
+                .count();
+            assert_eq!(
+                glyphs,
+                usize::from(presentation == k10s_atlas::WorkloadPresentation::Medallion),
+            );
+            if presentation == k10s_atlas::WorkloadPresentation::Card {
+                assert!(painted.fg.iter().any(|quad| quad.bounds == target.bounds));
+            }
+            for offset in [-0.4, 0.0, 0.4] {
+                let probe = point(
+                    target.bounds.center().x + target.bounds.size.width * offset,
+                    target.bounds.center().y,
+                );
+                assert!(target.contains(probe));
+                let (wx, wy) = camera.s2w(f32::from(probe.x), f32::from(probe.y), vw, vh);
+                assert!(scene.region_block_index_is_selective(
+                    path.region as usize,
+                    &Rect::new(wx, wy, 1e-3, 1e-3),
+                ));
+                assert_eq!(
+                    crate::pick::pick(
+                        &scene.scene,
+                        &camera,
+                        &pol,
+                        blend,
+                        vw,
+                        vh,
+                        f32::from(probe.x),
+                        f32::from(probe.y)
+                    ),
+                    Some(path),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_live_attachment_keeps_workload_glyph_scale_and_monotonic_targets() {
+    let (bare, attached, index) = live_attachment_snapshots();
+    let pol = policy(Knobs::default());
+    let inner = bare.blocks[index].inner;
+    let path = crate::PickPath {
+        region: bare.blocks[index].ext.ns,
+        block: Some(index as u32),
+        cell: None,
+        sat: None,
+    };
+    for font in [8.0, 14.0, 24.0, 32.0] {
+        let type_ = MapType {
+            workload: font,
+            pod: font,
+            ..Default::default()
+        };
+        let mut previous = [None; 2];
+        let mut medallions = 0;
+        let mut headers = 0;
+        for step in 1..=2400 {
+            let zoom = step as f32 * 0.01;
+            let camera = Camera {
+                cx: inner.center().0,
+                cy: inner.center().1,
+                zoom,
+            };
+            let stage = pol.stage_for_zoom(zoom);
+            let presentation = workload_presentation(&pol, inner, zoom, stage, type_);
+            let mut targets = [None; 2];
+            for (scene_index, scene) in [&bare, &attached].into_iter().enumerate() {
+                let target = crate::primitive::mark_primitive_typed(
+                    scene,
+                    path,
+                    camera,
+                    &pol,
+                    stage,
+                    (1600.0, 1000.0),
+                    (0.0, 0.0),
+                    type_,
+                );
+                let Some(target) = target else { continue };
+                let width = f32::from(target.bounds.size.width);
+                let height = f32::from(target.bounds.size.height);
+                if let Some((old_width, old_height)) = previous[scene_index] {
+                    assert!(
+                        width + 0.01 >= old_width && height + 0.01 >= old_height,
+                        "font {font}, zoom {zoom}, stage {stage}: {target:?} shrank"
+                    );
+                }
+                previous[scene_index] = Some((width, height));
+                targets[scene_index] = Some(target);
+            }
+            if matches!(
+                presentation,
+                k10s_atlas::WorkloadPresentation::Medallion
+                    | k10s_atlas::WorkloadPresentation::Detailed
+            ) {
+                assert_eq!(targets[0], targets[1], "attachments cannot resize identity");
+                if presentation == k10s_atlas::WorkloadPresentation::Medallion {
+                    medallions += 1;
+                } else {
+                    headers += 1;
+                }
+            }
+        }
+        assert!(medallions > 10 && headers > 10);
+    }
+}
+
 #[test]
 fn compact_workload_geometry_agrees_across_paint_pick_marks_overlays_and_counters() {
     use crate::overlay::{OverlayFrame, OverlayKind, OverlayMark, StampCache};
@@ -123,7 +412,7 @@ fn compact_workload_geometry_agrees_across_paint_pick_marks_overlays_and_counter
                         zoom,
                     };
                     let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
-                    let geometry = projection.workload(&scene, 0, 3, type_);
+                    let geometry = projection.workload_card(&scene, 0, 3, type_);
                     let pod =
                         projection.cell(scene.cells[cell_index].rect, 3, type_, geometry.heading);
                     let bounds = Bounds {
@@ -331,7 +620,7 @@ fn compact_workload_geometry_agrees_across_paint_pick_marks_overlays_and_counter
 }
 
 #[test]
-fn normal_map_rows_keep_their_existing_pitch_and_heading_height() {
+fn workload_headers_reserve_the_glyph_height_without_changing_pod_rows() {
     let type_ = MapType::default();
     assert_eq!(
         row_pitch(type_.workload, type_.line_height),
@@ -341,7 +630,8 @@ fn normal_map_rows_keep_their_existing_pitch_and_heading_height() {
         row_pitch(type_.pod, type_.line_height),
         type_.pod * type_.line_height
     );
-    assert_eq!(crate::primitive::name_band_height(type_), 54.0);
+    assert_eq!(crate::primitive::workload_row_pitch(type_), WL_ICON_MAX_PX);
+    assert_eq!(crate::primitive::name_band_height(type_), 80.0);
 }
 
 #[test]
@@ -426,14 +716,22 @@ fn removing_the_only_pod_keeps_observed_truth_and_a_bounded_workload_target() {
             if presentation == k10s_atlas::WorkloadPresentation::Hidden {
                 assert!(mark.is_none());
                 assert!(!sink.labels.iter().any(|job| job.text == "0 observed pods"));
-            } else if presentation == k10s_atlas::WorkloadPresentation::Medallion {
-                let medallion = projection.medallion(scene.blocks[0].rect, inner);
+            } else if matches!(
+                presentation,
+                k10s_atlas::WorkloadPresentation::Medallion
+                    | k10s_atlas::WorkloadPresentation::Card
+            ) {
+                let medallion = projection.medallion(inner);
                 assert_eq!(mark, Some(medallion));
-                assert!(
-                    sink.icons
-                        .iter()
-                        .any(|job| icon_bounds(job) == medallion.bounds)
-                );
+                if presentation == k10s_atlas::WorkloadPresentation::Medallion {
+                    assert!(
+                        sink.icons
+                            .iter()
+                            .any(|job| icon_bounds(job) == medallion.bounds)
+                    );
+                } else {
+                    assert!(sink.fg.iter().any(|quad| quad.bounds == medallion.bounds));
+                }
                 let point = medallion.bounds.center();
                 let picked = crate::pick::pick(
                     &scene,
@@ -448,8 +746,8 @@ fn removing_the_only_pod_keeps_observed_truth_and_a_bounded_workload_target() {
                 .unwrap();
                 assert_eq!(picked, block_path);
             } else {
-                let geometry = projection.workload(&scene, 0, stage, type_);
-                assert_eq!(geometry.body.bounds.size, size(px(168.0), px(74.0)));
+                let geometry = projection.workload_card(&scene, 0, stage, type_);
+                assert_eq!(geometry.body.bounds.size, size(px(168.0), px(100.0)));
                 assert_eq!(mark, Some(geometry.body));
                 assert!(
                     sink.fg
@@ -546,7 +844,7 @@ fn workload_card_colors_and_status_use_observed_pods() {
                     zoom,
                 };
                 let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
-                let geometry = projection.workload(&scene, 0, stage, type_);
+                let geometry = projection.workload_card(&scene, 0, stage, type_);
                 let heading = geometry
                     .heading
                     .expect("the observed workload has a heading");
@@ -669,17 +967,8 @@ fn every_glyph_size_is_on_the_shared_ladder() {
     assert!(seen >= 8, "the sweep drew {seen} glyphs and proves little");
 }
 
-// The user-visible half of the same change, and the bound that replaces
-// "it fits in the card".
-//
-// A glyph is deliberately allowed to be larger than its card: a workload
-// with two replicas has a card a few pixels across, and a card is not what
-// a person recognises it by. What it may never exceed is the HALO -- the
-// space that workload owns, which no other workload's halo overlaps --
-// because that is what keeps one namespace's glyphs off each other.
 #[test]
-fn a_workload_glyph_grows_to_fill_the_space_the_workload_owns() {
-    const WAS_FIXED_AT: f32 = 12.0;
+fn a_workload_glyph_reaches_its_readable_size_without_outgrowing_its_halo() {
     let scene = one_of_each(State::OK);
     let halo = scene.blocks[0].rect;
     let mut biggest = 0.0f32;
@@ -702,9 +991,8 @@ fn a_workload_glyph_grows_to_fill_the_space_the_workload_owns() {
         }
     }
     assert!(
-        biggest >= WAS_FIXED_AT * 3.0,
-        "the glyph never got past {biggest} px, which is what the constant it \
-             replaced already managed"
+        biggest == WL_ICON_MAX_PX,
+        "the glyph must reach the shared readable size, got {biggest} px"
     );
 
     // The other half, and the one a sweep of sizes cannot see: below the
@@ -732,12 +1020,7 @@ fn a_workload_glyph_grows_to_fill_the_space_the_workload_owns() {
             _ => None,
         })
         .expect("the workload glyph was drawn without chrome");
-    let halo_short = halo.w.min(halo.h) * zoom;
-    assert!(
-        f32::from(bounds.size.width) >= halo_short * 0.4,
-        "a {:?} glyph in a {halo_short} px halo is still a decoration",
-        bounds.size.width
-    );
+    assert!(f32::from(bounds.size.width) <= WL_ICON_MAX_PX);
     assert!(
         f32::from(bounds.size.width) >= WL_MEDALLION_MIN_PX,
         "a {:?} glyph is under the legibility floor and is a smudge",
@@ -864,69 +1147,206 @@ fn every_boxed_label_is_confined_to_what_it_names() {
     );
 }
 
-// A namespace keeps its silhouette for as long as it exists. The corner
-// radii are hashed from the island's ORIGIN precisely so that growing or
-// shrinking a namespace -- which both layout engines do by moving its far
-// edges only -- cannot make it pop into a different shape.
 #[test]
-fn an_island_keeps_its_shape_when_its_namespace_resizes() {
-    let short = 400.0f32;
-    assert!(
-        short >= super::ISLAND_DETAIL_MIN_PX,
-        "below the threshold every island is cut to one radius and this              proves nothing"
-    );
-    let small = island_radii(&Rect::new(120.0, 64.0, 400.0, 300.0), short);
-    let grown = island_radii(&Rect::new(120.0, 64.0, 900.0, 700.0), short);
-    assert_eq!(small, grown, "the same island changed shape as it grew");
+fn an_empty_namespace_centers_its_identity_in_the_reserved_tile() {
+    let mut scene = one_of_each(State::OK);
+    scene.regions[0].children = 0..0;
+    scene.blocks.clear();
+    scene.cells.clear();
+    scene.sats.clear();
+    scene.rebuild_spatial_index();
+    let (cx, cy) = scene.regions[0].rect.center();
+    for zoom in [0.5, 1.0, 2.0] {
+        let painted = walk_at(&scene, Camera { cx, cy, zoom });
+        let label = painted
+            .labels
+            .iter()
+            .find(|label| label.text == scene.regions[0].label.as_ref())
+            .expect("the reserved namespace tile has a readable name");
+        let center = (VH * 0.5, VW * 0.5);
+        assert!((label.y + label.height * 0.5 - center.0).abs() < 0.001);
+        assert!((label.x + label.width * 0.5 - center.1).abs() < 0.001);
+    }
+}
 
-    let moved = island_radii(&Rect::new(121.0, 64.0, 400.0, 300.0), short);
-    assert_ne!(
-        small, moved,
-        "two islands a pixel apart are cut to the same die"
-    );
-
-    // Under the threshold the caller never asks: a small island is cut to
-    // one radius, which is the measured trade -- at that size the difference
-    // between corners is a pixel or two, and computing it doubled the cost
-    // of the fit camera's walk. The walk is what proves the threshold is
-    // wired up, so it is checked through a real frame rather than here.
+#[test]
+fn namespace_corners_stay_uniform_across_detail_thresholds_and_relayout() {
     let scene = one_of_each(State::OK);
-    let far = Camera {
-        cx: 150.0,
-        cy: 120.0,
-        zoom: 0.05,
-    };
-    let corners = walk_at(&scene, far).bg[1].corner_radii;
-    assert_eq!(corners.top_left, corners.top_right);
-    assert_eq!(corners.top_left, corners.bottom_left);
-    assert_eq!(corners.top_left, corners.bottom_right);
-    assert!(f32::from(corners.top_left) > 0.0, "a square island");
+    let mut previous = 0.0;
+    for short in [15.0, 95.99, 96.0, 96.01, 400.0, 700.0] {
+        let camera = Camera {
+            cx: 150.0,
+            cy: 120.0,
+            zoom: short / scene.regions[0].rect.h,
+        };
+        let painted = walk_at(&scene, camera).bg[1].corner_radii;
+        let projected_short = scene.regions[0].rect.h * camera.zoom;
+        assert_eq!(painted, island_radii(projected_short));
+        assert_eq!(
+            painted,
+            Projection::new(camera, (VW, VH), (0.0, 0.0))
+                .region(scene.regions[0].rect)
+                .corners,
+        );
+        assert_eq!(painted.top_left, painted.top_right);
+        assert_eq!(painted.top_left, painted.bottom_left);
+        assert_eq!(painted.top_left, painted.bottom_right);
+        let radius = f32::from(painted.top_left);
+        assert!(radius > 0.0 && radius <= short * 0.5);
+        assert!(radius >= previous && radius - previous <= short * 0.5);
+        previous = radius;
 
-    let near = Camera {
-        cx: 150.0,
-        cy: 120.0,
-        zoom: 2.0,
-    };
-    let corners = walk_at(&scene, near).bg[1].corner_radii;
-    assert!(
-        corners.top_left != corners.bottom_right || corners.top_right != corners.bottom_left,
-        "an island large enough to show a coastline was cut square"
-    );
+        let mut moved = scene.clone();
+        moved.regions[0].rect.x += 1.0;
+        moved.regions[0].rect.w *= 1.5;
+        assert_eq!(walk_at(&moved, camera).bg[1].corner_radii, painted);
+    }
+}
 
-    // Bounded by construction: a corner radius is a fraction of the short
-    // side and never more than half of it, or gpui clamps it and the
-    // silhouette stops being the one that was chosen.
-    for corners in [small, grown, moved] {
-        for radius in [
-            corners.top_left,
-            corners.top_right,
-            corners.bottom_right,
-            corners.bottom_left,
-        ] {
-            let radius = f32::from(radius);
+#[test]
+fn single_pod_targets_do_not_shrink_when_card_and_pod_detail_appear() {
+    let scene = small_workload(State::OK, true);
+    let pol = policy(Knobs::default());
+    let path = crate::PickPath {
+        region: 0,
+        block: Some(0),
+        cell: None,
+        sat: None,
+    };
+    let (cx, cy) = scene.blocks[0].inner.center();
+    for font in [8.0, 14.0, 24.0, 32.0] {
+        let type_ = k10s_theme::MapType {
+            workload: font,
+            pod: font,
+            ..Default::default()
+        };
+        let mut previous = None;
+        let mut cards = 0;
+        for step in 1..=2400 {
+            let zoom = step as f32 * 0.01;
+            let camera = Camera { cx, cy, zoom };
+            let stage = pol.stage_for_zoom(zoom);
+            let Some(target) = crate::primitive::mark_primitive_typed(
+                &scene,
+                path,
+                camera,
+                &pol,
+                stage,
+                (1600.0, 1000.0),
+                (0.0, 0.0),
+                type_,
+            ) else {
+                continue;
+            };
+            if let Some((width, height)) = previous {
+                assert!(
+                    f32::from(target.bounds.size.width) + 0.01 >= width
+                        && f32::from(target.bounds.size.height) + 0.01 >= height,
+                    "font {font}, zoom {zoom}, stage {stage}: {target:?} shrank from {previous:?}"
+                );
+            }
+            previous = Some((
+                f32::from(target.bounds.size.width),
+                f32::from(target.bounds.size.height),
+            ));
+            if crate::primitive::workload_presentation(
+                &pol,
+                scene.blocks[0].inner,
+                zoom,
+                stage,
+                type_,
+            )
+            .card_shown()
+            {
+                cards += 1;
+            }
+        }
+        assert!(cards > 100, "the sweep must cross real card transitions");
+    }
+}
+
+#[test]
+fn a_workload_identity_glyph_never_shrinks_when_it_enters_the_header() {
+    let pol = policy(Knobs::default());
+    for attachments in [false, true] {
+        let mut scene = small_workload(State::OK, true);
+        if !attachments {
+            scene.blocks[0].rect = scene.blocks[0].inner;
+            scene.blocks[0].sats = 0..0;
+            scene.sats.clear();
+        }
+        scene.rebuild_spatial_index();
+        let (cx, cy) = scene.blocks[0].inner.center();
+        for font in [8.0, 14.0, 24.0, 32.0] {
+            let type_ = MapType {
+                workload: font,
+                pod: font,
+                ..Default::default()
+            };
+            let opts = FrameOpts {
+                theme: &k10s_theme::K10S_DARK.map,
+                policy: &pol,
+                type_,
+                edges_on: false,
+                skip_blocks: false,
+                hex: false,
+            };
+            let mut previous = 0.0;
+            let mut medallions = 0;
+            let mut headers = 0;
+            for step in 1..=2400 {
+                let zoom = step as f32 * 0.01;
+                let camera = Camera { cx, cy, zoom };
+                let stage = pol.stage_for_zoom(zoom);
+                let presentation =
+                    workload_presentation(&pol, scene.blocks[0].inner, zoom, stage, type_);
+                let mut painted = Collect::default();
+                walk(
+                    viewport(),
+                    &scene,
+                    camera,
+                    StageBlend::settled(stage),
+                    opts,
+                    &mut painted,
+                );
+                let glyphs: Vec<_> = painted
+                    .icons
+                    .iter()
+                    .filter_map(|job| {
+                        if let IconJob::Wl(_, primitive) = job {
+                            Some(primitive.bounds)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if matches!(
+                    presentation,
+                    k10s_atlas::WorkloadPresentation::Medallion
+                        | k10s_atlas::WorkloadPresentation::Detailed
+                ) {
+                    assert_eq!(
+                        glyphs.len(),
+                        1,
+                        "zoom {zoom}, font {font}, {presentation:?}"
+                    );
+                    let side = f32::from(glyphs[0].size.width);
+                    assert!(
+                        side >= previous,
+                        "glyph shrank from {previous} to {side} at zoom {zoom}"
+                    );
+                    assert!(side <= WL_ICON_MAX_PX);
+                    previous = side;
+                    if presentation == k10s_atlas::WorkloadPresentation::Medallion {
+                        medallions += 1;
+                    } else {
+                        headers += 1;
+                    }
+                }
+            }
             assert!(
-                radius > 0.0 && radius <= short * 0.5,
-                "{radius} is not a usable corner on a {short} px island"
+                medallions > 10 && headers > 10,
+                "both identity forms must be exercised"
             );
         }
     }
@@ -1029,7 +1449,16 @@ fn a_painted_severity_footer_picks_its_card_without_filling_the_rounded_gap() {
     scene.blocks[0].inner = Rect::new(40.0, 40.0, 30.0, 56.0);
     let inner = scene.blocks[0].inner;
     let pol = policy(Knobs::default());
-    let card_zoom = (pol.block_chrome_min_px + 1.0) / inner.w;
+    let type_ = MapType::default();
+    let card_zoom = ((crate::primitive::name_min_width(type_) + TEXT_PAD * 2.0 + 1.0) / inner.w)
+        .max(
+            (crate::primitive::name_band_height(type_)
+                + TEXT_PAD
+                + crate::primitive::HEADING_CLEARANCE
+                + 1.0)
+                * 2.0
+                / inner.h,
+        );
     for zoom in [
         card_zoom,
         crate::lod::STAGE_POD_LABEL,
@@ -1044,7 +1473,7 @@ fn a_painted_severity_footer_picks_its_card_without_filling_the_rounded_gap() {
         let blend = StageBlend::settled(pol.stage_for_zoom(zoom));
         let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
         let body = projection
-            .workload(&scene, 0, blend.walk_stage(), MapType::default())
+            .workload_card(&scene, 0, blend.walk_stage(), MapType::default())
             .body;
         let footer = body.severity_strip();
         let opts = FrameOpts {
@@ -1128,7 +1557,7 @@ fn detailed_pods_keep_identity_status_and_picking_inside_the_same_body() {
         ] {
             let camera = Camera { cx, cy, zoom };
             let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
-            let heading = projection.workload(&scene, 0, 3, type_).heading;
+            let heading = projection.workload_card(&scene, 0, 3, type_).heading;
             let body = projection
                 .cell(cell.rect, 3, type_, heading)
                 .expect("the centered pod clears its heading");
@@ -1244,7 +1673,7 @@ fn a_pinned_heading_selects_the_workload_and_excludes_obscured_pods() {
     let type_ = k10s_theme::MapType::default();
     let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
     let heading = projection
-        .workload(&scene, 0, 3, type_)
+        .workload_card(&scene, 0, 3, type_)
         .heading
         .expect("the workload enters the viewport");
     assert_eq!(
@@ -1308,7 +1737,7 @@ fn large_workload_names_stay_in_the_visible_band_while_panning() {
             let camera = Camera { cx, cy, zoom: 16.0 };
             let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
             let band = projection
-                .workload(&scene, 0, 3, type_)
+                .workload_card(&scene, 0, 3, type_)
                 .heading
                 .expect("part of the workload remains visible");
             let frame = walk_at(&scene, camera);

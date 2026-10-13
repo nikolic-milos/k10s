@@ -114,6 +114,9 @@ impl Workspace {
             return;
         }
         self.close_palette(window, cx);
+        self.close_picker(window, cx);
+        self.close_finder(window, cx);
+        self.close_cluster_finder(window, cx);
         let view = cx.new(LaunchView::new);
         let subscription = cx.subscribe_in(
             &view,
@@ -301,6 +304,10 @@ impl Workspace {
     /// What both doors do once the connection state behind them is settled.
     fn land_scene(&mut self, note: String, cx: &mut Context<Self>) {
         self.observability_navigation = Default::default();
+        self.refresh_surface_picker(cx);
+        if let Some(tab) = self.center.active() {
+            self.rebase_modal_focus(&tab.view.focus_handle(cx), cx);
+        }
         self.chose_scene(cx);
         self.status_note = Some(note);
         self.refresh_detail(cx);

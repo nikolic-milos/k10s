@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use bevy_ecs::prelude::{Mut, World};
 use k10s_core::layout::{
-    CARD_HEADER, CARD_PAD, NS_GAP, NS_HEADER, NS_PAD, POD_GAP, POD_PITCH, POD_SIZE, SAT_RING_GAP,
-    SAT_RING0_GAP, SAT_SIZE, WL_GAP, WL_HEADER, WL_PAD,
+    CARD_HEADER, CARD_PAD, NS_GAP, NS_HEADER, NS_MIN_HEIGHT, NS_MIN_WIDTH, NS_PAD, POD_GAP,
+    POD_PITCH, POD_SIZE, SAT_RING_GAP, SAT_RING0_GAP, SAT_SIZE, WL_GAP, WL_HEADER, WL_PAD,
 };
 use k10s_core::{
     ChildIndices, EdgeInst, Endpoint, IngestEvent, KindId, Op, Payload, Rect, ResourceEvent,
@@ -666,14 +666,12 @@ fn upsert_namespace(
     aggregates.ns_unhealthy[index] = 0.0;
     aggregates.ns_rollup[index] = Severity::Ok;
 
-    let width = NS_PAD * 2.0 + POD_SIZE + CARD_PAD * 2.0;
-    let height = NS_PAD * 2.0 + NS_HEADER + POD_SIZE + CARD_HEADER + CARD_PAD * 2.0;
     let x = if topology.ns_slots.active() == 1 {
         0.0
     } else {
         topology.bounds.max_x() + NS_GAP
     };
-    topology.ns_rects[index] = Rect::new(x, 0.0, width, height);
+    topology.ns_rects[index] = Rect::new(x, 0.0, NS_MIN_WIDTH, NS_MIN_HEIGHT);
     grow_world(topology, topology.ns_rects[index]);
 }
 
@@ -1466,12 +1464,7 @@ fn refit_after_batch(topology: &mut Topology, dirt: &mut BatchDirt, mode: Layout
             continue;
         }
         let region = topology.ns_rects[index];
-        let mut fitted = Rect::new(
-            region.x,
-            region.y,
-            NS_PAD * 2.0 + POD_SIZE + pad * 2.0,
-            NS_PAD * 2.0 + NS_HEADER + POD_SIZE + header + pad * 2.0,
-        );
+        let mut fitted = Rect::new(region.x, region.y, NS_MIN_WIDTH, NS_MIN_HEIGHT);
         for workload in children(&topology.ns_wl_range, &topology.region_blocks, index) {
             let rect = topology.wl_rects[workload];
             fitted.w = fitted.w.max(rect.max_x() - region.x + NS_PAD);

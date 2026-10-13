@@ -67,6 +67,93 @@ fn an_empty_namespace_gets_an_empty_edge_range() {
 }
 
 #[test]
+fn namespace_tiles_keep_their_reserved_space_through_live_membership_changes() {
+    use k10s_core::layout::{NS_MIN_HEIGHT, NS_MIN_WIDTH};
+
+    let initial = [
+        replay::scope("ns-prod", "prod", Op::Added),
+        replay::owner("wl-api", "prod", "api", KindId::DEPLOYMENT, Op::Added),
+        replay::instance("pod-api", "prod", "wl-api", State::OK, Op::Added),
+        replay::scope("ns-empty", "empty", Op::Added),
+    ];
+    for mode in [LayoutMode::Spread, LayoutMode::Dense] {
+        let mut bench = PublishBench::new(&initial, mode);
+        let held = bench.snapshot();
+        let held_regions = held.regions.clone();
+        let held_blocks = held.blocks.clone();
+        let held_cells = held.cells.clone();
+        let check = |bench: &mut PublishBench| {
+            topology::verify_derived_state(&mut bench.world);
+            let scene = bench.snapshot();
+            assert_published_matches_full(&bench.world, &scene);
+            for (index, region) in scene.regions.iter().enumerate() {
+                assert!(region.rect.w >= NS_MIN_WIDTH && region.rect.h >= NS_MIN_HEIGHT);
+                assert!(scene.bounds.contains(&region.rect));
+                for other in &scene.regions[index + 1..] {
+                    assert!(
+                        !region.rect.intersects(&other.rect),
+                        "{mode:?}: namespace overlap"
+                    );
+                }
+                for block in scene.region_block_indices(index) {
+                    assert!(region.rect.contains(&scene.blocks[block].rect));
+                    for cell in scene.block_cell_indices(block) {
+                        assert!(scene.blocks[block].inner.contains(&scene.cells[cell].rect));
+                    }
+                }
+            }
+            scene
+        };
+        check(&mut bench);
+        bench.apply_events(&[
+            replay::scope("ns-canary", "canary", Op::Added),
+            replay::scope("ns-next", "next", Op::Added),
+        ]);
+        bench.run_publish();
+        let empty = check(&mut bench);
+        let index = empty
+            .regions
+            .iter()
+            .position(|region| region.label.as_ref() == "canary")
+            .expect("the live namespace is published");
+        let reserved = empty.regions[index].rect;
+        assert_eq!((reserved.w, reserved.h), (NS_MIN_WIDTH, NS_MIN_HEIGHT));
+        assert!(empty.regions[index].children.is_empty());
+
+        for uid in ["wl-canary", "wl-reused"] {
+            bench.apply_events(&[
+                replay::owner(uid, "canary", "canary", KindId::DEPLOYMENT, Op::Added),
+                replay::instance("pod-canary", "canary", uid, State::OK, Op::Added),
+            ]);
+            bench.run_publish();
+            let populated = check(&mut bench);
+            assert_eq!(populated.regions[index].rect, reserved);
+            assert_eq!(populated.regions[index].children.len(), 1);
+            let (_, owner) = workload_named(&populated, "canary");
+            let owner_rect = owner.inner;
+            bench.apply_events(&[replay::owner(
+                uid,
+                "canary",
+                "canary",
+                KindId::DEPLOYMENT,
+                Op::Deleted,
+            )]);
+            bench.run_publish();
+            let removed = check(&mut bench);
+            assert_eq!(removed.regions[index].rect, reserved);
+            assert!(removed.regions[index].children.is_empty());
+            assert_eq!(populated.regions[index].children.len(), 1);
+            assert_eq!(workload_named(&populated, "canary").1.inner, owner_rect);
+            assert_eq!(empty.regions[index].rect, reserved);
+            assert!(empty.regions[index].children.is_empty());
+        }
+        assert_eq!(held.regions, held_regions);
+        assert_eq!(held.blocks, held_blocks);
+        assert_eq!(held.cells, held_cells);
+    }
+}
+
+#[test]
 fn attachment_changes_preserve_dependencies_until_their_targets_change() {
     let mut bench = fixture(true);
     let mut api = replay::owner("wl-api", "prod", "api", KindId::DEPLOYMENT, Op::Modified);

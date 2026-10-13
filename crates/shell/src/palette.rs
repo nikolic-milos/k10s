@@ -6,17 +6,24 @@
 //! browser"), scored by a small subsequence matcher that rewards word starts
 //! and contiguity. Confirming restores focus to whoever had it and then
 //! dispatches, so the command lands exactly where the keystroke would have.
-//! Scoring and humanizing are pure and tested; the view is the usual thin
-//! layer that repaints on notify.
+//! The centered surface picker uses the same matcher with named entries from
+//! cached discovery. Confirming opens or focuses the selected surface. Scoring
+//! and humanizing are pure and tested; the view repaints on notify.
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, ParentElement, Render, Role, SharedString, Styled, Window, div, prelude::*, px,
-    rgb,
+    MouseDownEvent, ParentElement, Render, Role, ScrollWheelEvent, SharedString, Styled, Window,
+    div, prelude::*, px, rgb, svg,
 };
 
+use crate::activity::ActivityId;
+use crate::surfaces::Surface;
 use crate::ui::{LIST_ROW_HEIGHT, MODAL_MAX_HEIGHT, MODAL_WIDTH};
-use crate::{CancelInput, CommitInput, DeleteInputChar, RowDown, RowUp};
+use crate::workspace::ObservabilityNavigation;
+use crate::{
+    CancelInput, CommitInput, DeleteInputChar, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp,
+    RowUp,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
@@ -227,9 +234,10 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaletteEvent {
+pub(crate) enum PaletteEvent {
     Dismissed,
     Confirmed(&'static str),
+    SurfaceConfirmed(ActivityId),
 }
 
 // One surviving candidate: which command, and which bytes of its display
@@ -246,6 +254,55 @@ pub struct PaletteView {
     query: String,
     matches: Vec<Match>,
     selected: usize,
+    surfaces: Option<SurfaceMenu>,
+    wheel_remainder: f32,
+}
+
+struct SurfaceMenu {
+    navigation: ObservabilityNavigation,
+    entries: Vec<Surface>,
+}
+
+fn query_matches(query: &str, commands: &[Command], surfaces: Option<&SurfaceMenu>) -> Vec<Match> {
+    let mut scored: Vec<(i64, Match)> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            fuzzy_match(query, &command.display)
+                .or_else(|| {
+                    let entry = surfaces?.entries.get(index)?;
+                    fuzzy_score(query, crate::surfaces::search_terms(entry.activity.id))
+                        .map(|score| (score, Vec::new()))
+                })
+                .map(|(score, hits)| {
+                    (
+                        score,
+                        Match {
+                            command: index,
+                            hits,
+                        },
+                    )
+                })
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.command.cmp(&b.1.command)));
+    scored.into_iter().map(|(_, matched)| matched).collect()
+}
+
+fn retained_selection(name: Option<&str>, commands: &[Command], matches: &[Match]) -> usize {
+    name.and_then(|name| {
+        matches
+            .iter()
+            .position(|matched| commands[matched.command].name == name)
+    })
+    .unwrap_or(0)
+}
+
+fn wheel_rows(remainder: &mut f32, delta: f32, row_height: f32) -> isize {
+    *remainder -= delta;
+    let rows = (*remainder / row_height).trunc() as isize;
+    *remainder -= rows as f32 * row_height;
+    rows
 }
 
 impl EventEmitter<PaletteEvent> for PaletteView {}
@@ -255,15 +312,78 @@ const VISIBLE_ROWS: usize = 12;
 impl PaletteView {
     pub fn new(cx: &mut Context<Self>) -> PaletteView {
         let commands = commands(cx);
+        Self::with_commands(commands, None, cx)
+    }
+
+    pub(crate) fn for_surfaces(
+        navigation: ObservabilityNavigation,
+        state: crate::activity::RailState,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let menu = SurfaceMenu {
+            navigation,
+            entries: crate::surfaces::entries(&navigation),
+        };
+        let selected = crate::surfaces::initial_selection(&menu.entries, state);
+        let mut view = Self::with_commands(Self::surface_commands(&menu), Some(menu), cx);
+        view.selected = selected;
+        view
+    }
+
+    fn surface_commands(menu: &SurfaceMenu) -> Vec<Command> {
+        menu.entries
+            .iter()
+            .map(|entry| Command {
+                name: entry.activity.id.action().name(),
+                display: entry.activity.label.to_owned(),
+            })
+            .collect()
+    }
+
+    fn with_commands(
+        commands: Vec<Command>,
+        surfaces: Option<SurfaceMenu>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut view = PaletteView {
             focus: cx.focus_handle(),
             commands,
             query: String::new(),
             matches: Vec::new(),
             selected: 0,
+            surfaces,
+            wheel_remainder: 0.0,
         };
         view.requery();
         view
+    }
+
+    pub(crate) fn is_surface_picker(&self) -> bool {
+        self.surfaces.is_some()
+    }
+
+    pub(crate) fn update_surfaces(
+        &mut self,
+        navigation: ObservabilityNavigation,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = &self.surfaces else { return };
+        if menu.navigation == navigation {
+            return;
+        }
+        let selected = self
+            .matches
+            .get(self.selected)
+            .map(|matched| self.commands[matched.command].name);
+        let menu = SurfaceMenu {
+            navigation,
+            entries: crate::surfaces::entries(&navigation),
+        };
+        self.commands = Self::surface_commands(&menu);
+        self.surfaces = Some(menu);
+        self.requery();
+        self.selected = retained_selection(selected, &self.commands, &self.matches);
+        cx.notify();
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
@@ -271,32 +391,29 @@ impl PaletteView {
     }
 
     fn requery(&mut self) {
-        let mut scored: Vec<(i64, Match)> = self
-            .commands
-            .iter()
-            .enumerate()
-            .filter_map(|(index, command)| {
-                fuzzy_match(&self.query, &command.display).map(|(score, hits)| {
-                    (
-                        score,
-                        Match {
-                            command: index,
-                            hits,
-                        },
-                    )
-                })
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.command.cmp(&b.1.command)));
-        self.matches = scored.into_iter().map(|(_, matched)| matched).collect();
+        self.matches = query_matches(&self.query, &self.commands, self.surfaces.as_ref());
         self.selected = 0;
+        self.wheel_remainder = 0.0;
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(self.matches.len().saturating_sub(1));
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        match self.matches.get(self.selected) {
-            Some(matched) => cx.emit(PaletteEvent::Confirmed(self.commands[matched.command].name)),
-            None => cx.emit(PaletteEvent::Dismissed),
-        }
+        let event = match self.matches.get(self.selected) {
+            Some(matched) => match &self.surfaces {
+                Some(menu) => {
+                    PaletteEvent::SurfaceConfirmed(menu.entries[matched.command].activity.id)
+                }
+                None => PaletteEvent::Confirmed(self.commands[matched.command].name),
+            },
+            None => PaletteEvent::Dismissed,
+        };
+        cx.emit(event);
     }
 
     fn hint(command: &Command, window: &Window, cx: &App) -> Option<String> {
@@ -314,17 +431,39 @@ impl PaletteView {
     }
 }
 
+fn palette_row_height(fonts: &k10s_theme::Typography, surfaces: bool) -> f32 {
+    if surfaces {
+        crate::ui::navigation_row_height(fonts, true)
+    } else {
+        LIST_ROW_HEIGHT.max(crate::ui::ui_line_height(fonts.small()) + crate::ui::CONTENT_PADDING)
+    }
+}
+
+fn palette_query_height(fonts: &k10s_theme::Typography, surfaces: bool) -> f32 {
+    let minimum: f32 = if surfaces { 48.0 } else { 36.0 };
+    minimum.max(crate::ui::ui_line_height(fonts.ui_size) + 16.0)
+}
+
 impl Render for PaletteView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = k10s_theme::active(cx).clone();
         let fonts = k10s_theme::typography(cx).clone();
+        let surfaces = self.is_surface_picker();
+        let row_height = palette_row_height(&fonts, surfaces);
+        let query_height = palette_query_height(&fonts, surfaces);
+        let maximum_height = if surfaces { 560.0 } else { MODAL_MAX_HEIGHT };
+        let maximum_height =
+            maximum_height.min((f32::from(window.viewport_size().height) - 48.0).max(0.0));
+        let visible_rows =
+            crate::ui::capacity(maximum_height, query_height + 8.0, row_height, VISIBLE_ROWS)
+                .max(1);
         let first = self
             .selected
-            .saturating_sub(VISIBLE_ROWS.saturating_sub(1))
+            .saturating_sub(visible_rows.saturating_sub(1))
             .min(
                 self.matches
                     .len()
-                    .saturating_sub(VISIBLE_ROWS.min(self.matches.len())),
+                    .saturating_sub(visible_rows.min(self.matches.len())),
             );
         struct Row {
             at: usize,
@@ -332,13 +471,14 @@ impl Render for PaletteView {
             display: String,
             hits: Vec<std::ops::Range<usize>>,
             hint: Option<String>,
+            surface: Option<Surface>,
         }
         let window_rows: Vec<Row> = self
             .matches
             .iter()
             .enumerate()
             .skip(first)
-            .take(VISIBLE_ROWS)
+            .take(visible_rows)
             .map(|(at, matched)| {
                 let command = &self.commands[matched.command];
                 Row {
@@ -347,6 +487,10 @@ impl Render for PaletteView {
                     display: command.display.clone(),
                     hits: matched.hits.clone(),
                     hint: Self::hint(command, window, cx),
+                    surface: self
+                        .surfaces
+                        .as_ref()
+                        .map(|menu| menu.entries[matched.command]),
                 }
             })
             .collect();
@@ -357,7 +501,7 @@ impl Render for PaletteView {
             .track_focus(&self.focus)
             .w(px(MODAL_WIDTH))
             .max_w_full()
-            .max_h(px(MODAL_MAX_HEIGHT))
+            .max_h(px(maximum_height))
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -368,16 +512,44 @@ impl Render for PaletteView {
             .shadow_lg()
             .font_family(fonts.ui_family.clone())
             .role(Role::Dialog)
-            .aria_label("Command palette")
+            .aria_label(if surfaces {
+                "Open a surface"
+            } else {
+                "Command palette"
+            })
             .on_action(cx.listener(|this, _: &RowUp, _, cx| {
-                this.selected = this.selected.saturating_sub(1);
+                this.move_selection(-1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowDown, _, cx| {
-                if this.selected + 1 < this.matches.len() {
-                    this.selected += 1;
-                }
+                this.move_selection(1);
                 cx.notify();
+            }))
+            .on_action(cx.listener(move |this, _: &RowPageUp, _, cx| {
+                this.move_selection(-(visible_rows as isize));
+                cx.notify();
+            }))
+            .on_action(cx.listener(move |this, _: &RowPageDown, _, cx| {
+                this.move_selection(visible_rows as isize);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &RowHome, _, cx| {
+                this.selected = 0;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &RowEnd, _, cx| {
+                this.selected = this.matches.len().saturating_sub(1);
+                cx.notify();
+            }))
+            .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                let delta = f32::from(event.delta.pixel_delta(px(row_height)).y);
+                let rows = wheel_rows(&mut this.wheel_remainder, delta, row_height);
+                let previous = this.selected;
+                this.move_selection(rows);
+                if this.selected != previous {
+                    cx.notify();
+                }
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &CommitInput, _, cx| {
                 this.confirm(cx);
@@ -414,27 +586,36 @@ impl Render for PaletteView {
                 // gated invariant even while a modal is open.
                 let caret = div()
                     .w(px(2.0))
-                    .h(px(18.0))
+                    .h(px(fonts.ui_size.max(18.0)))
                     .flex_none()
                     .bg(rgb(theme.shell.cursor));
                 let row = div()
                     .id("command-query")
-                    .h(px(36.0))
+                    .h(px(query_height))
                     .flex_none()
                     .px(px(10.0))
                     .flex()
                     .items_center()
                     .text_size(px(fonts.ui_size))
+                    .line_height(px(crate::ui::ui_line_height(fonts.ui_size)))
                     .border_b_1()
                     .border_color(rgb(theme.shell.border))
                     .role(Role::TextInput)
-                    .aria_label("Command query");
+                    .aria_label(if surfaces {
+                        "Find a tool or view"
+                    } else {
+                        "Command query"
+                    });
                 if self.query.is_empty() {
                     row.child(caret).child(
                         div()
                             .text_color(rgb(theme.shell.text_placeholder))
                             .whitespace_nowrap()
-                            .child("Execute a command…"),
+                            .child(if surfaces {
+                                "Find a tool or view…"
+                            } else {
+                                "Execute a command…"
+                            }),
                     )
                 } else {
                     row.child(
@@ -454,7 +635,11 @@ impl Render for PaletteView {
                     .flex_col()
                     .py(px(4.0))
                     .role(Role::ListBox)
-                    .aria_label("Commands")
+                    .aria_label(if surfaces {
+                        "Tools and views"
+                    } else {
+                        "Commands"
+                    })
                     .children(window_rows.into_iter().map(|row| {
                         // The characters the query hit, painted accent the
                         // way Zed's HighlightedLabel shows fuzzy positions.
@@ -470,7 +655,7 @@ impl Render for PaletteView {
                         let at = row.at;
                         div()
                             .id(("command", at))
-                            .h(px(LIST_ROW_HEIGHT))
+                            .h(px(row_height))
                             .flex_none()
                             .px(px(10.0))
                             .flex()
@@ -484,6 +669,7 @@ impl Render for PaletteView {
                             }))
                             .hover(|hovered| hovered.bg(rgb(theme.shell.element_hover)))
                             .text_size(px(fonts.small()))
+                            .line_height(px(crate::ui::ui_line_height(fonts.small())))
                             .text_color(rgb(theme.shell.text))
                             .role(Role::ListBoxOption)
                             .aria_label(row.display.clone())
@@ -495,7 +681,46 @@ impl Render for PaletteView {
                                     this.confirm(cx);
                                 }),
                             )
-                            .child(gpui::StyledText::new(row.display).with_highlights(highlights))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .min_w(px(0.0))
+                                    .children(row.surface.map(|entry| {
+                                        svg()
+                                            .path(entry.activity.icon)
+                                            .size(px(24.0))
+                                            .flex_none()
+                                            .text_color(rgb(theme.shell.text_muted))
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .child(
+                                                gpui::StyledText::new(row.display)
+                                                    .with_highlights(highlights),
+                                            )
+                                            .children(
+                                                row.surface.and_then(|entry| entry.notice).map(
+                                                    |notice| {
+                                                        div()
+                                                            .text_size(px(fonts.xsmall()))
+                                                            .line_height(px(
+                                                                crate::ui::ui_line_height(
+                                                                    fonts.xsmall(),
+                                                                ),
+                                                            ))
+                                                            .text_color(rgb(theme.shell.text_muted))
+                                                            .child(notice)
+                                                    },
+                                                ),
+                                            ),
+                                    ),
+                            )
                             .children(row.hint.map(|hint| {
                                 div()
                                     .px(px(4.0))
@@ -511,13 +736,18 @@ impl Render for PaletteView {
                     }))
                     .children(self.matches.is_empty().then(|| {
                         div()
-                            .h(px(LIST_ROW_HEIGHT))
+                            .h(px(row_height))
                             .px(px(10.0))
                             .flex()
                             .items_center()
                             .text_size(px(fonts.small()))
+                            .line_height(px(crate::ui::ui_line_height(fonts.small())))
                             .text_color(rgb(theme.shell.text_muted))
-                            .child("No command matches")
+                            .child(if surfaces {
+                                "No tool or view matches"
+                            } else {
+                                "No command matches"
+                            })
                     })),
             )
     }
@@ -526,6 +756,125 @@ impl Render for PaletteView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activity::ActivityId;
+    use k10s_provider::ToolPresence;
+
+    #[test]
+    fn both_palette_modes_contain_scaled_text_and_share_their_wheel_geometry() {
+        for half_pixels in 16..=64 {
+            let fonts = k10s_theme::Typography {
+                ui_size: half_pixels as f32 * 0.5,
+                ..Default::default()
+            };
+            for surfaces in [false, true] {
+                let row = palette_row_height(&fonts, surfaces);
+                let query = palette_query_height(&fonts, surfaces);
+                assert!(row >= crate::ui::ui_line_height(fonts.small()) + 8.0);
+                assert!(query >= crate::ui::ui_line_height(fonts.ui_size) + 16.0);
+                if surfaces {
+                    assert!(
+                        row >= crate::ui::ui_line_height(fonts.small())
+                            + crate::ui::ui_line_height(fonts.xsmall())
+                            + 8.0
+                    );
+                }
+                let mut remainder = 0.0;
+                assert_eq!(wheel_rows(&mut remainder, -row * 0.5, row), 0);
+                assert_eq!(wheel_rows(&mut remainder, -row * 0.5, row), 1);
+                assert_eq!(remainder, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn pixel_wheel_events_accumulate_rows_and_preserve_direction_changes() {
+        let mut remainder = 0.0;
+        assert_eq!(wheel_rows(&mut remainder, -20.0, 44.0), 0);
+        assert_eq!(wheel_rows(&mut remainder, -20.0, 44.0), 0);
+        assert_eq!(wheel_rows(&mut remainder, -20.0, 44.0), 1);
+        assert!((remainder - 16.0).abs() < 0.001);
+        assert_eq!(wheel_rows(&mut remainder, 16.0, 44.0), 0);
+        assert!(remainder.abs() < 0.001);
+        assert_eq!(wheel_rows(&mut remainder, 44.0, 44.0), -1);
+        assert_eq!(wheel_rows(&mut remainder, -132.0, 44.0), 3);
+        assert_eq!(wheel_rows(&mut remainder, 0.0, 44.0), 0);
+        assert!(remainder.abs() < 0.001);
+    }
+
+    fn menu(navigation: ObservabilityNavigation) -> SurfaceMenu {
+        SurfaceMenu {
+            navigation,
+            entries: crate::surfaces::entries(&navigation),
+        }
+    }
+
+    #[test]
+    fn surface_queries_find_backend_names_without_highlighting_unrelated_label_bytes() {
+        let menu = menu(ObservabilityNavigation::default());
+        let commands = PaletteView::surface_commands(&menu);
+        for (query, id) in [
+            ("Prometheus", ActivityId::Observe),
+            ("Grafana", ActivityId::Observe),
+            ("Loki", ActivityId::Observe),
+            ("Tempo", ActivityId::Traces),
+            ("Jaeger", ActivityId::Traces),
+            ("OpenTelemetry", ActivityId::Collectors),
+        ] {
+            let matches = query_matches(query, &commands, Some(&menu));
+            assert!(!matches.is_empty(), "{query}");
+            assert_eq!(menu.entries[matches[0].command].activity.id, id, "{query}");
+            assert!(matches[0].hits.is_empty(), "{query}");
+        }
+        let matches = query_matches("Traces", &commands, Some(&menu));
+        assert_eq!(
+            menu.entries[matches[0].command].activity.id,
+            ActivityId::Traces
+        );
+        assert_eq!(matches[0].hits, vec![0..6]);
+        assert!(query_matches("Tempo", &commands, None).is_empty());
+        assert!(query_matches("no-such-tool", &commands, Some(&menu)).is_empty());
+    }
+
+    #[test]
+    fn discovery_updates_keep_the_selected_action_when_earlier_rows_disappear() {
+        let unknown = menu(ObservabilityNavigation::default());
+        let commands = PaletteView::surface_commands(&unknown);
+        let matches = query_matches("", &commands, Some(&unknown));
+        let selected = unknown
+            .entries
+            .iter()
+            .position(|entry| entry.activity.id == ActivityId::Traces)
+            .unwrap();
+        let name = commands[matches[selected].command].name;
+        let updated = menu(ObservabilityNavigation {
+            observe: Some(ToolPresence::Missing),
+            traces: Some(ToolPresence::Blocked),
+            collectors: Some(ToolPresence::Ready),
+        });
+        let commands = PaletteView::surface_commands(&updated);
+        let matches = query_matches("", &commands, Some(&updated));
+        let selected = retained_selection(Some(name), &commands, &matches);
+        assert_eq!(
+            updated.entries[matches[selected].command].activity.id,
+            ActivityId::Traces
+        );
+        assert_eq!(
+            updated.entries[matches[selected].command].notice,
+            Some("Unavailable")
+        );
+        let observe = unknown
+            .entries
+            .iter()
+            .position(|entry| entry.activity.id == ActivityId::Observe)
+            .unwrap();
+        let old_commands = PaletteView::surface_commands(&unknown);
+        assert_eq!(
+            retained_selection(Some(old_commands[observe].name), &commands, &matches),
+            0
+        );
+        assert!(query_matches("Prometheus", &commands, Some(&updated)).is_empty());
+        assert_eq!(retained_selection(Some(name), &commands, &[]), 0);
+    }
 
     #[test]
     fn action_names_humanize_the_way_zed_users_expect() {

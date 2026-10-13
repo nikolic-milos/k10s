@@ -5,18 +5,16 @@ use k10s_theme::{MapType, quantize};
 
 use crate::PickPath;
 
-const ISLAND_RADIUS: f32 = 0.34;
+const ISLAND_RADIUS: f32 = 0.14;
+const ISLAND_RADIUS_MAX_PX: f32 = 16.0;
 pub(crate) const ISLAND_DETAIL_MIN_PX: f32 = 96.0;
-const ISLAND_JITTER: [f32; 16] = [
-    0.30, 0.38, 0.47, 0.55, 0.64, 0.72, 0.81, 0.89, 0.34, 0.43, 0.51, 0.60, 0.68, 0.77, 0.85, 1.00,
-];
 const CARD_RADIUS: f32 = 0.14;
 const CARD_RADIUS_MAX_PX: f32 = 14.0;
 const POD_RADIUS: f32 = 0.22;
 const GLYPH_RADIUS: f32 = 0.22;
 pub(crate) const WL_MEDALLION_MIN_PX: f32 = 16.0;
-const WL_MEDALLION_OF_HALO: f32 = 0.55;
-pub(crate) const WL_ICON_MAX_PX: f32 = 96.0;
+const WL_MEDALLION_OF_CARD: f32 = 0.55;
+pub(crate) const WL_ICON_MAX_PX: f32 = 32.0;
 const SAT_ICON_OF_CELL: f32 = 1.05;
 pub(crate) const SAT_ICON_MAX_PX: f32 = 48.0;
 
@@ -24,7 +22,7 @@ pub(crate) const NAME_MIN_WIDTH: f32 = 152.0;
 pub(crate) const POD_MARK_MIN: f32 = 24.0;
 pub(crate) const POD_DETAIL_MIN_WIDTH: f32 = 144.0;
 pub(crate) const POD_DETAIL_MAX_WIDTH: f32 = 224.0;
-const POD_MARK_MAX: f32 = 96.0;
+const POD_MARK_MAX: f32 = POD_DETAIL_MIN_HEIGHT;
 pub(crate) const POD_DETAIL_MIN_HEIGHT: f32 = 64.0;
 const POD_DETAIL_MAX_HEIGHT: f32 = 104.0;
 pub(crate) const TEXT_PAD: f32 = 8.0;
@@ -33,7 +31,12 @@ pub(crate) const HEADING_CLEARANCE: f32 = 4.0;
 
 #[inline]
 pub(crate) fn name_band_height(type_: MapType) -> f32 {
-    (row_pitch(type_.workload, type_.line_height) * 2.0 + TEXT_PAD * 2.0).ceil()
+    (workload_row_pitch(type_) * 2.0 + TEXT_PAD * 2.0).ceil()
+}
+
+#[inline]
+pub(crate) fn workload_row_pitch(type_: MapType) -> f32 {
+    row_pitch(type_.workload, type_.line_height).max(WL_ICON_MAX_PX)
 }
 
 #[inline]
@@ -75,15 +78,21 @@ pub(crate) fn workload_presentation(
     stage: u8,
     type_: MapType,
 ) -> WorkloadPresentation {
-    let stage = if stage == 1
-        && inner.w * zoom >= name_min_width(type_)
-        && inner.h * zoom >= name_band_height(type_)
-    {
-        2
+    let stage = if stage > 0 && !policy.stress && !policy.stress_curves {
+        let readable = inner.w * zoom >= name_min_width(type_) + TEXT_PAD * 2.0
+            && inner.h * zoom >= (name_band_height(type_) + TEXT_PAD + HEADING_CLEARANCE) * 2.0;
+        if readable { stage.max(2) } else { 1 }
     } else {
         stage
     };
-    policy.workload_presentation(inner.w, zoom, stage)
+    let presentation = policy.workload_presentation(inner.w, zoom, stage);
+    if presentation == WorkloadPresentation::Medallion
+        && inner.w.min(inner.h) * zoom < quantize(0.0)
+    {
+        WorkloadPresentation::Card
+    } else {
+        presentation
+    }
 }
 
 #[inline]
@@ -221,12 +230,7 @@ impl Projection {
     #[inline]
     pub(crate) fn region(self, rect: Rect) -> MarkPrimitive {
         let short_px = rect.w.min(rect.h) * self.camera.zoom;
-        region(
-            rect,
-            self.bounds(rect),
-            short_px,
-            short_px >= ISLAND_DETAIL_MIN_PX,
-        )
+        region(self.bounds(rect), short_px)
     }
 
     #[inline]
@@ -234,12 +238,32 @@ impl Projection {
         card(self.bounds(rect))
     }
 
-    /// Empty workloads use compact geometry at every card presentation. A
-    /// single observed Pod compacts only at detail. Both retain the published
-    /// hub and any child center so chrome does not move relationship anchors.
-    /// Multiple Pods keep their layout chrome and placement.
     #[inline]
     pub(crate) fn workload<R, B, C, S>(
+        self,
+        scene: &Scene<R, B, C, S>,
+        block_index: usize,
+        stage: u8,
+        type_: MapType,
+        presentation: WorkloadPresentation,
+    ) -> WorkloadPrimitive {
+        if presentation == WorkloadPresentation::Card {
+            let block = &scene.blocks[block_index];
+            WorkloadPrimitive {
+                body: self.medallion(block.inner),
+                heading: None,
+            }
+        } else {
+            self.workload_card(scene, block_index, stage, type_)
+        }
+    }
+
+    /// Zero or one observed Pod uses compact geometry at every card stage so
+    /// adding detail cannot suddenly shrink the same target. Both retain the
+    /// published hub and child center without moving relationship anchors.
+    /// Multiple Pods keep their layout chrome and placement.
+    #[inline]
+    pub(crate) fn workload_card<R, B, C, S>(
         self,
         scene: &Scene<R, B, C, S>,
         block_index: usize,
@@ -248,7 +272,7 @@ impl Projection {
     ) -> WorkloadPrimitive {
         let block = &scene.blocks[block_index];
         let mut body = self.card(block.inner);
-        let compact = block.children.is_empty() || (stage >= 3 && block.children.len() == 1);
+        let compact = block.children.len() <= 1;
         let heading = if compact {
             let (x, y) = block.inner.center();
             let hub = self.bounds(Rect::new(x, y, 0.0, 0.0));
@@ -363,17 +387,28 @@ impl Projection {
             && f32::from(bounds.origin.x) < self.origin.0 + self.viewport.0
     }
 
+    /// An attachment halo cannot enlarge the workload's own identity target.
     #[inline]
-    pub(crate) fn medallion(self, halo: Rect, inner: Rect) -> MarkPrimitive {
-        let halo_short = halo.w.min(halo.h) * self.camera.zoom;
-        let side = icon_side(
-            (halo_short * WL_MEDALLION_OF_HALO)
-                .max(WL_MEDALLION_MIN_PX)
-                .min(halo_short),
-            WL_ICON_MAX_PX,
-        );
-        let (center_x, center_y) = inner.center();
-        self.centered_glyph(center_x, center_y, side)
+    pub(crate) fn medallion(self, inner: Rect) -> MarkPrimitive {
+        let short = inner.w.min(inner.h) * self.camera.zoom;
+        let side = if short < WL_MEDALLION_MIN_PX {
+            quantize(0.0)
+        } else {
+            icon_side(
+                (short * WL_MEDALLION_OF_CARD).max(WL_MEDALLION_MIN_PX),
+                WL_ICON_MAX_PX,
+            )
+        };
+        let natural = self.bounds(inner);
+        let width = px(side).min(natural.size.width);
+        let height = px(side).min(natural.size.height);
+        glyph(Bounds {
+            origin: point(
+                natural.origin.x + (natural.size.width - width) * 0.5,
+                natural.origin.y + (natural.size.height - height) * 0.5,
+            ),
+            size: size(width, height),
+        })
     }
 
     #[inline]
@@ -383,8 +418,8 @@ impl Projection {
         row: usize,
         type_: MapType,
     ) -> MarkPrimitive {
-        let pitch = row_pitch(type_.workload, type_.line_height);
-        let side = quantize(type_.workload.max(16.0));
+        let pitch = workload_row_pitch(type_);
+        let side = WL_ICON_MAX_PX;
         glyph(Bounds {
             origin: point(
                 band.bounds.origin.x + px(TEXT_PAD),
@@ -420,17 +455,8 @@ impl Projection {
 }
 
 #[inline]
-pub(crate) fn region(
-    rect: Rect,
-    bounds: Bounds<Pixels>,
-    short_px: f32,
-    detailed: bool,
-) -> MarkPrimitive {
-    let corners = if detailed {
-        island_radii(&rect, short_px)
-    } else {
-        Corners::all(px(short_px * ISLAND_RADIUS))
-    };
+pub(crate) fn region(bounds: Bounds<Pixels>, short_px: f32) -> MarkPrimitive {
+    let corners = island_radii(short_px);
     MarkPrimitive { bounds, corners }
 }
 
@@ -467,20 +493,8 @@ fn icon_side(want: f32, max_px: f32) -> f32 {
 }
 
 #[inline]
-pub(crate) fn island_radii(rect: &Rect, short_px: f32) -> Corners<Pixels> {
-    let base = short_px * ISLAND_RADIUS;
-    // Both layout engines normalize the first island to the origin, so a salt
-    // prevents its otherwise all-zero identity from producing square corners.
-    let bits = ((rect.x.to_bits() as u64) ^ ((rect.y.to_bits() as u64) << 32))
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let hash = (bits ^ (bits >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    let corner = |shift: u32| px(base * ISLAND_JITTER[((hash >> shift) & 15) as usize]);
-    Corners {
-        top_left: corner(4),
-        top_right: corner(20),
-        bottom_right: corner(36),
-        bottom_left: corner(52),
-    }
+pub(crate) fn island_radii(short_px: f32) -> Corners<Pixels> {
+    Corners::all(px((short_px * ISLAND_RADIUS).min(ISLAND_RADIUS_MAX_PX)))
 }
 
 /// Resolution rejects hidden hierarchy levels so a stale selection cannot draw
@@ -537,7 +551,7 @@ pub(crate) fn mark_primitive_typed(
         let heading = workload_label_shown(policy, block.inner.w, camera.zoom)
             .then(|| {
                 projection
-                    .workload(scene, block_index, stage, type_)
+                    .workload_card(scene, block_index, stage, type_)
                     .heading
             })
             .flatten();
@@ -559,12 +573,13 @@ pub(crate) fn mark_primitive_typed(
     }
     if let Some(block_index) = path.block {
         let block = scene.blocks.get(block_index as usize)?;
-        return match workload_presentation(policy, block.inner, camera.zoom, stage, type_) {
+        let presentation = workload_presentation(policy, block.inner, camera.zoom, stage, type_);
+        return match presentation {
             WorkloadPresentation::Hidden => None,
-            WorkloadPresentation::Medallion => Some(projection.medallion(block.rect, block.inner)),
+            WorkloadPresentation::Medallion => Some(projection.medallion(block.inner)),
             WorkloadPresentation::Card | WorkloadPresentation::Detailed => Some(
                 projection
-                    .workload(scene, block_index as usize, stage, type_)
+                    .workload(scene, block_index as usize, stage, type_, presentation)
                     .body,
             ),
         };
@@ -619,7 +634,7 @@ mod tests {
                         (1600.0, 1000.0),
                         origin,
                     );
-                    let geometry = projection.workload(&scene, 0, 3, type_);
+                    let geometry = projection.workload_card(&scene, 0, 3, type_);
                     let envelope = projection.bounds(scene.blocks[0].inner);
                     let hub = projection.bounds(Rect::new(55.0, 68.0, 0.0, 0.0)).origin;
                     assert!(geometry.body.bounds.is_contained_within(&envelope));
@@ -644,12 +659,36 @@ mod tests {
                     }
                     if font == 14.0 {
                         assert_eq!(geometry.body.bounds.size.width, px(168.0));
-                        let height = if pods == 1 { 293.2 } else { 74.0 };
+                        let height = if pods == 1 { 319.2 } else { 100.0 };
                         assert!(
                             (f32::from(geometry.body.bounds.size.height) - height).abs() < 0.001
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn workload_headers_wait_for_both_readable_width_and_height() {
+        let policy = crate::lod::policy(Default::default());
+        for font in [8.0, 14.0, 32.0] {
+            let type_ = MapType {
+                workload: font,
+                ..Default::default()
+            };
+            let width = name_min_width(type_) + TEXT_PAD * 2.0;
+            let height = (name_band_height(type_) + TEXT_PAD + HEADING_CLEARANCE) * 2.0;
+            for (w, h, expected) in [
+                (width - 0.5, height, WorkloadPresentation::Medallion),
+                (width, height - 0.5, WorkloadPresentation::Medallion),
+                (width, height, WorkloadPresentation::Detailed),
+            ] {
+                let inner = Rect::new(40.0, 40.0, w, h);
+                assert_eq!(
+                    workload_presentation(&policy, inner, 1.0, 1, type_),
+                    expected
+                );
             }
         }
     }
@@ -667,8 +706,8 @@ mod tests {
             scene.blocks[0].inner = inner;
             let (cx, cy) = inner.center();
             for (font, max_width, height) in [
-                (8.0, 168.0, 68.0),
-                (14.0, 168.0, 74.0),
+                (8.0, 168.0, 100.0),
+                (14.0, 168.0, 100.0),
                 (32.0, 364.0, 123.0),
             ] {
                 let type_ = MapType {
@@ -685,7 +724,10 @@ mod tests {
                     (minimum + 16.0, -1),
                     (minimum + 16.0, 1),
                 ] {
-                    let zoom = width / inner.w;
+                    let zoom = (width / inner.w).max(
+                        (name_band_height(type_) + TEXT_PAD + HEADING_CLEARANCE) * 2.0 / inner.h,
+                    );
+                    let width = inner.w * zoom;
                     let center_x = match edge {
                         -1 => width * 0.5 - 5.0,
                         1 => viewport.0 + 5.0 - width * 0.5,
@@ -699,7 +741,7 @@ mod tests {
                     for origin in [(0.0, 0.0), (17.25, 23.5)] {
                         let projection = Projection::new(camera, viewport, origin);
                         assert!(projection.name_band(inner, type_).is_some());
-                        let geometry = projection.workload(&scene, 0, stage, type_);
+                        let geometry = projection.workload_card(&scene, 0, stage, type_);
                         let heading = geometry.heading.expect("the admitted name stays visible");
                         let envelope = projection.bounds(inner);
                         let hub = projection.bounds(Rect::new(cx, cy, 0.0, 0.0)).origin;
@@ -743,7 +785,7 @@ mod tests {
                     );
                     assert!(
                         projection
-                            .workload(&scene, 0, stage, type_)
+                            .workload_card(&scene, 0, stage, type_)
                             .heading
                             .is_none()
                     );
@@ -765,7 +807,7 @@ mod tests {
             (0.0, 0.0),
         );
         let type_ = MapType::default();
-        let direct = projection.workload(&scene, 0, 3, type_);
+        let direct = projection.workload_card(&scene, 0, 3, type_);
         let actual = scene.cells[0].clone();
         scene.cells[0].rect = Rect::new(1000.0, 1000.0, 10.0, 10.0);
         scene.cells.push(k10s_atlas::CellNode {
@@ -775,17 +817,17 @@ mod tests {
         });
         scene.cells.push(actual);
         scene.block_cells = vec![2];
-        assert_eq!(projection.workload(&scene, 0, 3, type_), direct);
+        assert_eq!(projection.workload_card(&scene, 0, 3, type_), direct);
         scene.blocks[0].children = 0..0;
-        let removed = projection.workload(&scene, 0, 3, type_);
+        let removed = projection.workload_card(&scene, 0, 3, type_);
         scene.cells.clear();
         scene.block_cells.clear();
-        assert_eq!(projection.workload(&scene, 0, 3, type_), removed);
-        assert_eq!(removed.body.bounds.size.height, px(74.0));
+        assert_eq!(projection.workload_card(&scene, 0, 3, type_), removed);
+        assert_eq!(removed.body.bounds.size.height, px(100.0));
     }
 
     #[test]
-    fn compact_chrome_clamps_but_many_children_and_earlier_lods_keep_their_geometry() {
+    fn compact_chrome_stays_consistent_across_card_stages_and_preserves_large_groups() {
         let mut scene = one_pod_scene();
         let type_ = MapType::default();
         let projection = Projection::new(
@@ -801,15 +843,25 @@ mod tests {
             body: projection.card(scene.blocks[0].inner),
             heading: projection.name_band(scene.blocks[0].inner, type_),
         };
-        assert_eq!(projection.workload(&scene, 0, 2, type_), original);
+        assert_eq!(
+            projection.workload_card(&scene, 0, 2, type_),
+            projection.workload_card(&scene, 0, 3, type_),
+        );
+        assert!(
+            projection
+                .workload_card(&scene, 0, 2, type_)
+                .body
+                .bounds
+                .is_contained_within(&original.body.bounds)
+        );
         for pods in [2, 2048] {
             scene.blocks[0].children = 0..pods;
             scene.cells.resize(pods as usize, scene.cells[0].clone());
-            assert_eq!(projection.workload(&scene, 0, 3, type_), original);
+            assert_eq!(projection.workload_card(&scene, 0, 3, type_), original);
         }
         scene.blocks[0].children = 0..1;
         scene.cells[0].rect = Rect::new(40.0, 40.0, 10.0, 10.0);
-        let geometry = projection.workload(&scene, 0, 3, type_);
+        let geometry = projection.workload_card(&scene, 0, 3, type_);
         let envelope = projection.bounds(scene.blocks[0].inner);
         assert_eq!(geometry.body.bounds.origin.y, envelope.origin.y);
         assert!(geometry.body.bounds.is_contained_within(&envelope));

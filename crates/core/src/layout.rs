@@ -21,6 +21,10 @@ pub const NS_PAD: f32 = 36.0;
 pub const NS_HEADER: f32 = 44.0;
 pub const NS_GAP: f32 = 120.0;
 
+/// Namespace identity keeps its reserved space as workloads enter and leave.
+pub const NS_MIN_WIDTH: f32 = 360.0;
+pub const NS_MIN_HEIGHT: f32 = 240.0;
+
 pub const CARD_PAD: f32 = 10.0;
 pub const CARD_HEADER: f32 = 26.0;
 

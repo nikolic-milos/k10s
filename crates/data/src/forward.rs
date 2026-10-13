@@ -7,11 +7,10 @@
 //! the [`Forwarder`] trait, which is what makes every lifecycle rule testable
 //! with no network. The production implementation, [`KubeForwarder`], binds a
 //! local listener on 127.0.0.1 and drives each accepted connection through
-//! kube's WebSocket port-forward; the scripted API server cannot speak an
-//! HTTP upgrade, so that implementation is exercised only against a live
-//! cluster and is kept deliberately thin.
+//! kube's WebSocket port-forward. A loopback test with a pending client proves
+//! active connection cancellation; live-cluster tests prove the HTTP upgrade
+//! and byte transfer that the scripted API server cannot speak.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::core::v1::{Pod, Service};
@@ -332,8 +331,11 @@ impl ForwardRegistry {
         // The lock is released around `start`: the forwarder may report
         // synchronously, and its report needs the entry it is about.
         let guard = self.forwarder.start(&spec, {
-            let inner = self.inner.clone();
+            let inner = Arc::downgrade(&self.inner);
             Box::new(move |event| {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
                 let mut inner = inner.lock().expect("forward registry lock");
                 if let Some(entry) = inner.entries.iter_mut().find(|e| e.row.id == id) {
                     match event {
@@ -378,33 +380,41 @@ impl ForwardRegistry {
     }
 }
 
-// The production side of the seam. Untestable against the scripted API
-// server (port-forward is an HTTP upgrade); kept to plumbing: bind, accept,
-// one kube port-forward per connection, bytes copied both ways.
+// The production side of the seam: bind, accept, one kube port-forward per
+// connection, and bytes copied both ways. Actual upgrades need a live cluster.
 pub struct KubeForwarder {
     client: Client,
     handle: tokio::runtime::Handle,
+}
+
+// Dropping kube's handle detaches its pump, so the connection must abort it.
+struct ForwardConnection(kube::api::Portforwarder);
+
+impl Drop for ForwardConnection {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl KubeForwarder {
     pub(crate) fn new(client: Client, handle: tokio::runtime::Handle) -> KubeForwarder {
         KubeForwarder { client, handle }
     }
-}
 
-impl Forwarder for KubeForwarder {
-    fn start(
+    fn start_with_listener(
         &self,
         spec: &ForwardSpec,
         on_event: Box<dyn Fn(ForwardEvent) + Send + Sync>,
+        listener: impl std::future::Future<Output = std::io::Result<tokio::net::TcpListener>>
+        + Send
+        + 'static,
     ) -> ForwardGuard {
         let (cancel_tx, mut cancel) = tokio::sync::oneshot::channel::<()>();
         let client = self.client.clone();
         let spec = spec.clone();
         self.handle.spawn(async move {
             let on_event: Arc<dyn Fn(ForwardEvent) + Send + Sync> = Arc::from(on_event);
-            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", spec.local_port)).await
-            {
+            let listener = match listener.await {
                 Ok(listener) => listener,
                 Err(error) => {
                     on_event(ForwardEvent::Dead(format!(
@@ -417,10 +427,10 @@ impl Forwarder for KubeForwarder {
             on_event(ForwardEvent::Ready);
             let api: Api<Pod> = Api::namespaced(client, &spec.namespace);
             let (dead_tx, mut dead) = tokio::sync::mpsc::channel::<String>(1);
-            let live_connections = Arc::new(AtomicUsize::new(0));
             let mut connections: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
                 let accepted = tokio::select! {
+                    biased;
                     _ = &mut cancel => return,
                     why = dead.recv() => {
                         on_event(ForwardEvent::Dead(
@@ -438,21 +448,37 @@ impl Forwarder for KubeForwarder {
                         return;
                     }
                 };
-                if live_connections.load(Ordering::Acquire) >= MAX_CONNECTIONS_PER_FORWARD {
+                if connections.len() >= MAX_CONNECTIONS_PER_FORWARD {
                     // Refused, not queued: the bound is the contract.
                     continue;
                 }
-                live_connections.fetch_add(1, Ordering::AcqRel);
                 let api = api.clone();
                 let spec = spec.clone();
                 let dead_tx = dead_tx.clone();
-                let live_connections = live_connections.clone();
                 connections.spawn(async move {
                     match api.portforward(&spec.pod, &[spec.remote_port]).await {
-                        Ok(mut forwarded) => {
-                            if let Some(mut upstream) = forwarded.take_stream(spec.remote_port) {
-                                let _ =
-                                    tokio::io::copy_bidirectional(&mut local, &mut upstream).await;
+                        Ok(forwarded) => {
+                            let mut forwarded = ForwardConnection(forwarded);
+                            let mut upstream = forwarded
+                                .0
+                                .take_stream(spec.remote_port)
+                                .expect("the requested port has a data stream");
+                            let error = forwarded
+                                .0
+                                .take_error(spec.remote_port)
+                                .expect("the requested port has an error channel");
+                            let copy = tokio::io::copy_bidirectional(&mut local, &mut upstream);
+                            tokio::pin!(copy);
+                            tokio::select! {
+                                biased;
+                                why = error => {
+                                    if let Some(why) = why {
+                                        let _ = dead_tx.try_send(why);
+                                    } else {
+                                        let _ = copy.await;
+                                    }
+                                }
+                                _ = &mut copy => {}
                             }
                         }
                         // The pod side refusing is the forward dying, not a
@@ -463,13 +489,26 @@ impl Forwarder for KubeForwarder {
                                 .try_send(crate::read::classify_text("port-forward", &error));
                         }
                     }
-                    live_connections.fetch_sub(1, Ordering::AcqRel);
                 });
             }
         });
         ForwardGuard::new(move || {
             let _ = cancel_tx.send(());
         })
+    }
+}
+
+impl Forwarder for KubeForwarder {
+    fn start(
+        &self,
+        spec: &ForwardSpec,
+        on_event: Box<dyn Fn(ForwardEvent) + Send + Sync>,
+    ) -> ForwardGuard {
+        self.start_with_listener(
+            spec,
+            on_event,
+            tokio::net::TcpListener::bind(("127.0.0.1", spec.local_port)),
+        )
     }
 }
 
@@ -522,9 +561,8 @@ mod tests {
         }
     }
 
-    /// A cluster that accepts the port-forward upgrade and then never answers,
-    /// so a connection task stays parked exactly where a real one waits for
-    /// the kubelet; every request it receives is reported first.
+    /// A client that reports the port-forward upgrade request and never
+    /// answers, so a connection task stays parked while awaiting the kubelet.
     fn hanging_client(reached: tokio::sync::mpsc::UnboundedSender<()>) -> Client {
         Client::new(
             tower::service_fn(move |_: http::Request<kube::client::Body>| {
@@ -534,14 +572,6 @@ mod tests {
             }),
             "prod",
         )
-    }
-
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind(("127.0.0.1", 0))
-            .expect("a free local port")
-            .local_addr()
-            .expect("a bound address")
-            .port()
     }
 
     fn spec(pod: &str, local: u16, remote: u16) -> ForwardSpec {
@@ -576,6 +606,37 @@ mod tests {
             "closing the row must cancel the forwarder's work"
         );
         assert!(!registry.close(row.id), "a second close finds nothing");
+    }
+
+    #[test]
+    fn the_last_registry_drop_cancels_with_retained_and_late_callbacks() {
+        let fake = FakeForwarder::default();
+        let registry = ForwardRegistry::new(Arc::new(fake.clone()));
+        let remaining = registry.clone();
+        let target = spec("api-1", 8080, 80);
+        registry.open(target.clone()).expect("opens");
+
+        drop(registry);
+        assert!(
+            fake.cancelled().is_empty(),
+            "one remaining registry keeps its forward open"
+        );
+        fake.report(0, ForwardEvent::Ready);
+        assert_eq!(remaining.list()[0].state, ForwardState::Active);
+
+        drop(remaining);
+        assert_eq!(
+            fake.cancelled(),
+            vec![target.clone()],
+            "retained callbacks cannot keep the last registry's guard alive"
+        );
+        fake.report(0, ForwardEvent::Ready);
+        fake.report(0, ForwardEvent::Dead("a late server sentence".into()));
+        assert_eq!(
+            fake.cancelled(),
+            vec![target],
+            "late callbacks return safely without another cancellation"
+        );
     }
 
     #[test]
@@ -659,18 +720,22 @@ mod tests {
     async fn closing_a_forward_ends_the_connections_it_was_still_carrying() {
         use tokio::io::AsyncReadExt;
 
-        let port = free_port();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a bound local listener");
+        let port = listener.local_addr().expect("a bound address").port();
         let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel();
         let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         let forwarder = KubeForwarder::new(
             hanging_client(reached_tx),
             tokio::runtime::Handle::current(),
         );
-        let guard = forwarder.start(
+        let guard = forwarder.start_with_listener(
             &spec("api-1", port, 80),
             Box::new(move |event| {
                 let _ = events_tx.send(event);
             }),
+            async move { Ok(listener) },
         );
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
@@ -682,9 +747,12 @@ mod tests {
         let mut connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("the forward is listening");
-        tokio::time::timeout(std::time::Duration::from_secs(5), reached.recv())
-            .await
-            .expect("the connection reaches the cluster and parks there");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), reached.recv())
+                .await
+                .expect("the connection reaches the client and parks there"),
+            Some(())
+        );
 
         drop(guard);
 
@@ -700,6 +768,76 @@ mod tests {
             Some(0),
             "the socket the copy task held is closed, not left open behind a cancelled guard"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forward_refuses_connections_past_its_bound_and_cancels_every_parked_connection() {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("a bound local listener");
+            let port = listener.local_addr().expect("a bound address").port();
+            let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel();
+            let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+            let forwarder = KubeForwarder::new(
+                hanging_client(reached_tx),
+                tokio::runtime::Handle::current(),
+            );
+            let guard = forwarder.start_with_listener(
+                &spec("api-1", port, 80),
+                Box::new(move |event| {
+                    let _ = events_tx.send(event);
+                }),
+                async move { Ok(listener) },
+            );
+            assert_eq!(events.recv().await, Some(ForwardEvent::Ready));
+
+            let mut connections = Vec::with_capacity(MAX_CONNECTIONS_PER_FORWARD);
+            for _ in 0..MAX_CONNECTIONS_PER_FORWARD {
+                let connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .expect("the forward accepts a connection within its bound");
+                assert_eq!(
+                    reached.recv().await,
+                    Some(()),
+                    "each accepted connection reaches the client and parks there"
+                );
+                connections.push(connection);
+            }
+
+            let mut refused = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("the local listener accepts the excess connection");
+            let mut byte = [0u8; 1];
+            let count = tokio::select! {
+                biased;
+                request = reached.recv() => {
+                    panic!("the excess connection must not reach the client: {request:?}");
+                }
+                read = refused.read(&mut byte) => read.expect("the excess socket closes"),
+            };
+            assert_eq!(count, 0, "the excess connection is refused with EOF");
+            assert!(matches!(
+                reached.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+
+            drop(guard);
+            for mut connection in connections {
+                assert_eq!(
+                    connection
+                        .read(&mut byte)
+                        .await
+                        .expect("the parked socket closes"),
+                    0,
+                    "cancellation closes every connection within the bound"
+                );
+            }
+        })
+        .await
+        .expect("the connection bound and cancellation finish within their budget");
     }
 
     #[test]

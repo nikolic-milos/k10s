@@ -1,4 +1,4 @@
-//! The left activity rail: which surfaces exist, and which icon is lit.
+//! Named navigation: which surfaces exist, which action opens each, and what is lit.
 //!
 //! The rail is a table of slots, not a pile of buttons in `render`. Adding a
 //! panel is one row; the dock still holds the panel. Chrome uses shipped vector
@@ -15,6 +15,7 @@ pub(crate) enum ActivityId {
     Flux,
     Day2,
     Observe,
+    Traces,
     Collectors,
     Policy,
     Ecosystem,
@@ -98,15 +99,22 @@ pub(crate) const ACTIVITIES: &[Activity] = &[
     },
     Activity {
         id: ActivityId::Observe,
-        icon: "icons/sparkle.svg",
-        label: "Grafana queries",
+        icon: "icons/chart-no-axes-combined.svg",
+        label: "Metrics and logs",
         element_id: "activity-observe",
+        group: ActivityGroup::Primary,
+    },
+    Activity {
+        id: ActivityId::Traces,
+        icon: "icons/route.svg",
+        label: "Traces",
+        element_id: "activity-traces",
         group: ActivityGroup::Primary,
     },
     Activity {
         id: ActivityId::Collectors,
         icon: "icons/tools/opentelemetry.svg",
-        label: "OpenTelemetry Collectors",
+        label: "Collectors",
         element_id: "activity-collectors",
         group: ActivityGroup::Primary,
     },
@@ -154,6 +162,35 @@ pub(crate) const ACTIVITIES: &[Activity] = &[
     },
 ];
 
+impl ActivityId {
+    pub(crate) fn action(self) -> Box<dyn gpui::Action> {
+        use crate::{
+            FindCluster, OpenArgo, OpenBrowser, OpenCollectors, OpenDay2, OpenEcosystem, OpenFlux,
+            OpenForwards, OpenNodes, OpenObserve, OpenPolicy, OpenReleases, OpenSettings,
+            OpenTraces, ShowStarmap, ToggleInspector, ToggleTerminal,
+        };
+        match self {
+            Self::Starmap => Box::new(ShowStarmap),
+            Self::Resources => Box::new(OpenBrowser),
+            Self::Nodes => Box::new(OpenNodes),
+            Self::Find => Box::new(FindCluster),
+            Self::Releases => Box::new(OpenReleases),
+            Self::Argo => Box::new(OpenArgo),
+            Self::Flux => Box::new(OpenFlux),
+            Self::Day2 => Box::new(OpenDay2),
+            Self::Observe => Box::new(OpenObserve),
+            Self::Traces => Box::new(OpenTraces),
+            Self::Collectors => Box::new(OpenCollectors),
+            Self::Policy => Box::new(OpenPolicy),
+            Self::Ecosystem => Box::new(OpenEcosystem),
+            Self::Forwards => Box::new(OpenForwards),
+            Self::Terminal => Box::new(ToggleTerminal),
+            Self::Inspector => Box::new(ToggleInspector),
+            Self::Settings => Box::new(OpenSettings),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LeftSlot {
     Resources,
@@ -173,6 +210,7 @@ pub(crate) enum CenterSlot {
     Flux,
     Day2,
     Observe,
+    Traces,
     Collectors,
     Policy,
     Ecosystem,
@@ -198,6 +236,7 @@ pub(crate) fn lit(id: ActivityId, state: RailState) -> bool {
         ActivityId::Flux => state.center == Some(CenterSlot::Flux),
         ActivityId::Day2 => state.center == Some(CenterSlot::Day2),
         ActivityId::Observe => state.center == Some(CenterSlot::Observe),
+        ActivityId::Traces => state.center == Some(CenterSlot::Traces),
         ActivityId::Collectors => state.center == Some(CenterSlot::Collectors),
         ActivityId::Policy => state.center == Some(CenterSlot::Policy),
         ActivityId::Ecosystem => state.center == Some(CenterSlot::Ecosystem),
@@ -234,7 +273,7 @@ mod tests {
             icons.push(slot.icon);
             elements.push(slot.element_id);
         }
-        assert_eq!(ids.len(), 16);
+        assert_eq!(ids.len(), ACTIVITIES.len());
     }
 
     #[test]
@@ -273,5 +312,12 @@ mod tests {
         assert!(lit(ActivityId::Collectors, collectors));
         assert!(!lit(ActivityId::Observe, collectors));
         assert!(!lit(ActivityId::Ecosystem, collectors));
+
+        let traces = RailState {
+            center: Some(CenterSlot::Traces),
+            ..RailState::default()
+        };
+        assert!(lit(ActivityId::Traces, traces));
+        assert!(!lit(ActivityId::Observe, traces));
     }
 }

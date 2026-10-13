@@ -104,6 +104,36 @@ fn namespaces_do_not_overlap_either_mode() {
 }
 
 #[test]
+fn namespace_identity_reserves_a_minimum_tile_in_both_modes() {
+    let mut spec = platform(42, 1000);
+    let populated = spec.namespaces.len();
+    for index in 0..3 {
+        spec.namespaces.push(crate::input::NsInput {
+            uid: format!("empty-{index}").into(),
+            name: format!("empty-{index}").into(),
+            workloads: Vec::new(),
+        });
+    }
+    for mode in [LayoutMode::Dense, LayoutMode::Spread] {
+        let out = layout(&spec, mode);
+        assert_eq!(out.ns_rects.len(), populated + 3);
+        for (index, rect) in out.ns_rects.iter().enumerate() {
+            assert!(out.bounds.contains(rect));
+            assert!(rect.w >= NS_MIN_WIDTH && rect.h >= NS_MIN_HEIGHT);
+            if index >= populated {
+                assert!(rect.w / rect.h >= 1.0 && rect.w / rect.h <= 2.0);
+            }
+            for other in &out.ns_rects[index + 1..] {
+                assert!(
+                    !rect.intersects(other),
+                    "{mode:?}: {rect:?} overlaps {other:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn spread_islands_keep_map_distance() {
     let spec = gen_input(42, 20_000, Scenario::Platform);
     let out = layout(&spec, LayoutMode::Spread);
@@ -413,21 +443,23 @@ fn only_attachment_modes_emit_satellite_rects() {
 
 #[test]
 fn layout_fingerprints_are_committed() {
-    let cases: &[(LayoutMode, u64, u32, u64)] = &[
-        (LayoutMode::Dense, 1234, 10_000, 0x20d2_6824_fecf_31a4),
-        (LayoutMode::Dense, 7, 25_000, 0xe9aa_f079_556b_16d5),
+    let cases: [(LayoutMode, u64, u32, u64); 4] = [
+        (LayoutMode::Dense, 1234, 10_000, 0xba30_c040_298a_91a4),
+        (LayoutMode::Dense, 7, 25_000, 0xc257_096a_a683_c6d5),
         (LayoutMode::Spread, 1234, 10_000, 0xedac_a8d8_afec_b255),
         (LayoutMode::Spread, 7, 25_000, 0x1c65_a882_421c_cd1a),
     ];
-    for &(mode, seed, objects, expected) in cases {
+    let actual = cases.map(|(mode, seed, objects, _)| {
         let spec = platform(seed, objects);
         let out = layout(&spec, mode);
-        let got = fingerprint(&out, transcendental_free(mode));
-        assert_eq!(
-            got, expected,
-            "{mode:?} seed {seed} objects {objects}: got {got:#018x}, want {expected:#018x}"
-        );
-    }
+        (
+            mode,
+            seed,
+            objects,
+            fingerprint(&out, transcendental_free(mode)),
+        )
+    });
+    assert_eq!(actual, cases, "layout fingerprints: {actual:#x?}");
 }
 
 #[test]

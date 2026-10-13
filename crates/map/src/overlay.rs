@@ -144,20 +144,21 @@ impl OverlayFrame {
                 Level::Region => Some(projection.region(located.rect)),
                 Level::Block => cached.block.and_then(|block_index| {
                     let block = scene.blocks.get(block_index)?;
-                    match crate::primitive::workload_presentation(
+                    let presentation = crate::primitive::workload_presentation(
                         policy,
                         block.inner,
                         camera.zoom,
                         stage,
                         type_,
-                    ) {
+                    );
+                    match presentation {
                         WorkloadPresentation::Hidden => None,
-                        WorkloadPresentation::Medallion => {
-                            Some(projection.medallion(block.rect, block.inner))
-                        }
-                        WorkloadPresentation::Card | WorkloadPresentation::Detailed => {
-                            Some(projection.workload(scene, block_index, stage, type_).body)
-                        }
+                        WorkloadPresentation::Medallion => Some(projection.medallion(block.inner)),
+                        WorkloadPresentation::Card | WorkloadPresentation::Detailed => Some(
+                            projection
+                                .workload(scene, block_index, stage, type_, presentation)
+                                .body,
+                        ),
                     }
                 }),
                 Level::Cell => cached.block.and_then(|block_index| {
@@ -166,7 +167,7 @@ impl OverlayFrame {
                         crate::primitive::workload_label_shown(policy, block.inner.w, camera.zoom)
                             .then(|| {
                                 projection
-                                    .workload(scene, block_index, stage, type_)
+                                    .workload_card(scene, block_index, stage, type_)
                                     .heading
                             })
                             .flatten();
@@ -997,7 +998,14 @@ mod tests {
 
     #[test]
     fn pod_stamps_follow_the_bounded_body_and_skip_pinned_headings() {
-        let scene = scene_two_islands();
+        let mut scene = scene_two_islands();
+        scene.cells.push(PodNode {
+            rect: Rect::new(42.0, 42.0, 16.0, 16.0),
+            label: "api-1".into(),
+            ext: PodExt { state: State::OK },
+        });
+        scene.blocks[0].children = 0..2;
+        Arc::make_mut(&mut scene.ids).cells.push("pod-api-1".into());
         let frame = OverlayFrame {
             kind: Some(OverlayKind::Policy),
             marks: vec![OverlayMark {
@@ -1014,7 +1022,7 @@ mod tests {
         };
         let type_ = MapType::default();
         let projection = crate::primitive::Projection::new(camera, (800.0, 600.0), (0.0, 0.0));
-        let heading = projection.workload(&scene, 0, 3, type_).heading;
+        let heading = projection.workload_card(&scene, 0, 3, type_).heading;
         let body = projection
             .cell(scene.cells[0].rect, 3, type_, heading)
             .expect("visible pod body");
@@ -1032,7 +1040,7 @@ mod tests {
             ..camera
         };
         let projection = crate::primitive::Projection::new(obscured, (800.0, 600.0), (0.0, 0.0));
-        let geometry = projection.workload(&scene, 0, 3, type_);
+        let geometry = projection.workload_card(&scene, 0, 3, type_);
         let heading = geometry
             .heading
             .expect("the pinned heading fits inside its owner");
@@ -1135,7 +1143,10 @@ mod tests {
                 label: None,
             }],
         };
-        let camera = looking_at_near();
+        let camera = Camera {
+            zoom: 4.0,
+            ..looking_at_near()
+        };
         let at_cards = frame.visible_stamps(
             &scene,
             camera,
@@ -1157,6 +1168,19 @@ mod tests {
             600.0,
         );
         assert_eq!(at_pods.len(), 1);
+        assert!(
+            frame
+                .visible_stamps(
+                    &scene,
+                    looking_at_near(),
+                    &policy(),
+                    StageBlend::settled(2),
+                    800.0,
+                    600.0,
+                )
+                .is_empty(),
+            "a cell stage still needs room for the workload's readable header",
+        );
     }
 
     #[test]

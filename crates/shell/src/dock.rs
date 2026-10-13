@@ -129,6 +129,8 @@ impl<T> Dock<T> {
 /// Where a dock edge lands when it is dragged to a point. Pure, because the
 /// clamps are the whole of it: a drag past either bound has to stop rather than
 /// let a dock eat the window or collapse to a line nobody can grab again.
+/// Pointer coordinates are window-relative; `left_offset` is the width before
+/// the left dock, while the other edges still use the window's far bounds.
 pub fn dragged_dock_sizes(
     mut sizes: DockSizes,
     edge: DockEdge,
@@ -136,9 +138,12 @@ pub fn dragged_dock_sizes(
     position_y: f32,
     viewport: Viewport,
     status_height: f32,
+    left_offset: f32,
 ) -> DockSizes {
     match edge {
-        DockEdge::Left => sizes.left = position_x.clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE),
+        DockEdge::Left => {
+            sizes.left = (position_x - left_offset).clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
+        }
         DockEdge::Right => {
             sizes.right = (viewport.width - position_x).clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
         }
@@ -306,6 +311,7 @@ mod tests {
                 height: 1000.0,
             },
             50.0,
+            0.0,
         );
         assert_eq!(sizes.bottom, 250.0);
         assert_eq!(700.0 + sizes.bottom, 950.0);
@@ -330,6 +336,7 @@ mod tests {
             0.0,
             viewport,
             STATUS_BAR_HEIGHT,
+            0.0,
         );
         assert_eq!(left.left, 420.0);
         assert_eq!(
@@ -345,6 +352,7 @@ mod tests {
             0.0,
             viewport,
             STATUS_BAR_HEIGHT,
+            0.0,
         );
         assert_eq!(right.right, 400.0);
 
@@ -355,6 +363,7 @@ mod tests {
             700.0,
             viewport,
             STATUS_BAR_HEIGHT,
+            0.0,
         );
         assert_eq!(bottom.bottom, 1000.0 - STATUS_BAR_HEIGHT - 700.0);
 
@@ -363,7 +372,7 @@ mod tests {
             (DockEdge::Right, 9000.0, 0.0),
             (DockEdge::Bottom, 0.0, 9000.0),
         ] {
-            let squashed = dragged_dock_sizes(start, edge, x, y, viewport, STATUS_BAR_HEIGHT);
+            let squashed = dragged_dock_sizes(start, edge, x, y, viewport, STATUS_BAR_HEIGHT, 0.0);
             let measured = match edge {
                 DockEdge::Left => squashed.left,
                 DockEdge::Right => squashed.right,
@@ -379,13 +388,44 @@ mod tests {
             (DockEdge::Right, -9000.0, 0.0),
             (DockEdge::Bottom, 0.0, -9000.0),
         ] {
-            let stretched = dragged_dock_sizes(start, edge, x, y, viewport, STATUS_BAR_HEIGHT);
+            let stretched = dragged_dock_sizes(start, edge, x, y, viewport, STATUS_BAR_HEIGHT, 0.0);
             let measured = match edge {
                 DockEdge::Left => stretched.left,
                 DockEdge::Right => stretched.right,
                 DockEdge::Bottom => stretched.bottom,
             };
             assert_eq!(measured, MAX_DOCK_SIZE, "a dock cannot eat the window");
+        }
+    }
+
+    #[test]
+    fn dragging_an_existing_edge_preserves_its_width_behind_either_rail() {
+        let sizes = DockSizes {
+            left: 320.0,
+            right: 300.0,
+            bottom: 200.0,
+        };
+        for width in [900.0, 960.0, 1600.0] {
+            let viewport = Viewport {
+                width,
+                height: 1000.0,
+            };
+            for offset in [0.0, crate::ui::activity_bar_width(width)] {
+                for (edge, x, y) in [
+                    (DockEdge::Left, offset + sizes.left, 0.0),
+                    (DockEdge::Right, width - sizes.right, 0.0),
+                    (
+                        DockEdge::Bottom,
+                        0.0,
+                        viewport.height - STATUS_BAR_HEIGHT - sizes.bottom,
+                    ),
+                ] {
+                    assert_eq!(
+                        dragged_dock_sizes(sizes, edge, x, y, viewport, STATUS_BAR_HEIGHT, offset),
+                        sizes,
+                    );
+                }
+            }
         }
     }
 

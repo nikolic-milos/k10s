@@ -166,7 +166,11 @@ fn reference_content(
             return;
         }
         if policy.region_label_shown(region.rect.w, zoom) {
-            let band = (NS_HEADER + NS_PAD) * zoom;
+            let band = if region.children.is_empty() {
+                (region.rect.h * zoom - crate::primitive::TEXT_PAD * 2.0).max(0.0)
+            } else {
+                (NS_HEADER + NS_PAD) * zoom
+            };
             let width = region.rect.w * zoom;
             let font = k10s_theme::quantize(
                 (width * 0.055)
@@ -178,7 +182,13 @@ fn reference_content(
             let row = Bounds {
                 origin: point(
                     bounds.origin.x,
-                    bounds.origin.y + px((band - line).max(0.0) * 0.5),
+                    bounds.origin.y
+                        + px(if region.children.is_empty() {
+                            crate::primitive::TEXT_PAD
+                        } else {
+                            0.0
+                        })
+                        + px((band - line).max(0.0) * 0.5),
                 ),
                 size: size(px(width), px(line)),
             };
@@ -192,11 +202,18 @@ fn reference_content(
             if !(region_inside || block.rect.intersects(&visible)) {
                 return;
             }
-            let effective_stage = if stage == 1
-                && block.inner.w * zoom >= crate::primitive::name_min_width(type_)
-                && block.inner.h * zoom >= name_band_height(type_)
-            {
-                2
+            let effective_stage = if !policy.stress && !policy.stress_curves {
+                let width = block.inner.w * zoom - crate::primitive::TEXT_PAD * 2.0;
+                let half_height = block.inner.h * zoom * 0.5
+                    - crate::primitive::TEXT_PAD
+                    - crate::primitive::HEADING_CLEARANCE;
+                if width >= crate::primitive::name_min_width(type_)
+                    && half_height >= name_band_height(type_)
+                {
+                    stage.max(2)
+                } else {
+                    1
+                }
             } else {
                 stage
             };
@@ -205,13 +222,20 @@ fn reference_content(
             } else {
                 policy.workload_presentation(block.inner.w, zoom, effective_stage)
             };
+            let presentation = if presentation == WorkloadPresentation::Medallion
+                && block.inner.w.min(block.inner.h) * zoom < k10s_theme::quantize(0.0)
+            {
+                WorkloadPresentation::Card
+            } else {
+                presentation
+            };
             let named = presentation.card_shown()
                 && block.inner.w * zoom >= policy.block_label_min_px
                 && zoom > policy.block_label_min_zoom;
             let heading = named
                 .then(|| {
                     projection
-                        .workload(scene, block_index, stage, type_)
+                        .workload(scene, block_index, stage, type_, presentation)
                         .heading
                 })
                 .flatten();
@@ -465,18 +489,20 @@ mod tests {
     #[test]
     fn cull_z2_draws_pods_sats_and_hexes() {
         let snap = tiny_scene();
-        let cam = Camera {
-            cx: 100.0,
-            cy: 50.0,
-            zoom: 3.0,
-        };
         let pol = policy(Knobs::default());
-        let blend = StageBlend::settled(pol.stage_for_zoom(cam.zoom));
-        let st = cull(&snap, &cam, blend, 1600.0, 1000.0, default_opts(&pol));
-        assert!(st.stage >= 2);
-        assert_eq!(st.drawn_cells, 1);
-        assert_eq!(st.drawn_sats, 1);
-        assert_eq!(st.curves, 1);
-        assert!(st.bg_cells > 0, "hex grid must be counted by the oracle");
+        for (zoom, cells) in [(3.0, 0), (5.0, 1)] {
+            let cam = Camera {
+                cx: 100.0,
+                cy: 50.0,
+                zoom,
+            };
+            let blend = StageBlend::settled(pol.stage_for_zoom(cam.zoom));
+            let st = cull(&snap, &cam, blend, 1600.0, 1000.0, default_opts(&pol));
+            assert_eq!(st.stage, 2);
+            assert_eq!(st.drawn_cells, cells, "zoom {zoom}");
+            assert_eq!(st.drawn_sats, 1);
+            assert_eq!(st.curves, 1);
+            assert!(st.bg_cells > 0, "hex grid must be counted by the oracle");
+        }
     }
 }

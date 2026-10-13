@@ -45,7 +45,7 @@ use k10s_provider::{
     PostureOutcome, ProviderSlot, RequestStop, ToolPresence, UsageOutcome,
 };
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ObservabilityNavigation {
     pub(crate) observe: Option<ToolPresence>,
     pub(crate) traces: Option<ToolPresence>,
@@ -912,19 +912,117 @@ impl Workspace {
     }
 
     pub(crate) fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_palette_view(false, window, cx);
+    }
+
+    pub(crate) fn toggle_surface_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_palette_view(true, window, cx);
+    }
+
+    pub(crate) fn set_observability_presence(
+        &mut self,
+        tag: &ItemTag,
+        presence: ToolPresence,
+        cx: &mut Context<Self>,
+    ) {
+        self.observability_navigation.set(tag, presence);
+        self.refresh_surface_picker(cx);
+    }
+
+    pub(crate) fn refresh_surface_picker(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self.palette.view() {
+            view.update(cx, |view, cx| {
+                view.update_surfaces(self.observability_navigation, cx)
+            });
+        }
+    }
+
+    pub(crate) fn has_modal(&self) -> bool {
+        self.palette.is_open()
+            || self.launch.is_open()
+            || self.picker.is_open()
+            || self.finder.is_open()
+            || self.cluster_finder.is_open()
+    }
+
+    pub(crate) fn rebase_modal_focus(&mut self, focus: &FocusHandle, cx: &App) {
+        self.launch.rebase_focus(focus);
+        let previous = self
+            .launch
+            .view()
+            .map(|view| view.read(cx).focus_handle())
+            .unwrap_or_else(|| focus.clone());
+        self.palette.rebase_focus(&previous);
+        self.picker.rebase_focus(&previous);
+        self.finder.rebase_focus(&previous);
+        self.cluster_finder.rebase_focus(&previous);
+    }
+
+    fn toggle_palette_view(&mut self, surfaces: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.bench {
             return;
         }
-        if self.palette.is_open() {
+        if self
+            .palette
+            .view()
+            .is_some_and(|view| view.read(cx).is_surface_picker() == surfaces)
+        {
             self.close_palette(window, cx);
             return;
         }
-        let view = cx.new(PaletteView::new);
+        self.close_palette(window, cx);
+        self.close_picker(window, cx);
+        self.close_finder(window, cx);
+        self.close_cluster_finder(window, cx);
+        self.close_launch(window, cx);
+        self.app_menu_open = false;
+        let state = if surfaces {
+            let mut state = self.rail_state();
+            if self.left.is_open()
+                && self
+                    .left
+                    .active()
+                    .is_some_and(|tab| tab.view.focus_handle(cx).contains_focused(window, cx))
+            {
+                state = crate::activity::RailState {
+                    left: state.left,
+                    ..Default::default()
+                };
+            } else if self.bottom.is_open()
+                && self
+                    .bottom
+                    .active()
+                    .is_some_and(|tab| tab.view.focus_handle(cx).contains_focused(window, cx))
+            {
+                state = crate::activity::RailState {
+                    bottom: state.bottom,
+                    ..Default::default()
+                };
+            } else {
+                state.left = None;
+                state.bottom = None;
+                state.inspector_open = false;
+            }
+            state
+        } else {
+            Default::default()
+        };
+        let view = cx.new(|cx| {
+            if surfaces {
+                PaletteView::for_surfaces(self.observability_navigation, state, cx)
+            } else {
+                PaletteView::new(cx)
+            }
+        });
         let subscription = cx.subscribe_in(
             &view,
             window,
             |this, _, event: &PaletteEvent, window, cx| match event {
                 PaletteEvent::Dismissed => this.close_palette(window, cx),
+                PaletteEvent::SurfaceConfirmed(id) => {
+                    this.close_palette(window, cx);
+                    this.open_surface(*id, window, cx);
+                }
                 PaletteEvent::Confirmed(name) => {
                     let name = *name;
                     // Zed's order: whoever had focus gets it back, then the

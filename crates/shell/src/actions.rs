@@ -17,6 +17,7 @@ actions!(
         ToggleInspector,
         ClearSelection,
         OpenPalette,
+        OpenSurfaces,
         ChooseCluster,
         OpenBrowser,
         OpenNodes,

@@ -23,15 +23,15 @@ use crate::selection::Selection;
 use crate::settings;
 use crate::tag::ItemTag;
 use crate::ui::{
-    self, ACTIVITY_BAR_WIDTH, DockSizes, MODAL_TOP, RESIZE_HANDLE_SIZE, TAB_HEIGHT,
-    TITLE_MARK_SIZE, brand_mark, icon_button, panel_header, rail_button, title_bar_height,
+    self, DockSizes, MODAL_TOP, RESIZE_HANDLE_SIZE, TAB_HEIGHT, TITLE_MARK_SIZE, brand_mark,
+    icon_button, panel_header, rail_button, title_bar_height,
 };
 use crate::workspace::Workspace;
 use crate::{
-    ChooseCluster, FindCluster, LoadSavedView, OpenArgo, OpenBrowser, OpenCollectors, OpenDay2,
-    OpenEcosystem, OpenFlux, OpenForwards, OpenHarbor, OpenMesh, OpenNodes, OpenObserve,
-    OpenPalette, OpenPolicy, OpenReleases, OpenSettings, OpenTraces, Quit, RetainedLogsSelection,
-    ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    ChooseCluster, LoadSavedView, OpenArgo, OpenBrowser, OpenCollectors, OpenDay2, OpenEcosystem,
+    OpenFlux, OpenForwards, OpenHarbor, OpenMesh, OpenNodes, OpenObserve, OpenPalette, OpenPolicy,
+    OpenReleases, OpenSurfaces, OpenTraces, Quit, RetainedLogsSelection, ToggleBottomDock,
+    ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
 use k10s_provider::{
     Bytes, Detail, Millicores, PostureOutcome, ToolPresence, UsageOutcome, UsageSample, UsageSource,
@@ -429,111 +429,97 @@ impl Workspace {
             )
     }
 
-    pub(crate) fn activity_rail(&self, theme: &Theme) -> impl IntoElement {
+    pub(crate) fn activity_rail(
+        &self,
+        theme: &Theme,
+        fonts: &Typography,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         use crate::activity::{ACTIVITIES, ActivityGroup, lit};
         let state = self.rail_state();
-        let mut primary = Vec::new();
-        let mut trailing = Vec::new();
-        for slot in ACTIVITIES {
-            let available = match slot.id {
-                crate::activity::ActivityId::Observe => {
-                    self.observability_navigation.available(&ItemTag::Observe)
-                }
-                crate::activity::ActivityId::Collectors => self
-                    .observability_navigation
-                    .available(&ItemTag::Collectors),
-                _ => true,
-            };
-            if !available {
-                continue;
-            }
-            let button = Self::activity_button(*slot, lit(slot.id, state), theme);
-            match slot.group {
-                ActivityGroup::Primary => primary.push(button),
-                ActivityGroup::Trailing => trailing.push(button),
-            }
-        }
+        let entries = |group| {
+            ACTIVITIES
+                .iter()
+                .filter(move |slot| slot.group == group)
+                .filter_map(|slot| crate::surfaces::surface(*slot, &self.observability_navigation))
+                .map(|entry| {
+                    Self::activity_button(entry, lit(entry.activity.id, state), theme, fonts)
+                })
+        };
+        let picker_active = self
+            .palette
+            .view()
+            .is_some_and(|view| view.read(cx).is_surface_picker());
         div()
             .id("activity-rail")
-            .w(px(ACTIVITY_BAR_WIDTH))
+            .w(px(ui::activity_bar_width(self.viewport.width)))
             .h_full()
             .flex_none()
             .flex()
             .flex_col()
-            .items_center()
-            .py(px(6.0))
+            .p(px(6.0))
             .gap(px(4.0))
             .bg(rgb(theme.shell.surface_background))
             .border_r_1()
             .border_color(rgb(theme.shell.border))
-            .role(Role::Toolbar)
-            .aria_label("Activity bar")
-            .children(primary)
-            .child(div().flex_1())
-            .children(trailing)
+            .role(Role::Complementary)
+            .aria_label("Tools and views")
+            .font_family(fonts.ui_family.clone())
+            .child(
+                rail_button(
+                    "surface-picker-button",
+                    "icons/menu.svg",
+                    "Tools and views",
+                    None,
+                    picker_active,
+                    theme,
+                    fonts,
+                )
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSurfaces), cx))
+                .tooltip(|window, cx| {
+                    let tooltip =
+                        ui::Tooltip::with_binding("Tools and views", &OpenSurfaces, window);
+                    cx.new(move |_| tooltip).into()
+                }),
+            )
+            .child(
+                div()
+                    .id("primary-navigation")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(entries(ActivityGroup::Primary)),
+            )
+            .child(div().h(px(1.0)).bg(rgb(theme.shell.border)))
+            .children(entries(ActivityGroup::Trailing))
     }
 
     fn activity_button(
-        slot: crate::activity::Activity,
+        entry: crate::surfaces::Surface,
         active: bool,
         theme: &Theme,
+        fonts: &Typography,
     ) -> gpui::AnyElement {
-        use crate::ShowStarmap;
-        use crate::activity::ActivityId;
+        let slot = entry.activity;
         let id = slot.id;
-        let label = slot.label;
-        rail_button(slot.element_id, slot.icon, label, active, theme)
-            .on_click(move |_, window, cx| match id {
-                ActivityId::Starmap => window.dispatch_action(Box::new(ShowStarmap), cx),
-                ActivityId::Resources => window.dispatch_action(Box::new(OpenBrowser), cx),
-                ActivityId::Nodes => window.dispatch_action(Box::new(OpenNodes), cx),
-                ActivityId::Find => window.dispatch_action(Box::new(FindCluster), cx),
-                ActivityId::Releases => window.dispatch_action(Box::new(OpenReleases), cx),
-                ActivityId::Argo => window.dispatch_action(Box::new(OpenArgo), cx),
-                ActivityId::Flux => window.dispatch_action(Box::new(OpenFlux), cx),
-                ActivityId::Day2 => window.dispatch_action(Box::new(OpenDay2), cx),
-                ActivityId::Observe => window.dispatch_action(Box::new(OpenObserve), cx),
-                ActivityId::Collectors => window.dispatch_action(Box::new(OpenCollectors), cx),
-                ActivityId::Policy => window.dispatch_action(Box::new(OpenPolicy), cx),
-                ActivityId::Ecosystem => window.dispatch_action(Box::new(OpenEcosystem), cx),
-                ActivityId::Forwards => window.dispatch_action(Box::new(OpenForwards), cx),
-                ActivityId::Terminal => window.dispatch_action(Box::new(ToggleTerminal), cx),
-                ActivityId::Inspector => window.dispatch_action(Box::new(ToggleInspector), cx),
-                ActivityId::Settings => window.dispatch_action(Box::new(OpenSettings), cx),
-            })
-            .tooltip(move |window, cx| {
-                let tooltip = match id {
-                    ActivityId::Starmap => ui::Tooltip {
-                        label: label.into(),
-                        key: None,
-                    },
-                    ActivityId::Resources => ui::Tooltip::with_binding(label, &OpenBrowser, window),
-                    ActivityId::Nodes => ui::Tooltip::with_binding(label, &OpenNodes, window),
-                    ActivityId::Find => ui::Tooltip::with_binding(label, &FindCluster, window),
-                    ActivityId::Releases => ui::Tooltip::with_binding(label, &OpenReleases, window),
-                    ActivityId::Argo => ui::Tooltip::with_binding(label, &OpenArgo, window),
-                    ActivityId::Flux => ui::Tooltip::with_binding(label, &OpenFlux, window),
-                    ActivityId::Day2 => ui::Tooltip::with_binding(label, &OpenDay2, window),
-                    ActivityId::Observe => ui::Tooltip::with_binding(label, &OpenObserve, window),
-                    ActivityId::Collectors => {
-                        ui::Tooltip::with_binding(label, &OpenCollectors, window)
-                    }
-                    ActivityId::Policy => ui::Tooltip::with_binding(label, &OpenPolicy, window),
-                    ActivityId::Ecosystem => {
-                        ui::Tooltip::with_binding(label, &OpenEcosystem, window)
-                    }
-                    ActivityId::Forwards => ui::Tooltip::with_binding(label, &OpenForwards, window),
-                    ActivityId::Terminal => {
-                        ui::Tooltip::with_binding(label, &ToggleTerminal, window)
-                    }
-                    ActivityId::Inspector => {
-                        ui::Tooltip::with_binding(label, &ToggleInspector, window)
-                    }
-                    ActivityId::Settings => ui::Tooltip::with_binding(label, &OpenSettings, window),
-                };
-                cx.new(move |_| tooltip).into()
-            })
-            .into_any_element()
+        rail_button(
+            slot.element_id,
+            slot.icon,
+            slot.label,
+            entry.notice,
+            active,
+            theme,
+            fonts,
+        )
+        .on_click(move |_, window, cx| window.dispatch_action(id.action(), cx))
+        .tooltip(move |window, cx| {
+            let tooltip = ui::Tooltip::with_binding(slot.label, id.action().as_ref(), window);
+            cx.new(move |_| tooltip).into()
+        })
+        .into_any_element()
     }
 
     /// The sentence the title bar's state dot is about.
@@ -582,6 +568,11 @@ impl Workspace {
             f32::from(event.event.position.y),
             self.viewport,
             status_height,
+            if self.bench {
+                0.0
+            } else {
+                ui::activity_bar_width(self.viewport.width)
+            },
         );
         let mut next = settings::active(cx).clone();
         dock::apply_dock_size(&mut next, sizes, edge);
@@ -935,6 +926,7 @@ impl Workspace {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .role(Role::Menu)
                     .aria_label("Application menu")
+                    .child(entry(28, "Tools and Views…", Box::new(OpenSurfaces)))
                     .child(entry(0, "Command Palette…", Box::new(OpenPalette)))
                     .child(entry(1, "Choose Cluster…", Box::new(ChooseCluster)))
                     .child(entry(2, "Load Saved View…", Box::new(LoadSavedView)))

@@ -51,6 +51,9 @@ macro_rules! embedded {
 // Fonts and brand assets use path lookup. Glyphs live in `icons` so the painter
 // can index them by model ID without scanning this table.
 const EMBEDDED: &[(&str, &'static [u8])] = embedded![
+    "icons/chart-no-axes-combined.svg",
+    "icons/route.svg",
+    "icons/lucide-ISC.txt",
     "fonts/inter/Inter-Regular.ttf",
     "fonts/inter/Inter-Italic.ttf",
     "fonts/inter/Inter-Medium.ttf",

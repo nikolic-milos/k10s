@@ -1365,51 +1365,79 @@ fn a_port_forward_carries_real_bytes_from_the_pod() {
         Fetched::Ok(row) => row,
         other => panic!("the forward must open: {other:?}"),
     };
+    let owned = OwnedForward(sync.reader.forwards().clone(), row.id);
     assert_eq!(row.spec.pod, pod);
     assert_eq!(
         row.spec.remote_port, 18081,
         "the container declares one port and the spec took it"
     );
 
-    // The listener is bound before the row is handed back, but the pump behind
-    // it may still be connecting, so this retries rather than assuming.
-    let address = format!("127.0.0.1:{}", row.spec.local_port);
-
-    let mut answer = String::new();
-    for attempt in 0..20 {
-        std::thread::sleep(Duration::from_millis(250));
-        let Ok(mut stream) = std::net::TcpStream::connect(&address) else {
-            continue;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], row.spec.local_port));
+    for request in 0..2 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("the listener opens within the request budget");
+            match std::net::TcpStream::connect_timeout(
+                &address,
+                remaining.min(Duration::from_millis(250)),
+            ) {
+                Ok(stream) => break stream,
+                Err(error) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "request {request}: the listener never opens: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
         };
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("a read timeout");
-        if stream
+            .set_write_timeout(Some(
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .expect("the request starts within its budget"),
+            ))
+            .expect("a write timeout");
+        stream
             .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
-            .is_err()
-        {
-            continue;
+            .expect("the complete request reaches the forward");
+        let mut answer = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            stream
+                .set_read_timeout(Some(
+                    deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .expect("the complete reply arrives within its budget"),
+                ))
+                .expect("a read timeout");
+            let count = stream
+                .read(&mut buffer)
+                .expect("the response ends with EOF");
+            if count == 0 {
+                break;
+            }
+            answer.extend_from_slice(&buffer[..count]);
         }
-        let mut buffer = Vec::new();
-        let _ = stream.read_to_end(&mut buffer);
-        answer = String::from_utf8_lossy(&buffer).to_string();
-        if answer.contains("k10s-forward-probe") {
-            break;
-        }
-        assert!(attempt < 19, "the forward never carried a reply");
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(
+            answer.contains("k10s-forward-probe"),
+            "request {request}: the bytes are the ones that container serves: {answer:?}"
+        );
+        drop(stream);
+        assert!(
+            owned
+                .0
+                .list()
+                .iter()
+                .any(|open| open.id == row.id
+                    && open.state == k10s_data::forward::ForwardState::Active),
+            "request {request}: an ordinary completed request leaves its forward active"
+        );
     }
-    assert!(
-        answer.contains("k10s-forward-probe"),
-        "the bytes are the ones that container serves and nothing else could \
-         have: {answer:?}"
-    );
-
-    let listed = sync.reader.forwards().list();
-    assert!(
-        listed.iter().any(|open| open.id == row.id),
-        "an open forward is listed while it is open"
-    );
-    assert!(sync.reader.forwards().close(row.id), "and closes by its id");
+    assert!(owned.0.close(row.id), "and closes by its id");
     assert!(
         !sync
             .reader
@@ -1419,6 +1447,317 @@ fn a_port_forward_carries_real_bytes_from_the_pod() {
             .any(|open| open.id == row.id),
         "and is gone from the registry afterwards"
     );
+}
+
+fn pod_tcp_metadata(
+    runtime: &tokio::runtime::Runtime,
+    api: &kube::Api<k8s_openapi::api::core::v1::Pod>,
+    pod: &str,
+) -> String {
+    use kube::api::AttachParams;
+    use tokio::io::AsyncReadExt;
+
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut attached = api
+                .exec(
+                    pod,
+                    ["cat", "/proc/net/tcp", "/proc/net/tcp6"],
+                    &AttachParams::default(),
+                )
+                .await
+                .expect("the probe's TCP metadata can be read");
+            let mut stdout = attached.stdout().expect("metadata stdout");
+            let mut stderr = attached.stderr().expect("metadata stderr");
+            let status = attached.take_status().expect("the command's exit status");
+            let mut output = String::new();
+            let mut error = String::new();
+            tokio::try_join!(
+                stdout.read_to_string(&mut output),
+                stderr.read_to_string(&mut error)
+            )
+            .expect("both metadata streams end");
+            let status = status.await.expect("the command reports its status");
+            assert_eq!(
+                status.status.as_deref(),
+                Some("Success"),
+                "{status:?}: {error}"
+            );
+            attached.join().await.expect("the metadata exec completes");
+            output
+        })
+        .await
+        .expect("the metadata read finishes within its budget")
+    })
+}
+
+struct OwnedForward(k10s_data::forward::ForwardRegistry, u64);
+
+impl Drop for OwnedForward {
+    fn drop(&mut self) {
+        self.0.close(self.1);
+    }
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn closing_a_port_forward_ends_an_established_remote_connection() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    use k8s_openapi::api::core::v1::Pod;
+    use k10s_data::forward::ForwardRequest;
+    use kube::api::Api;
+
+    assert!(
+        has_kubelet(),
+        "this live proof needs a kubelet and K10S_LIVE_KUBELET=1"
+    );
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "forward-probe-");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a metadata runtime");
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("the live client");
+    let api: Api<Pod> = Api::namespaced(client, &namespace());
+    let probe_port = 18081;
+    let probe_port_hex = format!("{probe_port:04X}");
+    let connections = || {
+        let metadata = pod_tcp_metadata(&runtime, &api, &pod);
+        metadata
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let local = fields.get(1)?;
+                if local.rsplit_once(':')?.1 != probe_port_hex {
+                    return None;
+                }
+                Some((
+                    format!("{local} {} {}", fields.get(2)?, fields.get(9)?),
+                    fields.get(3)?.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = connections();
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.open_forward(
+        ForwardRequest {
+            namespace: namespace(),
+            name: pod.clone(),
+            service: false,
+        },
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
+    let row = match wait(&rx) {
+        Fetched::Ok(row) => row,
+        other => panic!("the probe forward opens: {other:?}"),
+    };
+    let owned = OwnedForward(sync.reader.forwards().clone(), row.id);
+    assert_eq!(row.spec.remote_port, probe_port);
+    let address = format!("127.0.0.1:{}", row.spec.local_port);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut connection = loop {
+        match TcpStream::connect(&address) {
+            Ok(connection) => break connection,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the listener never opens: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    };
+    connection
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("an unfinished request reaches the forward");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let remote = loop {
+        let arrived: Vec<_> = connections()
+            .into_iter()
+            .filter(|(key, state)| state == "01" && !before.iter().any(|(old, _)| old == key))
+            .collect();
+        if !arrived.is_empty() {
+            assert_eq!(arrived.len(), 1, "one owned connection reaches the probe");
+            break arrived[0].0.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the upgrade never reaches the probe"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    connection
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("a held-stream timeout");
+    let mut byte = [0u8; 1];
+    let error = connection
+        .read(&mut byte)
+        .expect_err("the incomplete request remains open");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+
+    assert!(owned.0.close(row.id));
+    connection
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a cancellation timeout");
+    assert_eq!(
+        connection.read(&mut byte).expect("the local stream closes"),
+        0
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let _listener = loop {
+        match TcpListener::bind(&address) {
+            Ok(listener) => break listener,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the local port remains held: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while connections().iter().any(|(key, _)| key == &remote) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the remote connection remains open"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_port_refusal_after_upgrade_preserves_the_kubelets_sentence() {
+    use std::net::{SocketAddr, TcpStream};
+
+    use k8s_openapi::api::core::v1::Pod;
+    use k10s_data::forward::{ForwardSpec, ForwardState};
+    use kube::api::Api;
+    assert!(
+        has_kubelet(),
+        "this live proof needs a kubelet and K10S_LIVE_KUBELET=1"
+    );
+    struct RemoteForward(kube::api::Portforwarder);
+    impl Drop for RemoteForward {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "forward-probe-");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a refusal runtime");
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("the live client");
+    let api: Api<Pod> = Api::namespaced(client, &namespace());
+    let metadata = pod_tcp_metadata(&runtime, &api, &pod);
+    let occupied: std::collections::BTreeSet<u16> = metadata
+        .lines()
+        .filter_map(|line| {
+            let local = line.split_whitespace().nth(1)?;
+            let (_, port) = local.rsplit_once(':')?;
+            Some(u16::from_str_radix(port, 16).expect("the kernel reports a hexadecimal port"))
+        })
+        .collect();
+    let remote_port = (32768..=u16::MAX)
+        .find(|port| !occupied.contains(port))
+        .expect("the probe has an unbound TCP port");
+    let expected = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut direct = RemoteForward(
+                api.portforward(&pod, &[remote_port])
+                    .await
+                    .expect("the unserved port still upgrades"),
+            );
+            let error = direct
+                .0
+                .take_error(remote_port)
+                .expect("the server error channel");
+            let stream = direct
+                .0
+                .take_stream(remote_port)
+                .expect("the upgraded data stream");
+            let why = error.await.expect("the kubelet refuses the unbound port");
+            drop(stream);
+            why
+        })
+        .await
+        .expect("the actual port refusal arrives within the budget")
+    });
+    assert!(expected.contains("connection refused"), "{expected}");
+    assert!(expected.contains(&remote_port.to_string()), "{expected}");
+
+    let local_port = 18081;
+    let registry = sync.reader.forwards().clone();
+    let row = registry
+        .open(ForwardSpec {
+            namespace: namespace(),
+            pod,
+            local_port,
+            remote_port,
+        })
+        .expect("the managed refusal is registered");
+    let owned = OwnedForward(registry, row.id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = owned
+            .0
+            .list()
+            .into_iter()
+            .find(|current| current.id == row.id)
+            .expect("the owned forward remains registered");
+        match current.state {
+            ForwardState::Active => break,
+            ForwardState::Dead { why } => panic!("the owned local listener failed: {why}"),
+            ForwardState::Opening => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owned local listener never becomes active"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let address = SocketAddr::from(([127, 0, 0, 1], local_port));
+    let _connection = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .expect("the owned active listener accepts a connection");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let why = loop {
+        let row = owned
+            .0
+            .list()
+            .into_iter()
+            .find(|row| row.id == owned.1)
+            .expect("the failed forward remains visible");
+        if let ForwardState::Dead { why } = row.state {
+            break why;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server refusal was not labelled: {:?}",
+            row.state
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        why, expected,
+        "the actual server sentence survives the managed lifecycle"
+    );
+    assert!(owned.0.close(row.id));
 }
 
 fn nometrics_context() -> String {

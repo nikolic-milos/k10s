@@ -12,6 +12,17 @@ In the cluster chooser, type to filter contexts, use Up/Down and Enter. It marks
 contexts. Reopen with Ctrl+K, Ctrl+C or **Choose Cluster** in Ctrl+Shift+P. Failed
 connections preserve the workspace; successful switches retire old cluster tabs.
 
+The sidebar names its views. **Tools and views** or Ctrl+Alt+P opens a centered
+picker with larger icons. Type a view or backend name, navigate with arrows,
+PageUp/PageDown/Home/End or the wheel, then press Enter; Escape dismisses it.
+Prometheus, Grafana and Loki lead to **Metrics and logs**; Tempo and Jaeger
+lead to **Traces** and OpenTelemetry to **Collectors**. Trace lookup uses
+Jaeger only when Tempo is absent.
+Opening or filtering the picker uses cached discovery and starts no requests.
+Sources not yet checked remain labelled; known absence hides the entry and
+unavailable sources keep a labelled entry. Selecting one opens its native view,
+where the discovery or access failure is shown in detail.
+
 Explicit launch: `KUBECONFIG=/path/to/config k10s --cluster --context NAME`.
 Add repeatable `--namespace NS` when the account needs namespace-scoped
 discovery. A context identifies a cluster, user and optional namespace.
@@ -221,7 +232,6 @@ any request. Use the existing Helm tool when an operation requires its payloads.
   Verification/query are not atomic.
 - Arrows/PageUp/PageDown/Home/End navigate; `/` filters. Enter/Escape leave
   typing/filtering. Tab selects logs and Shift+Tab selects panels; click/scroll
-  also chooses focus. Ctrl+Tab or Ctrl+Shift+Tab switches tabs. Native keyboard
-  acceptance remains pending.
+  also chooses focus. Ctrl+Tab or Ctrl+Shift+Tab switches tabs.
 - Both `k10s-dark` and `k10s-light` themes exist. Compact shell density is not
   implemented. `--layout dense` changes map placement, not shell spacing.

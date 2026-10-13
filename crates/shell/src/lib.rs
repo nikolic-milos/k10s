@@ -20,8 +20,9 @@
 //! `Typing`), with text-typing keystrokes -- plain and shifted -- suppressed
 //! while an input mode is capturing. Panels and items render on notify only:
 //! zero paints at idle is a gated invariant and the shell must never be the
-//! reason it fails. The left edge is a thin activity rail of chrome icons;
-//! clicking one opens the matching dock or item. Brand glyphs stay on the map.
+//! reason it fails. Named navigation opens the matching dock or item. A centered
+//! surface picker uses the same entries and cached source presence without
+//! discovering services while it renders. Brand glyphs stay on the map.
 //!
 //! [`Workspace`] is one type described by five modules, split by what each is
 //! about rather than by what it is made of: `workspace` holds the state and the
@@ -92,6 +93,7 @@ mod render;
 mod saves;
 mod selection;
 mod spans;
+mod surfaces;
 mod tag;
 mod workspace;
 
