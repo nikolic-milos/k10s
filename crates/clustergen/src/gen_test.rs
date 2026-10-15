@@ -11,6 +11,85 @@ fn cfg(seed: u64, target_objects: u32) -> GenConfig {
 }
 
 #[test]
+fn pod_names_preserve_seeded_states_and_rng_position() {
+    let cases = [
+        (
+            0,
+            KindId::STATEFUL_SET,
+            &[] as &[&str],
+            0,
+            0xb585f767a79a3b6c,
+        ),
+        (
+            0,
+            KindId::STATEFUL_SET,
+            &["checkout-api-0", "checkout-api-1", "checkout-api-2"],
+            3,
+            0x81e2a6e67746a55f,
+        ),
+        (0, KindId::DEPLOYMENT, &[], 0, 0xb585f767a79a3b6c),
+        (
+            0,
+            KindId::DEPLOYMENT,
+            &[
+                "checkout-api-xz0qs-zuch5",
+                "checkout-api-to337-r26fr",
+                "checkout-api-71rsv-mb1ux",
+            ],
+            33,
+            0xfd7b015e308bbd24,
+        ),
+        (55, KindId::STATEFUL_SET, &[], 0, 0x90cfec50a50f8d97),
+        (
+            55,
+            KindId::STATEFUL_SET,
+            &["checkout-api-0", "checkout-api-1", "checkout-api-2"],
+            3,
+            0xc1383e9909555ec6,
+        ),
+        (55, KindId::DEPLOYMENT, &[], 0, 0x90cfec50a50f8d97),
+        (
+            55,
+            KindId::DEPLOYMENT,
+            &[
+                "checkout-api-xu3b1-4irf0",
+                "checkout-api-zn5i5-sb71s",
+                "checkout-api-fd92l-gu7nh",
+            ],
+            33,
+            0x982d56b004edb5ef,
+        ),
+    ];
+
+    for (seed, kind, names, word_pos, next_u64) in cases {
+        let replicas = u32::try_from(names.len()).unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let pods = gen_pods(&mut rng, "checkout-api", kind, replicas);
+        let expected: Vec<_> = names
+            .iter()
+            .map(|name| PodSpec {
+                name: (*name).to_owned(),
+                state: State::of(ReasonId::RUNNING),
+            })
+            .collect();
+        assert_eq!(
+            pods, expected,
+            "seed={seed}, kind={kind:?}, replicas={replicas}"
+        );
+        assert_eq!(
+            rng.get_word_pos(),
+            word_pos,
+            "seed={seed}, kind={kind:?}, replicas={replicas}"
+        );
+        assert_eq!(
+            rng.random::<u64>(),
+            next_u64,
+            "seed={seed}, kind={kind:?}, replicas={replicas}"
+        );
+    }
+}
+
+#[test]
 fn deterministic() {
     let a = generate(&cfg(42, 5000));
     let b = generate(&cfg(42, 5000));

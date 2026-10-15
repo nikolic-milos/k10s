@@ -525,9 +525,11 @@ fn sample_state(rng: &mut ChaCha8Rng) -> State {
     }
 }
 
-fn pod_suffix(rng: &mut ChaCha8Rng) -> String {
+fn pod_name(rng: &mut ChaCha8Rng, name: &str) -> String {
     const ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut s = String::with_capacity(11);
+    let mut s = String::with_capacity(name.len() + 12);
+    s.push_str(name);
+    s.push('-');
     for i in 0..11 {
         if i == 5 {
             s.push('-');
@@ -700,7 +702,7 @@ fn gen_pods(rng: &mut ChaCha8Rng, name: &str, kind: KindId, replicas: u32) -> Ve
             name: if kind == KindId::STATEFUL_SET {
                 format!("{name}-{i}")
             } else {
-                format!("{name}-{}", pod_suffix(rng))
+                pod_name(rng, name)
             },
             state: sample_state(rng),
         })
