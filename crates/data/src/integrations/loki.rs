@@ -16,6 +16,9 @@
 //! malformed members are refused rather than presented as a quiet window.
 //! Retained per-entry identity metadata requires bounded strings; invalid
 //! values refuse the answer instead of inheriting a stream's identity.
+//! Query replies request categorized labels so per-entry metadata does not
+//! split an indexed stream. Nested structuredMetadata and legacy flat metadata
+//! carry identity; parsed fields never supply or override it.
 
 use kube::Client;
 use serde::Deserialize;
@@ -317,6 +320,14 @@ fn line_of(value: &Value) -> Result<Option<LogLine>, String> {
     };
     let mut retained = Vec::new();
     if let Some(metadata) = arr.get(2).and_then(Value::as_object) {
+        let metadata = match metadata.get("structuredMetadata") {
+            Some(Value::Object(metadata)) => metadata,
+            // A legacy flat string label may be named structuredMetadata.
+            Some(Value::String(_)) | None => metadata,
+            Some(_) => {
+                return Err("Loki entry structuredMetadata is not an object".to_string());
+            }
+        };
         for (key, value) in metadata {
             if !matches!(
                 key.as_str(),

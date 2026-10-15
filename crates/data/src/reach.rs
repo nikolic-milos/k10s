@@ -749,9 +749,9 @@ pub fn proxy_path(found: &FoundService, rest: &str) -> String {
     }
 }
 
-/// GET a path on a bound tool. Proxy only: a forward is the shell's job and a
-/// settings https URL is a browser hole. The body is capped; oversize is
-/// Failed, not truncated.
+/// GET a path through the API proxy or a settings HTTP URL.
+/// A port-forward remains the shell's job; settings HTTPS opens in the browser.
+/// The body is capped; oversize is Failed, not truncated.
 pub async fn tool_get(client: &Client, bound: &Bound, rest: &str) -> Fetched<Vec<u8>> {
     tool_get_with_status(client, bound, rest).await.1
 }
@@ -786,8 +786,24 @@ pub(crate) async fn tool_get_with_status(
                 ),
             },
         ),
-        Transport::Url { base } => plaintext_http_get_with_status(base, rest, &bound.auth).await,
+        Transport::Url { base } => {
+            plaintext_http_get_with_status(
+                base,
+                rest,
+                &bound.auth,
+                categorized_loki_query(bound.kind, rest),
+            )
+            .await
+        }
     }
+}
+
+fn categorized_loki_query(kind: ToolKind, rest: &str) -> bool {
+    kind == ToolKind::Loki
+        && matches!(
+            rest.trim_start_matches('/').split('?').next(),
+            Some("loki/api/v1/query") | Some("loki/api/v1/query_range")
+        )
 }
 
 async fn proxy_get_with_status(
@@ -796,10 +812,14 @@ async fn proxy_get_with_status(
     rest: &str,
 ) -> (Option<http::StatusCode>, Fetched<Vec<u8>>) {
     let path = proxy_path(found, rest);
-    let request = match http::Request::get(&path)
-        .header(http::header::ACCEPT, "application/json")
-        .body(Vec::new())
-    {
+    let mut request = http::Request::get(&path).header(http::header::ACCEPT, "application/json");
+    if categorized_loki_query(found.kind, rest) {
+        request = request.header(
+            http::HeaderName::from_static("x-loki-response-encoding-flags"),
+            http::HeaderValue::from_static("categorize-labels"),
+        );
+    }
+    let request = match request.body(Vec::new()) {
         Ok(request) => request,
         Err(error) => {
             return (
@@ -967,10 +987,12 @@ async fn plaintext_http_get_with_status(
     base: &str,
     rest: &str,
     auth: &ToolAuth,
+    categorize_labels: bool,
 ) -> (Option<http::StatusCode>, Fetched<Vec<u8>>) {
     let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
     let mut status = None;
-    let outcome = plaintext_http_get_until(base, rest, auth, deadline, &mut status).await;
+    let outcome =
+        plaintext_http_get_until(base, rest, auth, categorize_labels, deadline, &mut status).await;
     (status, outcome)
 }
 
@@ -980,6 +1002,7 @@ async fn plaintext_http_get_until(
     base: &str,
     rest: &str,
     auth: &ToolAuth,
+    categorize_labels: bool,
     deadline: tokio::time::Instant,
     response_status: &mut Option<http::StatusCode>,
 ) -> Fetched<Vec<u8>> {
@@ -1010,6 +1033,9 @@ async fn plaintext_http_get_until(
     let mut request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nConnection: close\r\n"
     );
+    if categorize_labels {
+        request.push_str("X-Loki-Response-Encoding-Flags: categorize-labels\r\n");
+    }
     if let ToolAuth::NamedToken(token) = auth {
         request.push_str("Authorization: Bearer ");
         request.push_str(token);

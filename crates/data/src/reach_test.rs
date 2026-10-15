@@ -374,6 +374,7 @@ async fn a_settings_url_dripping_bytes_is_cut_off_at_one_total_deadline() {
         &format!("http://{addr}"),
         "",
         &ToolAuth::Anonymous,
+        false,
         deadline,
         &mut None,
     )

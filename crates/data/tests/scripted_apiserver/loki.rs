@@ -47,6 +47,7 @@ fn assert_get(script: &Script) {
     assert_eq!(seen[0].method, "GET");
     assert_eq!(seen[0].path, PATH);
     assert_eq!(seen[0].accept, "application/json");
+    assert_eq!(seen[0].loki_encoding_flags, "categorize-labels");
     assert_eq!(seen[0].content_type, "");
     assert_eq!(seen[0].body, "");
 }
@@ -191,5 +192,255 @@ fn valid_bounded_and_empty_entry_identity_survive_the_exact_get() {
         );
         assert!(!logs.truncated);
         assert_get(&script);
+    }
+}
+
+#[test]
+fn instant_queries_request_categorized_labels_after_one_exact_get() {
+    use k10s_data::integrations::loki::{InstantQuery, query};
+    const INSTANT: &str = "/api/v1/namespaces/observe/services/loki:3100/proxy/loki/api/v1/query?query=%7Bapp%3D%22api%22%7D&limit=10&direction=BACKWARD&time=2";
+    let script = Script::default();
+    script.route(
+        "GET",
+        INSTANT,
+        200,
+        r#"{"status":"success","data":{"resultType":"streams","result":[]}}"#,
+    );
+    let answer = runtime().block_on(async {
+        query(
+            &script.client(),
+            &Bound {
+                kind: ToolKind::Loki,
+                found: None,
+                transport: Transport::Proxy {
+                    namespace: "observe".into(),
+                    service: "loki".into(),
+                    port: 3100,
+                },
+                auth: ToolAuth::Anonymous,
+            },
+            &InstantQuery {
+                query: r#"{app="api"}"#.into(),
+                time_ns: Some(2),
+                limit: 10,
+            },
+        )
+        .await
+    });
+    assert!(matches!(answer, Fetched::Ok(_)), "{answer:?}");
+    let seen = script.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].method, "GET");
+    assert_eq!(seen[0].path, INSTANT);
+    assert_eq!(seen[0].accept, "application/json");
+    assert_eq!(seen[0].loki_encoding_flags, "categorize-labels");
+    assert_eq!(seen[0].content_type, "");
+    assert_eq!(seen[0].body, "");
+}
+
+#[test]
+fn a_flat_label_named_structured_metadata_keeps_entry_identity_after_the_exact_get() {
+    let (script, answer) = reply(
+        r#"[{"stream":{"k8s_pod_uid":"retired"},"values":[["1","line",{
+            "structuredMetadata":"ordinary-label",
+            "trace_id":"0123456789abcdef0123456789abcdef",
+            "k8s_pod_uid":"current",
+            "parsed":{"trace_id":"ffffffffffffffffffffffffffffffff","span_id":"ffffffffffffffff","k8s_pod_uid":"parsed"}
+        }]]}]"#,
+    );
+    let Fetched::Ok(logs) = answer else {
+        panic!("a flat string label must not become a malformed category: {answer:?}");
+    };
+    assert_eq!(logs.streams.len(), 1);
+    assert_eq!(logs.streams[0].lines.len(), 1);
+    let metadata = &logs.streams[0].lines[0].metadata;
+    assert_eq!(metadata.len(), 2);
+    assert!(
+        metadata
+            .iter()
+            .any(|(key, value)| key == "k8s_pod_uid" && value == "current")
+    );
+    assert!(
+        metadata.iter().any(|(key, value)| {
+            key == "trace_id" && value == "0123456789abcdef0123456789abcdef"
+        })
+    );
+    assert!(!logs.truncated);
+    assert_get(&script);
+}
+
+#[test]
+fn malformed_nested_entry_identity_refuses_the_whole_reply() {
+    for key in [
+        "trace_id",
+        "span_id",
+        "k8s_namespace_name",
+        "k8s_pod_name",
+        "k8s_pod_uid",
+        "k8s_node_name",
+    ] {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(10),
+            serde_json::json!("x".repeat(257)),
+        ] {
+            let is_string = value.is_string();
+            let result =
+                serde_json::json!([{"stream":{"k8s_pod_uid":"fallback"},"values":[["1","line",{
+                    "structuredMetadata": {(key):value}, "parsed": {(key):"parsed fallback"}
+                }]]}])
+                .to_string();
+            let (script, answer) = reply(&result);
+            let why = if is_string {
+                format!("Loki entry metadata {key} exceeds 256 bytes; its identity is refused")
+            } else {
+                format!("Loki entry metadata {key} has a non-string identity value")
+            };
+            assert_eq!(answer, Fetched::Failed { what: "loki", why });
+            assert_get(&script);
+        }
+    }
+    for malformed in [serde_json::json!(null), serde_json::json!([])] {
+        let result = serde_json::json!([{"stream":{"k8s_pod_uid":"fallback"},"values":[["1","line",{"structuredMetadata":malformed}]]}]).to_string();
+        let (script, answer) = reply(&result);
+        assert_eq!(
+            answer,
+            Fetched::Failed {
+                what: "loki",
+                why: "Loki entry structuredMetadata is not an object".into()
+            }
+        );
+        assert_get(&script);
+    }
+}
+
+#[test]
+fn direct_range_and_instant_urls_send_the_exact_categorized_request() {
+    use k10s_data::integrations::loki::{InstantQuery, query};
+    use std::io::{Read as _, Write as _};
+    for range in [true, false] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut connection = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the direct request did not arrive"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            connection
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut bytes = [0; 1024];
+                let read = connection.read(&mut bytes).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&bytes[..read]);
+                assert!(request.len() <= 16 * 1024);
+            }
+            let body = r#"{"status":"success","data":{"resultType":"streams","result":[]}}"#;
+            write!(
+                connection,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let script = Script::default();
+        let bound = Bound {
+            kind: ToolKind::Loki,
+            found: None,
+            transport: Transport::Url {
+                base: format!("http://{address}/named"),
+            },
+            auth: ToolAuth::Anonymous,
+        };
+        let answer = runtime().block_on(async {
+            if range {
+                query_range(
+                    &script.client(),
+                    &bound,
+                    &RangeQuery {
+                        query: r#"{app="api"}"#.into(),
+                        start_ns: 1,
+                        end_ns: 2,
+                        limit: 10,
+                    },
+                )
+                .await
+            } else {
+                query(
+                    &script.client(),
+                    &bound,
+                    &InstantQuery {
+                        query: r#"{app="api"}"#.into(),
+                        time_ns: Some(2),
+                        limit: 10,
+                    },
+                )
+                .await
+            }
+        });
+        assert!(matches!(answer, Fetched::Ok(_)), "{answer:?}");
+        assert!(script.seen().is_empty());
+        let request = server.join().unwrap();
+        let path = if range {
+            "query_range?query=%7Bapp%3D%22api%22%7D&start=1&end=2&limit=10&direction=BACKWARD"
+        } else {
+            "query?query=%7Bapp%3D%22api%22%7D&limit=10&direction=BACKWARD&time=2"
+        };
+        let expected = format!(
+            "GET /named/loki/api/v1/{path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: application/json\r\nConnection: close\r\nX-Loki-Response-Encoding-Flags: categorize-labels\r\n\r\n"
+        );
+        assert_eq!(request, expected);
+    }
+}
+
+#[test]
+fn readiness_and_non_loki_reads_do_not_request_query_encoding() {
+    for (kind, rest) in [
+        (ToolKind::Loki, "ready"),
+        (ToolKind::Prometheus, "loki/api/v1/query?query=up"),
+    ] {
+        let script = Script::default();
+        let path = format!("/api/v1/namespaces/observe/services/loki:3100/proxy/{rest}");
+        script.route("GET", &path, 200, "{}");
+        let answer = runtime().block_on(async {
+            k10s_data::reach::tool_get(
+                &script.client(),
+                &Bound {
+                    kind,
+                    found: None,
+                    transport: Transport::Proxy {
+                        namespace: "observe".into(),
+                        service: "loki".into(),
+                        port: 3100,
+                    },
+                    auth: ToolAuth::Anonymous,
+                },
+                rest,
+            )
+            .await
+        });
+        assert!(matches!(answer, Fetched::Ok(_)));
+        let seen = script.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(seen[0].path, path);
+        assert_eq!(seen[0].accept, "application/json");
+        assert_eq!(seen[0].content_type, "");
+        assert_eq!(seen[0].body, "");
+        assert_eq!(seen[0].loki_encoding_flags, "");
     }
 }

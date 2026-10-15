@@ -120,6 +120,7 @@ struct Seen {
     method: String,
     path: String,
     accept: String,
+    loki_encoding_flags: String,
     // The write half of the wire. A dry-run apply is only correct if its
     // content type and its bytes are, and neither is visible from the path.
     content_type: String,
@@ -350,6 +351,12 @@ impl Service<http::Request<Body>> for Script {
                 method: method.clone(),
                 path: path.clone(),
                 accept: accept.clone(),
+                loki_encoding_flags: req
+                    .headers()
+                    .get("X-Loki-Response-Encoding-Flags")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
                 content_type,
                 body: String::new(),
             });

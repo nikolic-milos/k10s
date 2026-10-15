@@ -138,6 +138,13 @@ correlation attributes fail the result instead of inheriting a stream-level matc
 [Loki OTel ingestion](https://grafana.com/docs/loki/latest/send-data/otel/),
 [OTel Kubernetes resource attributes](https://opentelemetry.io/docs/specs/semconv/resource/k8s/).
 
+Instant and range reads request `X-Loki-Response-Encoding-Flags: categorize-labels`
+so per-entry metadata does not split response streams. Correlation reads nested
+`structuredMetadata` and legacy flat entry metadata. The `parsed` category does
+not supply or override correlation identity.
+[Loki 3.7.7 reply encoding](https://raw.githubusercontent.com/grafana/loki/v3.7.7/pkg/util/httpreq/encoding_flags.go),
+[Loki 3.7.7 entry format](https://raw.githubusercontent.com/grafana/loki/v3.7.7/pkg/loghttp/entry.go).
+
 Select a real trace ID and **Open selected trace**, or Enter with log-table focus.
 Traces verifies returned ID, then span namespace/Pod/UID against captured scope.
 Time/name/trace-ID links alone do not prove Kubernetes identity. The pane labels

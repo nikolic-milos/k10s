@@ -265,3 +265,78 @@ fn root_and_child_spans_find_their_trace_log_with_recorded_uid_and_padded_time()
     });
     assert_eq!(sync.reader.observe_schedule_counts().rejected, 0);
 }
+
+#[test]
+#[ignore = "needs more than sixteen current producer emissions and categorized Loki replies; read-only"]
+fn current_uid_scoped_range_keeps_per_entry_identity_without_trace_stream_splitting() {
+    let (pod, uid, marker) = producer_receipt();
+    let end_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let emitted_ns = marker["timestamp_ns"]
+        .as_u64()
+        .expect("recorded emission timestamp");
+    assert!(
+        end_ns
+            .checked_sub(emitted_ns)
+            .is_some_and(|age| age <= 300_000_000_000)
+    );
+    let query = loki::RangeQuery {
+        query: format!(
+            "{{k8s_namespace_name=\"{NS}\",k8s_pod_name=\"{pod}\"}} | k8s_pod_uid=\"{uid}\""
+        ),
+        start_ns: end_ns - 900_000_000_000,
+        end_ns,
+        limit: 200,
+    };
+    let (_plane, sync) = connect(None);
+    let answer = logs(&sync.reader, query);
+    assert!(!answer.truncated);
+    assert_eq!(
+        answer.streams.len(),
+        1,
+        "per-entry trace identity must not split the response stream"
+    );
+    assert!(
+        answer.streams[0].lines.len() > 16,
+        "the broad current UID window must contain more than sixteen real emissions"
+    );
+    let mut found = false;
+    let mut newest = 0;
+    for stream in &answer.streams {
+        assert!(
+            stream
+                .labels
+                .iter()
+                .all(|(key, _)| !matches!(key.as_str(), "trace_id" | "span_id" | "k8s_pod_uid"))
+        );
+        for line in &stream.lines {
+            assert_eq!(attribute(stream, line, "k8s_namespace_name"), Some(NS));
+            assert_eq!(attribute(stream, line, "k8s_pod_name"), Some(pod.as_str()));
+            assert_eq!(attribute(stream, line, "k8s_pod_uid"), Some(uid.as_str()));
+            newest = newest.max(line.ts_ns);
+            if line.metadata.iter().any(|(key, value)| {
+                key == "trace_id" && Some(value.as_str()) == marker["trace_id"].as_str()
+            }) {
+                assert_eq!(line.ts_ns, emitted_ns);
+                found = true;
+            }
+        }
+    }
+    assert!(
+        found,
+        "the current completed emission must survive the scoped range"
+    );
+    assert!(
+        end_ns
+            .checked_sub(newest)
+            .is_some_and(|age| age <= 300_000_000_000)
+    );
+    kube_runtime().block_on(async {
+        let pods: kube::Api<Pod> =
+            kube::Api::namespaced(kube::Client::try_default().await.unwrap(), NS);
+        let after = pods.get_metadata(&pod).await.unwrap();
+        assert_eq!(after.metadata.uid.as_deref(), Some(uid.as_str()));
+    });
+}

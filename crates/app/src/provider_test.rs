@@ -1281,3 +1281,61 @@ fn the_silence_adapter_preserves_matchers_interval_and_destination() {
         }
     );
 }
+
+#[test]
+fn categorized_log_entries_preserve_all_trace_links_and_current_uid() {
+    let values: Vec<_> = (1_u64..=90).map(|index| serde_json::json!([
+        index.to_string(), "line", {
+            "structuredMetadata":{"trace_id":format!("{index:032X}"),"k8s_pod_uid":"current"},
+            "parsed":{"trace_id":"ffffffffffffffffffffffffffffffff","k8s_pod_uid":"parsed"}
+        }
+    ])).collect();
+    let body = serde_json::json!({"status":"success","data":{"resultType":"streams","result":[{
+        "stream":{"k8s_namespace_name":"prod","k8s_pod_name":"api","k8s_pod_uid":"retired"}, "values":values
+    }]}}).to_string();
+    let logs = k10s_data::integrations::loki::parse(body.as_bytes()).unwrap();
+    assert_eq!(logs.streams.len(), 1);
+    assert!(!logs.truncated);
+    let k10s_provider::LokiOutcome::Logs { entries, .. } = loki_outcome(Fetched::Ok(Some(logs)))
+    else {
+        panic!("categorized logs must remain entries")
+    };
+    assert_eq!(entries.len(), 90);
+    for (index, entry) in entries.iter().enumerate() {
+        assert_eq!(entry.timestamp_ns, (90 - index) as u64);
+        assert_eq!(entry.trace_id, Some(format!("{:032x}", 90 - index)));
+        assert_eq!(entry.attribute("k8s_pod_uid"), Some("current"));
+    }
+}
+
+#[test]
+fn parsed_only_log_fields_do_not_create_correlation_identity() {
+    for metadata in [
+        serde_json::json!({"parsed":{
+            "trace_id":"0123456789abcdef0123456789abcdef",
+            "span_id":"0123456789abcdef","k8s_pod_uid":"parsed"
+        }}),
+        serde_json::json!({"structuredMetadata":{},"parsed":{
+            "trace_id":"0123456789abcdef0123456789abcdef",
+            "span_id":"0123456789abcdef","k8s_pod_uid":"parsed"
+        }}),
+    ] {
+        let body = serde_json::json!({"status":"success","data":{"resultType":"streams","result":[{
+            "stream":{"k8s_namespace_name":"prod","k8s_pod_name":"api"},
+            "values":[["1","line",metadata]]
+        }]}})
+        .to_string();
+        let logs = k10s_data::integrations::loki::parse(body.as_bytes()).unwrap();
+        let k10s_provider::LokiOutcome::Logs { entries, .. } =
+            loki_outcome(Fetched::Ok(Some(logs)))
+        else {
+            panic!("parsed-only fields must not hide the log line")
+        };
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].metadata.is_empty());
+        assert_eq!(entries[0].trace_id, None);
+        for key in ["trace_id", "span_id", "k8s_pod_uid"] {
+            assert_eq!(entries[0].attribute(key), None);
+        }
+    }
+}
