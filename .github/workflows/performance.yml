@@ -27,6 +27,9 @@ jobs:
     name: i5-12600K baseline
     runs-on: [self-hosted, Linux, X64, k10s-perf-i5-12600k]
     timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: performance-current
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -35,6 +38,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          path: performance-current
 
       - name: Verify pinned toolchain
         run: rustup show
@@ -122,6 +127,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: benchmark-results-i5-12600k
-          path: ${{ env.RESULT_DIR }}/*.json
+          path: performance-current/${{ env.RESULT_DIR }}/*.json
           if-no-files-found: warn
           retention-days: 30
