@@ -338,6 +338,186 @@ fn a_malformed_value_is_counted_rather_than_skipped() {
 }
 
 #[test]
+fn escaped_strings_and_last_duplicate_values_keep_their_identity_order() {
+    let json = streams(
+        r#"[{
+            "stream":null,"stream":{"z":"\u007a","a":"\u0061"},
+            "values":null,"values":[["\u0031","line\n\uD83D\uDE80",{
+                "structuredMetadata":"legacy",
+                "k8s_node_name":"node",
+                "k8s_pod_uid":null,"k8s_pod_uid":"\u0063urrent",
+                "sp\u0061n_id":"span",
+                "trace_id":null,"trace\u005fid":"trace"
+            }]]
+        }]"#,
+    );
+    let logs = parse(json.as_bytes()).expect("the last decoded duplicate value wins");
+    assert_eq!(
+        logs.streams[0].labels,
+        [("a".into(), "a".into()), ("z".into(), "z".into())]
+    );
+    assert_eq!(
+        logs.streams[0].lines,
+        [LogLine {
+            ts_ns: 1,
+            line: "line\n\u{1f680}".into(),
+            metadata: vec![
+                ("k8s_node_name".into(), "node".into()),
+                ("k8s_pod_uid".into(), "current".into()),
+                ("span_id".into(), "span".into()),
+                ("trace_id".into(), "trace".into()),
+            ],
+        }]
+    );
+    assert!(!logs.truncated);
+    let json = streams(
+        r#"[{"stream":{},"values":[["1","line",{
+            "trace_id":"first","trace\u005fid":null
+        }]]}]"#,
+    );
+    assert_eq!(
+        parse(json.as_bytes()).unwrap_err(),
+        "Loki entry metadata trace_id has a non-string identity value"
+    );
+}
+
+#[test]
+fn nested_identity_overrides_malformed_flat_and_parsed_identity() {
+    for (nested, expected) in [
+        (
+            r#"{"k8s_pod_uid":"current"}"#,
+            vec![("k8s_pod_uid".to_string(), "current".to_string())],
+        ),
+        ("{}", Vec::new()),
+    ] {
+        let json = streams(&format!(
+            r#"[{{"stream":{{"k8s_pod_uid":"retired"}},"values":[["1","line",{{
+                "trace_id":null,"k8s_pod_uid":false,
+                "structuredMetadata":{nested},
+                "parsed":{{"trace_id":null,"k8s_pod_uid":"parsed"}}
+            }}]]}}]"#
+        ));
+        let logs = parse(json.as_bytes()).expect("only the nested identity category applies");
+        assert_eq!(logs.streams[0].lines[0].metadata, expected);
+        assert!(!logs.truncated);
+    }
+}
+
+#[test]
+fn malformed_row_prefixes_drop_before_identity_validation() {
+    let json = streams(
+        r#"[{"stream":{},"values":[
+            null,[],
+            ["18446744073709551616","overflow",{"trace_id":null}],
+            ["1",false,{"structuredMetadata":null}],
+            ["2"],
+            ["3","kept",{"trace_id":"trace"},{"ignored":"extra"}]
+        ]}]"#,
+    );
+    let logs = parse(json.as_bytes()).expect("malformed row prefixes are counted drops");
+    assert_eq!(logs.dropped_lines, 5);
+    assert_eq!(logs.dropped_streams, 0);
+    assert!(logs.truncated);
+    assert_eq!(
+        logs.streams[0].lines,
+        [LogLine {
+            ts_ns: 3,
+            line: "kept".into(),
+            metadata: vec![("trace_id".into(), "trace".into())],
+        }]
+    );
+}
+
+#[test]
+fn stream_structure_is_checked_after_either_cap() {
+    let line_cap = format!(
+        r#"{{"stream":{{}},"values":[{}]}}"#,
+        vec![r#"["1","kept"]"#; MAX_LINES].join(",")
+    );
+    let stream_cap = vec![r#"{"stream":{},"values":[]}"#; MAX_STREAMS].join(",");
+    for (prefix, index) in [(line_cap, 1), (stream_cap, MAX_STREAMS)] {
+        for (suffix, why) in [
+            (
+                r#"{"stream":null,"values":[]}"#,
+                "has no object-valued stream member",
+            ),
+            (
+                r#"{"stream":{"app":null},"values":null}"#,
+                "has a non-string label value",
+            ),
+            (
+                r#"{"stream":{},"values":null}"#,
+                "has no array-valued values member",
+            ),
+        ] {
+            let json = streams(&format!("[{prefix},{suffix}]"));
+            assert_eq!(
+                parse(json.as_bytes()).unwrap_err(),
+                format!("Loki stream {index} {why}")
+            );
+        }
+    }
+}
+
+#[test]
+fn identity_outside_the_line_or_stream_cap_is_counted_without_validation() {
+    let discarded = r#"["1","discarded",{"structuredMetadata":null}]"#;
+    let later = format!(r#"{{"stream":{{}},"values":[{discarded}]}}"#);
+    let kept = vec![r#"["1","kept"]"#; MAX_LINES].join(",");
+    let json = streams(&format!(
+        r#"[{{"stream":{{}},"values":[{kept},{discarded}]}},{later}]"#
+    ));
+    let logs = parse(json.as_bytes()).expect("the line budget skips discarded entry identity");
+    assert_eq!(logs.streams.len(), 1);
+    assert_eq!(logs.streams[0].lines.len(), MAX_LINES);
+    assert_eq!(logs.dropped_lines, 2);
+    assert_eq!(logs.dropped_streams, 1);
+    assert!(logs.truncated);
+
+    let first = vec![r#"{"stream":{},"values":[]}"#; MAX_STREAMS].join(",");
+    let json = streams(&format!("[{first},{later}]"));
+    let logs = parse(json.as_bytes()).expect("the stream budget skips discarded entry identity");
+    assert_eq!(logs.streams.len(), MAX_STREAMS);
+    assert_eq!(logs.dropped_lines, 1);
+    assert_eq!(logs.dropped_streams, 1);
+    assert!(logs.truncated);
+}
+
+#[test]
+fn ignored_and_capped_content_still_requires_valid_json() {
+    let nested = format!("{}0{}", "[".repeat(128), "]".repeat(128));
+    let first = vec![r#"{"stream":{},"values":[]}"#; MAX_STREAMS].join(",");
+    for invalid in [r#""\uD800""#, nested.as_str()] {
+        let item = format!(
+            r#"{{"stream":{{}},"values":[["1","line",{{"parsed":{{"ignored":{invalid}}}}}]]}}"#
+        );
+        for result in [format!("[{item}]"), format!("[{first},{item}]")] {
+            let why = parse(streams(&result).as_bytes())
+                .expect_err("ignored and discarded JSON is still validated");
+            assert!(
+                why.starts_with("Loki's answer is not query JSON: "),
+                "{why}"
+            );
+        }
+    }
+}
+
+#[test]
+fn clipping_releases_a_line_allocation_at_a_utf8_boundary() {
+    let prefix = "x".repeat(MAX_LINE_BYTES - 1);
+    let json = streams(&format!(
+        r#"[{{"stream":{{}},"values":[["1","{prefix}界tail"]]}}]"#
+    ));
+    let logs = parse(json.as_bytes()).expect("the partial character is clipped");
+    let line = &logs.streams[0].lines[0].line;
+    assert_eq!(line, &format!("{prefix}\u{2026}"));
+    assert!(line.capacity() <= MAX_LINE_BYTES + '\u{2026}'.len_utf8());
+    assert_eq!(logs.clipped_lines, 1);
+    assert_eq!(logs.dropped_lines, 0);
+    assert!(logs.truncated);
+}
+
+#[test]
 fn query_range_form_asks_for_backward_and_a_limit() {
     let form = range_form(&RangeQuery {
         query: r#"{app="api"}"#.into(),

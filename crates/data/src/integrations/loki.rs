@@ -240,17 +240,17 @@ pub fn parse(bytes: &[u8]) -> Result<Logs, String> {
             "this LogQL produced {result_type}, not log streams; metric LogQL is not shown here"
         ));
     }
-    let Some(items) = envelope.data.result.as_array() else {
+    let Value::Array(items) = envelope.data.result else {
         return Err("Loki's result is not a stream list".to_string());
     };
     collect(items)
 }
 
-fn collect(items: &[Value]) -> Result<Logs, String> {
+fn collect(items: Vec<Value>) -> Result<Logs, String> {
     let mut logs = Logs::default();
     let mut total_lines = 0usize;
-    for (index, item) in items.iter().enumerate() {
-        let Some(labels) = item.get("stream").and_then(Value::as_object) else {
+    for (index, mut item) in items.into_iter().enumerate() {
+        let Some(Value::Object(labels)) = item.get_mut("stream").map(Value::take) else {
             return Err(format!(
                 "Loki stream {index} has no object-valued stream member"
             ));
@@ -258,7 +258,7 @@ fn collect(items: &[Value]) -> Result<Logs, String> {
         if labels.values().any(|value| !value.is_string()) {
             return Err(format!("Loki stream {index} has a non-string label value"));
         }
-        let Some(values) = item.get("values").and_then(Value::as_array) else {
+        let Some(Value::Array(values)) = item.get_mut("values").map(Value::take) else {
             return Err(format!(
                 "Loki stream {index} has no array-valued values member"
             ));
@@ -273,9 +273,10 @@ fn collect(items: &[Value]) -> Result<Logs, String> {
             continue;
         }
         let mut lines = Vec::new();
-        for (i, value) in values.iter().enumerate() {
+        let value_count = values.len();
+        for (i, value) in values.into_iter().enumerate() {
             if total_lines >= MAX_LINES {
-                logs.dropped_lines += values.len() - i;
+                logs.dropped_lines += value_count - i;
                 logs.truncated = true;
                 break;
             }
@@ -295,12 +296,10 @@ fn collect(items: &[Value]) -> Result<Logs, String> {
             }
         }
         let mut labels: Vec<_> = labels
-            .iter()
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    value.as_str().expect("label type was checked").to_string(),
-                )
+            .into_iter()
+            .map(|(key, value)| match value {
+                Value::String(value) => (key, value),
+                _ => unreachable!("label type was checked"),
             })
             .collect();
         labels.sort_by(|a, b| a.0.cmp(&b.0));
@@ -309,19 +308,24 @@ fn collect(items: &[Value]) -> Result<Logs, String> {
     Ok(logs)
 }
 
-fn line_of(value: &Value) -> Result<Option<LogLine>, String> {
-    let parsed = (|| {
-        let arr = value.as_array()?;
-        let ts = arr.first()?.as_str()?.parse::<u64>().ok()?;
-        Some((arr, ts, arr.get(1)?.as_str()?))
-    })();
-    let Some((arr, ts_ns, line)) = parsed else {
+fn line_of(value: Value) -> Result<Option<LogLine>, String> {
+    let Value::Array(arr) = value else {
+        return Ok(None);
+    };
+    let mut values = arr.into_iter();
+    let Some(ts_ns) = values
+        .next()
+        .and_then(|value| value.as_str()?.parse::<u64>().ok())
+    else {
+        return Ok(None);
+    };
+    let Some(Value::String(line)) = values.next() else {
         return Ok(None);
     };
     let mut retained = Vec::new();
-    if let Some(metadata) = arr.get(2).and_then(Value::as_object) {
-        let metadata = match metadata.get("structuredMetadata") {
-            Some(Value::Object(metadata)) => metadata,
+    if let Some(Value::Object(mut metadata)) = values.next() {
+        let metadata = match metadata.get_mut("structuredMetadata") {
+            Some(Value::Object(metadata)) => std::mem::take(metadata),
             // A legacy flat string label may be named structuredMetadata.
             Some(Value::String(_)) | None => metadata,
             Some(_) => {
@@ -340,20 +344,22 @@ fn line_of(value: &Value) -> Result<Option<LogLine>, String> {
             ) {
                 continue;
             }
-            let text = value.as_str().ok_or_else(|| {
-                format!("Loki entry metadata {key} has a non-string identity value")
-            })?;
+            let Value::String(text) = value else {
+                return Err(format!(
+                    "Loki entry metadata {key} has a non-string identity value"
+                ));
+            };
             if text.len() > MAX_METADATA_VALUE_BYTES {
                 return Err(format!(
                     "Loki entry metadata {key} exceeds {MAX_METADATA_VALUE_BYTES} bytes; its identity is refused"
                 ));
             }
-            retained.push((key.clone(), text.to_string()));
+            retained.push((key, text));
         }
     }
     Ok(Some(LogLine {
         ts_ns,
-        line: line.to_string(),
+        line,
         metadata: retained,
     }))
 }
