@@ -3,20 +3,20 @@
 //! A person who confirmed a write waits for connecting, the answer's headers
 //! and every byte of its body. tower's `Timeout` stops at the headers and
 //! tower-http's body timeout bounds only the gap between frames, so neither
-//! bounds that wait. [`Deadline`] runs the call and collects the body under
-//! one `tokio::time::timeout_at`, which is only right because the interactive
-//! client never streams: exec sessions, forwards, log follows and watches stay
-//! on the sync client, where a total deadline would end them. Connecting is
-//! inside that one future because hyper-util's client connects inside the
-//! call it returns; a TLS handshake a listener accepts and never answers
-//! proves it (connect_test).
+//! bounds that wait. [`Deadline`] bounds the call and every body frame by the
+//! same absolute instant. Returning the headers without collecting the body
+//! lets bounded readers stop at their own cap and refusals drop an unread
+//! body. Exec sessions, forwards, log follows and watches stay on the sync
+//! client, where a total deadline would end them. Connecting is inside the
+//! call because hyper-util's client connects inside the future it returns; a
+//! TLS handshake a listener accepts and never answers proves it (connect_test).
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use http_body_util::{BodyExt as _, Full};
+use http_body_util::StreamBody;
 use kube::client::{Body, DynBody};
 use tower::{BoxError, Layer, Service};
 
@@ -77,15 +77,34 @@ where
         let until = tokio::time::Instant::now() + deadline;
         let answer = self.inner.call(request);
         Box::pin(async move {
-            let exchange = async {
-                let (parts, body) = answer.await?.into_parts();
-                let bytes = body.collect().await?.to_bytes();
-                let body: Box<DynBody> = Box::new(Full::new(bytes).map_err(|never| match never {}));
-                Ok::<_, BoxError>(http::Response::from_parts(parts, body))
-            };
-            tokio::time::timeout_at(until, exchange)
+            let (parts, body) = tokio::time::timeout_at(until, answer)
                 .await
-                .map_err(|_| Box::new(NoAnswer(deadline)) as BoxError)?
+                .map_err(|_| Box::new(NoAnswer(deadline)) as BoxError)??
+                .into_parts();
+            if body.is_end_stream() {
+                return Ok(http::Response::from_parts(parts, body));
+            }
+            let mut state = Some((body, Box::pin(tokio::time::sleep_until(until))));
+            let frames = futures::stream::poll_fn(move |cx| {
+                let Some((body, timer)) = state.as_mut() else {
+                    return Poll::Ready(None);
+                };
+                if tokio::time::Instant::now() >= until || timer.as_mut().poll(cx).is_ready() {
+                    state.take();
+                    return Poll::Ready(Some(Err(Box::new(NoAnswer(deadline)) as BoxError)));
+                }
+                let frame = Pin::new(body.as_mut()).poll_frame(cx);
+                if matches!(&frame, Poll::Ready(None | Some(Err(_)))) || body.is_end_stream() {
+                    state.take();
+                }
+                frame
+            });
+            let body: Box<DynBody> = Box::new(StreamBody::new(frames));
+            Ok(http::Response::from_parts(parts, body))
         })
     }
 }
+
+#[cfg(test)]
+#[path = "deadline_test.rs"]
+mod tests;

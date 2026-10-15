@@ -5,8 +5,10 @@
 //! apply, a day-2 call, a stored-manifest apply and a silence) go through the
 //! interactive client, with every read inside them that decides the write, a
 //! dry run's read of the object included, and each is judged by its answer in
-//! `connect::send_write`; any write added later belongs there too. Everything
-//! else, the long-lived streams included, uses the sync client.
+//! `connect::send_write`; any write added later belongs there too. Bounded
+//! observability reads also use the interactive client so cancellation and
+//! payload caps apply while consuming its deadline-bound body. Other reads
+//! and long-lived streams use the sync client.
 //!
 //! Every method is fire-and-forget onto the data plane's runtime with the
 //! answer handed to a caller-supplied callback -- the render thread never
