@@ -1148,6 +1148,49 @@ fn every_boxed_label_is_confined_to_what_it_names() {
 }
 
 #[test]
+fn a_namespace_title_uses_a_font_that_fits_its_reserved_header() {
+    let mut scene = one_of_each(State::OK);
+    scene.regions[0].rect = Rect::new(0.0, 0.0, 1500.0, 1000.0);
+    scene.bounds = scene.regions[0].rect;
+    let child_y = k10s_core::layout::NS_HEADER + k10s_core::layout::NS_PAD;
+    scene.blocks[0].rect.y = child_y;
+    scene.blocks[0].inner.y = child_y;
+    scene.cells[0].rect.y = child_y + 36.0;
+    scene.sats[0].rect.y = child_y + 10.0;
+    scene.rebuild_spatial_index();
+    let camera = Camera {
+        cx: 750.0,
+        cy: 500.0,
+        zoom: 0.4,
+    };
+    let pol = policy(Knobs::default());
+    let blend = StageBlend::settled(pol.stage_for_zoom(camera.zoom));
+    let opts = FrameOpts {
+        theme: &k10s_theme::K10S_DARK.map,
+        policy: &pol,
+        type_: k10s_theme::Typography::default().map(),
+        edges_on: false,
+        skip_blocks: false,
+        hex: false,
+    };
+    let mut painted = Collect::default();
+    let counts = walk(viewport(), &scene, camera, blend, opts, &mut painted);
+    let title = painted
+        .labels
+        .iter()
+        .find(|job| job.text == scene.regions[0].label.as_ref())
+        .expect("the reserved header can fit the namespace title");
+    assert_eq!(title.size_px, 20.0);
+    assert_eq!(title.width, 600.0);
+    assert!(title.height <= 32.0);
+    let (_, child_top) = camera.w2s(0.0, child_y, VW, VH);
+    assert!(title.y + title.height <= child_top);
+    let expected = crate::lod::cull(&scene, &camera, blend, VW, VH, opts);
+    assert_eq!(counts.labels, painted.labels.len());
+    assert_eq!(expected.labels, counts.labels);
+}
+
+#[test]
 fn an_empty_namespace_centers_its_identity_in_the_reserved_tile() {
     let mut scene = one_of_each(State::OK);
     scene.regions[0].children = 0..0;

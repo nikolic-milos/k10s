@@ -318,7 +318,7 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             };
             let size_px = quantize(
                 (width * 0.055)
-                    .min(band * 0.8)
+                    .min(band / self.type_.line_height)
                     .clamp(self.type_.region_min, self.type_.region_max),
             );
             let line = size_px * self.type_.line_height;

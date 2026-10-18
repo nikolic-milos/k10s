@@ -174,7 +174,7 @@ fn reference_content(
             let width = region.rect.w * zoom;
             let font = k10s_theme::quantize(
                 (width * 0.055)
-                    .min(band * 0.8)
+                    .min(band / type_.line_height)
                     .clamp(type_.region_min, type_.region_max),
             );
             let line = font * type_.line_height;
