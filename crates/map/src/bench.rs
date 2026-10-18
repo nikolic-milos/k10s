@@ -83,16 +83,16 @@ fn plan(a: &FlightAnchors, vw: f32, _vh: f32) -> Vec<Segment> {
     let fit = a.fit;
     let z1 = at(rx, ry, 0.12);
 
-    let hub = at(hx, hy, 2.2);
-    let z3 = at(hx, hy, 4.5);
+    let hub = at(hx, hy, crate::lod::STAGE_POD);
+    let z3 = at(hx, hy, crate::lod::MAX_USEFUL_ZOOM);
 
     let world_w = vw / fit.zoom;
     let half_span = (vw / 0.12 * 2.0).min(world_w * 0.35);
     let z1_left = at(rx - half_span, ry, 0.12);
     let z1_right = at(rx + half_span, ry, 0.12);
-    let pan_w2 = vw / 2.2;
-    let hub_left = at(hx - pan_w2 * 0.5, hy, 2.2);
-    let hub_right = at(hx + pan_w2 * 0.5, hy, 2.2);
+    let pan_w2 = vw / hub.zoom;
+    let hub_left = at(hx - pan_w2 * 0.5, hy, hub.zoom);
+    let hub_right = at(hx + pan_w2 * 0.5, hy, hub.zoom);
 
     let seg = |name, from, to| Segment {
         name,

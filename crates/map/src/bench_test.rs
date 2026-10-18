@@ -93,17 +93,22 @@ fn plan_keeps_its_shape_and_zoom_targets() {
     );
 
     let targets: Vec<f32> = segs.iter().map(|s| s.to.zoom).collect();
-    for zoom in [a.fit.zoom, 0.12, 2.2, 4.5] {
+    for zoom in [
+        a.fit.zoom,
+        0.12,
+        crate::lod::STAGE_POD,
+        crate::lod::MAX_USEFUL_ZOOM,
+    ] {
         assert!(targets.contains(&zoom), "zoom target {zoom} went missing");
     }
     assert!(
         segs.iter()
-            .any(|s| s.to.zoom == 2.2 && (s.to.cx, s.to.cy) == a.hub_center),
-        "hub zoom must show two-line sat labels"
+            .any(|s| s.to.zoom == crate::lod::STAGE_POD && (s.to.cx, s.to.cy) == a.hub_center),
+        "hub zoom must reach the Pod stage"
     );
     assert!(
         segs.iter()
-            .any(|s| s.to.zoom == 4.5 && (s.to.cx, s.to.cy) == a.hub_center),
+            .any(|s| s.to.zoom == crate::lod::MAX_USEFUL_ZOOM && (s.to.cx, s.to.cy) == a.hub_center),
         "pod detail must sit on the hub"
     );
     assert!(
@@ -111,6 +116,191 @@ fn plan_keeps_its_shape_and_zoom_targets() {
             .any(|s| s.to.zoom == 0.12 && s.from.cx != s.to.cx),
         "flight must include a Z1 pan"
     );
+}
+
+#[test]
+fn flight_emits_satellites_and_pod_detail_in_published_layouts() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::frame::tests::{Collect, viewport};
+    use crate::frame::{FrameOpts, IconJob, walk};
+    use crate::lod::{Knobs, policy};
+    use crate::primitive::Projection;
+    use k10s_atlas::StageMachine;
+    use k10s_core::{
+        IngestEvent, KindId, Op, Payload, ReasonId, ResourceEvent, Severity, State, replay,
+    };
+    use k10s_world::{LayoutMode, PublishBench};
+
+    let policy = policy(Knobs::default());
+    for mode in [LayoutMode::Spread, LayoutMode::Dense] {
+        for pods in [1, 5, 200] {
+            let case = format!("{mode:?}, {pods} Pods");
+            let mut events = vec![
+                replay::scope("ns-flight", "flight", Op::Added),
+                replay::owner(
+                    "flight-owner",
+                    "flight",
+                    "flight-workload",
+                    KindId::DEPLOYMENT,
+                    Op::Added,
+                ),
+            ];
+            events.extend((0..pods).map(|index| {
+                replay::instance(
+                    &format!("flight-workload-pod-{index}"),
+                    "flight",
+                    "flight-owner",
+                    State::of(ReasonId::FAILED),
+                    Op::Added,
+                )
+            }));
+            if mode.emits_attachments() {
+                for index in 0..2 {
+                    events.push(IngestEvent::Resource(ResourceEvent {
+                        kind: KindId::SERVICE,
+                        uid: format!("flight-service-{index}").into(),
+                        namespace: "flight".into(),
+                        name: format!("flight-service-{index}").into(),
+                        resource_version: 0,
+                        parent: Some("flight-owner".into()),
+                        op: Op::Added,
+                        payload: Payload::Attached {
+                            kind: KindId::SERVICE,
+                            detail: "ClusterIP".into(),
+                        },
+                    }));
+                }
+            }
+            let scene = PublishBench::new(&events, mode).snapshot();
+            let schedule = Rc::new(RefCell::new(Vec::new()));
+            let captured = schedule.clone();
+            let mut flight = Flight::new(move |anchors, vw, vh| {
+                let segments = plan(anchors, vw, vh);
+                *captured.borrow_mut() = segments.iter().map(|s| (s.name, s.dur)).collect();
+                segments
+            });
+            let mut stats = FrameStats::default();
+            let mut stages = StageMachine::new(crate::lod::STAGE_FADE_SECS);
+            let (vw, vh) = (FLIGHT_VIEWPORT[0], FLIGHT_VIEWPORT[1]);
+            let mut now = Instant::now();
+            assert!(matches!(
+                flight.frame(now, vw, vh, true, &scene, &mut stats),
+                FlightFrame::Camera(_)
+            ));
+            now += Duration::from_secs(1);
+            let FlightFrame::Camera(camera) = flight.frame(now, vw, vh, true, &scene, &mut stats)
+            else {
+                panic!("{case}: the stable viewport did not start the flight");
+            };
+            stages.update(&policy, camera.zoom, 1.0);
+            let mut visited = Vec::new();
+            for (name, duration) in schedule.take() {
+                for half in 0..2 {
+                    let dt = duration * 0.5;
+                    now += Duration::from_secs_f32(dt);
+                    let frame = flight.frame(now, vw, vh, true, &scene, &mut stats);
+                    let camera = match frame {
+                        FlightFrame::Camera(camera) | FlightFrame::Idle { camera, .. } => camera,
+                        FlightFrame::Done(_) => continue,
+                        _ => panic!("{case}: flight stopped during {name}"),
+                    };
+                    let blend = stages.update(&policy, camera.zoom, dt);
+                    if half != 0 {
+                        continue;
+                    }
+                    let stage = match name {
+                        "Z1 static (workload cards)" => 1,
+                        "Z2 static (hub + satellites)" => 2,
+                        "Z3 static (pod detail)" => 3,
+                        _ => continue,
+                    };
+                    assert!(blend.is_settled(), "{case}: {name}");
+                    assert_eq!(blend.walk_stage(), stage, "{case}: {name}");
+                    visited.push(stage);
+                    if stage == 1 || (stage == 2 && !mode.emits_attachments()) {
+                        continue;
+                    }
+                    for ui_size in [8.0, 14.0, 32.0] {
+                        let type_ = k10s_theme::Typography {
+                            ui_size,
+                            ..Default::default()
+                        }
+                        .map();
+                        let mut sink = Collect::default();
+                        walk(
+                            viewport(),
+                            &scene,
+                            camera,
+                            blend,
+                            FrameOpts {
+                                theme: &k10s_theme::K10S_DARK.map,
+                                policy: &policy,
+                                type_,
+                                edges_on: true,
+                                skip_blocks: false,
+                                hex: true,
+                            },
+                            &mut sink,
+                        );
+                        if stage == 2 {
+                            assert!(
+                                scene.sats.iter().any(|sat| {
+                                    sink.labels.iter().any(|job| job.text == sat.label.as_ref())
+                                }),
+                                "{case}, {ui_size}px: the hub has no satellite name"
+                            );
+                            assert!(
+                                sink.labels.iter().any(|job| job.text == "ClusterIP"),
+                                "{case}, {ui_size}px: the hub has no satellite detail"
+                            );
+                            continue;
+                        }
+                        let cell = scene
+                            .cells
+                            .iter()
+                            .find(|cell| {
+                                sink.labels
+                                    .iter()
+                                    .any(|job| job.text == cell.label.as_ref())
+                            })
+                            .unwrap_or_else(|| {
+                                panic!("{case}, {ui_size}px: no observed Pod name was emitted")
+                            });
+                        let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
+                        let heading = projection.workload_card(&scene, 0, stage, type_).heading;
+                        let body = projection
+                            .cell(cell.rect, stage, type_, heading)
+                            .expect("the named Pod has a body");
+                        assert!(sink.fg.iter().any(|quad| quad.bounds == body.bounds));
+                        assert!(
+                            sink.labels.iter().any(|job| {
+                                job.text == "Failed"
+                                    && job.x >= f32::from(body.bounds.origin.x)
+                                    && job.y >= f32::from(body.bounds.origin.y)
+                                    && job.x + job.width <= f32::from(body.bounds.right())
+                                    && job.y + job.height <= f32::from(body.bounds.bottom())
+                            }),
+                            "{case}, {ui_size}px: the named Pod has no status"
+                        );
+                        assert!(
+                            sink.icons.iter().any(|job| matches!(
+                                job,
+                                IconJob::Status(Severity::Err, mark)
+                                    if mark.bounds.origin.x >= body.bounds.origin.x
+                                        && mark.bounds.origin.y >= body.bounds.origin.y
+                                        && mark.bounds.right() <= body.bounds.right()
+                                        && mark.bounds.bottom() <= body.bounds.bottom()
+                            )),
+                            "{case}, {ui_size}px: the named Pod has no status glyph"
+                        );
+                    }
+                }
+            }
+            assert_eq!(visited, [1, 2, 3], "{case}");
+        }
+    }
 }
 
 #[test]
