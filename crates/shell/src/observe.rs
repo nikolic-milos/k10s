@@ -131,6 +131,7 @@ pub struct ObserveView {
     log_table: TableState,
     log_text: TableText,
     table_focus: ObserveTable,
+    panels_expanded: bool,
     chart: Entity<ChartView>,
     request: Option<DescribeRequest>,
     scope: Option<ObserveScope>,
@@ -191,6 +192,7 @@ impl ObserveView {
             log_table: TableState::new(),
             log_text: TableText::default(),
             table_focus: ObserveTable::Panels,
+            panels_expanded: false,
             chart: cx.new(|_| ChartView::new(false)),
             request: selection.map(|selection| selection.describe_request()),
             scope: None,
@@ -421,8 +423,10 @@ impl ObserveView {
     }
 
     fn focus_table(&mut self, table: ObserveTable, cx: &mut Context<Self>) {
-        if self.table_focus != table {
+        let panels_expanded = table == ObserveTable::Panels;
+        if self.table_focus != table || self.panels_expanded != panels_expanded {
             self.table_focus = table;
+            self.panels_expanded = panels_expanded;
             cx.notify();
         }
     }
@@ -539,6 +543,7 @@ impl ObserveView {
 
     fn begin_query(&mut self, cx: &mut Context<Self>) -> QueryIdentity {
         self.cancel_query(cx);
+        self.panels_expanded = false;
         self.status = "Fetching fixed range".into();
         cx.notify();
         QueryIdentity {
@@ -709,6 +714,7 @@ impl ObserveView {
         self.query_kind = QueryKind::Prom;
         if let Some(why) = &panel.unsupported {
             self.cancel_query(cx);
+            self.panels_expanded = true;
             self.status = failure_notice("Unsupported panel", why);
             cx.notify();
             return;
@@ -720,6 +726,7 @@ impl ObserveView {
             || panel.transformed
         {
             self.cancel_query(cx);
+            self.panels_expanded = true;
             self.status = "Unsupported panel semantics; use Open in Grafana or Raw query".into();
             cx.notify();
             return;
@@ -748,6 +755,10 @@ impl ObserveView {
     }
 
     fn open_grafana(&mut self, cx: &mut Context<Self>) {
+        if !self.panels_expanded {
+            self.focus_table(ObserveTable::Panels, cx);
+            return;
+        }
         let Some(uid) = self.table.selected_row().map(|row| row.uid.as_str()) else {
             return;
         };
@@ -1012,6 +1023,9 @@ impl ObserveView {
     }
 
     fn active_table(&mut self) -> &mut TableState {
+        if self.table_focus == ObserveTable::Panels {
+            self.panels_expanded = true;
+        }
         self.table_focus.state(&mut self.table, &mut self.log_table)
     }
 
@@ -1063,7 +1077,9 @@ impl crate::item::Item for ObserveView {
 
 impl Render for ObserveView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.table_text.update(&self.table);
+        if self.panels_expanded {
+            self.table_text.update(&self.table);
+        }
         self.log_text.update(&self.log_table);
         let cached_query = if self.query_label_typing {
             self.query_label.strip_suffix('_').unwrap_or("")
@@ -1086,6 +1102,7 @@ impl Render for ObserveView {
                 .px(px(8.0))
                 .py(px(4.0))
                 .cursor_pointer()
+                .whitespace_nowrap()
                 .hover(|style| style.bg(rgb(theme.shell.element_hover)))
                 .child(label)
         };
@@ -1147,6 +1164,8 @@ impl Render for ObserveView {
                     this.raw_query(cx);
                 } else if this.table_focus == ObserveTable::Logs {
                     this.follow_trace(cx);
+                } else if !this.panels_expanded {
+                    this.focus_table(ObserveTable::Panels, cx);
                 } else {
                     this.run_selected(cx);
                 }
@@ -1167,6 +1186,9 @@ impl Render for ObserveView {
             .on_action(cx.listener(|this, _: &EnterFilter, _, cx| {
                 this.filtering = true;
                 this.typing = false;
+                if this.table_focus == ObserveTable::Panels {
+                    this.panels_expanded = true;
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &DeleteInputChar, _, cx| {
@@ -1225,6 +1247,7 @@ impl Render for ObserveView {
                 div()
                     .flex()
                     .gap(px(8.0))
+                    .flex_wrap()
                     .child(button("range-15m", "15 minutes").on_click(cx.listener(
                         |this, _, _, cx| {
                             this.set_range(900_000, cx);
@@ -1270,69 +1293,82 @@ impl Render for ObserveView {
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        this.table_focus = ObserveTable::Panels;
-                        let delta = f32::from(event.delta.pixel_delta(px(24.0)).y);
-                        this.table.move_selection(-(delta / 24.0).round() as i64);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
                     .child(
-                        div().child(if self.catalogue_enabled && !self.catalog_pending {
-                            "Grafana panels"
-                        } else {
-                            "Cached Grafana panels"
-                        }),
+                        button(
+                            "panel-catalog-toggle",
+                            match (
+                                self.panels_expanded,
+                                self.catalogue_enabled && !self.catalog_pending,
+                            ) {
+                                (false, true) => "Show Grafana panels",
+                                (true, true) => "Hide Grafana panels",
+                                (false, false) => "Show cached Grafana panels",
+                                (true, false) => "Hide cached Grafana panels",
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.panels_expanded = !this.panels_expanded;
+                            if !this.panels_expanded && this.table_focus == ObserveTable::Panels {
+                                this.filtering = false;
+                            }
+                            cx.notify();
+                        })),
                     )
-                    .child(
-                        div()
-                            .font_family(fonts.buffer_family.clone())
-                            .text_color(rgb(theme.shell.text_muted))
-                            .child(SharedString::from(self.table_text.header())),
-                    )
-                    .children(
-                        self.table_text
-                            .lines()
-                            .iter()
-                            .enumerate()
-                            .map(|(offset, line)| {
-                                let selected = self.table.line_selected(offset);
+                    .when(self.panels_expanded, |catalog| {
+                        catalog
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &ScrollWheelEvent, _, cx| {
+                                    this.table_focus = ObserveTable::Panels;
+                                    let delta = f32::from(event.delta.pixel_delta(px(24.0)).y);
+                                    this.table.move_selection(-(delta / 24.0).round() as i64);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                },
+                            ))
+                            .child(
                                 div()
-                                    .id(("panel", offset))
                                     .font_family(fonts.buffer_family.clone())
-                                    .px(px(6.0))
-                                    .py(px(3.0))
-                                    .overflow_hidden()
-                                    .cursor_pointer()
-                                    .bg(rgb(if selected {
-                                        theme.shell.element_selected
-                                    } else {
-                                        theme.shell.editor_background
-                                    }))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.table_focus = ObserveTable::Panels;
-                                            this.table.select_visible_offset(offset);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(SharedString::from(line.clone()))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.0))
-                            .child(
-                                button("panel-run", "Run panel")
-                                    .on_click(cx.listener(|this, _, _, cx| this.run_selected(cx))),
+                                    .text_color(rgb(theme.shell.text_muted))
+                                    .child(SharedString::from(self.table_text.header())),
                             )
+                            .children(self.table_text.lines().iter().enumerate().map(
+                                |(offset, line)| {
+                                    let selected = self.table.line_selected(offset);
+                                    div()
+                                        .id(("panel", offset))
+                                        .font_family(fonts.buffer_family.clone())
+                                        .px(px(6.0))
+                                        .py(px(3.0))
+                                        .overflow_hidden()
+                                        .cursor_pointer()
+                                        .bg(rgb(if selected {
+                                            theme.shell.element_selected
+                                        } else {
+                                            theme.shell.editor_background
+                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.table_focus = ObserveTable::Panels;
+                                                this.table.select_visible_offset(offset);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(SharedString::from(line.clone()))
+                                },
+                            ))
                             .child(
-                                button("grafana-open", "Open in Grafana")
-                                    .on_click(cx.listener(|this, _, _, cx| this.open_grafana(cx))),
-                            ),
-                    )
+                                div()
+                                    .flex()
+                                    .gap(px(8.0))
+                                    .child(button("panel-run", "Run panel").on_click(
+                                        cx.listener(|this, _, _, cx| this.run_selected(cx)),
+                                    ))
+                                    .child(button("grafana-open", "Open in Grafana").on_click(
+                                        cx.listener(|this, _, _, cx| this.open_grafana(cx)),
+                                    )),
+                            )
+                    })
             }))
             .child(
                 div()
@@ -1367,7 +1403,10 @@ impl Render for ObserveView {
                     .child(self.query_label.clone()),
             )
             .child(div().child(self.status.clone()))
-            .child(div().child(self.table_focus.label()))
+            .children(
+                (self.panels_expanded || !self.logs.is_empty())
+                    .then(|| div().child(self.table_focus.label())),
+            )
             .child(
                 div()
                     .id("observe-result")
