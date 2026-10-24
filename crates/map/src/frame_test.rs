@@ -34,6 +34,14 @@ pub(crate) fn viewport() -> Bounds<Pixels> {
     }
 }
 
+#[test]
+fn label_job_storage_stays_within_128_bytes() {
+    assert!(
+        std::mem::size_of::<LabelJob>() <= 128,
+        "label jobs must not embed the shaped line's decoration storage"
+    );
+}
+
 fn scene(cell_label: &str) -> SceneSnapshot {
     SceneSnapshot {
         identity_rev: 1,
@@ -48,6 +56,7 @@ fn scene(cell_label: &str) -> SceneSnapshot {
                 weight: 1,
                 children: 0..1,
                 ext: NsExt {
+                    workload_label: k10s_core::NsExt::workload_label(1),
                     unhealthy_frac: 0.25,
                     rollup: Severity::Warn,
                 },
@@ -122,11 +131,17 @@ pub(crate) fn icon_bounds(job: &IconJob) -> Bounds<Pixels> {
         IconJob::Wl(_, primitive)
         | IconJob::ToolId(_, primitive)
         | IconJob::Sat(_, primitive)
-        | IconJob::Status(_, primitive) => primitive.bounds,
+        | IconJob::Status(_, primitive)
+        | IconJob::NamespaceStatus(_, primitive) => primitive.bounds,
     }
 }
 
 pub(crate) fn walk_at(scene: &SceneSnapshot, camera: Camera) -> Collect {
+    let pol = policy(Knobs::default());
+    walk_at_stage(scene, camera, pol.stage_for_zoom(camera.zoom))
+}
+
+pub(crate) fn walk_at_stage(scene: &SceneSnapshot, camera: Camera, stage: u8) -> Collect {
     let pol = policy(Knobs::default());
     let opts = FrameOpts {
         theme: &k10s_theme::K10S_DARK.map,
@@ -136,7 +151,7 @@ pub(crate) fn walk_at(scene: &SceneSnapshot, camera: Camera) -> Collect {
         skip_blocks: false,
         hex: false,
     };
-    let blend = StageBlend::settled(pol.stage_for_zoom(camera.zoom));
+    let blend = StageBlend::settled(stage);
     let mut sink = Collect::default();
     walk(viewport(), scene, camera, blend, opts, &mut sink);
     sink

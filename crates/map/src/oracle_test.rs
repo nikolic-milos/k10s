@@ -2,8 +2,8 @@ use gpui::{Bounds, PaintQuad, Pixels, point, px, size};
 use k10s_atlas::testing::{SceneSpec, scene as base_scene};
 use k10s_atlas::{Camera, CullStats, LodPolicy, MAX_ZOOM, MIN_ZOOM, StageBlend};
 use k10s_core::{
-    KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, SatExt, SatNode, SceneData, SceneSnapshot,
-    Severity, State, ToolId, WlExt, WorkloadNode,
+    KindId, NsExt, NsNode, PodExt, PodNode, ReasonId, Rect, SatExt, SatNode, SceneData,
+    SceneSnapshot, Severity, State, ToolId, WlExt, WorkloadNode,
 };
 use std::sync::Arc;
 
@@ -89,7 +89,8 @@ impl FrameSink for Tally {
             IconJob::Wl(_, primitive)
             | IconJob::ToolId(_, primitive)
             | IconJob::Sat(_, primitive)
-            | IconJob::Status(_, primitive) => primitive.bounds,
+            | IconJob::Status(_, primitive)
+            | IconJob::NamespaceStatus(_, primitive) => primitive.bounds,
         };
         self.place(f32::from(b.origin.x), f32::from(b.origin.y));
     }
@@ -176,6 +177,7 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
                     weight: r.weight,
                     children: r.children.clone(),
                     ext: NsExt {
+                        workload_label: k10s_core::NsExt::workload_label(r.children.len()),
                         unhealthy_frac: (i % 5) as f32 * 0.15,
                         rollup: SEVERITIES[i % SEVERITIES.len()],
                     },
@@ -735,7 +737,7 @@ fn dense_spec() -> SceneSpec {
 }
 
 #[test]
-fn stage_zero_without_label_candidates_matches_indexed_and_direct_paint() {
+fn stage_zero_without_room_for_a_row_matches_indexed_and_direct_paint() {
     let (view, vw, vh) = VIEWPORTS[0];
     let blends = [
         StageBlend::settled(0),
@@ -801,7 +803,10 @@ fn stage_zero_without_label_candidates_matches_indexed_and_direct_paint() {
                             opts: FrameOpts {
                                 policy: &policy,
                                 theme: &k10s_theme::K10S_DARK.map,
-                                type_: k10s_theme::Typography::default().map(),
+                                type_: k10s_theme::MapType {
+                                    region_min: scene.bounds.h.max(vh) * 2.0,
+                                    ..k10s_theme::Typography::default().map()
+                                },
                                 edges_on: true,
                                 skip_blocks: false,
                                 hex,
@@ -820,43 +825,38 @@ fn stage_zero_without_label_candidates_matches_indexed_and_direct_paint() {
 }
 
 #[test]
-fn stage_zero_label_candidates_keep_geometry_checks_at_zero_and_nonzero_budgets() {
-    let scene = snapshot(fanout_spec());
-    let region = scene.regions[0].rect;
-    let (cx, _) = region.center();
+fn stage_zero_overview_admission_keeps_geometry_and_budget_drops_separate() {
+    let mut scene = snapshot(SceneSpec::uniform(1, 1));
+    scene.regions[0].rect = Rect::new(0.0, 0.0, 360.0, 240.0);
+    scene.bounds = scene.regions[0].rect;
+    scene.rebuild_spatial_index();
     let (view, vw, vh) = VIEWPORTS[0];
-    for (camera_name, zoom, top, retained) in [
-        ("retained", 1.0, 200.0, true),
-        ("top clipped", 1.0, 0.0, false),
-        ("bottom clipped", 1.0, vh - 20.0, false),
-        ("short title band", 0.05, 200.0, false),
+    for (camera_name, zoom, center_y, candidates) in [
+        ("retained", 1.0, 250.0, 2),
+        ("top clipped", 1.0, 0.0, 0),
+        ("bottom clipped", 1.0, vh - 1.0, 0),
+        ("locator only", 0.05, 250.0, 0),
     ] {
         let camera = Camera {
-            cx,
-            cy: region.y + (vh * 0.5 - top) / zoom,
+            cx: 180.0,
+            cy: 120.0 + (vh * 0.5 - center_y) / zoom,
             zoom,
         };
-        for max_labels in [0, 1] {
+        for max_labels in [0, 1, 2] {
             let policy = LodPolicy {
                 max_labels,
                 ..lod::policy(Knobs::default())
             };
             let blend = StageBlend::settled(0);
-            let atlas = k10s_atlas::cull(&scene, &camera, &policy, blend, vw, vh, false, false);
-            assert_eq!(atlas.drawn_regions, 1);
-            assert_eq!(
-                (atlas.labels, atlas.labels_dropped),
-                (max_labels, 1 - max_labels)
-            );
             let case = Case {
-                scene: "fanout",
+                scene: "single namespace",
                 view,
                 vw,
                 vh,
                 camera: camera_name,
                 blend,
                 knobs: Knobs::default(),
-                budgets: "region label candidates",
+                budgets: "overview admission",
                 opts: FrameOpts {
                     policy: &policy,
                     theme: &k10s_theme::K10S_DARK.map,
@@ -869,14 +869,12 @@ fn stage_zero_label_candidates_keep_geometry_checks_at_zero_and_nonzero_budgets(
             let st = check(&case, &scene, camera);
             assert_eq!(st.stage, 0);
             assert_eq!(st.drawn_regions, 1);
+            let admitted = max_labels.min(candidates);
             assert_eq!(
                 (st.labels, st.labels_dropped),
-                if retained {
-                    (max_labels, 1 - max_labels)
-                } else {
-                    (0, 0)
-                },
+                (admitted, candidates - admitted)
             );
+            assert_eq!((st.drawn_blocks, st.drawn_cells, st.drawn_sats), (0, 0, 0));
         }
     }
 }

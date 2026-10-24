@@ -442,7 +442,9 @@ fn object_is_drawn(
     block: Option<&k10s_core::WorkloadNode>,
     type_: MapType,
 ) -> bool {
-    if !located.rect.intersects(visible) {
+    if (stage < 2 && !policy.stress && !policy.stress_curves && located.level != Level::Region)
+        || !located.rect.intersects(visible)
+    {
         return false;
     }
     match located.level {
@@ -801,6 +803,7 @@ mod tests {
             weight: 1,
             children: 0..1,
             ext: NsExt {
+                workload_label: k10s_core::NsExt::workload_label(1),
                 unhealthy_frac: 0.0,
                 rollup: Severity::Ok,
             },
@@ -811,6 +814,7 @@ mod tests {
             weight: 0,
             children: 1..1,
             ext: NsExt {
+                workload_label: k10s_core::NsExt::workload_label(0),
                 unhealthy_frac: 0.0,
                 rollup: Severity::Ok,
             },
@@ -1155,10 +1159,7 @@ mod tests {
             800.0,
             600.0,
         );
-        assert!(
-            at_cards.is_empty(),
-            "stage 1 draws the card, not the pods inside it"
-        );
+        assert!(at_cards.is_empty(), "stage 1 draws the namespace aggregate");
         let at_pods = frame.visible_stamps(
             &scene,
             camera,
@@ -1388,7 +1389,10 @@ mod tests {
     #[test]
     fn an_invalidated_cache_re_resolves_replaced_marks() {
         let scene = scene_two_islands();
-        let camera = looking_at_near();
+        let camera = Camera {
+            zoom: policy().stage_cell,
+            ..looking_at_near()
+        };
         let region_frame = OverlayFrame {
             kind: Some(OverlayKind::Policy),
             marks: vec![OverlayMark {

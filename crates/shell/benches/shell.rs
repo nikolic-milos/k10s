@@ -254,6 +254,9 @@ fn map_scene() -> k10s_core::SceneSnapshot {
             weight: 0,
             children: first_block..snap.scene.blocks.len() as u32,
             ext: NsExt {
+                workload_label: k10s_core::NsExt::workload_label(
+                    (snap.scene.blocks.len() as u32 - first_block) as usize,
+                ),
                 unhealthy_frac: 0.0,
                 rollup: Severity::Ok,
             },

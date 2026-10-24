@@ -137,7 +137,7 @@ pub(crate) fn pick_typed<R, B, C, S>(
         cell: None,
         sat: None,
     };
-    if stage == 0 {
+    if stage == 0 || (stage == 1 && !policy.stress && !policy.stress_curves) {
         return Some(path);
     }
 
@@ -260,7 +260,7 @@ mod tests {
         };
         let mut sat_hit: Option<(u32, u32)> = None;
         let mut heading_hit = false;
-        if stage == 0 {
+        if stage == 0 || (stage == 1 && !policy.stress && !policy.stress_curves) {
             return Some(path);
         }
 
@@ -374,10 +374,10 @@ mod tests {
                 let (sx, sy) = (f32::from(probe.x), f32::from(probe.y));
                 let (wx, wy) = camera.s2w(sx, sy, vw, vh);
                 assert!(s.region_block_index_is_selective(0, &Rect::new(wx, wy, 1e-3, 1e-3)));
-                let indexed = pick(&s, &camera, &policy, StageBlend::settled(1), vw, vh, sx, sy);
+                let indexed = pick(&s, &camera, &policy, StageBlend::settled(2), vw, vh, sx, sy);
                 assert_eq!(
                     indexed,
-                    reference(&s, &camera, &policy, StageBlend::settled(1), vw, vh, sx, sy)
+                    reference(&s, &camera, &policy, StageBlend::settled(2), vw, vh, sx, sy)
                 );
                 assert_eq!(indexed.unwrap().block, Some(0));
             }
@@ -387,10 +387,10 @@ mod tests {
             ] {
                 assert!(!glyph.contains(probe));
                 let (sx, sy) = (f32::from(probe.x), f32::from(probe.y));
-                let indexed = pick(&s, &camera, &policy, StageBlend::settled(1), vw, vh, sx, sy);
+                let indexed = pick(&s, &camera, &policy, StageBlend::settled(2), vw, vh, sx, sy);
                 assert_eq!(
                     indexed,
-                    reference(&s, &camera, &policy, StageBlend::settled(1), vw, vh, sx, sy)
+                    reference(&s, &camera, &policy, StageBlend::settled(2), vw, vh, sx, sy)
                 );
                 assert_eq!(indexed.unwrap().block, None);
             }
@@ -408,7 +408,7 @@ mod tests {
         };
         let type_ = k10s_theme::MapType::default();
         for sparse in [false, true] {
-            for (pods, stage) in [(0, 1), (0, 2), (0, 3), (1, 3)] {
+            for (pods, stage) in [(0, 0), (0, 1), (0, 2), (0, 3), (1, 1), (1, 3)] {
                 let blend = StageBlend::settled(stage);
                 let mut s = scene(SceneSpec::uniform(1, 128));
                 s.regions[0].rect = Rect::new(-10000.0, -10000.0, 20000.0, 20000.0);
@@ -470,6 +470,11 @@ mod tests {
                     probes.push((pod.bounds.center(), Level::Cell, Some(cell_index as u32)));
                 }
                 for (point, level, cell) in probes {
+                    let (level, cell) = if stage < 2 {
+                        (Level::Region, None)
+                    } else {
+                        (level, cell)
+                    };
                     let (sx, sy) = (f32::from(point.x), f32::from(point.y));
                     let (wx, wy) = camera.s2w(sx, sy, vw, vh);
                     assert!(s.region_block_index_is_selective(0, &Rect::new(wx, wy, 1e-3, 1e-3)));
@@ -631,7 +636,7 @@ mod tests {
             &s,
             &camera,
             &policy,
-            StageBlend::settled(1),
+            StageBlend::settled(2),
             vw,
             vh,
             f32::from(probe.x),
@@ -646,7 +651,7 @@ mod tests {
             &s,
             &camera,
             &policy,
-            StageBlend::settled(1),
+            StageBlend::settled(2),
             vw,
             vh,
             f32::from(padding.x),
@@ -692,7 +697,7 @@ mod tests {
             sx,
             sy,
         )
-        .expect("the workload remains displayed before the handoff");
+        .expect("the namespace remains displayed before the handoff");
         let after = pick(
             &s,
             &camera,
@@ -709,7 +714,7 @@ mod tests {
         )
         .expect("the detailed card is displayed at the handoff");
 
-        assert_eq!(before.block, Some(0));
+        assert_eq!(before.block, None);
         assert_eq!(before.cell, None);
         assert_eq!(after.block, Some(0));
         assert_eq!(after.cell, Some(0));

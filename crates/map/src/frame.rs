@@ -90,6 +90,10 @@ pub struct LabelJob {
     pub height: f32,
     /// A suffix of the canonical metadata name. Identity never uses this offset.
     pub text_start: usize,
+    /// Overview identities and totals are omitted unless the entire line fits.
+    pub whole_line: bool,
+    /// A shared owner survives FIFO eviction without embedding line decorations.
+    pub prepared: Option<std::rc::Rc<gpui::ShapedLine>>,
 }
 
 pub enum IconJob {
@@ -97,6 +101,23 @@ pub enum IconJob {
     ToolId(ToolId, crate::MarkPrimitive),
     Sat(KindId, crate::MarkPrimitive),
     Status(Severity, crate::MarkPrimitive),
+    NamespaceStatus(Severity, crate::MarkPrimitive),
+}
+
+pub(crate) fn overview_alpha(blend: StageBlend) -> f32 {
+    if blend.from < 2 && blend.to < 2 {
+        1.0
+    } else {
+        1.0 - blend.stage_alpha(2)
+    }
+}
+
+pub(crate) fn workload_alpha(blend: StageBlend, policy: &LodPolicy) -> f32 {
+    blend.stage_alpha(if policy.stress || policy.stress_curves {
+        1
+    } else {
+        2
+    })
 }
 
 pub trait FrameSink {
@@ -177,6 +198,7 @@ struct FrameWalk<'a, S> {
     // A per-region loop must not touch the theme struct: that is the hoist the
     // 14-18% regression bought, and these are text colours, not exceptions.
     region_label: gpui::Rgba,
+    overview_label: gpui::Rgba,
     workload_label: gpui::Rgba,
     sat_label: gpui::Rgba,
     sat_detail_label: gpui::Rgba,
@@ -218,7 +240,12 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             region.rect.h
         };
         let detailed = short >= self.island_detail_min;
-        let primitive = region_primitive(self.screen_bounds(&region.rect), short * self.zoom);
+        let overview = (self.stage < 2 && !self.policy.stress && !self.policy.stress_curves)
+            .then(|| self.projection().namespace(region.rect, self.type_));
+        let primitive = overview.map_or_else(
+            || region_primitive(self.screen_bounds(&region.rect), short * self.zoom),
+            |geometry| geometry.body,
+        );
         let bounds = primitive.bounds;
 
         // One quad, whatever the stage. The stage decides its colours, the LOD
@@ -289,6 +316,51 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         }
         self.stats.quads += 1;
 
+        if let Some(geometry) = overview {
+            for (bounds, text, face) in [
+                (geometry.name, &region.label, LabelFace::Display),
+                (
+                    geometry.summary,
+                    &region.ext.workload_label,
+                    LabelFace::Display,
+                ),
+            ] {
+                let Some(bounds) = bounds else { continue };
+                if !self.projection().label_visible(bounds, self.type_) {
+                    continue;
+                }
+                push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
+                    text: SharedString::from(text),
+                    x: f32::from(bounds.origin.x),
+                    y: f32::from(bounds.origin.y),
+                    size_px: self.type_.region_min,
+                    color: self.overview_label,
+                    face,
+                    width: f32::from(bounds.size.width),
+                    height: f32::from(bounds.size.height),
+                    text_start: 0,
+                    whole_line: true,
+                    prepared: None,
+                });
+            }
+            if let Some(status) = geometry.status
+                && self.projection().label_visible(status.bounds, self.type_)
+                && self.policy.sat_icon_shown()
+            {
+                push_icon(&mut self.stats, self.policy, self.sink, || {
+                    IconJob::NamespaceStatus(
+                        if region.weight == 0 {
+                            Severity::Unknown
+                        } else {
+                            region.ext.rollup
+                        },
+                        status,
+                    )
+                });
+            }
+            return;
+        }
+
         if self.policy.region_label_shown(region.rect.w, self.zoom) {
             let (x, y) = self.camera.w2s(
                 region.rect.x,
@@ -342,6 +414,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 width,
                 height: line,
                 text_start: 0,
+                whole_line: false,
+                prepared: None,
             });
         }
     }
@@ -486,6 +560,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 width,
                 height: line,
                 text_start: 0,
+                whole_line: false,
+                prepared: None,
             });
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::new_static(crate::status::workload_label(
@@ -500,6 +576,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 width,
                 height: line,
                 text_start: 0,
+                whole_line: false,
+                prepared: None,
             });
             if self.policy.sat_icon_shown() {
                 push_icon(&mut self.stats, self.policy, self.sink, || {
@@ -665,6 +743,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 width,
                 height: name * self.type_.line_height,
                 text_start: 0,
+                whole_line: false,
+                prepared: None,
             });
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
                 text: SharedString::from(&satellite.ext.detail),
@@ -676,6 +756,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 width,
                 height: detail * self.type_.line_height,
                 text_start: 0,
+                whole_line: false,
+                prepared: None,
             });
         }
 
@@ -796,6 +878,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 width: width - TEXT_PAD * 2.0,
                 height: line,
                 text_start,
+                whole_line: false,
+                prepared: None,
             });
             let inset = quantize(size_px.max(16.0)) + STATUS_GAP;
             push_label(&mut self.stats, self.policy, self.sink, || LabelJob {
@@ -808,6 +892,8 @@ impl<S: FrameSink> FrameWalk<'_, S> {
                 width: width - TEXT_PAD * 2.0 - inset,
                 height: line,
                 text_start: 0,
+                whole_line: false,
+                prepared: None,
             });
         }
     }
@@ -817,7 +903,9 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             for (index, region) in scene.regions.iter().enumerate() {
                 if region.rect.intersects(&self.visible) {
                     self.paint_region(region);
-                    if self.stage != 0 {
+                    if self.stage != 0
+                        && (self.stage >= 2 || self.policy.stress || self.policy.stress_curves)
+                    {
                         self.walk_region_children::<true>(scene, index, region);
                     }
                 }
@@ -827,7 +915,9 @@ impl<S: FrameSink> FrameWalk<'_, S> {
             scene.for_each_region_candidate(&visible, |index, region| {
                 if region.rect.intersects(&visible) {
                     self.paint_region(region);
-                    if self.stage != 0 {
+                    if self.stage != 0
+                        && (self.stage >= 2 || self.policy.stress || self.policy.stress_curves)
+                    {
                         self.walk_region_children::<DIRECT>(scene, index, region);
                     }
                 }
@@ -943,7 +1033,7 @@ pub fn walk<S: FrameSink>(
     let viewport = (f32::from(bounds.size.width), f32::from(bounds.size.height));
     let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
     let stage = blend.walk_stage();
-    let block_alpha = blend.stage_alpha(1);
+    let block_alpha = workload_alpha(blend, opts.policy);
     let cell_alpha = blend.stage_alpha(2);
     let bg_for_shade = rgb(opts.theme.bg);
     let workload_paint = SEVERITIES.map(|severity| {
@@ -994,6 +1084,7 @@ pub fn walk<S: FrameSink>(
         pod_hollow: SEVERITIES
             .map(|severity| scale_alpha(opts.theme.pod_color(severity), cell_alpha).into()),
         region_label: rgb(opts.theme.region_label),
+        overview_label: scale_alpha(rgb(opts.theme.region_label), overview_alpha(blend)),
         workload_label: scale_alpha(rgb(opts.theme.workload_label), block_alpha),
         sat_label: scale_alpha(rgb(opts.theme.sat_label), cell_alpha),
         sat_detail_label: scale_alpha(rgb(opts.theme.sat_detail_label), cell_alpha),

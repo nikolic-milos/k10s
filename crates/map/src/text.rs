@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
 use gpui::{Font, Hsla, ShapedLine, SharedString, TextRun, WindowTextSystem, px};
 
@@ -33,7 +34,7 @@ struct CacheKey {
 
 struct BoundedCache {
     capacity: usize,
-    entries: HashMap<CacheKey, ShapedLine>,
+    entries: HashMap<CacheKey, Rc<ShapedLine>>,
     insertion_order: VecDeque<CacheKey>,
     stats: CacheStats,
 }
@@ -57,7 +58,7 @@ impl BoundedCache {
         size_px: f32,
         color: Hsla,
         text_system: &WindowTextSystem,
-    ) -> ShapedLine {
+    ) -> Rc<ShapedLine> {
         let key = CacheKey {
             text: text.clone(),
             text_start,
@@ -94,7 +95,7 @@ impl BoundedCache {
             underline: None,
             strikethrough: None,
         };
-        let line = text_system.shape_line(displayed, px(size_px), &[run], None);
+        let line = Rc::new(text_system.shape_line(displayed, px(size_px), &[run], None));
         self.insertion_order.push_back(key.clone());
         self.entries.insert(key, line.clone());
         line
@@ -108,7 +109,7 @@ impl BoundedCache {
         size_px: f32,
         color: Hsla,
         text_system: &WindowTextSystem,
-    ) -> ShapedLine {
+    ) -> Rc<ShapedLine> {
         self.stats.misses += 1;
         let displayed = if text_start == 0 {
             text
@@ -123,7 +124,7 @@ impl BoundedCache {
             underline: None,
             strikethrough: None,
         };
-        text_system.shape_line(displayed, px(size_px), &[run], None)
+        Rc::new(text_system.shape_line(displayed, px(size_px), &[run], None))
     }
 }
 
@@ -158,7 +159,7 @@ impl TextCache {
         color: Hsla,
         settled: bool,
         text_system: &WindowTextSystem,
-    ) -> ShapedLine {
+    ) -> Rc<ShapedLine> {
         if self.enabled && settled {
             self.labels
                 .shape(text, text_start, font, size_px, color, text_system)
@@ -226,9 +227,11 @@ mod tests {
         let color = gpui::rgb(0xffffff).into();
         let mut cache = BoundedCache::new(2);
 
-        cache.shape("a".into(), 0, &font, 12.0, color, &system);
+        let retained = cache.shape("a".into(), 0, &font, 12.0, color, &system);
         cache.shape("b".into(), 0, &font, 12.0, color, &system);
-        cache.shape("a".into(), 0, &font, 12.0, color, &system);
+        let warm = cache.shape("a".into(), 0, &font, 12.0, color, &system);
+        assert!(Rc::ptr_eq(&retained, &warm));
+        drop(warm);
         assert_eq!(
             cache.stats,
             CacheStats {
@@ -242,6 +245,12 @@ mod tests {
         assert_eq!(cache.entries.len(), 2);
         assert!(!cache.entries.keys().any(|key| key.text == "a"));
         assert_eq!(cache.stats.evictions, 1);
+        assert_eq!(Rc::strong_count(&retained), 1);
+        drop(cache);
+        assert_eq!(retained.text, "a");
+        let weak = Rc::downgrade(&retained);
+        drop(retained);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
@@ -262,6 +271,7 @@ mod tests {
         let before = cache.stats;
         let warm = cache.shape(text.clone(), 13, &font, 14.0, color, &system);
         assert_eq!(warm.text, suffix.text);
+        assert!(Rc::ptr_eq(&warm, &suffix));
         assert_eq!(cache.stats.since(before).hits, 1);
         let full = cache.shape(text.clone(), 0, &font, 14.0, color, &system);
         assert_eq!(full.text, text);

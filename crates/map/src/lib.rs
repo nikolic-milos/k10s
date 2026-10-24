@@ -5,9 +5,12 @@
 //! re-derived by independent atlas and map admission walks and must agree
 //! counter for counter. Painting is damage-driven -- zero paints at idle under
 //! `--churn 0` is a gated invariant -- and the paint path must not allocate
-//! per frame at steady state: labels come from a bounded shaped-text cache
-//! that only serves settled frames, and the `bench-alloc` ratchet holds the
-//! walk at zero allocations.
+//! per frame at steady state. Canvas prepaint performs the single frame walk
+//! and retains each admitted label's shared line owner for drawing; the bounded
+//! text cache serves settled frames. Map elapsed time and cache accounting
+//! include preparation; the elapsed interval can include intervening GPUI work
+//! and ends before the HUD. The `bench-alloc` ratchet holds the walk at zero
+//! allocations.
 
 mod bench;
 mod chrome;

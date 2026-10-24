@@ -1011,3 +1011,179 @@ fn adding_a_service_live_rebuilds_the_same_edges_as_a_full_materialize() {
     assert_eq!(extra_edges(&snap).len(), 2);
     assert_published_matches_full(&world, &snap);
 }
+
+#[test]
+fn namespace_totals_follow_published_children_through_deletion_and_slot_reuse() {
+    for mode in [LayoutMode::Spread, LayoutMode::Dense] {
+        let mut bench = PublishBench::new(&replay::initial_sync().events, mode);
+        let batches = [
+            (
+                vec![replay::owner(
+                    "wl-two",
+                    "prod",
+                    "two",
+                    KindId::JOB,
+                    Op::Added,
+                )],
+                "2 workloads",
+            ),
+            (
+                vec![replay::owner(
+                    "wl-api",
+                    "prod",
+                    "api",
+                    KindId::DEPLOYMENT,
+                    Op::Deleted,
+                )],
+                "1 workload",
+            ),
+            (
+                vec![replay::owner(
+                    "wl-two",
+                    "prod",
+                    "two",
+                    KindId::JOB,
+                    Op::Deleted,
+                )],
+                "0 workloads",
+            ),
+            (
+                vec![replay::owner(
+                    "wl-reused",
+                    "prod",
+                    "reused",
+                    KindId::JOB,
+                    Op::Added,
+                )],
+                "1 workload",
+            ),
+        ];
+        assert_eq!(
+            region_named(&bench.snapshot(), "prod")
+                .1
+                .ext
+                .workload_label
+                .as_ref(),
+            "1 workload"
+        );
+        let mut saw_sparse = false;
+        for (events, expected) in batches {
+            bench.apply_events(&events);
+            bench.run_publish();
+            let snapshot = bench.snapshot();
+            saw_sparse |= !snapshot.region_blocks.is_empty();
+            let (region, node) = region_named(&snapshot, "prod");
+            assert_eq!(node.ext.workload_label.as_ref(), expected);
+            let names: Vec<_> = snapshot
+                .region_block_indices(region)
+                .map(|index| snapshot.blocks[index].label.as_ref())
+                .collect();
+            match expected {
+                "2 workloads" => assert_eq!(names, ["api", "two"]),
+                "0 workloads" => assert!(names.is_empty()),
+                _ => assert_eq!(names.len(), 1),
+            }
+            assert_published_matches_full(&bench.world, &snapshot);
+        }
+        let snap = bench.snapshot();
+        assert!(
+            saw_sparse,
+            "live edits must exercise published sparse adjacency"
+        );
+        let current = snap.locate("wl-reused").unwrap();
+        assert_eq!(snap.blocks[current.slot].label.as_ref(), "reused");
+    }
+}
+
+#[test]
+fn namespace_count_strings_are_reused_across_health_only_pool_updates() {
+    let spec = input_of(881, 3000, Scenario::Platform);
+    let scene = k10s_core::new_shared_scene();
+    let (mut world, mut schedule) = build_world(&spec, scene, LayoutMode::Spread);
+    schedule.run(&mut world);
+    for index in 0..SNAPSHOT_POOL_DEPTH {
+        set_pod_state(
+            &mut world,
+            0,
+            st(if index % 2 == 0 {
+                Severity::Err
+            } else {
+                Severity::Warn
+            }),
+        );
+        schedule.run(&mut world);
+    }
+    let before: Vec<Vec<_>> = world
+        .resource::<SnapshotPool>()
+        .bufs
+        .iter()
+        .map(|snapshot| {
+            snapshot
+                .regions
+                .iter()
+                .map(|node| node.ext.workload_label.clone())
+                .collect()
+        })
+        .collect();
+    for index in 0..SNAPSHOT_POOL_DEPTH {
+        set_pod_state(
+            &mut world,
+            0,
+            st(if index % 2 == 0 {
+                Severity::Unknown
+            } else {
+                Severity::Ok
+            }),
+        );
+        schedule.run(&mut world);
+    }
+    for (snapshot, previous) in world.resource::<SnapshotPool>().bufs.iter().zip(before) {
+        for (node, label) in snapshot.regions.iter().zip(previous) {
+            assert!(Arc::ptr_eq(&node.ext.workload_label, &label));
+        }
+    }
+}
+
+#[test]
+fn namespace_count_reuse_also_covers_full_materialization_and_structural_patches() {
+    let spec = input_of(882, 3000, Scenario::Platform);
+    let scene = k10s_core::new_shared_scene();
+    let (world, _) = build_world(&spec, scene, LayoutMode::Spread);
+    let topo = world.resource::<Topology>();
+    let agg = world.resource::<Aggregates>();
+    let mut snapshot = SceneSnapshot::default();
+    crate::materialize_regions(&mut snapshot.regions, &topo, &agg);
+    let before: Vec<_> = snapshot
+        .regions
+        .iter()
+        .map(|node| node.ext.workload_label.clone())
+        .collect();
+    crate::materialize_regions(&mut snapshot.regions, &topo, &agg);
+    for (index, (node, previous)) in snapshot.regions.iter().zip(before).enumerate() {
+        assert!(Arc::ptr_eq(&node.ext.workload_label, &previous));
+        let patched = crate::ns_node(&topo, &agg, index, Some(node));
+        assert!(Arc::ptr_eq(&patched.ext.workload_label, &previous));
+    }
+}
+
+#[test]
+fn namespace_aggregate_health_uses_the_observed_rollup_without_changing_the_total() {
+    let mut bench = PublishBench::new(&replay::initial_sync().events, LayoutMode::Spread);
+    for (state, expected) in [
+        (State::of(ReasonId::CRASH_LOOP_BACK_OFF), Severity::Err),
+        (State::OK, Severity::Ok),
+    ] {
+        bench.apply_events(&[replay::instance(
+            "pod-1",
+            "prod",
+            "wl-api",
+            state,
+            Op::Modified,
+        )]);
+        bench.run_publish();
+        let snapshot = bench.snapshot();
+        let (_, region) = region_named(&snapshot, "prod");
+        assert_eq!(region.ext.workload_label.as_ref(), "1 workload");
+        assert_eq!(region.ext.rollup, expected);
+    }
+}

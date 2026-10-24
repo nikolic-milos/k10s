@@ -3,20 +3,24 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
-    App, Bounds, PaintQuad, Pixels, SharedString, TextAlign, TextRun, TransformationMatrix, Window,
-    fill, point, px, quad, rgb, size,
+    App, Bounds, PaintQuad, Pixels, ShapedLine, SharedString, TextAlign, TextRun,
+    TransformationMatrix, Window, WindowTextSystem, fill, point, px, quad, rgb, size,
 };
 use k10s_assets::icons::{kind_icon, tool_icon};
-use k10s_atlas::{Camera, DrawnCounts, FLIGHT_VIEWPORT, FrameSpans, FrameStats, StageBlend};
+use k10s_atlas::{
+    Camera, CullStats, DrawnCounts, FLIGHT_VIEWPORT, FrameSpans, FrameStats, StageBlend,
+};
 use k10s_core::SceneSnapshot;
 use k10s_theme::scale_alpha;
 
 use crate::frame::{self, FrameOpts, IconJob, LabelFace, LabelJob, PaintSink};
 use crate::lod::lod;
 use crate::primitive::mark_primitive_typed;
-use crate::text::{self, Grouped, TextCache};
+use crate::text::{self, CacheStats, Grouped, TextCache};
 use crate::{OverlayFrame, PickPath, hex, overlay};
 
 fn skip_workloads() -> bool {
@@ -170,15 +174,41 @@ fn paint_marks(
 struct LabelCounts {
     lines: usize,
     glyphs: usize,
+    fit_refused: usize,
 }
 
 impl LabelCounts {
+    fn fits(&mut self, job: &LabelJob, line: &ShapedLine, viewport: Bounds<Pixels>) -> bool {
+        if !job.whole_line {
+            return true;
+        }
+        let width = line.width();
+        let left = px(job.x)
+            + if job.face == LabelFace::Display {
+                (px(job.width) - width) * 0.5
+            } else {
+                px(0.0)
+            };
+        let fits = width <= px(job.width)
+            && line.ascent + line.descent <= px(job.height)
+            && left >= viewport.origin.x
+            && left + width <= viewport.right()
+            && px(job.y) >= viewport.origin.y
+            && px(job.y + job.height) <= viewport.bottom();
+        self.fit_refused += usize::from(!fits);
+        fits
+    }
+
     fn count(&mut self, text: &str) {
         self.lines += 1;
         self.glyphs += text.chars().count();
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Direct paint controls retain a complete-frame entry."
+)]
 #[expect(clippy::too_many_arguments)]
 pub(super) fn paint_map(
     canvas_bounds: Bounds<Pixels>,
@@ -203,8 +233,104 @@ pub(super) fn paint_map(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let frame_start = std::time::Instant::now();
-    stats.borrow_mut().begin_frame(frame_start, was_continuous);
+    let prepared = prepare_map(
+        canvas_bounds,
+        scene,
+        camera,
+        blend,
+        bg_buf,
+        fg_buf,
+        label_buf,
+        icon_buf,
+        text_cache,
+        edges_on,
+        was_continuous,
+        bench_letterbox,
+        window,
+        cx,
+    );
+    paint_prepared_map(
+        prepared,
+        scene,
+        stats,
+        bg_buf,
+        fg_buf,
+        label_buf,
+        icon_buf,
+        text_cache,
+        marks,
+        overlay,
+        overlay_cache,
+        churn_on,
+        hud_on,
+        animating,
+        window,
+        cx,
+    );
+}
+
+pub(super) struct PreparedMapFrame {
+    canvas_bounds: Bounds<Pixels>,
+    bounds: Bounds<Pixels>,
+    camera: Camera,
+    blend: StageBlend,
+    theme: Arc<k10s_theme::Theme>,
+    typography: k10s_theme::Typography,
+    counts: CullStats,
+    paths: frame::FramePaths,
+    frame_start: Instant,
+    walk_us: f32,
+    text_prepare_us: f32,
+    cache_before: CacheStats,
+    edges_on: bool,
+    bench_letterbox: bool,
+    was_continuous: bool,
+}
+
+fn prepare_labels(
+    labels: &mut [LabelJob],
+    typography: &k10s_theme::Typography,
+    cache: &mut TextCache,
+    settled: bool,
+    text_system: &WindowTextSystem,
+) {
+    let ui_font = gpui::font(typography.ui_family.clone());
+    let display_font = gpui::font(typography.display_family.clone());
+    for job in labels {
+        let font = match job.face {
+            LabelFace::Ui => &ui_font,
+            LabelFace::Display => &display_font,
+        };
+        job.prepared = Some(cache.shape_label(
+            job.text.clone(),
+            job.text_start,
+            font,
+            job.size_px,
+            job.color.into(),
+            settled,
+            text_system,
+        ));
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(super) fn prepare_map(
+    canvas_bounds: Bounds<Pixels>,
+    scene: &SceneSnapshot,
+    camera: Camera,
+    blend: StageBlend,
+    bg_buf: &Rc<RefCell<Vec<PaintQuad>>>,
+    fg_buf: &Rc<RefCell<Vec<PaintQuad>>>,
+    label_buf: &Rc<RefCell<Vec<LabelJob>>>,
+    icon_buf: &Rc<RefCell<Vec<IconJob>>>,
+    text_cache: &Rc<RefCell<TextCache>>,
+    edges_on: bool,
+    was_continuous: bool,
+    bench_letterbox: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> PreparedMapFrame {
+    let frame_start = Instant::now();
     // One refcount bump per frame, at walk setup and never inside it: the
     // walk itself still reads plain `MapTheme` fields, which is the whole
     // reason that struct is `Copy` scalars.
@@ -216,17 +342,10 @@ pub(super) fn paint_map(
     let mut icons = icon_buf.borrow_mut();
 
     let bounds = if bench_letterbox {
-        window.paint_quad(fill(canvas_bounds, rgb(theme.map.bg)));
         letterbox_bounds(canvas_bounds)
     } else {
         canvas_bounds
     };
-
-    let ox = f32::from(bounds.origin.x);
-    let oy = f32::from(bounds.origin.y);
-    let zoom = camera.zoom;
-    let block_alpha = blend.stage_alpha(1);
-    let cell_alpha = blend.stage_alpha(2);
 
     let opts = FrameOpts {
         policy: lod(),
@@ -237,7 +356,7 @@ pub(super) fn paint_map(
         hex: hex::hex_on(),
     };
 
-    let walk_start = std::time::Instant::now();
+    let walk_start = Instant::now();
     let mut sink = PaintSink::new(&mut bg, &mut fg, &mut labels, &mut icons, glow_on());
     let counts = frame::walk(bounds, scene, camera, blend, opts, &mut sink);
     let paths = sink.into_paths();
@@ -260,6 +379,87 @@ pub(super) fn paint_map(
         debug_assert_eq!(counts.icons, icons.len(), "icon counter drifted");
     }
 
+    let walk_end = Instant::now();
+    let mut cache = text_cache.borrow_mut();
+    let cache_before = cache.stats();
+    let text_start = Instant::now();
+    prepare_labels(
+        &mut labels,
+        &typography,
+        &mut cache,
+        blend.is_settled(),
+        window.text_system(),
+    );
+    let text_prepare_us = span_us(text_start, Instant::now());
+    PreparedMapFrame {
+        canvas_bounds,
+        bounds,
+        camera,
+        blend,
+        theme,
+        typography,
+        counts,
+        paths,
+        frame_start,
+        walk_us: span_us(walk_start, walk_end),
+        text_prepare_us,
+        cache_before,
+        edges_on,
+        bench_letterbox,
+        was_continuous,
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(super) fn paint_prepared_map(
+    prepared: PreparedMapFrame,
+    scene: &SceneSnapshot,
+    stats: &Rc<RefCell<FrameStats>>,
+    bg_buf: &Rc<RefCell<Vec<PaintQuad>>>,
+    fg_buf: &Rc<RefCell<Vec<PaintQuad>>>,
+    label_buf: &Rc<RefCell<Vec<LabelJob>>>,
+    icon_buf: &Rc<RefCell<Vec<IconJob>>>,
+    text_cache: &Rc<RefCell<TextCache>>,
+    marks: Marks,
+    overlay: &OverlayFrame,
+    overlay_cache: &Rc<RefCell<overlay::StampCache>>,
+    churn_on: bool,
+    hud_on: bool,
+    animating: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let PreparedMapFrame {
+        canvas_bounds,
+        bounds,
+        camera,
+        blend,
+        theme,
+        typography,
+        counts,
+        paths,
+        frame_start,
+        walk_us,
+        text_prepare_us,
+        cache_before,
+        edges_on,
+        bench_letterbox,
+        was_continuous,
+    } = prepared;
+    stats.borrow_mut().begin_frame(frame_start, was_continuous);
+    let bg = bg_buf.borrow();
+    let fg = fg_buf.borrow();
+    let labels = label_buf.borrow();
+    let icons = icon_buf.borrow();
+    let ox = f32::from(bounds.origin.x);
+    let oy = f32::from(bounds.origin.y);
+    let zoom = camera.zoom;
+    let block_alpha = frame::workload_alpha(blend, lod());
+    let namespace_alpha = frame::overview_alpha(blend);
+    let cell_alpha = blend.stage_alpha(2);
+    if bench_letterbox {
+        window.paint_quad(fill(canvas_bounds, rgb(theme.map.bg)));
+    }
     let bg_quads_start = std::time::Instant::now();
     window.paint_quads(&bg);
 
@@ -317,7 +517,7 @@ pub(super) fn paint_map(
             blend,
             vw,
             vh,
-            opts.type_,
+            typography.map(),
         );
         overlay::paint_stamps(
             &stamps,
@@ -334,7 +534,7 @@ pub(super) fn paint_map(
             blend.walk_stage(),
             marks,
             &theme.map,
-            opts.type_,
+            typography.map(),
             window,
         );
     }
@@ -374,6 +574,15 @@ pub(super) fn paint_map(
                             scale_alpha(theme.map.kind_color(*kind), cell_alpha).into(),
                         )
                     }
+                    IconJob::NamespaceStatus(severity, primitive) => {
+                        let (key, data) = crate::status::icon(*severity);
+                        (
+                            key,
+                            data,
+                            snap_to_device(primitive.bounds, scale),
+                            scale_alpha(theme.map.pod_color(*severity), namespace_alpha).into(),
+                        )
+                    }
                     IconJob::Status(severity, primitive) => {
                         let (key, data) = crate::status::icon(*severity);
                         (
@@ -404,25 +613,15 @@ pub(super) fn paint_map(
     }
 
     let text_start = std::time::Instant::now();
-    let ui_font = gpui::font(typography.ui_family.clone());
-    let display_font = gpui::font(typography.display_family.clone());
     let mut label_counts = LabelCounts::default();
-    let mut cache = text_cache.borrow_mut();
-    let cache_before = cache.stats();
     for job in labels.iter() {
-        let font = match job.face {
-            LabelFace::Ui => &ui_font,
-            LabelFace::Display => &display_font,
-        };
-        let line = cache.shape_label(
-            job.text.clone(),
-            job.text_start,
-            font,
-            job.size_px,
-            job.color.into(),
-            blend.is_settled(),
-            window.text_system(),
-        );
+        let line = job
+            .prepared
+            .as_ref()
+            .expect("map labels were prepared before drawing");
+        if !label_counts.fits(job, line, bounds) {
+            continue;
+        }
         let line_height = px(job.height).max(line.ascent + line.descent);
         let origin = point(px(job.x), px(job.y) + (px(job.height) - line_height) * 0.5);
         let mask = gpui::ContentMask {
@@ -443,8 +642,7 @@ pub(super) fn paint_map(
             label_counts.count(&line.text);
         }
     }
-    let cache_delta = cache.stats().since(cache_before);
-    drop(cache);
+    let cache_delta = text_cache.borrow().stats().since(cache_before);
     let text_end = std::time::Instant::now();
 
     {
@@ -464,6 +662,7 @@ pub(super) fn paint_map(
             cells: counts.drawn_cells,
         };
         st.labels_dropped = counts.labels_dropped;
+        st.labels_fit_refused = label_counts.fit_refused;
         st.icons_dropped = counts.icons_dropped;
         st.text_cache.hits = cache_delta.hits;
         st.text_cache.misses = cache_delta.misses;
@@ -493,11 +692,11 @@ pub(super) fn paint_map(
     let hud_end = std::time::Instant::now();
 
     stats.borrow_mut().push_spans(FrameSpans {
-        walk_us: span_us(walk_start, bg_quads_start),
+        walk_us,
         quads_us: span_us(bg_quads_start, paths_start) + span_us(fg_quads_start, icons_start),
         paths_us: span_us(paths_start, fg_quads_start),
         icons_us: span_us(icons_start, text_start),
-        text_us: span_us(text_start, text_end),
+        text_us: text_prepare_us + span_us(text_start, text_end),
         hud_us: span_us(hud_start, hud_end),
     });
 }
@@ -573,7 +772,7 @@ fn paint_hud(
     .expect("writing to a String is infallible");
     write!(
         lines[3],
-        "  |  quads {}  lines {}  glyphs {}  icons {}  edges {}  dropped {}L/{}I",
+        "  |  quads {}  lines {}  glyphs {}  icons {}  edges {}  dropped {}L/{}I  fit refused {}L",
         Grouped(st.quads as u32),
         st.lines,
         Grouped(st.glyphs as u32),
@@ -581,6 +780,7 @@ fn paint_hud(
         st.edges,
         st.labels_dropped,
         st.icons_dropped,
+        st.labels_fit_refused,
     )
     .expect("writing to a String is infallible");
     write!(lines[4], "sats {}  curves {}", st.sats, st.curves)

@@ -109,6 +109,14 @@ pub struct MarkPrimitive {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NamespacePrimitive {
+    pub body: MarkPrimitive,
+    pub name: Option<Bounds<Pixels>>,
+    pub summary: Option<Bounds<Pixels>>,
+    pub status: Option<MarkPrimitive>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WorkloadPrimitive {
     pub body: MarkPrimitive,
     pub heading: Option<MarkPrimitive>,
@@ -231,6 +239,54 @@ impl Projection {
     pub(crate) fn region(self, rect: Rect) -> MarkPrimitive {
         let short_px = rect.w.min(rect.h) * self.camera.zoom;
         region(self.bounds(rect), short_px)
+    }
+
+    /// The overview uses the namespace's existing indexed envelope. A small
+    /// namespace remains a locator when its text rows have no physical room.
+    #[inline]
+    pub(crate) fn namespace(self, rect: Rect, type_: MapType) -> NamespacePrimitive {
+        let body = self.region(rect);
+        let inset = body.bounds.inset(px(TEXT_PAD));
+        let line = type_.region_min * type_.line_height;
+        let width = f32::from(inset.size.width);
+        let height = f32::from(inset.size.height);
+        let mut result = NamespacePrimitive {
+            body,
+            name: None,
+            summary: None,
+            status: None,
+        };
+        if width <= 0.0 || height < line {
+            return result;
+        }
+        let two_rows = height >= line * 2.0 + HEADING_CLEARANCE;
+        let rows = if two_rows {
+            line * 2.0 + HEADING_CLEARANCE
+        } else {
+            line
+        };
+        let top = inset.origin.y + px((height - rows) * 0.5);
+        result.name = Some(Bounds {
+            origin: point(inset.origin.x, top),
+            size: size(inset.size.width, px(line)),
+        });
+        let side = quantize(type_.region_min).min(line);
+        if !two_rows || width <= side + STATUS_GAP {
+            return result;
+        }
+        let summary_top = top + px(line + HEADING_CLEARANCE);
+        result.status = Some(MarkPrimitive {
+            bounds: Bounds {
+                origin: point(inset.origin.x, summary_top + px((line - side) * 0.5)),
+                size: size(px(side), px(side)),
+            },
+            corners: Corners::all(px(0.0)),
+        });
+        result.summary = Some(Bounds {
+            origin: point(inset.origin.x + px(side + STATUS_GAP), summary_top),
+            size: size(inset.size.width - px(side + STATUS_GAP), px(line)),
+        });
+        result
     }
 
     #[inline]
@@ -580,6 +636,9 @@ pub(crate) fn mark_primitive_typed(
 ) -> Option<MarkPrimitive> {
     scene.regions.get(path.region as usize)?;
     let projection = Projection::new(camera, viewport, origin);
+    if stage < 2 && !policy.stress && !policy.stress_curves && path.level() != Level::Region {
+        return None;
+    }
     if let Some(cell_index) = path.cell {
         let block_index = path.block? as usize;
         let block = scene.blocks.get(block_index)?;

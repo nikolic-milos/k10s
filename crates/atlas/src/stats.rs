@@ -250,6 +250,8 @@ pub struct FrameStats {
     pub bg_cells: usize,
     pub drawn: DrawnCounts,
     pub labels_dropped: usize,
+    /// Admitted whole-line jobs omitted after measuring their prepared glyphs.
+    pub labels_fit_refused: usize,
     pub icons_dropped: usize,
     pub text_cache: TextCacheCounts,
 }

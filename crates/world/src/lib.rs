@@ -641,29 +641,45 @@ fn rollup(
     scratch.ns_list.clear();
 }
 
+fn namespace_workload_label(previous: Option<&NsNode>, workloads: usize) -> Arc<str> {
+    previous
+        .filter(|node| node.children.len() == workloads)
+        .map_or_else(
+            || NsExt::workload_label(workloads),
+            |node| node.ext.workload_label.clone(),
+        )
+}
+
 fn materialize_regions(out: &mut Vec<NsNode>, topo: &Topology, agg: &Aggregates) {
-    out.clear();
-    out.extend(
-        topo.ns_rects
-            .iter()
-            .zip(&topo.ns_labels)
-            .zip(&topo.ns_wl_range)
-            .zip(&topo.ns_pod_count)
-            .zip(&agg.ns_unhealthy)
-            .zip(&agg.ns_rollup)
-            .map(
-                |(((((&rect, label), wl_range), &pod_count), &unhealthy_frac), &rollup)| NsNode {
-                    rect,
-                    label: label.clone(),
-                    weight: pod_count,
-                    children: wl_range.clone(),
-                    ext: NsExt {
-                        unhealthy_frac,
-                        rollup,
-                    },
-                },
-            ),
-    );
+    out.reserve(topo.ns_rects.len().saturating_sub(out.len()));
+    for (index, (((((&rect, label), wl_range), &pod_count), &unhealthy_frac), &rollup)) in topo
+        .ns_rects
+        .iter()
+        .zip(&topo.ns_labels)
+        .zip(&topo.ns_wl_range)
+        .zip(&topo.ns_pod_count)
+        .zip(&agg.ns_unhealthy)
+        .zip(&agg.ns_rollup)
+        .enumerate()
+    {
+        let node = NsNode {
+            rect,
+            label: label.clone(),
+            weight: pod_count,
+            children: wl_range.clone(),
+            ext: NsExt {
+                workload_label: namespace_workload_label(out.get(index), wl_range.len()),
+                unhealthy_frac,
+                rollup,
+            },
+        };
+        if index < out.len() {
+            out[index] = node;
+        } else {
+            out.push(node);
+        }
+    }
+    out.truncate(topo.ns_rects.len());
 }
 
 fn materialize_blocks(out: &mut Vec<WorkloadNode>, topo: &Topology, agg: &Aggregates) {
@@ -872,13 +888,14 @@ fn materialize_published_snapshot(
     snap
 }
 
-fn ns_node(topo: &Topology, agg: &Aggregates, i: usize) -> NsNode {
+fn ns_node(topo: &Topology, agg: &Aggregates, i: usize, previous: Option<&NsNode>) -> NsNode {
     NsNode {
         rect: topo.ns_rects[i],
         label: topo.ns_labels[i].clone(),
         weight: topo.ns_pod_count[i],
         children: topo.ns_wl_range[i].clone(),
         ext: NsExt {
+            workload_label: namespace_workload_label(previous, topo.ns_wl_range[i].len()),
             unhealthy_frac: agg.ns_unhealthy[i],
             rollup: agg.ns_rollup[i],
         },
@@ -954,11 +971,11 @@ fn patch_structural_into(
     let SceneSnapshot { scene, ids, .. } = snap;
     let ids = Arc::make_mut(ids);
     for i in scene.regions.len()..topo.ns_rects.len() {
-        scene.regions.push(ns_node(topo, agg, i));
+        scene.regions.push(ns_node(topo, agg, i, None));
         ids.regions.push(uid_of(&topo.ns_slots, i));
     }
     for &i in &structural.nss {
-        scene.regions[i as usize] = ns_node(topo, agg, i as usize);
+        scene.regions[i as usize] = ns_node(topo, agg, i as usize, scene.regions.get(i as usize));
         ids.regions[i as usize] = uid_of(&topo.ns_slots, i as usize);
     }
     for i in scene.blocks.len()..topo.wl_rects.len() {

@@ -116,10 +116,7 @@ pub fn cull(
         opts.skip_blocks,
     );
     let visible = camera.visible_world(vw, vh);
-    // Stage zero only refines region label candidates, including budget drops.
-    if st.stage != 0 || st.labels != 0 || st.labels_dropped != 0 {
-        reference_content(scene, *camera, blend.walk_stage(), (vw, vh), opts, &mut st);
-    }
+    reference_content(scene, *camera, blend.walk_stage(), (vw, vh), opts, &mut st);
     st.bg_cells = crate::hex::visible_count(&visible, camera.zoom, !opts.hex_shown());
     st.edges = if opts.edges_on && blend.walk_stage() >= 2 && !opts.stress_any() {
         reference_edges(scene, *camera, blend.walk_stage(), (vw, vh), opts, &visible)
@@ -163,6 +160,49 @@ fn reference_content(
     // curves and the unchanged region cardinality.
     scene.for_each_region_candidate(&visible, |region_index, region| {
         if !region.rect.intersects(&visible) {
+            return;
+        }
+        if stage < 2 && !opts.stress_any() {
+            let bounds = projection.bounds(region.rect).inset(px(TEXT_PAD));
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            let line = type_.region_min * type_.line_height;
+            if width > 0.0 && height >= line {
+                let two_rows = height >= line * 2.0 + crate::primitive::HEADING_CLEARANCE;
+                let rows = if two_rows {
+                    line * 2.0 + crate::primitive::HEADING_CLEARANCE
+                } else {
+                    line
+                };
+                let top = bounds.origin.y + px((height - rows) * 0.5);
+                let name = Bounds {
+                    origin: point(bounds.origin.x, top),
+                    size: size(bounds.size.width, px(line)),
+                };
+                st.labels += usize::from(projection.label_visible(name, type_));
+                let side = k10s_theme::quantize(type_.region_min).min(line);
+                if two_rows && width > side + crate::primitive::STATUS_GAP {
+                    let summary_top = top + px(line + crate::primitive::HEADING_CLEARANCE);
+                    let summary = Bounds {
+                        origin: point(
+                            bounds.origin.x + px(side + crate::primitive::STATUS_GAP),
+                            summary_top,
+                        ),
+                        size: size(
+                            bounds.size.width - px(side + crate::primitive::STATUS_GAP),
+                            px(line),
+                        ),
+                    };
+                    st.labels += usize::from(projection.label_visible(summary, type_));
+                    let status = Bounds {
+                        origin: point(bounds.origin.x, summary_top + px((line - side) * 0.5)),
+                        size: size(px(side), px(side)),
+                    };
+                    st.icons += usize::from(
+                        policy.sat_icon_shown() && projection.label_visible(status, type_),
+                    );
+                }
+            }
             return;
         }
         if policy.region_label_shown(region.rect.w, zoom) {
@@ -424,6 +464,7 @@ mod tests {
                     weight: 1,
                     children: 0..1,
                     ext: NsExt {
+                        workload_label: k10s_core::NsExt::workload_label(1),
                         unhealthy_frac: 0.0,
                         rollup: Severity::Ok,
                     },

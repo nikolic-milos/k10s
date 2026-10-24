@@ -681,6 +681,9 @@ mod tests {
                 weight: 0,
                 children: first_block..blocks.len() as u32,
                 ext: NsExt {
+                    workload_label: k10s_core::NsExt::workload_label(
+                        (blocks.len() as u32 - first_block) as usize,
+                    ),
                     unhealthy_frac: 0.0,
                     rollup: Severity::Ok,
                 },

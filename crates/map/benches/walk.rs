@@ -173,6 +173,7 @@ fn snapshot(spec: SceneSpec) -> SceneSnapshot {
                     weight: r.weight,
                     children: r.children.clone(),
                     ext: NsExt {
+                        workload_label: k10s_core::NsExt::workload_label(r.children.len()),
                         unhealthy_frac: (i % 5) as f32 * 0.15,
                         rollup: SEVERITIES[i % SEVERITIES.len()],
                     },

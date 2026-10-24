@@ -73,6 +73,7 @@ fn hover_scene() -> SceneSnapshot {
         weight: 1,
         children: 0..1,
         ext: k10s_core::NsExt {
+            workload_label: k10s_core::NsExt::workload_label(1),
             unhealthy_frac: 0.5,
             rollup: Severity::Warn,
         },
@@ -156,6 +157,7 @@ fn hover_cards_stay_inside_the_viewport() {
         weight: 0,
         children: 0..0,
         ext: k10s_core::NsExt {
+            workload_label: k10s_core::NsExt::workload_label(0),
             unhealthy_frac: 0.0,
             rollup: Severity::Ok,
         },
@@ -195,6 +197,7 @@ fn hover_cards_stand_down_when_the_viewport_cannot_contain_them() {
         weight: 0,
         children: 0..0,
         ext: k10s_core::NsExt {
+            workload_label: k10s_core::NsExt::workload_label(0),
             unhealthy_frac: 0.0,
             rollup: Severity::Ok,
         },

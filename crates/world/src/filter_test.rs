@@ -19,6 +19,7 @@ fn tiny() -> SceneSnapshot {
             weight: 3,
             children: 0..2,
             ext: NsExt {
+                workload_label: k10s_core::NsExt::workload_label(2),
                 unhealthy_frac: 0.5,
                 rollup: Severity::Err,
             },
@@ -29,6 +30,7 @@ fn tiny() -> SceneSnapshot {
             weight: 1,
             children: 2..3,
             ext: NsExt {
+                workload_label: k10s_core::NsExt::workload_label(1),
                 unhealthy_frac: 1.0,
                 rollup: Severity::Warn,
             },

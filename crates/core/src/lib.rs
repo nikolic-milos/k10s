@@ -39,10 +39,24 @@ pub use overlay::OverlayKind;
 pub use prepared::{PreparedNamespace, PreparedPod, PreparedSat, PreparedScene, PreparedWorkload};
 pub use replay::RecordedStream;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NsExt {
     pub unhealthy_frac: f32,
     pub rollup: Severity,
+    /// Prepared with the published child range so paint never formats counts.
+    pub workload_label: Arc<str>,
+}
+
+impl NsExt {
+    /// Preparing the full total with publication keeps formatting out of frames.
+    pub fn workload_label(workloads: usize) -> Arc<str> {
+        let noun = if workloads == 1 {
+            "workload"
+        } else {
+            "workloads"
+        };
+        format!("{workloads} {noun}").into()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -557,14 +571,14 @@ mod tests {
 
     #[test]
     fn node_extension_strides_are_pinned() {
-        assert_eq!(size_of::<NsExt>(), 8, "NsExt");
+        assert_eq!(size_of::<NsExt>(), 24, "NsExt");
         assert_eq!(size_of::<WlExt>(), 12, "WlExt");
         assert_eq!(size_of::<PodExt>(), 8, "PodExt");
         assert_eq!(size_of::<SatExt>(), 24, "SatExt");
         assert_eq!(size_of::<State>(), 8, "State");
         assert_eq!(size_of::<Severity>(), 1, "Severity is the rollup axis");
 
-        assert_eq!(size_of::<NsNode>(), 56, "NsNode");
+        assert_eq!(size_of::<NsNode>(), 72, "NsNode");
         assert_eq!(size_of::<WorkloadNode>(), 80, "WorkloadNode");
         assert_eq!(size_of::<PodNode>(), 40, "PodNode");
         assert_eq!(size_of::<SatNode>(), 56, "SatNode");
@@ -583,6 +597,7 @@ mod locate_tests {
             weight: 0,
             children: 0..1,
             ext: NsExt {
+                workload_label: NsExt::workload_label(1),
                 unhealthy_frac: 0.0,
                 rollup: Severity::Ok,
             },

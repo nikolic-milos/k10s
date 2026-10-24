@@ -17,7 +17,7 @@ use k10s_core::{SceneSnapshot, SharedScene, WorldCtrl};
 use crate::bench::{Bench, BenchOp};
 use crate::frame::{IconJob, LabelJob};
 use crate::lod::{self, lod};
-use crate::paint::{Marks, device_px, paint_map};
+use crate::paint::{Marks, device_px, paint_prepared_map, prepare_map};
 use crate::pick::pick_typed;
 use crate::present::PresentProbe;
 use crate::selection::Mark;
@@ -808,6 +808,12 @@ impl Render for MapView {
         } else {
             gpui::CursorStyle::Arrow
         };
+        let prepare_scene = scene.clone();
+        let prepare_bg = bg_buf.clone();
+        let prepare_fg = fg_buf.clone();
+        let prepare_labels = label_buf.clone();
+        let prepare_icons = icon_buf.clone();
+        let prepare_text = text_cache.clone();
         let paint_scene = scene.clone();
         let overlay = Rc::clone(&self.overlay);
         let overlay_cache = self.overlay_cache.clone();
@@ -900,8 +906,25 @@ impl Render for MapView {
             .key_context("Map")
             .child(
                 canvas(
-                    |_, _, _| {},
-                    move |bounds, _, window, cx| {
+                    move |bounds, window, cx| {
+                        prepare_map(
+                            bounds,
+                            &prepare_scene,
+                            camera,
+                            blend,
+                            &prepare_bg,
+                            &prepare_fg,
+                            &prepare_labels,
+                            &prepare_icons,
+                            &prepare_text,
+                            edges_on,
+                            was_continuous,
+                            bench_letterbox,
+                            window,
+                            cx,
+                        )
+                    },
+                    move |bounds, prepared, window, cx| {
                         let next_bounds = k10s_core::Rect::new(
                             f32::from(bounds.origin.x),
                             f32::from(bounds.origin.y),
@@ -919,11 +942,9 @@ impl Render for MapView {
                         if device_px(prev, scale) != device_px(next_bounds, scale) {
                             window.request_animation_frame();
                         }
-                        paint_map(
-                            bounds,
+                        paint_prepared_map(
+                            prepared,
                             &paint_scene,
-                            camera,
-                            blend,
                             &stats,
                             &bg_buf,
                             &fg_buf,
@@ -933,12 +954,9 @@ impl Render for MapView {
                             marks,
                             &overlay,
                             &overlay_cache,
-                            edges_on,
                             churn_on,
                             hud_on,
-                            was_continuous,
                             animating,
-                            bench_letterbox,
                             window,
                             cx,
                         );

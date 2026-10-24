@@ -165,6 +165,7 @@ mod tests {
             weight: 0,
             children: 0..1,
             ext: NsExt {
+                workload_label: k10s_core::NsExt::workload_label(1),
                 unhealthy_frac: 0.0,
                 rollup: Severity::Ok,
             },

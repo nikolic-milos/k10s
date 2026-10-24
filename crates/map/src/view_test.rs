@@ -36,6 +36,7 @@ fn identity_scene(rev: u64, uid: &str) -> SceneSnapshot {
         weight: 1,
         children: 0..0,
         ext: NsExt {
+            workload_label: k10s_core::NsExt::workload_label(0),
             unhealthy_frac: 0.0,
             rollup: Severity::Ok,
         },

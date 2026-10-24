@@ -28,6 +28,7 @@ fn one_of_each(pod_state: State) -> SceneSnapshot {
                 weight: 1,
                 children: 0..1,
                 ext: NsExt {
+                    workload_label: k10s_core::NsExt::workload_label(1),
                     unhealthy_frac: 0.2,
                     rollup: Severity::Warn,
                 },
@@ -179,15 +180,15 @@ fn live_asymmetric_halos_keep_identity_paint_pick_marks_overlays_and_culling_bou
             cy: block.inner.center().1,
             zoom,
         };
-        let blend = StageBlend::settled(1);
+        let blend = StageBlend::settled(2);
         let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
-        let presentation = workload_presentation(&pol, block.inner, zoom, 1, type_);
+        let presentation = workload_presentation(&pol, block.inner, zoom, 2, type_);
         let target = crate::primitive::mark_primitive_typed(
             &scene,
             path,
             camera,
             &pol,
-            1,
+            2,
             (vw, vh),
             (0.0, 0.0),
             type_,
@@ -200,7 +201,7 @@ fn live_asymmetric_halos_keep_identity_paint_pick_marks_overlays_and_culling_bou
                 path,
                 camera,
                 &pol,
-                1,
+                2,
                 (vw, vh),
                 (0.0, 0.0),
                 type_,
@@ -366,11 +367,14 @@ fn a_live_attachment_keeps_workload_glyph_scale_and_monotonic_targets() {
                 previous[scene_index] = Some((width, height));
                 targets[scene_index] = Some(target);
             }
-            if matches!(
-                presentation,
-                k10s_atlas::WorkloadPresentation::Medallion
-                    | k10s_atlas::WorkloadPresentation::Detailed
-            ) {
+            if stage >= 2
+                && matches!(
+                    presentation,
+                    k10s_atlas::WorkloadPresentation::Medallion
+                        | k10s_atlas::WorkloadPresentation::Detailed
+                )
+            {
+                assert!(targets[0].is_some() && targets[1].is_some());
                 assert_eq!(targets[0], targets[1], "attachments cannot resize identity");
                 if presentation == k10s_atlas::WorkloadPresentation::Medallion {
                     medallions += 1;
@@ -713,7 +717,7 @@ fn removing_the_only_pod_keeps_observed_truth_and_a_bounded_workload_target() {
                 (0.0, 0.0),
                 type_,
             );
-            if presentation == k10s_atlas::WorkloadPresentation::Hidden {
+            if stage < 2 || presentation == k10s_atlas::WorkloadPresentation::Hidden {
                 assert!(mark.is_none());
                 assert!(!sink.labels.iter().any(|job| job.text == "0 observed pods"));
             } else if matches!(
@@ -1011,7 +1015,7 @@ fn a_workload_glyph_reaches_its_readable_size_without_outgrowing_its_halo() {
         cy: card.center().1,
         zoom,
     };
-    let sink = walk_at(&scene, camera);
+    let sink = walk_at_stage(&scene, camera, 2);
     let bounds = sink
         .icons
         .iter()
@@ -1046,14 +1050,18 @@ fn workload_lod_never_stacks_medallion_card_and_pods() {
         zoom: 0.20,
     };
     let mid_frame = walk_at(&scene, mid);
-    assert_eq!(mid_frame.fg.len(), 0, "the medallion retained a card");
+    assert_eq!(
+        mid_frame.fg.len(),
+        0,
+        "the namespace overview retained a child card"
+    );
     assert_eq!(
         mid_frame
             .icons
             .iter()
             .filter(|job| matches!(job, IconJob::Wl(..) | IconJob::ToolId(..)))
             .count(),
-        1
+        0
     );
 
     let near = Camera {
@@ -1096,7 +1104,7 @@ fn workload_lod_never_stacks_medallion_card_and_pods() {
         viewport(),
         &scene,
         mid,
-        StageBlend::settled(1),
+        StageBlend::settled(2),
         opts,
         &mut fallback,
     );
@@ -1177,7 +1185,7 @@ fn a_namespace_title_uses_a_font_that_fits_its_reserved_header() {
         zoom: 0.4,
     };
     let pol = policy(Knobs::default());
-    let blend = StageBlend::settled(pol.stage_for_zoom(camera.zoom));
+    let blend = StageBlend::settled(2);
     let opts = FrameOpts {
         theme: &k10s_theme::K10S_DARK.map,
         policy: &pol,
@@ -1204,9 +1212,10 @@ fn a_namespace_title_uses_a_font_that_fits_its_reserved_header() {
 }
 
 #[test]
-fn an_empty_namespace_centers_its_identity_in_the_reserved_tile() {
+fn an_empty_namespace_centers_its_identity_and_exact_zero_total() {
     let mut scene = one_of_each(State::OK);
     scene.regions[0].children = 0..0;
+    scene.regions[0].ext.workload_label = NsExt::workload_label(0);
     scene.blocks.clear();
     scene.cells.clear();
     scene.sats.clear();
@@ -1214,14 +1223,14 @@ fn an_empty_namespace_centers_its_identity_in_the_reserved_tile() {
     let (cx, cy) = scene.regions[0].rect.center();
     for zoom in [0.5, 1.0, 2.0] {
         let painted = walk_at(&scene, Camera { cx, cy, zoom });
-        let label = painted
-            .labels
-            .iter()
-            .find(|label| label.text == scene.regions[0].label.as_ref())
-            .expect("the reserved namespace tile has a readable name");
-        let center = (VH * 0.5, VW * 0.5);
-        assert!((label.y + label.height * 0.5 - center.0).abs() < 0.001);
-        assert!((label.x + label.width * 0.5 - center.1).abs() < 0.001);
+        assert_eq!(painted.labels.len(), 2);
+        let name = &painted.labels[0];
+        let count = &painted.labels[1];
+        assert_eq!(name.text, scene.regions[0].label.as_ref());
+        assert_eq!(count.text, "0 workloads");
+        assert!(name.whole_line && count.whole_line);
+        assert!((name.y + count.y + count.height - VH).abs() < 0.001);
+        assert!((name.x + name.width * 0.5 - VW * 0.5).abs() < 0.001);
     }
 }
 
@@ -1376,11 +1385,13 @@ fn a_workload_identity_glyph_never_shrinks_when_it_enters_the_header() {
                         }
                     })
                     .collect();
-                if matches!(
-                    presentation,
-                    k10s_atlas::WorkloadPresentation::Medallion
-                        | k10s_atlas::WorkloadPresentation::Detailed
-                ) {
+                if stage >= 2
+                    && matches!(
+                        presentation,
+                        k10s_atlas::WorkloadPresentation::Medallion
+                            | k10s_atlas::WorkloadPresentation::Detailed
+                    )
+                {
                     assert_eq!(
                         glyphs.len(),
                         1,
@@ -2708,6 +2719,590 @@ fn hidden_workloads_keep_literal_world_relationship_anchors() {
             );
             assert!(sink.fg.is_empty());
             assert_eq!(sink.edges, vec![[expected, expected, expected]]);
+        }
+    }
+}
+
+fn overview_fixture(sparse: bool, indexed: bool) -> (SceneSnapshot, usize) {
+    let mut scene = small_workload(State::OK, sparse);
+    let block = if sparse {
+        let actual = scene.blocks[0].clone();
+        scene.blocks[0].rect = Rect::default();
+        scene.blocks[0].inner = Rect::default();
+        scene.blocks[0].children = 0..0;
+        scene.blocks[0].sats = 0..0;
+        let empty = scene.blocks[0].clone();
+        scene.blocks.push(empty);
+        scene.blocks.push(actual);
+        scene.region_blocks = vec![2];
+        Arc::make_mut(&mut scene.ids).blocks = ["", "", "workload"]
+            .into_iter()
+            .map(Arc::<str>::from)
+            .collect();
+        2
+    } else {
+        0
+    };
+    for index in 1..129 {
+        let mut region = scene.regions[0].clone();
+        region.rect = Rect::new(index as f32 * 2000.0, 0.0, 400.0, 300.0);
+        region.label = format!("distant-{index}").into();
+        region.children = 0..0;
+        region.ext.workload_label = NsExt::workload_label(0);
+        scene.regions.push(region);
+        Arc::make_mut(&mut scene.ids)
+            .regions
+            .push(format!("namespace-{index}").into());
+    }
+    scene.bounds = Rect::new(0.0, 0.0, 256400.0, 300.0);
+    scene.rebuild_spatial_index();
+    if !indexed {
+        scene.spatial_index = Default::default();
+    }
+    (scene, block)
+}
+
+#[test]
+fn namespace_overview_has_literal_rows_and_one_shared_indexed_locator() {
+    use crate::overlay::{OverlayFrame, OverlayKind, OverlayMark, StampCache};
+    let pol = policy(Knobs::default());
+    let camera = Camera {
+        cx: 200.0,
+        cy: 150.0,
+        zoom: 2.0,
+    };
+    for sparse in [false, true] {
+        for indexed in [false, true] {
+            let (scene, block) = overview_fixture(sparse, indexed);
+            assert_eq!(
+                scene.region_index_is_selective(&camera.visible_world(VW, VH)),
+                indexed
+            );
+            let region_path = crate::PickPath {
+                region: 0,
+                block: None,
+                cell: None,
+                sat: None,
+            };
+            let child_paths = [
+                crate::PickPath {
+                    block: Some(block as u32),
+                    ..region_path
+                },
+                crate::PickPath {
+                    block: Some(block as u32),
+                    cell: Some(if sparse { 2 } else { 0 }),
+                    ..region_path
+                },
+                crate::PickPath {
+                    block: Some(block as u32),
+                    sat: Some(0),
+                    ..region_path
+                },
+            ];
+            for stage in [0, 1] {
+                let blend = StageBlend::settled(stage);
+                for origin in [(0.0, 0.0), (47.25, 19.5)] {
+                    let bounds = Bounds {
+                        origin: point(px(origin.0), px(origin.1)),
+                        size: size(px(VW), px(VH)),
+                    };
+                    let opts = FrameOpts {
+                        policy: &pol,
+                        theme: &k10s_theme::K10S_DARK.map,
+                        type_: MapType::default(),
+                        edges_on: true,
+                        skip_blocks: false,
+                        hex: false,
+                    };
+                    let mut painted = Collect::default();
+                    let counts = walk(bounds, &scene, camera, blend, opts, &mut painted);
+                    assert_eq!(
+                        counts,
+                        crate::lod::cull(&scene, &camera, blend, VW, VH, opts)
+                    );
+                    assert_eq!((counts.quads, counts.labels, counts.icons), (2, 2, 1));
+                    assert_eq!(
+                        (counts.drawn_blocks, counts.drawn_cells, counts.drawn_sats),
+                        (0, 0, 0)
+                    );
+                    assert!(painted.fg.is_empty());
+                    assert_eq!(painted.labels[0].text, "payments-production-eu-west");
+                    assert_eq!(painted.labels[1].text, "1 workload");
+                    let expected_body = Bounds {
+                        origin: point(px(origin.0 + 400.0), px(origin.1 + 200.0)),
+                        size: size(px(800.0), px(600.0)),
+                    };
+                    assert_eq!(painted.bg[1].bounds, expected_body);
+                    assert!(painted.labels.iter().all(|job| job.whole_line
+                        && job.text_start == 0
+                        && job.prepared.is_none()));
+                    // Default type is 14 px with a 1.35 line height and a 4 px row gap.
+                    assert!((painted.labels[0].y - origin.1 - 479.1).abs() < 0.001);
+                    assert!((painted.labels[1].y - origin.1 - 502.0).abs() < 0.001);
+                    for job in &painted.labels {
+                        let row = Bounds {
+                            origin: point(px(job.x), px(job.y)),
+                            size: size(px(job.width), px(job.height)),
+                        };
+                        assert!(row.is_contained_within(&expected_body));
+                    }
+                    let outline = crate::primitive::mark_primitive_typed(
+                        &scene,
+                        region_path,
+                        camera,
+                        &pol,
+                        stage,
+                        (VW, VH),
+                        origin,
+                        MapType::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(outline.bounds, expected_body);
+                    assert_eq!(outline.corners, painted.bg[1].corner_radii);
+                    for path in child_paths {
+                        assert!(
+                            crate::primitive::mark_primitive_typed(
+                                &scene,
+                                path,
+                                camera,
+                                &pol,
+                                stage,
+                                (VW, VH),
+                                origin,
+                                MapType::default(),
+                            )
+                            .is_none()
+                        );
+                    }
+                    for world_point in [(55.0, 68.0), (55.0, 81.0), (219.0, 99.0)] {
+                        let (x, y) = camera.w2s(world_point.0, world_point.1, VW, VH);
+                        assert_eq!(
+                            crate::pick::pick(&scene, &camera, &pol, blend, VW, VH, x, y),
+                            Some(region_path)
+                        );
+                    }
+                    let overlay = OverlayFrame {
+                        kind: Some(OverlayKind::Policy),
+                        marks: ["namespace", "workload", "pod-current", "satellite"]
+                            .into_iter()
+                            .map(|uid| OverlayMark {
+                                uid: uid.into(),
+                                tint: Some(Severity::Warn),
+                                sparkline: None,
+                                label: None,
+                            })
+                            .collect(),
+                    };
+                    let stamps = overlay.visible_stamps_typed(
+                        &mut StampCache::default(),
+                        &scene,
+                        camera,
+                        &pol,
+                        blend,
+                        VW,
+                        VH,
+                        MapType::default(),
+                    );
+                    assert_eq!(stamps.len(), 1);
+                    assert_eq!(stamps[0].screen, Rect::new(400.0, 200.0, 800.0, 600.0));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn namespace_handoff_keeps_counts_and_children_on_the_displayed_side() {
+    use crate::overlay::{OverlayFrame, OverlayKind, OverlayMark, StampCache};
+    let pol = policy(Knobs::default());
+    let camera = Camera {
+        cx: 55.0,
+        cy: 68.0,
+        zoom: 2.4,
+    };
+    let (scene, block) = overview_fixture(true, true);
+    let path = crate::PickPath {
+        region: 0,
+        block: Some(block as u32),
+        cell: None,
+        sat: None,
+    };
+    for (from, to) in [(1, 2), (2, 1)] {
+        for t in [0.0, 0.49, 0.5, 0.51, 1.0] {
+            let blend = StageBlend { from, to, t };
+            let shown = if t < 0.5 { from } else { to };
+            let eased = t * t * (3.0 - 2.0 * t);
+            let expected_detail_alpha = if to == 2 { eased } else { 1.0 - eased };
+            let expected_overview_alpha = 1.0 - expected_detail_alpha;
+            let opts = FrameOpts {
+                policy: &pol,
+                theme: &k10s_theme::K10S_DARK.map,
+                type_: MapType::default(),
+                edges_on: false,
+                skip_blocks: false,
+                hex: false,
+            };
+            let mut sink = Collect::default();
+            let counts = walk(viewport(), &scene, camera, blend, opts, &mut sink);
+            assert_eq!(
+                counts,
+                crate::lod::cull(&scene, &camera, blend, VW, VH, opts)
+            );
+            assert_eq!(
+                sink.labels.iter().any(|job| job.text == "1 workload"),
+                shown == 1
+            );
+            assert_eq!(
+                sink.icons.iter().any(|job| matches!(job, IconJob::Wl(..))),
+                shown == 2
+            );
+            if shown == 1 {
+                assert!(expected_overview_alpha > 0.0);
+                assert!(
+                    sink.labels
+                        .iter()
+                        .all(|job| (job.color.a - expected_overview_alpha).abs() < 0.001)
+                );
+            } else {
+                assert!(expected_detail_alpha > 0.0);
+            }
+            assert!((workload_alpha(blend, &pol) - expected_detail_alpha).abs() < 0.001);
+            assert!((overview_alpha(blend) - expected_overview_alpha).abs() < 0.001);
+            assert_eq!(
+                crate::primitive::mark_primitive_typed(
+                    &scene,
+                    path,
+                    camera,
+                    &pol,
+                    shown,
+                    (VW, VH),
+                    (0.0, 0.0),
+                    MapType::default()
+                )
+                .is_some(),
+                shown == 2
+            );
+            let (x, y) = camera.w2s(55.0, 68.0, VW, VH);
+            assert_eq!(
+                crate::pick::pick(&scene, &camera, &pol, blend, VW, VH, x, y)
+                    .unwrap()
+                    .block,
+                (shown == 2).then_some(block as u32)
+            );
+            let overlay = OverlayFrame {
+                kind: Some(OverlayKind::Policy),
+                marks: vec![OverlayMark {
+                    uid: "workload".into(),
+                    tint: Some(Severity::Warn),
+                    sparkline: None,
+                    label: None,
+                }],
+            };
+            assert_eq!(
+                overlay
+                    .visible_stamps_typed(
+                        &mut StampCache::default(),
+                        &scene,
+                        camera,
+                        &pol,
+                        blend,
+                        VW,
+                        VH,
+                        MapType::default()
+                    )
+                    .len(),
+                usize::from(shown == 2)
+            );
+        }
+    }
+    let mut machine = k10s_atlas::StageMachine::new(crate::lod::STAGE_FADE_SECS);
+    assert_eq!(machine.settle(&pol, 1.0).walk_stage(), 1);
+    machine.update(&pol, camera.zoom, 0.0);
+    assert!(machine.animating());
+    let settled = machine.settle(&pol, camera.zoom);
+    assert!(settled.is_settled() && !machine.animating());
+    assert_eq!(settled.walk_stage(), 2);
+    let sink = walk_at_stage(&scene, camera, settled.walk_stage());
+    assert!(sink.icons.iter().any(|job| matches!(job, IconJob::Wl(..))));
+    assert!(!sink.labels.iter().any(|job| job.text == "1 workload"));
+    let exit_zoom = pol.stage_cell * pol.stage_exit - 0.001;
+    let exit = machine.settle(&pol, exit_zoom);
+    assert!(exit.is_settled() && !machine.animating());
+    assert_eq!(exit.walk_stage(), 1);
+    assert!(
+        walk_at_stage(
+            &scene,
+            Camera {
+                zoom: exit_zoom,
+                ..camera
+            },
+            exit.walk_stage()
+        )
+        .labels
+        .iter()
+        .any(|job| job.text == "1 workload")
+    );
+}
+
+#[test]
+fn overview_budgets_drop_whole_jobs_and_tiny_namespaces_remain_locators() {
+    let (mut scene, _) = overview_fixture(false, true);
+    let camera = Camera {
+        cx: 200.0,
+        cy: 150.0,
+        zoom: 2.0,
+    };
+    for max_labels in [0, 1, 2] {
+        let pol = LodPolicy {
+            max_labels,
+            max_icons: 0,
+            ..policy(Knobs::default())
+        };
+        let opts = FrameOpts {
+            policy: &pol,
+            theme: &k10s_theme::K10S_DARK.map,
+            type_: MapType::default(),
+            edges_on: false,
+            skip_blocks: false,
+            hex: false,
+        };
+        let mut sink = Collect::default();
+        let counts = walk(
+            viewport(),
+            &scene,
+            camera,
+            StageBlend::settled(1),
+            opts,
+            &mut sink,
+        );
+        assert_eq!(
+            (counts.labels, counts.labels_dropped, counts.icons_dropped),
+            (max_labels, 2 - max_labels, 1)
+        );
+        if max_labels == 1 {
+            assert_eq!(sink.labels[0].text, "payments-production-eu-west");
+        }
+    }
+    scene.regions[0].rect = Rect::new(0.0, 140.0, 400.0, 20.0);
+    scene.rebuild_spatial_index();
+    let single = walk_at_stage(&scene, camera, 1);
+    assert_eq!(single.labels.len(), 1);
+    assert_eq!(single.labels[0].text, "payments-production-eu-west");
+    assert!(single.icons.is_empty());
+    scene.regions[0].rect = Rect::new(192.0, 146.0, 16.0, 8.0);
+    scene.rebuild_spatial_index();
+    let sink = walk_at_stage(&scene, camera, 1);
+    assert_eq!(sink.bg.len(), 2);
+    assert!(sink.labels.is_empty() && sink.icons.is_empty() && sink.fg.is_empty());
+    assert_eq!(sink.bg[1].bounds.size, size(px(32.0), px(16.0)));
+    let pol = policy(Knobs::default());
+    assert_eq!(
+        crate::pick::pick(
+            &scene,
+            &camera,
+            &pol,
+            StageBlend::settled(1),
+            VW,
+            VH,
+            VW * 0.5,
+            VH * 0.5
+        )
+        .unwrap()
+        .block,
+        None
+    );
+}
+
+#[test]
+fn overview_suppression_preserves_explicit_stress_controls() {
+    let (scene, block) = overview_fixture(true, true);
+    let camera = Camera {
+        cx: 55.0,
+        cy: 68.0,
+        zoom: 2.4,
+    };
+    let path = crate::PickPath {
+        region: 0,
+        block: Some(block as u32),
+        cell: None,
+        sat: None,
+    };
+    for knobs in [
+        Knobs {
+            stress_quads: true,
+            ..Default::default()
+        },
+        Knobs {
+            stress_curves: true,
+            ..Default::default()
+        },
+    ] {
+        let pol = policy(knobs);
+        let opts = FrameOpts {
+            policy: &pol,
+            theme: &k10s_theme::K10S_DARK.map,
+            type_: MapType::default(),
+            edges_on: false,
+            skip_blocks: false,
+            hex: false,
+        };
+        let blend = StageBlend::settled(1);
+        let mut sink = Collect::default();
+        let counts = walk(viewport(), &scene, camera, blend, opts, &mut sink);
+        assert_eq!(
+            counts,
+            crate::lod::cull(&scene, &camera, blend, VW, VH, opts)
+        );
+        assert!(counts.drawn_blocks > 0);
+        assert!(!sink.labels.iter().any(|job| job.text == "1 workload"));
+        assert!(
+            crate::primitive::mark_primitive_typed(
+                &scene,
+                path,
+                camera,
+                &pol,
+                1,
+                (VW, VH),
+                (0.0, 0.0),
+                MapType::default()
+            )
+            .is_some()
+        );
+        assert_eq!(
+            workload_alpha(
+                StageBlend {
+                    from: 1,
+                    to: 2,
+                    t: 0.0
+                },
+                &pol
+            ),
+            1.0
+        );
+    }
+}
+
+#[test]
+fn published_namespace_totals_stay_exact_and_zero_observed_pods_never_show_healthy() {
+    use k10s_core::{Op, replay};
+    use k10s_world::{LayoutMode, PublishBench};
+
+    for mode in [LayoutMode::Spread, LayoutMode::Dense] {
+        let initial = [replay::scope("ns-quiet", "quiet", Op::Added)];
+        let mut bench = PublishBench::new(&initial, mode);
+        let cases = [
+            (vec![], 0, 0, "0 workloads", Severity::Unknown),
+            (
+                vec![replay::owner(
+                    "wl-a",
+                    "quiet",
+                    "a",
+                    KindId::DEPLOYMENT,
+                    Op::Added,
+                )],
+                1,
+                0,
+                "1 workload",
+                Severity::Unknown,
+            ),
+            (
+                vec![replay::owner("wl-b", "quiet", "b", KindId::JOB, Op::Added)],
+                2,
+                0,
+                "2 workloads",
+                Severity::Unknown,
+            ),
+            (
+                vec![replay::instance(
+                    "pod-a",
+                    "quiet",
+                    "wl-a",
+                    State::OK,
+                    Op::Added,
+                )],
+                2,
+                1,
+                "2 workloads",
+                Severity::Ok,
+            ),
+            (
+                vec![replay::instance(
+                    "pod-a",
+                    "quiet",
+                    "wl-a",
+                    State::of(ReasonId::CRASH_LOOP_BACK_OFF),
+                    Op::Modified,
+                )],
+                2,
+                1,
+                "2 workloads",
+                Severity::Err,
+            ),
+            (
+                vec![replay::instance(
+                    "pod-a",
+                    "quiet",
+                    "wl-a",
+                    State::OK,
+                    Op::Deleted,
+                )],
+                2,
+                0,
+                "2 workloads",
+                Severity::Unknown,
+            ),
+            (
+                vec![replay::owner(
+                    "wl-a",
+                    "quiet",
+                    "a",
+                    KindId::DEPLOYMENT,
+                    Op::Deleted,
+                )],
+                1,
+                0,
+                "1 workload",
+                Severity::Unknown,
+            ),
+            (
+                vec![replay::owner(
+                    "wl-b",
+                    "quiet",
+                    "b",
+                    KindId::JOB,
+                    Op::Deleted,
+                )],
+                0,
+                0,
+                "0 workloads",
+                Severity::Unknown,
+            ),
+        ];
+        for (events, workloads, observed_pods, expected_count, expected_status) in cases {
+            if !events.is_empty() {
+                bench.apply_events(&events);
+                bench.run_publish();
+            }
+            let snapshot = bench.snapshot();
+            let located = snapshot.locate("ns-quiet").unwrap();
+            let region = &snapshot.regions[located.slot];
+            assert_eq!(region.weight, observed_pods);
+            assert_eq!(snapshot.region_block_indices(located.slot).len(), workloads);
+            assert_eq!(region.ext.workload_label.as_ref(), expected_count);
+            let (cx, cy) = region.rect.center();
+            let camera = Camera { cx, cy, zoom: 2.0 };
+            for stage in [0, 1] {
+                let sink = walk_at_stage(&snapshot, camera, stage);
+                assert_eq!(sink.labels.len(), 2);
+                assert_eq!(sink.labels[0].text, "quiet");
+                assert_eq!(sink.labels[1].text, expected_count);
+                assert_eq!(sink.icons.len(), 1);
+                assert!(
+                    matches!(&sink.icons[0], IconJob::NamespaceStatus(severity, _) if *severity == expected_status)
+                );
+                assert!(sink.fg.is_empty());
+            }
         }
     }
 }
