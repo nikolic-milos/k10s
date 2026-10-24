@@ -516,11 +516,22 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         }
         let block_inside = region_inside || self.visible.contains(&block.rect);
         if presentation != WorkloadPresentation::Hidden || self.policy.stress_curves {
-            let (hub_x, hub_y) = block.inner.center();
-            let (x, y) = self
-                .camera
-                .w2s(hub_x, hub_y, self.viewport.0, self.viewport.1);
-            let hub = (self.origin.0 + x, self.origin.1 + y);
+            let hub = match geometry {
+                Some(geometry)
+                    if block.children.len() == 1
+                        && presentation == WorkloadPresentation::Detailed =>
+                {
+                    let center = geometry.body.bounds.center();
+                    (f32::from(center.x), f32::from(center.y))
+                }
+                _ => {
+                    let (hub_x, hub_y) = block.inner.center();
+                    let (x, y) = self
+                        .camera
+                        .w2s(hub_x, hub_y, self.viewport.0, self.viewport.1);
+                    (self.origin.0 + x, self.origin.1 + y)
+                }
+            };
             if DIRECT {
                 let start = block.sats.start as usize;
                 for (offset, satellite) in scene.sats[start..block.sats.end as usize]
@@ -848,17 +859,44 @@ impl<S: FrameSink> FrameWalk<'_, S> {
         }
 
         if self.edges_on && self.stage >= 2 && !self.policy.stress && !self.policy.stress_curves {
-            self.stats.edges =
-                k10s_atlas::walk_edges(scene, &self.visible, self.policy.max_edges, |a, b| {
+            let projection = self.projection();
+            let visible = self.visible;
+            self.stats.edges = k10s_atlas::walk_edge_candidates(
+                scene,
+                &visible,
+                self.policy.max_edges,
+                |edge, original| {
+                    let segment = if self.skip_blocks {
+                        original
+                    } else {
+                        projection.edge_segment(
+                            scene,
+                            edge,
+                            original,
+                            self.policy,
+                            self.stage,
+                            self.type_,
+                        )
+                    };
+                    if !segment.bounds().intersects(&visible) {
+                        return false;
+                    }
+                    let (a, b) = (original.a, original.b);
                     let hash = ((a.0.to_bits() as u64) << 32 ^ a.1.to_bits() as u64)
                         ^ ((b.0.to_bits() as u64) << 16 ^ b.1.to_bits() as u64);
-                    let a = self.camera.w2s(a.0, a.1, self.viewport.0, self.viewport.1);
-                    let b = self.camera.w2s(b.0, b.1, self.viewport.0, self.viewport.1);
+                    let a =
+                        self.camera
+                            .w2s(segment.a.0, segment.a.1, self.viewport.0, self.viewport.1);
+                    let b =
+                        self.camera
+                            .w2s(segment.b.0, segment.b.1, self.viewport.0, self.viewport.1);
                     let start = (self.origin.0 + a.0, self.origin.1 + a.1);
                     let end = (self.origin.0 + b.0, self.origin.1 + b.1);
                     let control = curve_ctrl(start, end, bow_jitter(hash) * 0.6);
                     self.sink.edge(start, control, end);
-                });
+                    true
+                },
+            );
         }
         self.stats
     }

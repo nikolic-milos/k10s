@@ -165,9 +165,9 @@ impl EdgeSegment {
     /// A horizontal or vertical edge has a degenerate box, and a degenerate box
     /// intersects nothing -- the line would vanish from the very index built to
     /// find it. `cull::edge_visible` fattens the same way when it tests an edge
-    /// against the viewport, and the two must keep agreeing: an index whose
-    /// boxes are thinner than the visibility test's would hand the walk edges it
-    /// then drops, and a fatter one would hide edges that are on screen.
+    /// against the viewport. Index bounds must cover that box so they cannot
+    /// discard a visible segment. Conservative index bounds may be larger;
+    /// final segment visibility still decides which candidates are admitted.
     pub fn bounds(self) -> Rect {
         Rect::new(
             self.a.0.min(self.b.0),
@@ -261,6 +261,23 @@ impl EdgeIndex {
         )
     }
 
+    #[cfg(any(test, feature = "testing"))]
+    pub fn selective_candidate_count(&self, visible: &Rect) -> Option<usize> {
+        if self.root == NO_EDGE_INDEX_NODE {
+            return None;
+        }
+        let mut candidates = 0;
+        let mut visited = 0;
+        self.count_candidates(
+            self.root,
+            visible,
+            EDGE_INDEX_CANDIDATE_LIMIT,
+            &mut candidates,
+            &mut visited,
+        )
+        .then_some(candidates)
+    }
+
     pub(crate) fn for_each_candidate(
         &self,
         visible: &Rect,
@@ -332,7 +349,10 @@ fn build_edge_index_node<R, B, C, S>(
 
     if end - start <= EDGE_INDEX_LEAF_LEN as u32 {
         let bounds = (start..end)
-            .filter_map(|i| scene.edge_segments[i as usize].map(EdgeSegment::bounds))
+            .filter_map(|i| {
+                scene.edge_segments[i as usize]
+                    .map(|segment| edge_candidate_bounds(scene, scene.edges[i as usize], segment))
+            })
             .reduce(rect_union)?;
         nodes[slot as usize] = EdgeIndexNode {
             bounds,
@@ -379,6 +399,29 @@ fn rect_union(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 pub(crate) fn edge_bounds<R, B, C, S>(scene: &Scene<R, B, C, S>, edge: Edge) -> Option<Rect> {
     resolve_edge(scene, edge).map(EdgeSegment::bounds)
+}
+
+/// A single-child block mark may move anywhere inside its layout card.
+/// Include the segment's one-unit minimum thickness at the far edges too.
+pub(crate) fn edge_candidate_bounds<R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    edge: Edge,
+    segment: EdgeSegment,
+) -> Rect {
+    let mut bounds = segment.bounds();
+    for endpoint in [edge.a, edge.b] {
+        if endpoint.level() == Level::Block {
+            let block = &scene.blocks[endpoint.index() as usize];
+            if block.children.len() == 1 {
+                let inner = block.inner;
+                bounds = rect_union(
+                    bounds,
+                    Rect::new(inner.x, inner.y, inner.w + 1.0, inner.h + 1.0),
+                );
+            }
+        }
+    }
+    bounds
 }
 
 pub(crate) fn resolve_edge<R, B, C, S>(

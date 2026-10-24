@@ -453,7 +453,15 @@ mod tests {
                 let mut probes = vec![
                     (padding, Level::Region, None),
                     (heading, Level::Block, None),
-                    (hub, Level::Block, None),
+                    (
+                        hub,
+                        if pods == 0 {
+                            Level::Block
+                        } else {
+                            Level::Region
+                        },
+                        None,
+                    ),
                 ];
                 if pods == 1 {
                     let pod = projection

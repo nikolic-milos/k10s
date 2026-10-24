@@ -91,6 +91,8 @@ pub(crate) struct Collect {
     pub(crate) icons: Vec<IconJob>,
     pub(crate) bg: Vec<PaintQuad>,
     pub(crate) fg: Vec<PaintQuad>,
+    pub(crate) curves: Vec<[(f32, f32); 3]>,
+    pub(crate) edges: Vec<[(f32, f32); 3]>,
 }
 
 impl FrameSink for Collect {
@@ -107,8 +109,12 @@ impl FrameSink for Collect {
         self.icons.push(icon);
     }
     fn hex_ring(&mut self, _: &[(f32, f32); 6]) {}
-    fn curve(&mut self, _: (f32, f32), _: (f32, f32), _: (f32, f32)) {}
-    fn edge(&mut self, _: (f32, f32), _: (f32, f32), _: (f32, f32)) {}
+    fn curve(&mut self, hub: (f32, f32), ctrl: (f32, f32), sat: (f32, f32)) {
+        self.curves.push([hub, ctrl, sat]);
+    }
+    fn edge(&mut self, a: (f32, f32), ctrl: (f32, f32), b: (f32, f32)) {
+        self.edges.push([a, ctrl, b]);
+    }
 }
 
 pub(crate) fn icon_bounds(job: &IconJob) -> Bounds<Pixels> {

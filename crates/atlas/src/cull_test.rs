@@ -1516,3 +1516,300 @@ fn fade_counts_exactly_one_displayed_stage() {
         assert_eq!(fading, expected, "fade {blend:?} counted both stages");
     }
 }
+
+#[test]
+fn typed_edge_candidates_cover_moved_marks_without_spending_rejected_budget() {
+    for cross in [false, true] {
+        let mut indexed = scattered_edge_scene();
+        for (index, block) in indexed.blocks.iter_mut().enumerate() {
+            block.children = index as u32..index as u32 + 1;
+            indexed.cells.push(CellNode {
+                rect: Rect::new(block.inner.x + 4.0, 114.0, 10.0, 4.0),
+                label: "child".into(),
+                ext: (),
+            });
+        }
+        for (index, edge) in indexed.edges.iter_mut().enumerate() {
+            if !index.is_multiple_of(2) {
+                std::mem::swap(&mut edge.a, &mut edge.b);
+            }
+        }
+        if cross {
+            indexed.regions[0].children = 0..1;
+            indexed.regions.push(RegionNode {
+                rect: indexed.regions[0].rect,
+                label: "other".into(),
+                weight: 1,
+                children: 1..indexed.blocks.len() as u32,
+                ext: (),
+            });
+            indexed.region_edges = vec![0..0, 0..0];
+            indexed.cross_edges = 0..indexed.edges.len() as u32;
+        }
+        indexed.rebuild_edge_indexes();
+        let index = if cross {
+            &indexed.cross_edge_index
+        } else {
+            &indexed.region_edge_indexes[0]
+        };
+        let mut reached = 0;
+        let mut admitted = 0;
+        for step in 0..ROW_EDGES {
+            let visible = Rect::new(step as f32 * ROW_PITCH, 117.0, ROW_PITCH * 2.5, 2.0);
+            reached += usize::from(index.is_selective(&visible));
+            assert_eq!(walk_edges(&indexed, &visible, usize::MAX, |_, _| {}), 0);
+            for budget in [0, 1, 2, 7, usize::MAX] {
+                let expected: Vec<_> = indexed
+                    .edges
+                    .iter()
+                    .copied()
+                    .filter(|edge| {
+                        // Literal marks at y118, beyond the old center line at y110.
+                        // An explicit rejection must leave the first budget slot free.
+                        let ax = indexed.blocks[edge.a.index() as usize].inner.x + 10.0;
+                        let bx = indexed.blocks[edge.b.index() as usize].inner.x + 10.0;
+                        !edge.a.index().is_multiple_of(3)
+                            && ax.min(bx) < visible.max_x()
+                            && visible.x < ax.max(bx).max(ax.min(bx) + 1.0)
+                    })
+                    .take(budget)
+                    .collect();
+                for cached in [false, true] {
+                    for use_index in [false, true] {
+                        let mut scene = indexed.clone();
+                        if !cached {
+                            scene.edge_segments.clear();
+                        }
+                        if !use_index {
+                            scene.region_edge_indexes.clear();
+                            scene.cross_edge_index = Default::default();
+                        }
+                        let mut actual = Vec::new();
+                        let count =
+                            walk_edge_candidates(&scene, &visible, budget, |edge, original| {
+                                assert_eq!(
+                                    original.a,
+                                    scene.blocks[edge.a.index() as usize].inner.center()
+                                );
+                                assert_eq!(
+                                    original.b,
+                                    scene.blocks[edge.b.index() as usize].inner.center()
+                                );
+                                if edge.a.index().is_multiple_of(3) {
+                                    return false;
+                                }
+                                let ax = original.a.0;
+                                let bx = original.b.0;
+                                let intersects = ax.min(bx) < visible.max_x()
+                                    && visible.x < ax.max(bx).max(ax.min(bx) + 1.0);
+                                if intersects {
+                                    actual.push(edge);
+                                }
+                                intersects
+                            });
+                        assert_eq!(count, expected.len(), "cross {cross}, budget {budget}");
+                        assert_eq!(actual, expected);
+                        admitted += count;
+                    }
+                }
+            }
+        }
+        assert!(
+            reached > 0,
+            "the conservative index must actually answer a selective query"
+        );
+        assert!(
+            admitted > 0,
+            "the moved marks must actually enter the viewport"
+        );
+        assert_eq!(
+            walk_edge_candidates(
+                &indexed,
+                &Rect::new(-100.0, -100.0, 2.0, 2.0),
+                usize::MAX,
+                |_, _| panic!("an outside envelope reached admission")
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+fn indexed_moved_endpoint_candidates_include_the_minimum_segment_thickness() {
+    for cross in [false, true] {
+        let mut indexed = scattered_edge_scene();
+        let target = Edge::blocks(0, 1);
+        assert_eq!(indexed.edges[0], target);
+        indexed.blocks[0].children = 0..1;
+        indexed.blocks[1].children = 1..2;
+        indexed.blocks[1].rect = Rect::new(20.0, 100.0, 20.0, 20.0);
+        indexed.blocks[1].inner = indexed.blocks[1].rect;
+        indexed.cells = vec![
+            CellNode {
+                rect: Rect::new(19.5, 119.5, 0.5, 0.5),
+                label: "left".into(),
+                ext: (),
+            },
+            CellNode {
+                rect: Rect::new(20.0, 119.5, 0.5, 0.5),
+                label: "right".into(),
+                ext: (),
+            },
+        ];
+        indexed.totals.cells = 2;
+        if cross {
+            for (index, block) in indexed.blocks.iter_mut().enumerate() {
+                let x = if index.is_multiple_of(2) { 0.0 } else { 20.0 };
+                let y = 100.0 + (index / 2) as f32 * ROW_PITCH;
+                block.rect = Rect::new(x, y, 20.0, 20.0);
+                block.inner = block.rect;
+            }
+            indexed.edges = (0..ROW_EDGES)
+                .map(|index| Edge::blocks(index as u32, (index ^ 1) as u32))
+                .collect();
+            let left = (0..indexed.blocks.len()).step_by(2);
+            let right = (1..indexed.blocks.len()).step_by(2);
+            let boundary = left.len() as u32;
+            indexed.region_blocks = left.chain(right).map(|index| index as u32).collect();
+            let height = 140.0 + (ROW_EDGES / 2) as f32 * ROW_PITCH;
+            indexed.bounds = Rect::new(0.0, 0.0, 40.0, height);
+            indexed.regions[0].rect = Rect::new(0.0, 0.0, 20.0, height);
+            indexed.regions[0].children = 0..boundary;
+            indexed.regions.push(RegionNode {
+                rect: Rect::new(20.0, 0.0, 20.0, height),
+                label: "other".into(),
+                weight: 1,
+                children: boundary..indexed.blocks.len() as u32,
+                ext: (),
+            });
+            indexed.totals.regions = 2;
+            indexed.region_edges = vec![0..0, 0..0];
+            indexed.cross_edges = 0..ROW_EDGES as u32;
+        }
+        indexed.rebuild_edge_indexes();
+        // The endpoint marks stop before x20.5/y120.5. Their minimum one-unit
+        // segment box reaches the strip beyond them and both layout cards.
+        let visible = Rect::new(20.5, 120.5, 0.1, 0.1);
+        let index = if cross {
+            &indexed.cross_edge_index
+        } else {
+            &indexed.region_edge_indexes[0]
+        };
+        assert!(
+            index
+                .selective_candidate_count(&visible)
+                .is_some_and(|count| count > 0)
+        );
+        assert_eq!(walk_edges(&indexed, &visible, usize::MAX, |_, _| {}), 0);
+        for budget in [0, 1, 2, usize::MAX] {
+            let expected = if budget == 0 { vec![] } else { vec![target] };
+            for cached in [false, true] {
+                for use_index in [false, true] {
+                    let mut scene = indexed.clone();
+                    if !cached {
+                        scene.edge_segments.clear();
+                    }
+                    if !use_index {
+                        scene.region_edge_indexes.clear();
+                        scene.cross_edge_index = Default::default();
+                    }
+                    let mut actual = Vec::new();
+                    let count = walk_edge_candidates(&scene, &visible, budget, |edge, original| {
+                        let segment = if edge == target {
+                            assert_eq!(original.a, (10.0, 110.0));
+                            assert_eq!(original.b, (30.0, 110.0));
+                            crate::scene::EdgeSegment {
+                                a: (19.75, 119.75),
+                                b: (20.25, 119.75),
+                            }
+                        } else {
+                            original
+                        };
+                        let (ax, ay) = segment.a;
+                        let (bx, by) = segment.b;
+                        let intersects = ax.min(bx) < 20.6
+                            && 20.5 < ax.min(bx) + (ax - bx).abs().max(1.0)
+                            && ay.min(by) < 120.6
+                            && 120.5 < ay.min(by) + (ay - by).abs().max(1.0);
+                        if intersects {
+                            actual.push(edge);
+                        }
+                        intersects
+                    });
+                    assert_eq!(count, expected.len());
+                    assert_eq!(
+                        actual, expected,
+                        "cross {cross}, cached {cached}, indexed {use_index}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn local_moved_endpoint_candidates_reach_beyond_the_region_by_the_segment_thickness() {
+    let mut indexed = scattered_edge_scene();
+    let target = Edge::blocks(0, 1);
+    assert_eq!(indexed.edges[0], target);
+    indexed.blocks[0].children = 0..1;
+    indexed.blocks[1].children = 1..2;
+    indexed.blocks[1].rect = Rect::new(20.0, 100.0, 20.0, 20.0);
+    indexed.blocks[1].inner = indexed.blocks[1].rect;
+    indexed.cells = vec![
+        CellNode {
+            rect: Rect::new(19.5, 119.5, 0.5, 0.5),
+            label: "left".into(),
+            ext: (),
+        },
+        CellNode {
+            rect: Rect::new(20.0, 119.5, 0.5, 0.5),
+            label: "right".into(),
+            ext: (),
+        },
+    ];
+    indexed.totals.cells = 2;
+    indexed.bounds.h = 120.0;
+    indexed.regions[0].rect.h = 120.0;
+    indexed.rebuild_edge_indexes();
+    let visible = Rect::new(20.5, 120.5, 0.1, 0.1);
+    assert!(!indexed.regions[0].rect.intersects(&visible));
+    let moved = crate::scene::EdgeSegment {
+        a: (19.75, 119.75),
+        b: (20.25, 119.75),
+    };
+    assert_eq!(moved.bounds(), Rect::new(19.75, 119.75, 1.0, 1.0));
+    assert!(moved.bounds().intersects(&visible));
+    assert!(
+        indexed.region_edge_indexes[0]
+            .selective_candidate_count(&visible)
+            .is_some_and(|count| count > 0)
+    );
+    for cached in [false, true] {
+        for use_index in [false, true] {
+            let mut scene = indexed.clone();
+            if !cached {
+                scene.edge_segments.clear();
+            }
+            if !use_index {
+                scene.region_edge_indexes.clear();
+            }
+            assert_eq!(walk_edges(&scene, &visible, usize::MAX, |_, _| {}), 0);
+            for budget in [0, 1, 2] {
+                let mut actual = Vec::new();
+                let count = walk_edge_candidates(&scene, &visible, budget, |edge, original| {
+                    if edge != target {
+                        return false;
+                    }
+                    assert_eq!(original.a, (10.0, 110.0));
+                    assert_eq!(original.b, (30.0, 110.0));
+                    actual.push(edge);
+                    true
+                });
+                let expected = if budget == 0 { vec![] } else { vec![target] };
+                assert_eq!(count, expected.len());
+                assert_eq!(actual, expected, "cached {cached}, indexed {use_index}");
+            }
+        }
+    }
+}

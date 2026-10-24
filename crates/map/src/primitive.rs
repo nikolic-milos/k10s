@@ -1,5 +1,5 @@
 use gpui::{Bounds, Corners, Pixels, Point, point, px, size};
-use k10s_atlas::{Camera, LodPolicy, Scene, WorkloadPresentation};
+use k10s_atlas::{Camera, Edge, EdgeSegment, Level, LodPolicy, Scene, WorkloadPresentation};
 use k10s_core::{Rect, SceneSnapshot};
 use k10s_theme::{MapType, quantize};
 
@@ -258,10 +258,55 @@ impl Projection {
         }
     }
 
+    /// Keep relationship admission in world units while the anchor follows the
+    /// same displayed body as paint, picking and selection.
+    #[inline]
+    pub(crate) fn edge_segment<R, B, C, S>(
+        self,
+        scene: &Scene<R, B, C, S>,
+        edge: Edge,
+        segment: EdgeSegment,
+        policy: &LodPolicy,
+        stage: u8,
+        type_: MapType,
+    ) -> EdgeSegment {
+        let projection = Self::new(self.camera, self.viewport, (0.0, 0.0));
+        let anchor = |endpoint: k10s_atlas::Endpoint, world| {
+            if endpoint.level() != Level::Block {
+                return world;
+            }
+            let index = endpoint.index() as usize;
+            let block = &scene.blocks[index];
+            if block.children.len() != 1 {
+                return world;
+            }
+            let presentation =
+                workload_presentation(policy, block.inner, self.camera.zoom, stage, type_);
+            if presentation != WorkloadPresentation::Detailed {
+                return world;
+            }
+            let center = projection
+                .workload(scene, index, stage, type_, presentation)
+                .body
+                .bounds
+                .center();
+            self.camera.s2w(
+                f32::from(center.x),
+                f32::from(center.y),
+                self.viewport.0,
+                self.viewport.1,
+            )
+        };
+        EdgeSegment {
+            a: anchor(edge.a, segment.a),
+            b: anchor(edge.b, segment.b),
+        }
+    }
+
     /// Zero or one observed Pod uses compact geometry at every card stage so
-    /// adding detail cannot suddenly shrink the same target. Both retain the
-    /// published hub and child center without moving relationship anchors.
-    /// Multiple Pods keep their layout chrome and placement.
+    /// adding detail cannot suddenly shrink the same target. An occupied card
+    /// follows its displayed Pod without reserving space for the world hub.
+    /// Empty cards retain the hub; multiple Pods keep their layout chrome.
     #[inline]
     pub(crate) fn workload_card<R, B, C, S>(
         self,
@@ -274,15 +319,13 @@ impl Projection {
         let mut body = self.card(block.inner);
         let compact = block.children.len() <= 1;
         let heading = if compact {
-            let (x, y) = block.inner.center();
-            let hub = self.bounds(Rect::new(x, y, 0.0, 0.0));
-            let content = scene
-                .block_cell_indices(block_index)
-                .next()
-                .map_or(hub, |index| {
-                    self.cell_body(scene.cells[index].rect, stage, type_).bounds
-                })
-                .union(&hub);
+            let content = scene.block_cell_indices(block_index).next().map_or_else(
+                || {
+                    let (x, y) = block.inner.center();
+                    self.bounds(Rect::new(x, y, 0.0, 0.0))
+                },
+                |index| self.cell_body(scene.cells[index].rect, stage, type_).bounds,
+            );
             let width =
                 content.size.width.max(px(name_min_width(type_).ceil())) + px(TEXT_PAD * 2.0);
             let top = content.origin.y - px(TEXT_PAD + name_band_height(type_) + HEADING_CLEARANCE);
@@ -295,6 +338,10 @@ impl Projection {
                 .intersect(&body.bounds),
             );
             let mut band = body.bounds.inset(px(TEXT_PAD));
+            if !block.children.is_empty() {
+                let bottom = band.bottom().min(content.origin.y - px(HEADING_CLEARANCE));
+                band.size.height = (bottom - band.origin.y).max(px(0.0));
+            }
             let heading = self.name_band_bounds(band, type_);
             if heading.is_some() || !block.children.is_empty() {
                 heading
@@ -613,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn small_workloads_bound_chrome_without_moving_pods_or_hubs() {
+    fn small_workloads_bound_chrome_without_moving_pod_centers() {
         let mut scene = one_pod_scene();
         for pods in [1, 0] {
             scene.blocks[0].children = 0..pods;
@@ -638,7 +685,9 @@ mod tests {
                     let envelope = projection.bounds(scene.blocks[0].inner);
                     let hub = projection.bounds(Rect::new(55.0, 68.0, 0.0, 0.0)).origin;
                     assert!(geometry.body.bounds.is_contained_within(&envelope));
-                    assert!(geometry.body.contains(hub));
+                    if pods == 0 {
+                        assert!(geometry.body.contains(hub));
+                    }
                     let heading = geometry.heading.expect("the heading fits");
                     assert!(heading.bounds.is_contained_within(&geometry.body.bounds));
                     if pods == 1 {
@@ -659,7 +708,7 @@ mod tests {
                     }
                     if font == 14.0 {
                         assert_eq!(geometry.body.bounds.size.width, px(168.0));
-                        let height = if pods == 1 { 319.2 } else { 100.0 };
+                        let height = if pods == 1 { 164.0 } else { 100.0 };
                         assert!(
                             (f32::from(geometry.body.bounds.size.height) - height).abs() < 0.001
                         );
@@ -865,7 +914,11 @@ mod tests {
         let envelope = projection.bounds(scene.blocks[0].inner);
         assert_eq!(geometry.body.bounds.origin.y, envelope.origin.y);
         assert!(geometry.body.bounds.is_contained_within(&envelope));
-        assert!(geometry.body.contains(envelope.center()));
+        assert!(
+            geometry
+                .body
+                .contains(projection.bounds(scene.cells[0].rect).center())
+        );
         if let Some(heading) = geometry.heading {
             assert!(heading.bounds.is_contained_within(&geometry.body.bounds));
         }

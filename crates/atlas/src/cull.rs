@@ -620,6 +620,30 @@ pub fn walk_edges<R, B, C, S>(
     max_edges: usize,
     mut emit: impl FnMut((f32, f32), (f32, f32)),
 ) -> usize {
+    walk_edges_inner::<false, R, B, C, S>(scene, visible, max_edges, |_, segment| {
+        emit(segment.a, segment.b);
+        true
+    })
+}
+
+/// Visit typed candidates before final display-space admission. A single-child
+/// block's endpoint may move within its inner card. Returning false omits that
+/// candidate without consuming the edge budget; accepted edges keep scene order.
+pub fn walk_edge_candidates<R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    visible: &Rect,
+    max_edges: usize,
+    admit: impl FnMut(crate::scene::Edge, crate::scene::EdgeSegment) -> bool,
+) -> usize {
+    walk_edges_inner::<true, R, B, C, S>(scene, visible, max_edges, admit)
+}
+
+fn walk_edges_inner<const CANDIDATES: bool, R, B, C, S>(
+    scene: &Scene<R, B, C, S>,
+    visible: &Rect,
+    max_edges: usize,
+    mut admit: impl FnMut(crate::scene::Edge, crate::scene::EdgeSegment) -> bool,
+) -> usize {
     if max_edges == 0 || scene.edges.is_empty() {
         return 0;
     }
@@ -630,7 +654,17 @@ pub fn walk_edges<R, B, C, S>(
         for (region_index, (region, range)) in
             scene.regions.iter().zip(&scene.region_edges).enumerate()
         {
-            if range.is_empty() || !region.rect.intersects(visible) {
+            let bounds = if CANDIDATES {
+                Rect::new(
+                    region.rect.x,
+                    region.rect.y,
+                    region.rect.w + 1.0,
+                    region.rect.h + 1.0,
+                )
+            } else {
+                region.rect
+            };
+            if range.is_empty() || !bounds.intersects(visible) {
                 continue;
             }
             let used_index = scene
@@ -638,74 +672,78 @@ pub fn walk_edges<R, B, C, S>(
                 .get(region_index)
                 .is_some_and(|index| {
                     index.covers(range)
-                        && scan_indexed_edges(
-                            index, scene, visible, max_edges, &mut drawn, &mut emit,
+                        && scan_indexed_edges::<CANDIDATES, R, B, C, S>(
+                            index, scene, visible, max_edges, &mut drawn, &mut admit,
                         )
                 });
             if !used_index
-                && !scan_edges(
+                && !scan_edges::<CANDIDATES, R, B, C, S>(
                     scene,
                     range.start as usize..range.end as usize,
                     visible,
                     max_edges,
                     &mut drawn,
-                    &mut emit,
+                    &mut admit,
                 )
             {
                 return drawn;
             }
         }
         let used_index = scene.cross_edge_index.covers(&scene.cross_edges)
-            && scan_indexed_edges(
+            && scan_indexed_edges::<CANDIDATES, R, B, C, S>(
                 &scene.cross_edge_index,
                 scene,
                 visible,
                 max_edges,
                 &mut drawn,
-                &mut emit,
+                &mut admit,
             );
         if !used_index {
-            scan_edges(
+            scan_edges::<CANDIDATES, R, B, C, S>(
                 scene,
                 scene.cross_edges.start as usize..scene.cross_edges.end as usize,
                 visible,
                 max_edges,
                 &mut drawn,
-                &mut emit,
+                &mut admit,
             );
         }
     } else {
-        scan_edges(
+        scan_edges::<CANDIDATES, R, B, C, S>(
             scene,
             0..scene.edges.len(),
             visible,
             max_edges,
             &mut drawn,
-            &mut emit,
+            &mut admit,
         );
     }
     drawn
 }
 
 #[inline]
-fn scan_edges<R, B, C, S>(
+fn scan_edges<const CANDIDATES: bool, R, B, C, S>(
     scene: &Scene<R, B, C, S>,
     range: std::ops::Range<usize>,
     visible: &Rect,
     max_edges: usize,
     drawn: &mut usize,
-    emit: &mut impl FnMut((f32, f32), (f32, f32)),
+    admit: &mut impl FnMut(crate::scene::Edge, crate::scene::EdgeSegment) -> bool,
 ) -> bool {
     if let Some(segments) = scene.edge_segments.get(range.clone()) {
-        for &segment in segments {
+        for (&edge, &segment) in scene.edges[range].iter().zip(segments) {
             let Some(segment) = segment else {
                 continue;
             };
             if *drawn >= max_edges {
                 return false;
             }
-            if edge_visible(segment.a, segment.b, visible) {
-                emit(segment.a, segment.b);
+            let intersects = if CANDIDATES {
+                crate::scene::edge_candidate_bounds(scene, edge, segment).intersects(visible)
+            } else {
+                edge_visible(segment.a, segment.b, visible)
+            };
+            if intersects && admit(edge, segment) {
                 *drawn += 1;
             }
         }
@@ -719,27 +757,31 @@ fn scan_edges<R, B, C, S>(
         let Some(segment) = crate::scene::resolve_edge(scene, edge) else {
             continue;
         };
-        if edge_visible(segment.a, segment.b, visible) {
-            emit(segment.a, segment.b);
+        let intersects = if CANDIDATES {
+            crate::scene::edge_candidate_bounds(scene, edge, segment).intersects(visible)
+        } else {
+            edge_visible(segment.a, segment.b, visible)
+        };
+        if intersects && admit(edge, segment) {
             *drawn += 1;
         }
     }
     true
 }
 
-fn scan_indexed_edges<R, B, C, S>(
+fn scan_indexed_edges<const CANDIDATES: bool, R, B, C, S>(
     index: &crate::scene::EdgeIndex,
     scene: &Scene<R, B, C, S>,
     visible: &Rect,
     max_edges: usize,
     drawn: &mut usize,
-    emit: &mut impl FnMut((f32, f32), (f32, f32)),
+    admit: &mut impl FnMut(crate::scene::Edge, crate::scene::EdgeSegment) -> bool,
 ) -> bool {
     if !index.is_selective(visible) {
         return false;
     }
     index.for_each_candidate(visible, |range| {
-        scan_edges(scene, range, visible, max_edges, drawn, emit)
+        scan_edges::<CANDIDATES, R, B, C, S>(scene, range, visible, max_edges, drawn, admit)
     });
     true
 }

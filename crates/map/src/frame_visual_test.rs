@@ -1036,7 +1036,8 @@ fn a_workload_glyph_reaches_its_readable_size_without_outgrowing_its_halo() {
 
 #[test]
 fn workload_lod_never_stacks_medallion_card_and_pods() {
-    let scene = one_of_each(State::OK);
+    let mut scene = one_of_each(State::OK);
+    scene.cells[0].rect.x = scene.blocks[0].inner.center().0 - scene.cells[0].rect.w * 0.5;
     let block = &scene.blocks[0];
     let center = block.inner.center();
     let mid = Camera {
@@ -1064,6 +1065,18 @@ fn workload_lod_never_stacks_medallion_card_and_pods() {
     assert!(
         near_frame.fg.len() >= 4,
         "the detailed representation lost its card, chrome, or pod"
+    );
+    assert!(
+        near_frame
+            .labels
+            .iter()
+            .any(|label| label.text == scene.blocks[0].label.as_ref()),
+        "the detailed representation lost its workload heading"
+    );
+    let pod = Projection::new(near, (VW, VH), (0.0, 0.0)).bounds(scene.cells[0].rect);
+    assert!(
+        near_frame.fg.iter().any(|quad| quad.bounds == pod),
+        "the detailed representation lost its Pod"
     );
 
     let pol = policy(Knobs {
@@ -1707,7 +1720,11 @@ fn detailed_pods_keep_identity_status_and_picking_inside_the_same_body() {
 
 #[test]
 fn a_pinned_heading_selects_the_workload_and_excludes_obscured_pods() {
-    let scene = one_of_each(State::OK);
+    let mut scene = one_of_each(State::OK);
+    let mut second = scene.cells[0].clone();
+    second.rect.x += k10s_core::layout::POD_PITCH;
+    scene.cells.push(second);
+    scene.blocks[0].children = 0..2;
     let camera = Camera {
         cx: 55.0,
         cy: 105.0,
@@ -1772,7 +1789,11 @@ fn a_pinned_heading_selects_the_workload_and_excludes_obscured_pods() {
 
 #[test]
 fn large_workload_names_stay_in_the_visible_band_while_panning() {
-    let scene = one_of_each(State::OK);
+    let mut scene = one_of_each(State::OK);
+    let mut second = scene.cells[0].clone();
+    second.rect.x += k10s_core::layout::POD_PITCH;
+    scene.cells.push(second);
+    scene.blocks[0].children = 0..2;
     let type_ = k10s_theme::MapType::default();
     let mut observed = 0;
     for cx in [55.0, 95.0, 130.0] {
@@ -1818,4 +1839,875 @@ fn a_workload_without_observed_pods_does_not_claim_health() {
             .iter()
             .any(|job| matches!(job, IconJob::Status(Severity::Unknown, _)))
     );
+}
+
+#[test]
+fn published_compact_cards_follow_pods_without_repositioning_either_layout() {
+    use crate::overlay::{OverlayFrame, OverlayKind, OverlayMark, StampCache};
+    use k10s_core::{IngestEvent, Op, Payload, ResourceEvent, replay};
+    use k10s_world::{LayoutMode, PublishBench};
+
+    let pol = policy(Knobs::default());
+    let (vw, vh) = (8000.0, 6000.0);
+    for mode in [LayoutMode::Spread, LayoutMode::Dense] {
+        for pods in [0, 1, 4] {
+            for sparse in [false, true] {
+                let mut events = vec![
+                    replay::scope("ns-prod", "prod", Op::Added),
+                    replay::owner("wl-api", "prod", "api", KindId::DEPLOYMENT, Op::Added),
+                ];
+                if sparse {
+                    events.push(replay::instance(
+                        "retired",
+                        "prod",
+                        "wl-api",
+                        State::OK,
+                        Op::Added,
+                    ));
+                }
+                for index in 0..pods {
+                    events.push(replay::instance(
+                        &format!("pod-{index}"),
+                        "prod",
+                        "wl-api",
+                        State::OK,
+                        Op::Added,
+                    ));
+                }
+                events.push(IngestEvent::Resource(ResourceEvent {
+                    kind: KindId::SERVICE,
+                    uid: "svc-api".into(),
+                    namespace: "prod".into(),
+                    name: "svc-api".into(),
+                    resource_version: 0,
+                    parent: Some("wl-api".into()),
+                    op: Op::Added,
+                    payload: Payload::Attached {
+                        kind: KindId::SERVICE,
+                        detail: "ClusterIP".into(),
+                    },
+                }));
+                let mut bench = PublishBench::new(&events, mode);
+                if sparse {
+                    bench.apply_events(&[replay::instance(
+                        "retired",
+                        "prod",
+                        "wl-api",
+                        State::OK,
+                        Op::Deleted,
+                    )]);
+                    bench.run_publish();
+                }
+                let scene = bench.snapshot();
+                let index = scene.locate("wl-api").unwrap().slot;
+                let block = &scene.blocks[index];
+                assert_eq!(block.children.len(), pods);
+                if sparse && pods > 0 {
+                    assert!(!scene.block_cells.is_empty());
+                    assert!(scene.ids.cells[0].is_empty());
+                }
+                let cell_index = scene.block_cell_indices(index).next();
+                if pods == 1 {
+                    let rect = scene.cells[cell_index.unwrap()].rect;
+                    let (header, height) = match mode {
+                        LayoutMode::Spread => (26.0, 56.0),
+                        LayoutMode::Dense => (16.0, 46.0),
+                    };
+                    let (width, column) = if sparse { (44.0, 24.0) } else { (30.0, 10.0) };
+                    assert_eq!((block.inner.w, block.inner.h), (width, height));
+                    assert!((rect.x - block.inner.x - column).abs() < 0.001);
+                    assert!((rect.y - block.inner.y - header - 10.0).abs() < 0.001);
+                }
+                let path = crate::PickPath {
+                    region: block.ext.ns,
+                    block: Some(index as u32),
+                    cell: None,
+                    sat: None,
+                };
+                for (font, zoom, heading_height, empty_height, detail_height, detail_width) in [
+                    (14.0, 14.4, 80.0, 100.0, 164.0, 168.0),
+                    (32.0, 32.0, 103.0, 123.0, 226.0, 364.0),
+                ] {
+                    let type_ = MapType {
+                        workload: font,
+                        pod: font,
+                        ..Default::default()
+                    };
+                    for stage in [2, 3] {
+                        let center = if pods == 1 {
+                            scene.cells[cell_index.unwrap()].rect.center()
+                        } else {
+                            block.inner.center()
+                        };
+                        let camera = Camera {
+                            cx: center.0,
+                            cy: center.1,
+                            zoom,
+                        };
+                        let projection = Projection::new(camera, (vw, vh), (0.0, 0.0));
+                        let geometry = projection.workload_card(&scene, index, stage, type_);
+                        let heading = geometry.heading.expect("the complete heading fits");
+                        assert_eq!(heading.bounds.size.height, px(heading_height));
+                        if pods == 0 {
+                            assert_eq!(
+                                geometry.body.bounds.size,
+                                size(px(detail_width), px(empty_height))
+                            );
+                        } else if pods == 1 {
+                            let pod = projection
+                                .cell(
+                                    scene.cells[cell_index.unwrap()].rect,
+                                    stage,
+                                    type_,
+                                    Some(heading),
+                                )
+                                .expect("the Pod clears its heading");
+                            let height = if stage == 2 {
+                                heading_height + 84.0
+                            } else {
+                                detail_height
+                            };
+                            assert_eq!(
+                                geometry.body.bounds.size,
+                                size(px(detail_width), px(height))
+                            );
+                            assert_eq!(
+                                pod.bounds.center(),
+                                projection
+                                    .bounds(scene.cells[cell_index.unwrap()].rect)
+                                    .center()
+                            );
+                            assert_eq!(pod.bounds.origin.y - heading.bounds.bottom(), px(4.0));
+                            assert_eq!(
+                                geometry.body.bounds.bottom() - pod.bounds.bottom(),
+                                px(8.0)
+                            );
+                            let old_hub = projection
+                                .bounds(Rect::new(
+                                    block.inner.center().0,
+                                    block.inner.center().1,
+                                    0.0,
+                                    0.0,
+                                ))
+                                .origin;
+                            let hub_inside = !sparse && mode == LayoutMode::Dense && font == 14.0;
+                            assert_eq!(geometry.body.contains(old_hub), hub_inside);
+                            assert_eq!(
+                                crate::pick::pick_typed(
+                                    &scene,
+                                    &camera,
+                                    &pol,
+                                    StageBlend::settled(stage),
+                                    vw,
+                                    vh,
+                                    f32::from(old_hub.x),
+                                    f32::from(old_hub.y),
+                                    type_,
+                                )
+                                .unwrap()
+                                .block,
+                                hub_inside.then_some(index as u32)
+                            );
+                        } else {
+                            assert_eq!(geometry.body, projection.card(block.inner));
+                        }
+                        let opts = FrameOpts {
+                            policy: &pol,
+                            theme: &k10s_theme::K10S_DARK.map,
+                            type_,
+                            edges_on: false,
+                            skip_blocks: false,
+                            hex: false,
+                        };
+                        for origin in [(0.0, 0.0), (17.25, 23.5)] {
+                            let mut sink = Collect::default();
+                            let bounds = Bounds {
+                                origin: point(px(origin.0), px(origin.1)),
+                                size: size(px(vw), px(vh)),
+                            };
+                            let stats = walk(
+                                bounds,
+                                &scene,
+                                camera,
+                                StageBlend::settled(stage),
+                                opts,
+                                &mut sink,
+                            );
+                            assert_eq!(
+                                stats,
+                                crate::lod::cull(
+                                    &scene,
+                                    &camera,
+                                    StageBlend::settled(stage),
+                                    vw,
+                                    vh,
+                                    opts
+                                )
+                            );
+                            let translated = Projection::new(camera, (vw, vh), origin)
+                                .workload_card(&scene, index, stage, type_);
+                            assert!(
+                                sink.fg
+                                    .iter()
+                                    .any(|quad| quad.bounds == translated.body.bounds)
+                            );
+                            assert_eq!(
+                                crate::primitive::mark_primitive_typed(
+                                    &scene,
+                                    path,
+                                    camera,
+                                    &pol,
+                                    stage,
+                                    (vw, vh),
+                                    origin,
+                                    type_,
+                                ),
+                                Some(translated.body)
+                            );
+                            assert_eq!(sink.curves.len(), usize::from(mode.emits_attachments()));
+                            for [hub, _, end] in sink.curves {
+                                let expected = if pods == 1 {
+                                    translated.body.bounds.center()
+                                } else {
+                                    Projection::new(camera, (vw, vh), origin)
+                                        .bounds(Rect::new(
+                                            block.inner.center().0,
+                                            block.inner.center().1,
+                                            0.0,
+                                            0.0,
+                                        ))
+                                        .origin
+                                };
+                                assert_eq!(hub, (f32::from(expected.x), f32::from(expected.y)));
+                                assert!(translated.body.contains(point(px(hub.0), px(hub.1))));
+                                let sat = scene.block_sat_indices(index).next().unwrap();
+                                let target = Projection::new(camera, (vw, vh), origin)
+                                    .bounds(scene.sats[sat].rect)
+                                    .center();
+                                assert!((end.0 - f32::from(target.x)).abs() < 0.001);
+                                assert!((end.1 - f32::from(target.y)).abs() < 0.001);
+                            }
+                        }
+                        let overlay = OverlayFrame {
+                            kind: Some(OverlayKind::Policy),
+                            marks: vec![OverlayMark {
+                                uid: "wl-api".into(),
+                                tint: Some(Severity::Warn),
+                                sparkline: None,
+                                label: None,
+                            }],
+                        };
+                        let stamps = overlay.visible_stamps_typed(
+                            &mut StampCache::default(),
+                            &scene,
+                            camera,
+                            &pol,
+                            StageBlend::settled(stage),
+                            vw,
+                            vh,
+                            type_,
+                        );
+                        assert_eq!(stamps.len(), 1);
+                        assert_eq!(
+                            stamps[0].screen,
+                            Rect::new(
+                                f32::from(geometry.body.bounds.origin.x),
+                                f32::from(geometry.body.bounds.origin.y),
+                                f32::from(geometry.body.bounds.size.width),
+                                f32::from(geometry.body.bounds.size.height),
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_compact_heading_requires_room_above_the_visible_pod() {
+    use crate::overlay::{OverlayFrame, OverlayKind, OverlayMark, StampCache};
+
+    let scene = small_workload(State::OK, true);
+    let type_ = MapType::default();
+    let pol = policy(Knobs::default());
+    for (cy, top) in [(100.0, 164.0), (105.0, 84.0)] {
+        let camera = Camera {
+            cx: 55.0,
+            cy,
+            zoom: 16.0,
+        };
+        for stage in [2, 3] {
+            let blend = StageBlend::settled(stage);
+            let projection = Projection::new(camera, (VW, VH), (0.0, 0.0));
+            let geometry = projection.workload_card(&scene, 0, stage, type_);
+            assert!(geometry.heading.is_none());
+            let pod = projection
+                .cell(scene.cells[2].rect, stage, type_, geometry.heading)
+                .unwrap();
+            assert_eq!(pod.bounds.origin.y, px(top));
+            assert_eq!(pod.bounds.bottom(), px(top + 64.0));
+            let mut sink = Collect::default();
+            let opts = FrameOpts {
+                policy: &pol,
+                theme: &k10s_theme::K10S_DARK.map,
+                type_,
+                edges_on: false,
+                skip_blocks: false,
+                hex: false,
+            };
+            let stats = walk(viewport(), &scene, camera, blend, opts, &mut sink);
+            assert_eq!(
+                stats,
+                crate::lod::cull(&scene, &camera, blend, VW, VH, opts)
+            );
+            assert!(sink.fg.iter().any(|quad| quad.bounds == pod.bounds));
+            assert!(
+                !sink
+                    .labels
+                    .iter()
+                    .any(|label| label.text == scene.blocks[0].label.as_ref())
+            );
+            let center = pod.bounds.center();
+            let picked = crate::pick::pick_typed(
+                &scene,
+                &camera,
+                &pol,
+                blend,
+                VW,
+                VH,
+                f32::from(center.x),
+                f32::from(center.y),
+                type_,
+            )
+            .unwrap();
+            assert_eq!(picked.cell, Some(2));
+            assert_eq!(
+                crate::primitive::mark_primitive_typed(
+                    &scene,
+                    picked,
+                    camera,
+                    &pol,
+                    stage,
+                    (VW, VH),
+                    (0.0, 0.0),
+                    type_,
+                ),
+                Some(pod)
+            );
+            let overlay = OverlayFrame {
+                kind: Some(OverlayKind::Policy),
+                marks: vec![OverlayMark {
+                    uid: "pod-current".into(),
+                    tint: Some(Severity::Warn),
+                    sparkline: None,
+                    label: None,
+                }],
+            };
+            let stamps = overlay.visible_stamps_typed(
+                &mut StampCache::default(),
+                &scene,
+                camera,
+                &pol,
+                blend,
+                VW,
+                VH,
+                type_,
+            );
+            assert_eq!(stamps.len(), 1);
+            assert_eq!(
+                stamps[0].screen,
+                Rect::new(
+                    f32::from(pod.bounds.origin.x),
+                    f32::from(pod.bounds.origin.y),
+                    f32::from(pod.bounds.size.width),
+                    f32::from(pod.bounds.size.height),
+                )
+            );
+        }
+    }
+}
+
+fn published_edge_workloads(
+    mode: k10s_world::LayoutMode,
+    pods: usize,
+    sparse: bool,
+    owners: usize,
+) -> Arc<SceneSnapshot> {
+    use k10s_core::{IngestEvent, Op, Payload, replay};
+    use k10s_world::PublishBench;
+
+    let mut events = Vec::new();
+    let mut removals = Vec::new();
+    for namespace in 0..2 {
+        let ns = format!("ns{namespace}");
+        events.push(replay::scope(&format!("ns-{ns}"), &ns, Op::Added));
+        for index in 0..owners {
+            let uid = format!("wl-{namespace}-{index}");
+            let mut owner = replay::owner(&uid, &ns, &uid, KindId::DEPLOYMENT, Op::Added);
+            let IngestEvent::Resource(resource) = &mut owner else {
+                unreachable!()
+            };
+            let Payload::Owner { depends_on, .. } = &mut resource.payload else {
+                unreachable!()
+            };
+            depends_on.extend([
+                Arc::from(format!("wl-{namespace}-{}", index ^ 1)),
+                Arc::from(format!("wl-{}-{index}", 1 - namespace)),
+            ]);
+            events.push(owner);
+            if sparse {
+                let retired = format!("retired-{namespace}-{index}");
+                events.push(replay::instance(&retired, &ns, &uid, State::OK, Op::Added));
+                removals.push(replay::instance(
+                    &retired,
+                    &ns,
+                    &uid,
+                    State::OK,
+                    Op::Deleted,
+                ));
+            }
+            for pod in 0..pods {
+                events.push(replay::instance(
+                    &format!("pod-{namespace}-{index}-{pod}"),
+                    &ns,
+                    &uid,
+                    State::OK,
+                    Op::Added,
+                ));
+            }
+        }
+    }
+    let mut bench = PublishBench::new(&events, mode);
+    if sparse {
+        bench.apply_events(&removals);
+        bench.run_publish();
+    }
+    bench.snapshot()
+}
+
+fn expected_published_edge_anchor(
+    scene: &SceneSnapshot,
+    endpoint: k10s_core::Endpoint,
+    camera: Camera,
+    viewport: (f32, f32),
+    origin: (f32, f32),
+    heading_offset: f32,
+) -> (f32, f32) {
+    let block = &scene.blocks[endpoint.index() as usize];
+    let center = if block.children.len() == 1 {
+        let cell = scene
+            .block_cell_indices(endpoint.index() as usize)
+            .next()
+            .unwrap();
+        scene.cells[cell].rect.center()
+    } else {
+        block.inner.center()
+    };
+    let (x, y) = camera.w2s(center.0, center.1, viewport.0, viewport.1);
+    (
+        origin.0 + x,
+        origin.1 + y
+            - if block.children.len() == 1 {
+                heading_offset
+            } else {
+                0.0
+            },
+    )
+}
+
+#[test]
+fn published_relationships_follow_compact_marks_in_both_directions() {
+    use k10s_world::LayoutMode;
+
+    for mode in [LayoutMode::Spread, LayoutMode::Dense] {
+        for pods in [0, 1, 4] {
+            for sparse in [false, true] {
+                let scene = published_edge_workloads(mode, pods, sparse, 2);
+                assert_eq!(scene.edges.len(), 8);
+                assert_eq!(scene.cross_edges.len(), 4);
+                assert_eq!(scene.block_cell_indices(0).len(), pods);
+                if sparse && pods == 1 {
+                    assert!(scene.ids.cells[0].is_empty());
+                    let cell = scene.block_cell_indices(0).next().unwrap();
+                    assert_eq!(scene.cells[cell].rect.x - scene.blocks[0].inner.x, 24.0);
+                    assert_eq!(scene.blocks[0].inner.w, 44.0);
+                }
+                let (vw, vh) = (80000.0, 60000.0);
+                let center = scene.bounds.center();
+                for (font, zoom, offset) in [
+                    (8.0, 14.4, 42.0),
+                    (14.0, 14.4, 42.0),
+                    (24.0, 24.0, 42.5),
+                    (32.0, 32.0, 53.5),
+                ] {
+                    let type_ = MapType {
+                        workload: font,
+                        pod: font,
+                        ..Default::default()
+                    };
+                    let camera = Camera {
+                        cx: center.0,
+                        cy: center.1,
+                        zoom,
+                    };
+                    let visible = camera.visible_world(vw, vh);
+                    assert!(visible.contains(&scene.bounds));
+                    for stage in [2, 3] {
+                        for budget in [0, 1, 7, 8, 9] {
+                            let mut pol = policy(Knobs::default());
+                            pol.max_edges = budget;
+                            let opts = FrameOpts {
+                                policy: &pol,
+                                theme: &k10s_theme::K10S_DARK.map,
+                                type_,
+                                edges_on: true,
+                                skip_blocks: false,
+                                hex: false,
+                            };
+                            let mut original = Vec::new();
+                            let count = k10s_atlas::walk_edges(&scene, &visible, budget, |a, b| {
+                                original.push((a, b))
+                            });
+                            assert_eq!(count, budget.min(8));
+                            let world_expected: Vec<_> = scene
+                                .edges
+                                .iter()
+                                .take(budget)
+                                .map(|edge| {
+                                    (
+                                        scene.blocks[edge.a.index() as usize].inner.center(),
+                                        scene.blocks[edge.b.index() as usize].inner.center(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(original, world_expected);
+                            for origin in [(0.0, 0.0), (17.25, 23.5)] {
+                                let mut sink = Collect::default();
+                                let stats = walk(
+                                    Bounds {
+                                        origin: point(px(origin.0), px(origin.1)),
+                                        size: size(px(vw), px(vh)),
+                                    },
+                                    &scene,
+                                    camera,
+                                    StageBlend::settled(stage),
+                                    opts,
+                                    &mut sink,
+                                );
+                                assert_eq!(stats.edges, budget.min(8));
+                                assert_eq!(
+                                    stats,
+                                    crate::lod::cull(
+                                        &scene,
+                                        &camera,
+                                        StageBlend::settled(stage),
+                                        vw,
+                                        vh,
+                                        opts
+                                    )
+                                );
+                                assert_eq!(sink.edges.len(), budget.min(8));
+                                for (edge, [a, control, b]) in scene.edges.iter().zip(&sink.edges) {
+                                    for (actual, endpoint) in [(*a, edge.a), (*b, edge.b)] {
+                                        let expected = expected_published_edge_anchor(
+                                            &scene,
+                                            endpoint,
+                                            camera,
+                                            (vw, vh),
+                                            origin,
+                                            offset,
+                                        );
+                                        assert!((actual.0 - expected.0).abs() < 0.02);
+                                        assert!((actual.1 - expected.1).abs() < 0.02);
+                                    }
+                                    assert!(control.0.is_finite() && control.1.is_finite());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn indexed_published_relationships_admit_the_displayed_segment_after_the_world_segment_leaves() {
+    use k10s_atlas::EdgeSegment;
+    use k10s_world::LayoutMode;
+
+    let type_ = MapType::default();
+    let (vw, vh) = (64.0, 48.0);
+    for mode in [LayoutMode::Spread, LayoutMode::Dense] {
+        for sparse in [false, true] {
+            let indexed = published_edge_workloads(mode, 1, sparse, 68);
+            assert_eq!(indexed.region_edge_indexes.len(), 2);
+            assert_eq!(indexed.region_edges[0].len(), 68);
+            assert_eq!(indexed.region_edges[1].len(), 68);
+            assert_eq!(indexed.cross_edges.len(), 136);
+            for cross in [false, true] {
+                for reverse in [false, true] {
+                    let (target, camera) = indexed
+                        .edges
+                        .iter()
+                        .copied()
+                        .find_map(|edge| {
+                            let a = &indexed.blocks[edge.a.index() as usize];
+                            let b = &indexed.blocks[edge.b.index() as usize];
+                            if (a.ext.ns != b.ext.ns) != cross
+                                || (edge.a.index() > edge.b.index()) != reverse
+                            {
+                                return None;
+                            }
+                            let lower = if a.inner.center().1 >= b.inner.center().1 {
+                                edge.a
+                            } else {
+                                edge.b
+                            };
+                            let cell = indexed
+                                .block_cell_indices(lower.index() as usize)
+                                .next()
+                                .unwrap();
+                            let center = indexed.cells[cell].rect.center();
+                            let camera = Camera {
+                                cx: center.0,
+                                cy: center.1 - 42.0 / 14.4,
+                                zoom: 14.4,
+                            };
+                            let visible = camera.visible_world(vw, vh);
+                            let index = if cross {
+                                &indexed.cross_edge_index
+                            } else {
+                                &indexed.region_edge_indexes[a.ext.ns as usize]
+                            };
+                            index
+                                .selective_candidate_count(&visible)
+                                .is_some_and(|count| count > 0)
+                                .then_some((edge, camera))
+                        })
+                        .expect(
+                            "the real publication must reach a selective nonempty edge-index leaf",
+                        );
+                    let a = indexed.blocks[target.a.index() as usize].inner.center();
+                    let b = indexed.blocks[target.b.index() as usize].inner.center();
+                    let visible = camera.visible_world(vw, vh);
+                    assert!(!EdgeSegment { a, b }.bounds().intersects(&visible));
+                    for stage in [2, 3] {
+                        let expected: Vec<_> = indexed
+                            .edges
+                            .iter()
+                            .copied()
+                            .filter(|edge| {
+                                let (ax, ay) = expected_published_edge_anchor(
+                                    &indexed,
+                                    edge.a,
+                                    camera,
+                                    (vw, vh),
+                                    (0.0, 0.0),
+                                    42.0,
+                                );
+                                let (bx, by) = expected_published_edge_anchor(
+                                    &indexed,
+                                    edge.b,
+                                    camera,
+                                    (vw, vh),
+                                    (0.0, 0.0),
+                                    42.0,
+                                );
+                                ax.min(bx) < vw + 8.0
+                                    && -8.0 < ax.min(bx) + (ax - bx).abs().max(14.4)
+                                    && ay.min(by) < vh + 8.0
+                                    && -8.0 < ay.min(by) + (ay - by).abs().max(14.4)
+                            })
+                            .collect();
+                        assert!(expected.contains(&target));
+                        for budget in [
+                            0,
+                            1,
+                            expected.len().saturating_sub(1),
+                            expected.len(),
+                            expected.len() + 1,
+                        ] {
+                            let mut pol = policy(Knobs::default());
+                            pol.max_edges = budget;
+                            let opts = FrameOpts {
+                                policy: &pol,
+                                theme: &k10s_theme::K10S_DARK.map,
+                                type_,
+                                edges_on: true,
+                                skip_blocks: false,
+                                hex: false,
+                            };
+                            for use_index in [false, true] {
+                                for cached in [false, true] {
+                                    let mut scene = (*indexed).clone();
+                                    if !use_index {
+                                        scene.region_edge_indexes.clear();
+                                        scene.cross_edge_index = Default::default();
+                                    }
+                                    if !cached {
+                                        scene.edge_segments.clear();
+                                    }
+                                    for origin in [(0.0, 0.0), (17.25, 23.5)] {
+                                        let mut sink = Collect::default();
+                                        let stats = walk(
+                                            Bounds {
+                                                origin: point(px(origin.0), px(origin.1)),
+                                                size: size(px(vw), px(vh)),
+                                            },
+                                            &scene,
+                                            camera,
+                                            StageBlend::settled(stage),
+                                            opts,
+                                            &mut sink,
+                                        );
+                                        assert_eq!(stats.edges, budget.min(expected.len()));
+                                        assert_eq!(
+                                            stats,
+                                            crate::lod::cull(
+                                                &scene,
+                                                &camera,
+                                                StageBlend::settled(stage),
+                                                vw,
+                                                vh,
+                                                opts
+                                            )
+                                        );
+                                        assert_eq!(sink.edges.len(), budget.min(expected.len()));
+                                        for (edge, [a, control, b]) in
+                                            expected.iter().zip(&sink.edges)
+                                        {
+                                            for (actual, endpoint) in [(*a, edge.a), (*b, edge.b)] {
+                                                let want = expected_published_edge_anchor(
+                                                    &scene,
+                                                    endpoint,
+                                                    camera,
+                                                    (vw, vh),
+                                                    origin,
+                                                    42.0,
+                                                );
+                                                assert!((actual.0 - want.0).abs() < 0.002);
+                                                assert!((actual.1 - want.1).abs() < 0.002);
+                                            }
+                                            assert!(control.0.is_finite() && control.1.is_finite());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn relationship_projection_preserves_other_endpoint_kinds_and_small_workload_presentations() {
+    use k10s_atlas::{Edge, EdgeSegment, Endpoint};
+
+    let scene = one_of_each(State::OK);
+    let pol = policy(Knobs::default());
+    let type_ = MapType::default();
+    for zoom in [0.01, 0.04, 0.14, 0.30, 16.0, 40.0] {
+        let camera = Camera {
+            cx: 55.0,
+            cy: 81.0,
+            zoom,
+        };
+        let projection = Projection::new(camera, (VW, VH), (17.25, 23.5));
+        for other in [Endpoint::region(0), Endpoint::cell(0), Endpoint::sat(0)] {
+            let world = match other.level() {
+                k10s_atlas::Level::Region => scene.regions[0].rect.center(),
+                k10s_atlas::Level::Cell => scene.cells[0].rect.center(),
+                k10s_atlas::Level::Sat => scene.sats[0].rect.center(),
+                k10s_atlas::Level::Block => unreachable!(),
+            };
+            let hub = scene.blocks[0].inner.center();
+            for reverse in [false, true] {
+                let (edge, original) = if reverse {
+                    (
+                        Edge {
+                            a: other,
+                            b: Endpoint::block(0),
+                        },
+                        EdgeSegment { a: world, b: hub },
+                    )
+                } else {
+                    (
+                        Edge {
+                            a: Endpoint::block(0),
+                            b: other,
+                        },
+                        EdgeSegment { a: hub, b: world },
+                    )
+                };
+                let actual = projection.edge_segment(&scene, edge, original, &pol, 3, type_);
+                assert_eq!(if reverse { actual.a } else { actual.b }, world);
+                let presentation =
+                    workload_presentation(&pol, scene.blocks[0].inner, zoom, 3, type_);
+                if presentation != k10s_atlas::WorkloadPresentation::Detailed {
+                    assert_eq!(actual, original);
+                }
+                assert_eq!(
+                    actual,
+                    Projection::new(camera, (VW, VH), (0.0, 0.0))
+                        .edge_segment(&scene, edge, original, &pol, 3, type_)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hidden_workloads_keep_literal_world_relationship_anchors() {
+    use k10s_atlas::Edge;
+
+    let mut scene = one_of_each(State::OK);
+    scene.edges = vec![Edge::blocks(0, 0)];
+    scene.rebuild_edge_indexes();
+    let camera = Camera {
+        cx: 100.0,
+        cy: 105.0,
+        zoom: 16.0,
+    };
+    let pol = policy(Knobs::default());
+    let opts = FrameOpts {
+        policy: &pol,
+        theme: &k10s_theme::K10S_DARK.map,
+        type_: MapType::default(),
+        edges_on: true,
+        skip_blocks: true,
+        hex: false,
+    };
+    for stage in [2, 3] {
+        for (origin, expected) in [
+            ((0.0, 0.0), (800.0, 500.0)),
+            ((17.25, 23.5), (817.25, 523.5)),
+        ] {
+            let mut sink = Collect::default();
+            let stats = walk(
+                Bounds {
+                    origin: point(px(origin.0), px(origin.1)),
+                    size: size(px(VW), px(VH)),
+                },
+                &scene,
+                camera,
+                StageBlend::settled(stage),
+                opts,
+                &mut sink,
+            );
+            assert_eq!(stats.drawn_blocks, 0);
+            assert_eq!(stats.drawn_cells, 0);
+            assert_eq!(stats.curves, 0);
+            assert_eq!(stats.edges, 1);
+            assert_eq!(
+                stats,
+                crate::lod::cull(&scene, &camera, StageBlend::settled(stage), VW, VH, opts,)
+            );
+            assert!(sink.fg.is_empty());
+            assert_eq!(sink.edges, vec![[expected, expected, expected]]);
+        }
+    }
 }

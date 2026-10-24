@@ -122,7 +122,7 @@ pub fn cull(
     }
     st.bg_cells = crate::hex::visible_count(&visible, camera.zoom, !opts.hex_shown());
     st.edges = if opts.edges_on && blend.walk_stage() >= 2 && !opts.stress_any() {
-        reference_edges(scene, &visible, opts.policy.max_edges)
+        reference_edges(scene, *camera, blend.walk_stage(), (vw, vh), opts, &visible)
     } else {
         0
     };
@@ -336,7 +336,15 @@ fn reference_content(
     st.icons = st.icons.min(policy.max_icons);
 }
 
-fn reference_edges(scene: &SceneSnapshot, visible: &Rect, max_edges: usize) -> usize {
+fn reference_edges(
+    scene: &SceneSnapshot,
+    camera: Camera,
+    stage: u8,
+    viewport: (f32, f32),
+    opts: FrameOpts<'_>,
+    visible: &Rect,
+) -> usize {
+    let projection = crate::primitive::Projection::new(camera, viewport, (0.0, 0.0));
     let rect = |e: Endpoint| {
         let i = e.index() as usize;
         match e.level() {
@@ -349,14 +357,23 @@ fn reference_edges(scene: &SceneSnapshot, visible: &Rect, max_edges: usize) -> u
 
     let mut drawn = 0;
     for e in &scene.edges {
-        if drawn >= max_edges {
+        if drawn >= opts.policy.max_edges {
             break;
         }
         let (Some(a), Some(b)) = (rect(e.a), rect(e.b)) else {
             continue;
         };
-        let (ax, ay) = a.center();
-        let (bx, by) = b.center();
+        let original = k10s_atlas::EdgeSegment {
+            a: a.center(),
+            b: b.center(),
+        };
+        let segment = if opts.skip_blocks {
+            original
+        } else {
+            projection.edge_segment(scene, *e, original, opts.policy, stage, opts.type_)
+        };
+        let (ax, ay) = segment.a;
+        let (bx, by) = segment.b;
         let span = Rect::new(
             ax.min(bx),
             ay.min(by),
