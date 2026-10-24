@@ -4,6 +4,8 @@
 //! takes the pane down. A log link retains its exact Kubernetes scope and
 //! loses that association when the selection or trace ID changes. A selected
 //! span opens retained logs by its own resource attributes and time bounds.
+//! Headers and visible rows share a horizontal viewport; vertical navigation
+//! remains a table selection.
 
 use std::rc::Rc;
 
@@ -14,10 +16,11 @@ use gpui::{
 };
 
 use crate::table::{TableState, TableText};
+use crate::table_scroll::{TableScroll, table_key_context};
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{
     CancelInput, CommitInput, DeleteInputChar, EnterFilter, LogsRow, OpenRow, Refresh, RowDown,
-    RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
+    RowEnd, RowHome, RowPageDown, RowPageUp, RowUp, TableScrollLeft, TableScrollRight,
 };
 use k10s_provider::{
     ClusterProvider, ObserveScope, RequestStop, SpanLogQuery, SpanView, TableColumn, TablePage,
@@ -47,6 +50,7 @@ pub struct TracesView {
     focus: FocusHandle,
     provider: Rc<dyn ClusterProvider>,
     table: TableState,
+    columns: TableScroll,
     table_text: TableText,
     query: String,
     typing: bool,
@@ -82,6 +86,7 @@ impl TracesView {
             focus: cx.focus_handle(),
             provider,
             table: TableState::new(),
+            columns: TableScroll::default(),
             table_text: TableText::default(),
             query: String::new(),
             typing: false,
@@ -413,11 +418,7 @@ impl Render for TracesView {
 
         div()
             .id("traces-view")
-            .key_context(if self.typing || self.filtering {
-                "Typing"
-            } else {
-                "Browse"
-            })
+            .key_context(table_key_context(self.typing || self.filtering, false))
             .track_focus(&self.focus)
             .size_full()
             .relative()
@@ -449,6 +450,16 @@ impl Render for TracesView {
             .on_action(cx.listener(|this, _: &RowEnd, _, cx| {
                 this.table.select_last();
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TableScrollLeft, _, cx| {
+                if this.columns.left() {
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &TableScrollRight, _, cx| {
+                if this.columns.right() {
+                    cx.notify();
+                }
             }))
             .on_action(cx.listener(|this, _: &OpenRow, _, cx| {
                 if this.typing {
@@ -592,100 +603,105 @@ impl Render for TracesView {
                     .child(self.query_label.clone()),
             )
             .child(
-                div()
-                    .h(px(TABLE_HEADER_HEIGHT))
-                    .flex_none()
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .bg(rgb(theme.shell.editor_background))
-                    .border_b_1()
-                    .border_color(rgb(theme.shell.border_variant))
-                    .font_family(fonts.buffer_family.clone())
-                    .text_size(px(fonts.ui_size))
-                    .text_color(rgb(theme.shell.text_muted))
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .child(SharedString::from(self.table_text.header())),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id("trace-rows")
-                            .flex_1()
-                            .min_h(px(LIST_ROW_HEIGHT))
-                            .overflow_hidden()
-                            .relative()
-                            .flex()
-                            .flex_col()
-                            .role(Role::ListBox)
-                            .aria_label("spans")
-                            .child(
-                                canvas(
-                                    move |bounds, _, cx| {
-                                        let _ = view.update(cx, |this, cx| {
-                                            this.resize(
-                                                f32::from(bounds.size.width),
-                                                f32::from(bounds.size.height),
-                                                cx,
-                                            );
-                                        });
-                                    },
-                                    |_, _, _, _| {},
+                self.columns.render(
+                    div()
+                        .h(px(TABLE_HEADER_HEIGHT))
+                        .flex_none()
+                        .px(px(12.0))
+                        .flex()
+                        .items_center()
+                        .bg(rgb(theme.shell.editor_background))
+                        .border_b_1()
+                        .border_color(rgb(theme.shell.border_variant))
+                        .font_family(fonts.buffer_family.clone())
+                        .text_size(px(fonts.ui_size))
+                        .text_color(rgb(theme.shell.text_muted))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(SharedString::from(self.table_text.header())),
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("trace-rows")
+                                .flex_1()
+                                .min_h(px(LIST_ROW_HEIGHT))
+                                .overflow_hidden()
+                                .relative()
+                                .flex()
+                                .flex_col()
+                                .role(Role::ListBox)
+                                .aria_label("spans")
+                                .child(
+                                    canvas(
+                                        move |bounds, _, cx| {
+                                            let _ = view.update(cx, |this, cx| {
+                                                this.resize(
+                                                    f32::from(bounds.size.width),
+                                                    f32::from(bounds.size.height),
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                        |_, _, _, _| {},
+                                    )
+                                    .absolute()
+                                    .size_full(),
                                 )
-                                .absolute()
-                                .size_full(),
-                            )
-                            .children(self.table_text.lines().iter().enumerate().map(
-                                |(offset, line)| {
-                                    let selected = self.table.line_selected(offset);
-                                    let line = SharedString::from(line.clone());
-                                    let mut row = div()
-                                        .id(("trace-row", offset))
-                                        .h(px(LIST_ROW_HEIGHT))
-                                        .flex_none()
-                                        .px(px(12.0))
-                                        .flex()
-                                        .items_center()
-                                        .font_family(fonts.buffer_family.clone())
-                                        .text_size(px(fonts.ui_size))
-                                        .text_color(rgb(theme.shell.editor_foreground))
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .cursor_pointer()
-                                        .role(Role::ListBoxOption)
-                                        .aria_label(line.clone())
-                                        .aria_selected(selected)
-                                        .hover(|style| style.bg(rgb(theme.shell.element_hover)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                                this.table.select_visible_offset(offset);
-                                                cx.notify();
-                                            }),
-                                        );
-                                    if selected {
-                                        row = row.bg(rgb(theme.shell.element_selected));
-                                    }
-                                    row.child(line)
-                                },
-                            )),
-                    )
-                    .children(self.status.clone().map(|status| {
-                        div()
-                            .flex_none()
-                            .p(px(12.0))
-                            .text_size(px(fonts.ui_size))
-                            .text_color(rgb(theme.shell.text))
-                            .child(status)
-                    })),
+                                .children(self.table_text.lines().iter().enumerate().map(
+                                    |(offset, line)| {
+                                        let selected = self.table.line_selected(offset);
+                                        let line = SharedString::from(line.clone());
+                                        let mut row = div()
+                                            .id(("trace-row", offset))
+                                            .h(px(LIST_ROW_HEIGHT))
+                                            .flex_none()
+                                            .px(px(12.0))
+                                            .flex()
+                                            .items_center()
+                                            .font_family(fonts.buffer_family.clone())
+                                            .text_size(px(fonts.ui_size))
+                                            .text_color(rgb(theme.shell.editor_foreground))
+                                            .whitespace_nowrap()
+                                            .overflow_hidden()
+                                            .cursor_pointer()
+                                            .role(Role::ListBoxOption)
+                                            .aria_label(line.clone())
+                                            .aria_selected(selected)
+                                            .hover(|style| style.bg(rgb(theme.shell.element_hover)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this, _: &MouseDownEvent, _, cx| {
+                                                        this.table.select_visible_offset(offset);
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            );
+                                        if selected {
+                                            row = row.bg(rgb(theme.shell.element_selected));
+                                        }
+                                        row.child(line)
+                                    },
+                                )),
+                        ),
+                    &theme,
+                    &fonts,
+                    cx,
+                ),
             )
+            .children(self.status.clone().map(|status| {
+                div()
+                    .flex_none()
+                    .p(px(12.0))
+                    .text_size(px(fonts.ui_size))
+                    .text_color(rgb(theme.shell.text))
+                    .child(status)
+            }))
             .child(
                 div()
                     .h(px(STATUS_BAR_HEIGHT))

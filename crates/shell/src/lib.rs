@@ -94,6 +94,7 @@ mod saves;
 mod selection;
 mod spans;
 mod surfaces;
+mod table_scroll;
 mod tag;
 mod workspace;
 

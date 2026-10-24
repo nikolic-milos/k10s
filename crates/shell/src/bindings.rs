@@ -38,6 +38,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
     // own context keeps tab/shift-tab from stealing focus travel elsewhere.
     let ecosystem = Some("Ecosystem");
     let observe = Some("Observe");
+    let table = Some("Table");
     let doc = Some("Doc");
     let typing = Some("Typing");
     let editor = Some("Editor");
@@ -87,6 +88,8 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("pagedown", RowPageDown, browse),
         KeyBinding::new("home", RowHome, browse),
         KeyBinding::new("end", RowEnd, browse),
+        KeyBinding::new("left", TableScrollLeft, table),
+        KeyBinding::new("right", TableScrollRight, table),
         KeyBinding::new("enter", OpenRow, browse),
         KeyBinding::new("l", LogsRow, browse),
         KeyBinding::new("s", ExecRow, browse),

@@ -69,6 +69,8 @@ actions!(
         RowPageDown,
         RowHome,
         RowEnd,
+        TableScrollLeft,
+        TableScrollRight,
         OpenRow,
         LogsRow,
         ExecRow,
@@ -176,6 +178,7 @@ actions!(
 pub const KEY_CONTEXTS: &[&str] = &[
     "Workspace",
     "Browse",
+    "Table",
     "Observe",
     "Forwards",
     "Releases",

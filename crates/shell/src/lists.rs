@@ -7,6 +7,8 @@
 //! an action. A denial stays labelled. Other unserved adapters emit
 //! [`InventoryEvent::NotServed`] so the workspace can remove their panes.
 //! Collector requests stop on hide and reject replies from an older listing.
+//! Headers and visible rows share a horizontal viewport; vertical navigation
+//! remains a table selection.
 
 use std::rc::Rc;
 
@@ -18,11 +20,13 @@ use gpui::{
 
 use crate::confirm::{Latch, Slot, StatusText, nothing_listed};
 use crate::table::TableState;
+use crate::table_scroll::{TableScroll, table_key_context};
 use crate::tag::ItemTag;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header, status_slot};
 use crate::{
     CancelInput, CommitInput, DeleteInputChar, EnterFilter, HelmDiff, HelmRollback, OpenRow,
-    Refresh, RevealHelm, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp,
+    Refresh, RevealHelm, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp, TableScrollLeft,
+    TableScrollRight,
 };
 use k10s_provider::{ClusterProvider, RequestStop, TableOutcome, TablePage, ToolPresence};
 
@@ -126,6 +130,7 @@ pub struct InventoryView {
     provider: Rc<dyn ClusterProvider>,
     kind: InventoryKind,
     table: TableState,
+    columns: TableScroll,
     loading: bool,
     status: Option<SharedString>,
     // A listing that was denied or failed. Its own line, never hidden behind
@@ -231,6 +236,7 @@ impl InventoryView {
             provider,
             kind,
             table: TableState::new(),
+            columns: TableScroll::default(),
             loading: true,
             status: None,
             fetch_label: None,
@@ -474,15 +480,10 @@ impl Render for InventoryView {
 
         div()
             .id("inventory-view")
-            .key_context(if self.filtering {
-                "Typing"
-            } else if self.kind == InventoryKind::Helm {
-                // Browse plus the release commands: only the Helm inventory
-                // listens for v/u/shift-v, so only it offers them.
-                "Browse Releases"
-            } else {
-                "Browse"
-            })
+            .key_context(table_key_context(
+                self.filtering,
+                self.kind == InventoryKind::Helm,
+            ))
             .track_focus(&self.focus)
             .size_full()
             .relative()
@@ -520,6 +521,16 @@ impl Render for InventoryView {
                 this.latch.disarm();
                 this.table.select_last();
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TableScrollLeft, _, cx| {
+                if this.columns.left() {
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &TableScrollRight, _, cx| {
+                if this.columns.right() {
+                    cx.notify();
+                }
             }))
             .on_action(cx.listener(|this, _: &OpenRow, _, cx| {
                 this.refuse_payload_action(cx);
@@ -583,99 +594,104 @@ impl Render for InventoryView {
             }))
             .child(panel_header(&theme, &fonts, self.breadcrumb()))
             .child(
-                div()
-                    .h(px(TABLE_HEADER_HEIGHT))
-                    .flex_none()
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .bg(rgb(theme.shell.editor_background))
-                    .border_b_1()
-                    .border_color(rgb(theme.shell.border_variant))
-                    .font_family(fonts.buffer_family.clone())
-                    .text_size(px(fonts.small()))
-                    .text_color(rgb(theme.shell.text_muted))
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .child(self.table.header_line()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id("inventory-rows")
-                            .flex_1()
-                            .min_h(px(LIST_ROW_HEIGHT))
-                            .overflow_hidden()
-                            .relative()
-                            .flex()
-                            .flex_col()
-                            .role(Role::ListBox)
-                            .aria_label(self.kind.title())
-                            .child(
-                                canvas(
-                                    move |bounds, _, cx| {
-                                        let _ = view.update(cx, |this, cx| {
-                                            this.resize(
-                                                f32::from(bounds.size.width),
-                                                f32::from(bounds.size.height),
-                                                cx,
-                                            );
-                                        });
-                                    },
-                                    |_, _, _, _| {},
+                self.columns.render(
+                    div()
+                        .h(px(TABLE_HEADER_HEIGHT))
+                        .flex_none()
+                        .px(px(12.0))
+                        .flex()
+                        .items_center()
+                        .bg(rgb(theme.shell.editor_background))
+                        .border_b_1()
+                        .border_color(rgb(theme.shell.border_variant))
+                        .font_family(fonts.buffer_family.clone())
+                        .text_size(px(fonts.small()))
+                        .text_color(rgb(theme.shell.text_muted))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(self.table.header_line()),
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("inventory-rows")
+                                .flex_1()
+                                .min_h(px(LIST_ROW_HEIGHT))
+                                .overflow_hidden()
+                                .relative()
+                                .flex()
+                                .flex_col()
+                                .role(Role::ListBox)
+                                .aria_label(self.kind.title())
+                                .child(
+                                    canvas(
+                                        move |bounds, _, cx| {
+                                            let _ = view.update(cx, |this, cx| {
+                                                this.resize(
+                                                    f32::from(bounds.size.width),
+                                                    f32::from(bounds.size.height),
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                        |_, _, _, _| {},
+                                    )
+                                    .absolute()
+                                    .size_full(),
                                 )
-                                .absolute()
-                                .size_full(),
-                            )
-                            .children(self.table.visible_lines().into_iter().enumerate().map(
-                                |(offset, (selected, line))| {
-                                    let mut row = div()
-                                        .id(("inventory-row", offset))
-                                        .h(px(LIST_ROW_HEIGHT))
-                                        .flex_none()
-                                        .px(px(12.0))
-                                        .flex()
-                                        .items_center()
-                                        .font_family(fonts.buffer_family.clone())
-                                        .text_size(px(fonts.small()))
-                                        .text_color(rgb(theme.shell.editor_foreground))
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .cursor_pointer()
-                                        .role(Role::ListBoxOption)
-                                        .aria_label(line.clone())
-                                        .aria_selected(selected)
-                                        .hover(|style| style.bg(rgb(theme.shell.element_hover)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                                this.latch.disarm();
-                                                this.table.select_visible_offset(offset);
-                                                cx.notify();
-                                            }),
-                                        );
-                                    if selected {
-                                        row = row.bg(rgb(theme.shell.element_selected));
-                                    }
-                                    row.child(line)
-                                },
-                            ))
-                            .children(empty.then(|| {
-                                div()
-                                    .p(px(12.0))
-                                    .text_size(px(fonts.ui_size))
-                                    .text_color(rgb(theme.shell.text_muted))
-                                    .child(self.kind.empty_hint())
-                            })),
-                    )
-                    .children(slot),
+                                .children(self.table.visible_lines().into_iter().enumerate().map(
+                                    |(offset, (selected, line))| {
+                                        let mut row = div()
+                                            .id(("inventory-row", offset))
+                                            .h(px(LIST_ROW_HEIGHT))
+                                            .flex_none()
+                                            .px(px(12.0))
+                                            .flex()
+                                            .items_center()
+                                            .font_family(fonts.buffer_family.clone())
+                                            .text_size(px(fonts.small()))
+                                            .text_color(rgb(theme.shell.editor_foreground))
+                                            .whitespace_nowrap()
+                                            .overflow_hidden()
+                                            .cursor_pointer()
+                                            .role(Role::ListBoxOption)
+                                            .aria_label(line.clone())
+                                            .aria_selected(selected)
+                                            .hover(|style| style.bg(rgb(theme.shell.element_hover)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this, _: &MouseDownEvent, _, cx| {
+                                                        this.latch.disarm();
+                                                        this.table.select_visible_offset(offset);
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            );
+                                        if selected {
+                                            row = row.bg(rgb(theme.shell.element_selected));
+                                        }
+                                        row.child(line)
+                                    },
+                                ))
+                                .children(empty.then(|| {
+                                    div()
+                                        .p(px(12.0))
+                                        .text_size(px(fonts.ui_size))
+                                        .text_color(rgb(theme.shell.text_muted))
+                                        .child(self.kind.empty_hint())
+                                })),
+                        ),
+                    &theme,
+                    &fonts,
+                    cx,
+                ),
             )
+            .children(slot)
             .child(
                 div()
                     .h(px(STATUS_BAR_HEIGHT))
