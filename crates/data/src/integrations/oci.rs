@@ -775,10 +775,8 @@ async fn registry_get(client: &Client, reach: &ToolReach, rest: &str) -> Fetched
 fn unbound_why(unbound: &Unbound) -> String {
     let mut why = unbound.why.clone();
     why.push_str("; Cosign signatures and SBOMs are not listed and not verified");
-    if let Some(url) = &unbound.browser_url {
-        why.push_str("; open ");
-        why.push_str(url);
-        why.push_str(" in the system browser");
+    if unbound.browser_url.is_some() {
+        why.push_str("; open the tool in the system browser");
     }
     why
 }

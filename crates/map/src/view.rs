@@ -585,6 +585,19 @@ impl MapView {
     }
 
     #[cfg(feature = "testing")]
+    pub fn testing_paint_snapshot(&self) -> crate::testing::PaintSnapshot {
+        let stats = self.stats.borrow();
+        crate::testing::PaintSnapshot {
+            frames: stats.frames(),
+            paint_ok_lines: stats.lines,
+            paint_ok_source_scalars: stats.glyphs,
+            fit_refused: stats.labels_fit_refused,
+            paint_errors: stats.label_paint_errors,
+            cache: stats.text_cache,
+        }
+    }
+
+    #[cfg(feature = "testing")]
     pub fn testing_enable_text_cache(&mut self, enabled: bool) {
         self.text_cache.borrow_mut().set_enabled(enabled);
     }

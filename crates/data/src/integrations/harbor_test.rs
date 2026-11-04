@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::integrations::oci::{digest_index, parse_image_id};
-use crate::reach::{Bound, ToolAuth, ToolKind, ToolReach, Transport, Unbound};
+use crate::reach::{Bound, ToolAuth, ToolKind, ToolReach, Transport};
 use crate::read::Fetched;
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -164,17 +164,24 @@ async fn absent_harbor_is_served_false_so_the_section_stays_invisible() {
 
 #[tokio::test]
 async fn https_harbor_is_a_browser_hole_not_a_fetch() {
-    let reach = ToolReach::Unbound(Unbound {
-        kind: ToolKind::Harbor,
-        found: None,
-        why: "Harbor is named as an https URL; open it in the system browser, or name an http \
-              URL or an in-cluster Service"
-            .into(),
-        browser_url: Some("https://harbor.example".into()),
-    });
+    let url = "https://harbor.example/private-path?token=private-query#private-fragment";
+    let settings = crate::reach::ReachSettings {
+        harbor: crate::reach::ToolOverride {
+            url: Some(url.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let reach = crate::reach::bind(&unused_client(), ToolKind::Harbor, &settings).await;
+    assert!(
+        matches!(&reach, ToolReach::Unbound(value) if value.browser_url.as_deref() == Some(url))
+    );
     match fetch(&unused_client(), &reach).await {
         Fetched::Failed { why, .. } => {
-            assert!(why.contains("https://harbor.example"), "{why}");
+            assert!(why.contains("open the tool in the system browser"), "{why}");
+            for secret in ["private-path", "private-query", "private-fragment"] {
+                assert!(!why.contains(secret), "{why}");
+            }
         }
         other => panic!("https is a hole, not {other:?}"),
     }

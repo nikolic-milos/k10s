@@ -185,3 +185,153 @@ fn a_named_token_never_rides_the_service_proxy() {
 
     drop(runtime);
 }
+
+fn limited_range_body(count: usize, dense_first: bool, result_type: &str) -> String {
+    let result = if result_type == "scalar" {
+        serde_json::json!([1, "2"])
+    } else {
+        serde_json::Value::Array((0..count).map(|index| {
+            let mut row = serde_json::json!({"metric":{"namespace":"prod","pod":format!("pod-{index}")}});
+            if result_type == "vector" {
+                row["value"] = serde_json::json!([1, "2"]);
+            } else {
+                let points = if dense_first && index == 0 { 5001 } else { 1 };
+                row["values"] = serde_json::Value::Array((0..points).map(|n| serde_json::json!([n, "2"])).collect());
+            }
+            row
+        }).collect())
+    };
+    serde_json::json!({"status":"success","data":{"resultType":result_type,"result":result}})
+        .to_string()
+}
+
+fn assert_limited_query_request(script: &Script, path: &str) {
+    let requests = script.seen();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the limit notice cannot issue another query"
+    );
+    let request = &requests[0];
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, path);
+    assert_eq!(request.accept, "application/json");
+    assert_eq!(request.content_type, "");
+    assert!(request.body_collected);
+    assert!(request.body.is_empty());
+}
+
+#[test]
+fn range_limit_is_a_request_bound_possibility_independent_of_local_omission_counts() {
+    let path = "/api/v1/namespaces/monitoring/services/prometheus:9090/proxy/api/v1/query_range?query=up&start=0&end=900&step=30s&limit=256";
+    for (count, dense, result_type) in [
+        (255, false, "matrix"),
+        (256, false, "matrix"),
+        (257, false, "matrix"),
+        (256, true, "matrix"),
+        (256, false, "vector"),
+        (1, false, "scalar"),
+    ] {
+        let script = Script::default();
+        script.route(
+            "GET",
+            path,
+            200,
+            limited_range_body(count, dense, result_type),
+        );
+        let answer = runtime().block_on(async {
+            query_range(
+                &script.client(),
+                &prometheus_bound(ToolAuth::Anonymous, proxy()),
+                "up",
+                0.0,
+                900.0,
+                "30s",
+            )
+            .await
+        });
+        let Fetched::Ok(result) = answer else {
+            panic!("the bounded numeric response must parse")
+        };
+        let dropped = count.saturating_sub(256) + usize::from(dense);
+        assert_eq!(result.dropped_series, dropped);
+        assert_eq!(result.truncated, dropped != 0);
+        assert_eq!(result.series.len(), count.min(256) - usize::from(dense));
+        let expected = (result_type != "scalar" && count >= 256).then_some(256);
+        assert_eq!(result.possible_server_limit, expected);
+        assert_limited_query_request(&script, path);
+    }
+}
+
+#[test]
+fn generic_parsing_and_instant_queries_do_not_invent_a_server_request_limit() {
+    for count in [256, 257] {
+        let body = limited_range_body(count, false, "vector");
+        let parsed = k10s_data::integrations::prom::parse_response(body.as_bytes()).unwrap();
+        assert_eq!(parsed.possible_server_limit, None);
+        let script = Script::default();
+        let path = "/api/v1/namespaces/monitoring/services/prometheus:9090/proxy/api/v1/query?query=up&time=0";
+        script.route("GET", path, 200, body);
+        let answer = runtime().block_on(async {
+            query(
+                &script.client(),
+                &prometheus_bound(ToolAuth::Anonymous, proxy()),
+                "up",
+                Some(0.0),
+            )
+            .await
+        });
+        let Fetched::Ok(result) = answer else {
+            panic!("instant numeric response")
+        };
+        assert_eq!(result.possible_server_limit, None);
+        assert_limited_query_request(&script, path);
+    }
+}
+
+#[test]
+fn annotation_overflow_preserves_data_or_server_failure_without_an_extra_request() {
+    use k10s_data::integrations::prom::MAX_ANNOTATIONS_PER_LEVEL;
+
+    let path = "/api/v1/namespaces/monitoring/services/prometheus:9090/proxy/api/v1/query_range?query=up&start=0&end=900&step=30s&limit=256";
+    for error in [false, true] {
+        let mut body: serde_json::Value = serde_json::from_str(RANGE_JSON).unwrap();
+        body["warnings"] =
+            serde_json::json!(vec!["complete warning"; MAX_ANNOTATIONS_PER_LEVEL + 2]);
+        body["infos"] = serde_json::json!(vec!["complete info"; MAX_ANNOTATIONS_PER_LEVEL + 3]);
+        if error {
+            body["status"] = "error".into();
+            body["errorType"] = "execution".into();
+            body["error"] = "the server could not evaluate the requested range".into();
+        }
+        let script = Script::default();
+        script.route("GET", path, 200, body.to_string());
+        let answer = runtime().block_on(async {
+            query_range(
+                &script.client(),
+                &prometheus_bound(ToolAuth::Anonymous, proxy()),
+                "up",
+                0.0,
+                900.0,
+                "30s",
+            )
+            .await
+        });
+        if error {
+            assert!(
+                matches!(answer, Fetched::Failed { what: "prometheus", ref why }
+                if why == "execution: the server could not evaluate the requested range")
+            );
+        } else {
+            let Fetched::Ok(result) = answer else {
+                panic!("successful data and annotation counts")
+            };
+            assert_eq!(result.series.len(), 1);
+            assert_eq!(result.warnings.len(), MAX_ANNOTATIONS_PER_LEVEL);
+            assert_eq!(result.infos.len(), MAX_ANNOTATIONS_PER_LEVEL);
+            assert_eq!(result.warnings_omitted, 2);
+            assert_eq!(result.infos_omitted, 3);
+        }
+        assert_limited_query_request(&script, path);
+    }
+}

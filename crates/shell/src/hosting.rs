@@ -509,7 +509,8 @@ impl Workspace {
                             cx,
                         );
                         this.close_tagged(tag, window, cx);
-                        this.status_note = Some(format!("{what} is not served by this cluster"));
+                        this.status_notes
+                            .set_general(Some(format!("{what} is not served by this cluster")));
                         cx.notify();
                     }
                     InventoryEvent::RevealRelease {
@@ -645,7 +646,8 @@ impl Workspace {
             |this, _, event: &InventoryEvent, window, cx| match event {
                 InventoryEvent::NotServed { tag, what } => {
                     this.close_tagged(tag, window, cx);
-                    this.status_note = Some(format!("{what} is not served by this cluster"));
+                    this.status_notes
+                        .set_general(Some(format!("{what} is not served by this cluster")));
                     cx.notify();
                 }
                 InventoryEvent::RevealPod { namespace, pod } => {
@@ -670,25 +672,27 @@ impl Workspace {
         });
         if found {
             self.activate_center(0, window, cx);
-            self.status_note = None;
+            self.status_notes.set_general(None);
         } else {
-            self.status_note = Some(format!(
+            self.status_notes.set_general(Some(format!(
                 "the alert names {namespace}/{pod}, which is not on this cluster's map"
-            ));
+            )));
         }
         cx.notify();
     }
 
     pub(crate) fn open_silence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(selection) = self.selection.as_ref() else {
-            self.status_note = Some("pick a namespace or pod to silence its alerts".to_string());
+            self.status_notes.set_general(Some(
+                "pick a namespace or pod to silence its alerts".to_string(),
+            ));
             cx.notify();
             return;
         };
         let matchers = match crate::alerts::matchers(selection) {
             Ok(matchers) => matchers,
             Err(why) => {
-                self.status_note = Some(why);
+                self.status_notes.set_general(Some(why));
                 cx.notify();
                 return;
             }
@@ -702,7 +706,8 @@ impl Workspace {
         provider.bind_alertmanager(Box::new(move |outcome| {
             let _ = tx.send(outcome);
         }));
-        self.status_note = Some("looking for Alertmanager...".to_string());
+        self.status_notes
+            .set_general(Some("looking for Alertmanager...".to_string()));
         cx.notify();
         let this = cx.weak_entity();
         window
@@ -718,7 +723,7 @@ impl Workspace {
                     }
                     match outcome {
                         k10s_provider::AlertmanagerOutcome::Ready(endpoint) => {
-                            this.status_note = None;
+                            this.status_notes.set_general(None);
                             this.open_item(tag, Place::Center, window, cx, |_, _, cx| {
                                 (
                                     cx.new(|cx| {
@@ -731,11 +736,12 @@ impl Workspace {
                             });
                         }
                         k10s_provider::AlertmanagerOutcome::Absent => {
-                            this.status_note =
-                                Some("Alertmanager is not served by this cluster".to_string())
+                            this.status_notes.set_general(Some(
+                                "Alertmanager is not served by this cluster".to_string(),
+                            ))
                         }
                         k10s_provider::AlertmanagerOutcome::Failed(why) => {
-                            this.status_note = Some(why)
+                            this.status_notes.set_general(Some(why))
                         }
                     }
                     cx.notify();
@@ -856,6 +862,23 @@ impl Workspace {
                                     }
                                 }
                             }
+                            ObserveEvent::CatalogDetails(notices) => {
+                                this.open_notice(
+                                    "Grafana notice details",
+                                    notices.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            ObserveEvent::QueryDetails(notices) => {
+                                this.open_notice("Query details", notices.clone(), window, cx);
+                            }
+                            ObserveEvent::ScopeDetails(notices) => {
+                                this.open_notice("Scope details", notices.clone(), window, cx);
+                            }
+                            ObserveEvent::SourceDetails(notices) => {
+                                this.open_notice("Source details", notices.clone(), window, cx);
+                            }
                             ObserveEvent::NotServed => {
                                 this.set_observability_presence(
                                     &ItemTag::Observe,
@@ -863,10 +886,10 @@ impl Workspace {
                                     cx,
                                 );
                                 this.close_tagged(&ItemTag::Observe, window, cx);
-                                this.status_note = Some(
+                                this.status_notes.set_general(Some(
                                     "Grafana, Prometheus and Loki are not served by this cluster"
                                         .into(),
-                                );
+                                ));
                                 cx.notify();
                             }
                         }
@@ -994,8 +1017,9 @@ impl Workspace {
                                     cx,
                                 );
                                 this.close_tagged(&ItemTag::Traces, window, cx);
-                                this.status_note =
-                                    Some("Tempo and Jaeger are not served by this cluster".into());
+                                this.status_notes.set_general(Some(
+                                    "Tempo and Jaeger are not served by this cluster".into(),
+                                ));
                                 cx.notify();
                             }
                         }
@@ -1024,7 +1048,8 @@ impl Workspace {
                 let _ = tx.send(outcome);
             }),
         );
-        self.status_note = Some(format!("revealing {name} revision {revision}"));
+        self.status_notes
+            .set_general(Some(format!("revealing {name} revision {revision}")));
         cx.notify();
         let this = cx.weak_entity();
         window
@@ -1035,12 +1060,13 @@ impl Workspace {
                             this.open_helm_scratches(reveal, window, cx);
                         }
                         HelmRevealOutcome::Denied(what) => {
-                            this.status_note =
-                                Some(format!("{what}: access denied for this account"));
+                            this.status_notes.set_general(Some(format!(
+                                "{what}: access denied for this account"
+                            )));
                             cx.notify();
                         }
                         HelmRevealOutcome::Failed(why) => {
-                            this.status_note = Some(why);
+                            this.status_notes.set_general(Some(why));
                             cx.notify();
                         }
                     });
@@ -1084,7 +1110,9 @@ impl Workspace {
             window,
             cx,
         );
-        self.status_note = Some(format!("revealed {namespace}/{name} revision {revision}"));
+        self.status_notes.set_general(Some(format!(
+            "revealed {namespace}/{name} revision {revision}"
+        )));
         cx.notify();
     }
 
@@ -1141,7 +1169,8 @@ impl Workspace {
                 let _ = tx.send(outcome);
             }),
         );
-        self.status_note = Some(format!("diffing {name} revision {from} against {to}"));
+        self.status_notes
+            .set_general(Some(format!("diffing {name} revision {from} against {to}")));
         cx.notify();
         let this = cx.weak_entity();
         window
@@ -1156,12 +1185,13 @@ impl Workspace {
                             this.open_helm_report(id, title, lines, window, cx);
                         }
                         DocOutcome::Denied(what) => {
-                            this.status_note =
-                                Some(format!("{what}: access denied for this account"));
+                            this.status_notes.set_general(Some(format!(
+                                "{what}: access denied for this account"
+                            )));
                             cx.notify();
                         }
                         DocOutcome::Failed(why) => {
-                            this.status_note = Some(why);
+                            this.status_notes.set_general(Some(why));
                             cx.notify();
                         }
                     });
@@ -1193,9 +1223,9 @@ impl Workspace {
                 let _ = tx.send(outcome);
             }),
         );
-        self.status_note = Some(format!(
+        self.status_notes.set_general(Some(format!(
             "applying {name} revision {revision}: not helm rollback (hooks will not run)"
-        ));
+        )));
         cx.notify();
         let this = cx.weak_entity();
         window
@@ -1221,7 +1251,7 @@ impl Workspace {
                             .to_string(),
                     };
                     this.rollback_answered(note.clone().into(), cx);
-                    this.status_note = Some(note);
+                    this.status_notes.set_general(Some(note));
                     cx.notify();
                 });
             })
@@ -1325,10 +1355,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(sources) = editor.read(cx).diff_sources() else {
-            self.status_note = Some(
+            self.status_notes.set_general(Some(
                 "this buffer was not read from the cluster, so there is no copy to compare it with"
                     .to_string(),
-            );
+            ));
             cx.notify();
             return;
         };
@@ -1497,9 +1527,9 @@ impl Workspace {
     ) {
         let Some(config) = self.config.clone() else {
             if !self.bench {
-                self.status_note = Some(
+                self.status_notes.set_general(Some(
                     "no config directory on this platform, so there is no file to edit".to_string(),
-                );
+                ));
                 cx.notify();
             }
             return;
@@ -1576,8 +1606,8 @@ impl Workspace {
             self.activate_bottom(index, window, cx);
             return;
         }
-        let provider = self.provider();
-        let view = cx.new(|cx| ForwardsView::new(provider, start, cx));
+        let slot = self.slot.clone();
+        let view = cx.new(|cx| ForwardsView::new(slot, start, cx));
         self.open_bottom(Tab::new(ItemTag::Forwards, view), window, cx);
     }
 
@@ -1748,8 +1778,9 @@ impl Workspace {
                     let handle = tab.view.focus_handle(cx);
                     window.focus(&handle, cx);
                 }
-                self.status_note =
-                    Some("unsaved changes; ctrl-w again to discard them".to_string());
+                self.status_notes.set_general(Some(
+                    "unsaved changes; ctrl-w again to discard them".to_string(),
+                ));
                 cx.notify();
             }
             CloseTarget::Center(land_on) => {

@@ -2,16 +2,21 @@
 //!
 //! The editor's apply, exec, logs, port-forward, and usage stay in that
 //! file. This one drives Helm, Argo, Flux, overlays, describe, tables,
-//! observability, and day-2 against the same cluster and the same two extra
-//! identities. Ignored by default for the same no-network reason.
+//! observability, and day-2 against the same cluster. Existing restricted
+//! identities and a disposable catalogue identity prove their respective RBAC
+//! cases. Ignored by default for the same no-network reason.
+//! The Grafana RBAC proof creates a disposable identity with Service discovery
+//! and named proxy reads, then removes only its own UID-pinned resources.
+//! The Grafana forward proof creates two uniquely named Services in sequence,
+//! selecting the existing Grafana workload with numeric and named target ports.
+//! It removes each created Service by UID and proves loopback listener release.
 //!
 //! ```text
 //! KUBECONFIG=/path/to/kubeconfig cargo test -p k10s-data --test live_adapters -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! `--test-threads=1` is required: the day-2 tests share a throwaway
-//! Deployment that a parallel scale races. Grafana lock fixtures also need
-//! exclusive access to the shared database.
+//! Deployment that a parallel scale races.
 //!
 //! Helm inventory reads release Secret metadata only. Payload reveal, diff and
 //! stored-revision apply refuse without reading or modifying a release. Argo
@@ -22,11 +27,10 @@
 //! The decode-failure proof needs the lab's permissive CNPG fixture CRD. It
 //! creates one generated Cluster with an invalid instances field and removes
 //! it before checking the returned ecosystem table.
-//! The Grafana failure proof needs the observability lab's monitoring release
-//! and its monitoring-grafana PVC. A generated pod holds a SQLite lock without
-//! changing data. It is deleted even when a check panics; run this suite alone.
-//! Saturated telemetry proves client cancellation and concurrent Kubernetes
-//! reads and watch delivery, not backend cancellation or native UI latency.
+//! Grafana timeout and saturation proofs delay only complete, bounded successful
+//! replies from the actual service on the interactive client. They never access
+//! its storage. They prove client cancellation and concurrent Kubernetes reads
+//! and watch delivery, not server locks, backend cancellation or native UI latency.
 //!
 //! The drain proof requires `live_fixtures.sh --with kwok`: it drains a fake
 //! kwok node whose one pod sits under a PodDisruptionBudget with no disruption
@@ -46,6 +50,13 @@ use std::time::Duration;
 
 #[path = "live_adapters/collector_route.rs"]
 mod collector_route;
+#[path = "live_adapters/forward_grafana.rs"]
+mod forward_grafana;
+#[path = "live_adapters/grafana_delay.rs"]
+mod grafana_delay;
+#[cfg(unix)]
+#[path = "live_adapters/grafana_rbac.rs"]
+mod grafana_rbac;
 #[path = "live_adapters/inspector.rs"]
 mod inspector;
 #[path = "live_adapters/trace_logs.rs"]
@@ -577,159 +588,47 @@ fn an_unreadable_live_resource_survives_into_the_ecosystem_table() {
     }
 }
 
-async fn with_grafana_storage_lock<T>(
-    client: &kube::Client,
-    check: impl std::future::Future<Output = T>,
-) -> T {
-    use futures::FutureExt;
-    use k8s_openapi::api::core::v1::Pod;
-    use kube::api::{AttachParams, DeleteParams, PostParams, Preconditions};
-    use kube::runtime::wait::{await_condition, conditions};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), "observability");
-    let fixture: Pod = serde_json::from_value(serde_json::json!({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": {"generateName": "k10s-grafana-lock-"},
-            "spec": {
-                "restartPolicy": "Never", "activeDeadlineSeconds": 120,
-                "securityContext": {
-                    "runAsUser": 472, "runAsGroup": 472, "fsGroup": 472, "runAsNonRoot": true,
-                },
-                "containers": [{
-                    "name": "lock",
-                    "image": "python:3.14.7-alpine3.24@sha256:c6ead215bfd31f1e433d968853b7a769989117115b728874824e6c0a27cb96fc",
-                    "command": ["python", "-c", "import time; time.sleep(120)"],
-                    "resources": {
-                        "requests": {"cpu": "10m", "memory": "32Mi"},
-                        "limits": {"memory": "96Mi"},
-                    },
-                    "securityContext": {
-                        "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]},
-                    },
-                    "volumeMounts": [{"name": "storage", "mountPath": "/var/lib/grafana"}],
-                }],
-                "volumes": [{
-                    "name": "storage", "persistentVolumeClaim": {"claimName": "monitoring-grafana"},
-                }],
-            },
-    })).expect("the lock fixture");
-    let created = tokio::time::timeout(
-        Duration::from_secs(60),
-        pods.create(&PostParams::default(), &fixture),
-    )
-    .await
-    .expect("the lock pod create timed out; a write may have landed without a returned UID")
-    .expect("the lock pod");
-    let name = created.metadata.name.expect("the generated name");
-    let uid = created.metadata.uid.expect("the generated UID");
-
-    let checked = std::panic::AssertUnwindSafe(async {
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            await_condition(pods.clone(), &name, conditions::is_pod_running()),
-        )
-        .await
-        .expect("the lock pod starts within a minute")
-        .expect("the pod can be watched");
-        let code = r#"
-import sqlite3
-import sys
-
-database = sqlite3.connect("file:/var/lib/grafana/grafana.db?mode=rw", uri=True)
-database.execute("BEGIN EXCLUSIVE")
-print("locked", flush=True)
-sys.stdin.readline()
-database.rollback()
-print("released", flush=True)
-"#;
-        let mut lock = tokio::time::timeout(
-            Duration::from_secs(10),
-            pods.exec(
-                &name,
-                ["python", "-u", "-c", code],
-                &AttachParams::default()
-                    .stdin(true)
-                    .stdout(true)
-                    .stderr(true),
-            ),
-        )
-        .await
-        .expect("the lock process attaches within 10 seconds")
-        .expect("the lock process attaches");
-        let status = lock.take_status().expect("the remote exit status");
-        let mut input = lock.stdin().expect("the release channel");
-        let mut output = BufReader::new(lock.stdout().expect("the lock markers")).lines();
-        let marker = tokio::time::timeout(Duration::from_secs(10), output.next_line())
-            .await
-            .expect("the database can be locked")
-            .expect("the lock marker can be read");
-        assert_eq!(marker.as_deref(), Some("locked"));
-
-        let checked = std::panic::AssertUnwindSafe(check).catch_unwind().await;
-
-        tokio::time::timeout(Duration::from_secs(10), input.write_all(b"release\n"))
-            .await
-            .expect("the database lock release channel answers within 10 seconds")
-            .expect("release the database lock");
-        let marker = tokio::time::timeout(Duration::from_secs(10), output.next_line())
-            .await
-            .expect("the lock releases")
-            .expect("the release marker can be read");
-        assert_eq!(marker.as_deref(), Some("released"));
-        let status = tokio::time::timeout(Duration::from_secs(10), status)
-            .await
-            .expect("the lock process exits")
-            .expect("the exit status arrives");
-        assert_eq!(status.status.as_deref(), Some("Success"), "{status:?}");
-        tokio::time::timeout(Duration::from_secs(10), lock.join())
-            .await
-            .expect("the lock process ends")
-            .expect("the lock connection closes");
-        checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    })
-    .catch_unwind()
-    .await;
-
-    tokio::time::timeout(Duration::from_secs(15), async {
-        match pods
-            .delete(
-                &name,
-                &DeleteParams {
-                    grace_period_seconds: Some(0),
-                    preconditions: Some(Preconditions {
-                        uid: Some(uid.clone()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(kube::Error::Api(error)) if error.code == 404 => {}
-            Err(error) => panic!("generated lock pod {name} UID {uid} cleanup refused: {error}"),
-        }
-        await_condition(pods, &name, conditions::is_deleted(&uid))
-            .await
-            .expect("the lock pod cleanup can be watched");
-    })
-    .await
-    .expect("the generated lock pod is removed within 15 seconds");
-    checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-}
-
 #[test]
-#[ignore = "needs the observability lab's Grafana and PVC; see the module comment"]
-fn a_busy_live_grafana_catalog_reports_its_timeout_and_recovers() {
+#[ignore = "needs the real observability Grafana; delays only its actual successful search reply"]
+fn a_delayed_live_grafana_catalog_reports_its_timeout_and_recovers() {
+    use k10s_data::integrations::grafana;
     use k10s_data::reach::{self, ToolKind, ToolReach};
+    use std::sync::Arc;
 
-    let (_plane, sync) = connect(None);
-    let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader.fetch_grafana_catalog(move |answer| {
-        let _ = tx.send(answer);
-    });
-    let Fetched::Ok(before) = wait(&rx) else {
+    assert!(std::env::var_os("KUBECONFIG").is_some());
+    let (sink, _events) = crossbeam_channel::bounded(DEFAULT_EVENT_SINK_CAPACITY);
+    let plane = k10s_data::spawn(sink).expect("the production data runtime");
+    let runtime = plane.runtime();
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("the real lab client");
+    let (interactive, delay) = grafana_delay::client(runtime, client.clone(), "api/search", 1);
+    let namespace = namespace();
+    let sync = runtime
+        .block_on(k10s_data::sync_from(
+            k10s_data::connect::Clients {
+                sync: client.clone(),
+                interactive,
+            },
+            &namespace,
+            &Options {
+                probe_namespaces: vec![namespace.clone()],
+                ..Default::default()
+            },
+            plane.events().clone(),
+            Arc::new(k10s_data::IngestMetrics::default()),
+        ))
+        .expect("the real cluster sync");
+    let fetch = || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = sync.reader.observe_grafana(move |answer| {
+            let _ = tx.send(answer);
+        });
+        let answer = wait(&rx);
+        drop(stop);
+        answer
+    };
+    let Fetched::Ok(before) = fetch() else {
         panic!("the lab's Grafana catalog must initially answer");
     };
     assert!(before.served && !before.dashboards.is_empty());
@@ -738,54 +637,100 @@ fn a_busy_live_grafana_catalog_reports_its_timeout_and_recovers() {
         "the initial catalog must be complete: {:?}",
         before.errors
     );
-
-    kube_runtime().block_on(async {
-        let mut config = kube::Config::infer().await.expect("the fixture kubeconfig");
-        config.default_retry = false;
-        let client = kube::Client::try_from(config).expect("the fixture client");
-        let (reached, answer) = with_grafana_storage_lock(&client, async {
-            let reached = reach::bind(&client, ToolKind::Grafana, &ReachSettings::default()).await;
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            sync.reader.fetch_grafana_catalog(move |answer| {
-                let _ = tx.send(answer);
-            });
-            let answer = tokio::time::timeout(Duration::from_secs(15), rx).await;
-            (reached, answer)
-        })
-        .await;
-        assert!(
-            matches!(reached, ToolReach::Bound(_)),
-            "health still answers while storage is locked: {reached:?}"
-        );
-        let answer = answer
-            .expect("the catalog reports within the budget")
-            .expect("the callback arrives");
-        let Fetched::Ok(partial) = answer else {
-            panic!("healthy provisioned dashboards remain visible beside the timeout: {answer:?}");
-        };
-        assert!(partial.served && !partial.dashboards.is_empty());
-        assert_eq!(
-            partial.errors,
-            ["Grafana search: grafana did not answer within 4 seconds"]
-        );
-        for dashboard in &partial.dashboards {
-            assert!(before.dashboards.contains(dashboard), "{dashboard:?}");
+    let provisioned = runtime.block_on(async {
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            grafana::fetch_provisioned_from_configmaps(&client),
+        )
+        .await
+        .expect("the actual provisioning catalogue answers within 15 seconds")
+        {
+            Fetched::Ok(provisioned) => provisioned,
+            other => panic!("the independent provisioning catalogue must answer: {other:?}"),
         }
     });
-
+    assert!(
+        !provisioned.truncated
+            && provisioned.errors.is_empty()
+            && !provisioned.dashboards.is_empty(),
+        "the independent provisioning catalogue must be complete: {provisioned:?}"
+    );
+    assert!(
+        provisioned.dashboards.iter().all(|dashboard| {
+            dashboard.source == grafana::DashboardSource::ConfigMap && !dashboard.truncated
+        }),
+        "the independent catalogue must contain complete ConfigMap definitions: {provisioned:?}"
+    );
+    delay.arm();
     let (tx, rx) = std::sync::mpsc::channel();
-    sync.reader.fetch_grafana_catalog(move |answer| {
+    let stop = sync.reader.observe_grafana(move |answer| {
         let _ = tx.send(answer);
     });
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while delay.completed() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one bounded actual search body arrives before the delay");
+        assert_eq!(delay.active(), 1);
+        let reached = tokio::time::timeout(
+            Duration::from_secs(2),
+            reach::bind(&client, ToolKind::Grafana, &ReachSettings::default()),
+        )
+        .await
+        .expect("Grafana health answers within two seconds during the client delay");
+        assert!(
+            matches!(reached, ToolReach::Bound(_)),
+            "Grafana health answers during the client delay: {reached:?}"
+        );
+        assert_eq!(
+            delay.active(),
+            1,
+            "the search remains delayed after health answers"
+        );
+    });
+    let answer = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the catalog reports within the budget");
+    let Fetched::Ok(partial) = answer else {
+        panic!("healthy provisioned dashboards remain beside the timeout: {answer:?}");
+    };
+    assert!(partial.served && !partial.dashboards.is_empty());
     assert_eq!(
-        wait(&rx),
+        partial.errors,
+        ["Grafana search: grafana did not answer within 4 seconds"]
+    );
+    assert_eq!(
+        partial.dashboards, provisioned.dashboards,
+        "the timeout retains every complete actual ConfigMap definition and its provenance"
+    );
+    drop(stop);
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while delay.active() != 0 || sync.reader.observe_schedule_counts().admitted != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timeout drops the actual delayed client response and scheduler slot");
+    });
+    delay.release();
+    assert_eq!(
+        fetch(),
         Fetched::Ok(before),
-        "the catalog recovers after releasing the lock"
+        "the catalog recovers through the same real service"
+    );
+    assert_eq!(delay.completed(), 1);
+    println!(
+        "real Grafana successful reply delayed before client timeout: {:?}; server locks, server cancellation and native latency are not measured",
+        delay.witnesses()
     );
 }
 
 #[test]
-#[ignore = "needs the owned pilot, Grafana and PVC; run the live suite serially"]
+#[ignore = "needs the owned pilot and real Grafana; delays only successful panel replies"]
 fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_progress() {
     use futures::FutureExt;
     use k8s_openapi::api::{
@@ -805,7 +750,9 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
         std::env::var_os("KUBECONFIG").is_some(),
         "the real lab kubeconfig is required"
     );
-    let runtime = kube_runtime();
+    let (sink, events) = crossbeam_channel::bounded(DEFAULT_EVENT_SINK_CAPACITY);
+    let plane = k10s_data::spawn(sink).expect("the production data runtime");
+    let runtime = plane.runtime();
     let (client, pod, uid, node) = runtime.block_on(async {
         let mut config = kube::Config::infer().await.expect("the fixture kubeconfig");
         config.default_retry = false;
@@ -856,8 +803,14 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
         (client, name, uid, node)
     });
 
-    let (sink, events) = crossbeam_channel::bounded(DEFAULT_EVENT_SINK_CAPACITY);
-    let plane = k10s_data::spawn(sink).expect("the production data runtime");
+    // A queued request may begin while the six cancellation handles drop.
+    let (interactive, delay) = grafana_delay::client(
+        runtime,
+        client.clone(),
+        "api/datasources/proxy/uid/prometheus/api/v1/query_range",
+        6,
+    );
+    let metrics = std::sync::Arc::new(k10s_data::IngestMetrics::default());
     let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(16);
     let drain = std::thread::spawn(move || {
         for event in events {
@@ -877,13 +830,20 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
             }
         }
     });
-    let sync = plane
-        .sync(&Options {
-            context: None,
-            kubeconfig: None,
-            probe_namespaces: vec![NS.into()],
-            sync_timeout: Duration::from_secs(30),
-        })
+    let sync = runtime
+        .block_on(k10s_data::sync_from(
+            k10s_data::connect::Clients {
+                sync: client.clone(),
+                interactive,
+            },
+            NS,
+            &Options {
+                probe_namespaces: vec![NS.into()],
+                ..Default::default()
+            },
+            plane.events().clone(),
+            metrics.clone(),
+        ))
         .expect("the real pilot sync");
     let deployments = kind(&sync.reader, "deployments.apps");
     assert_eq!(deployments.id, KindId::DEPLOYMENT);
@@ -1006,11 +966,14 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
         result
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let warm_stop = sync
-        .reader
-        .observe_panel(target.clone(), variables.clone(), move |answer| {
+    let warm_stop = sync.reader.observe_panel(
+        catalog.query_source.clone(),
+        target.clone(),
+        variables.clone(),
+        move |answer| {
             let _ = tx.send(answer);
-        });
+        },
+    );
     let before = current_panel(wait(&rx));
     drop(warm_stop);
     drop(catalog_stop);
@@ -1021,14 +984,15 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }).await.expect("warm requests release their scheduler slots");
-        with_grafana_storage_lock(&client, async {
+        {
+            delay.arm();
             let stalled_at = Instant::now();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(6);
             let mut stops = Vec::with_capacity(6);
             for request in 0..6 {
                 let tx = reply_tx.clone();
-                stops.push(sync.reader.observe_panel(target.clone(), variables.clone(), move |answer| {
+                stops.push(sync.reader.observe_panel(catalog.query_source.clone(), target.clone(), variables.clone(), move |answer| {
                     let _ = tx.try_send((request, answer));
                 }));
             }
@@ -1039,14 +1003,18 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
                     if counts.active == 2 && counts.admitted == 6 { break; }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-            }).await.expect("two requests run while four wait against locked Grafana");
+            }).await.expect("two requests run while four wait on delayed real Grafana replies");
+            tokio::time::timeout_at(deadline, async {
+                while delay.completed() != 2 { tokio::task::yield_now().await; }
+            }).await.expect("two complete bounded actual panel bodies arrive before the delay");
+            assert_eq!(delay.active(), 2);
             let saturated = sync.reader.observe_schedule_counts();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let _rejected = sync.reader.observe_panel(target.clone(), variables.clone(), move |answer| { let _ = tx.send(answer); });
+            let _rejected = sync.reader.observe_panel(catalog.query_source.clone(), target.clone(), variables.clone(), move |answer| { let _ = tx.send(answer); });
             let rejected = tokio::time::timeout_at(deadline, rx).await.expect("capacity refusal is immediate").expect("the refusal callback");
             assert_eq!(rejected, Fetched::Failed {
                 what: "telemetry",
-                why: "telemetry is busy: two requests are active and four are waiting".into(),
+                why: "telemetry is busy: request capacity is full; try again shortly".into(),
             });
 
             let api: kube::Api<Deployment> = kube::Api::namespaced(client.clone(), NS);
@@ -1067,7 +1035,7 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
                     }
                 }
             })).expect("the zero-replica progress fixture");
-            let metrics_before = plane.metrics();
+            let metrics_before = metrics.forwarded.load(std::sync::atomic::Ordering::Relaxed);
             let created_at = Instant::now();
             let created = tokio::time::timeout_at(deadline, api.create(&PostParams::default(), &fixture))
                 .await.expect("progress Deployment create timed out; a write may have landed without a returned UID")
@@ -1105,7 +1073,7 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
                 assert_eq!(still_stalled.active, 2, "{still_stalled:?}");
                 assert_eq!(still_stalled.admitted, 6, "{still_stalled:?}");
                 let premature = reply_rx.try_recv();
-                assert!(matches!(premature, Err(tokio::sync::mpsc::error::TryRecvError::Empty)), "locked requests must not finish before cancellation: {premature:?}");
+                assert!(matches!(premature, Err(tokio::sync::mpsc::error::TryRecvError::Empty)), "delayed requests must not finish before cancellation: {premature:?}");
 
                 let cancelled_at = Instant::now();
                 drop(stops);
@@ -1116,6 +1084,9 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }).await.expect("cancellation releases active and waiting capacity before backend timeout");
+                tokio::time::timeout_at(deadline, async {
+                    while delay.active() != 0 { tokio::task::yield_now().await; }
+                }).await.expect("cancellation drops both delayed real responses");
                 let released_at = Instant::now();
                 let cancelled_reply = tokio::time::timeout_at(deadline, reply_rx.recv()).await
                     .expect("all cancelled callback senders are dropped");
@@ -1131,9 +1102,9 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
                 assert_eq!(counts.peak_active, 2);
                 assert_eq!(counts.peak_admitted, 6);
                 assert_eq!(counts.rejected, 1);
-                let metrics_after = plane.metrics();
-                assert!(metrics_after.forwarded > metrics_before.forwarded, "{metrics_before:?} -> {metrics_after:?}");
-                println!("live telemetry client cancellation and data-plane progress: producer={NS}/{pod} UID={uid}, probe={name} UID={probe_uid}, saturated={saturated:?}, recovered={counts:?}, watch={:?}, ordinary_read={:?}, cancellation={:?}, stall_total={:?}, ingest={metrics_before:?}->{metrics_after:?}; server cancellation, unfinished wire bytes and GPUI responsiveness are not measured",
+                let metrics_after = metrics.forwarded.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(metrics_after > metrics_before, "{metrics_before:?} -> {metrics_after:?}");
+                println!("live telemetry client cancellation and data-plane progress: producer={NS}/{pod} UID={uid}, probe={name} UID={probe_uid}, saturated={saturated:?}, recovered={counts:?}, watch={:?}, ordinary_read={:?}, cancellation={:?}, stall_total={:?}, ingest={metrics_before:?}->{metrics_after:?}; server lock behavior, server cancellation and GPUI responsiveness are not measured",
                     delivered_at.duration_since(created_at), read_at.duration_since(read_started), released_at.duration_since(cancelled_at), stalled_at.elapsed());
             }).catch_unwind().await;
             tokio::time::timeout(Duration::from_secs(15), async {
@@ -1148,14 +1119,21 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
                 }
                 await_condition(api, &name, conditions::is_deleted(&probe_uid)).await.expect("the progress fixture cleanup can be watched");
             }).await.expect("the owned progress Deployment is removed within 15 seconds");
+            delay.release();
+            println!("actual bounded Grafana replies delayed for client saturation: {:?}; no server lock or server cancellation is proven", delay.witnesses());
             checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        }).await;
+        }
     });
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let _stop = sync.reader.observe_panel(target, variables, move |answer| {
-        let _ = tx.send(answer);
-    });
+    let _stop = sync.reader.observe_panel(
+        catalog.query_source.clone(),
+        target,
+        variables,
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
     let after = current_panel(wait(&rx));
     runtime.block_on(async {
         let pods: kube::Api<Pod> = kube::Api::namespaced(client, NS);
@@ -1248,7 +1226,8 @@ fn overlays_degrade_to_a_note_when_the_adapter_is_not_on_the_cluster() {
         overlay::Kind::MeshObserved,
     ] {
         let (tx, rx) = std::sync::mpsc::channel();
-        sync.reader
+        let _stop = sync
+            .reader
             .fetch_overlay(kind, settings.clone(), move |fetched| {
                 let _ = tx.send(fetched);
             });
@@ -1266,6 +1245,124 @@ fn overlays_degrade_to_a_note_when_the_adapter_is_not_on_the_cluster() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "needs the live lab; delays an actual provisioning response without mutations"]
+fn cancelling_a_real_metrics_overlay_releases_capacity_for_a_fresh_overlay_result() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PROVISIONING: &str =
+        "/api/v1/configmaps?&labelSelector=grafana_dashboard+in+%281%2Ctrue%29&limit=200";
+    assert!(std::env::var_os("KUBECONFIG").is_some());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a live overlay runtime");
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("the live lab client");
+    let armed = Arc::new(AtomicBool::new(false));
+    let intercepted = Arc::new(AtomicBool::new(false));
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+    let underlying = client.clone();
+    let armed_for_service = armed.clone();
+    let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+        let client = underlying.clone();
+        let armed = armed_for_service.clone();
+        let intercepted = intercepted.clone();
+        let seen_tx = seen_tx.clone();
+        async move {
+            let target = request.method() == http::Method::GET
+                && request
+                    .uri()
+                    .path_and_query()
+                    .is_some_and(|path| path.as_str() == PROVISIONING)
+                && armed.load(Ordering::Relaxed)
+                && !intercepted.swap(true, Ordering::Relaxed);
+            if !target {
+                return client.send(request).await;
+            }
+            assert!(request.headers().get(http::header::ACCEPT).is_none());
+            assert!(request.headers().get(http::header::CONTENT_TYPE).is_none());
+            let (parts, body) = request.into_parts();
+            let bytes = body.collect_bytes().await?;
+            assert!(bytes.is_empty(), "provisioning reads have no body");
+            let response = client
+                .send(http::Request::from_parts(
+                    parts,
+                    kube::client::Body::from(bytes),
+                ))
+                .await?;
+            assert!(
+                response.status().is_success(),
+                "the real provisioning list answered"
+            );
+            seen_tx
+                .send(())
+                .expect("real provisioning response witness");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<_, kube::Error>(response)
+        }
+    });
+    let namespace = namespace();
+    let delayed = runtime.block_on(async { kube::Client::new(service, namespace.clone()) });
+    let (events, _events_rx) = crossbeam_channel::bounded(DEFAULT_EVENT_SINK_CAPACITY);
+    let sync = runtime
+        .block_on(k10s_data::sync_from(
+            k10s_data::connect::Clients {
+                sync: client,
+                interactive: delayed,
+            },
+            &namespace,
+            &Options {
+                probe_namespaces: vec![namespace.clone()],
+                ..Default::default()
+            },
+            events,
+            Arc::new(k10s_data::IngestMetrics::default()),
+        ))
+        .expect("the live lab sync");
+    armed.store(true, Ordering::Relaxed);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = sync.reader.fetch_overlay(
+        overlay::Kind::Metrics,
+        ReachSettings::default(),
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
+    wait(&seen_rx);
+    assert_eq!(sync.reader.observe_schedule_counts().active, 1);
+    drop(stop);
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sync.reader.observe_schedule_counts().admitted != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled overlay releases admission");
+    });
+    assert_eq!(sync.reader.observe_schedule_counts().active, 0);
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _stop = sync.reader.fetch_overlay(
+        overlay::Kind::Metrics,
+        ReachSettings::default(),
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
+    assert!(
+        matches!(wait(&rx), Fetched::Ok(_)),
+        "a fresh admitted overlay must return a frame, which may contain a source failure note"
+    );
 }
 
 #[test]
@@ -2549,6 +2646,8 @@ fn a_service_forward_reads_the_pilot_through_a_named_prometheus_url() {
             namespace: "observability".into(),
             name: "monitoring-kube-prometheus-prometheus".into(),
             service: true,
+            service_port: None,
+            expected_service: None,
         },
         move |answer| {
             let _ = tx.send(answer);
@@ -2854,9 +2953,14 @@ fn restricted_accounts_read_current_pilot_metrics_and_grafana_panels() {
                 min_interval: panel.min_interval.clone(),
             };
             let (tx, rx) = std::sync::mpsc::channel();
-            let _panel_stop = sync.reader.observe_panel(target, variables, move |answer| {
-                let _ = tx.send(answer);
-            });
+            let _panel_stop = sync.reader.observe_panel(
+                catalog.query_source.clone(),
+                target,
+                variables,
+                move |answer| {
+                    let _ = tx.send(answer);
+                },
+            );
             let result = match wait(&rx) {
                 Fetched::Ok(Some(result)) => result,
                 other => panic!("{context} panel {}: {other:?}", panel.title),
@@ -3053,9 +3157,11 @@ fn collector_pipeline_links_current_workload_metrics_logs_and_trace() {
             step_ms: 15000,
             min_interval: panel.min_interval.clone(),
         };
-        let _stop = sync.reader.observe_panel(target, vars, move |answer| {
-            let _ = tx.send((answer, k10s_data::telemetry::request_metrics()));
-        });
+        let _stop =
+            sync.reader
+                .observe_panel(catalog.query_source.clone(), target, vars, move |answer| {
+                    let _ = tx.send((answer, k10s_data::telemetry::request_metrics()));
+                });
         let (answer, metrics) = wait(&rx);
         let result = match answer {
             Fetched::Ok(Some(result)) => result,

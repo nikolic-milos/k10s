@@ -1,7 +1,9 @@
 //! Translate observability queries and alert operations into provider outcomes.
 
 use super::kubernetes::table_outcome;
+use k10s_core::ServiceIdentity;
 use k10s_data::read::Fetched;
+use std::sync::Arc;
 
 pub(super) fn omitted_notice_answer(uid: &str) -> Option<k10s_provider::AlertPodOutcome> {
     k10s_data::integrations::alertmanager::is_omitted_notice(uid).then(|| {
@@ -180,12 +182,61 @@ pub(super) fn tool_presence(seen: k10s_data::read::Seen) -> k10s_provider::ToolP
 /// attacker-shaped; percent-encoding here keeps the launcher's URL gate
 /// sufficient. Real Grafana uids are alphanumeric with `-`/`_` and pass
 /// through unchanged.
-fn grafana_panel_url(base: Option<&str>, uid: &str, panel_id: i64) -> Option<String> {
-    let base = base?.trim_end_matches('/');
+/// Browser-only HTTPS locations keep the user's complete destination.
+fn grafana_panel_url(base: Option<&str>, uid: &str, panel_id: Option<i64>) -> Option<String> {
+    let base = base?;
+    if base
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        return Some(base.to_string());
+    }
+    let base = base.trim_end_matches('/');
     if uid.is_empty() {
         return Some(base.to_string());
     }
-    k10s_provider::grafana_panel_path(uid, panel_id).map(|path| format!("{base}{path}"))
+    let path = match panel_id {
+        Some(id) => k10s_provider::grafana_panel_path(uid, id),
+        None => k10s_provider::grafana_dashboard_path(uid),
+    }?;
+    Some(format!("{base}{path}"))
+}
+
+#[cfg(test)]
+mod browser_url_tests {
+    use super::grafana_panel_url;
+
+    #[test]
+    fn browser_only_https_keeps_the_exact_configured_location() {
+        for base in [
+            "https://grafana.test/d/overview?orgId=1#panel",
+            "https://grafana.test/d/overview",
+            "https://grafana.test/",
+            "HTTPS://grafana.test/d/overview?orgId=1#panel",
+        ] {
+            assert_eq!(
+                grafana_panel_url(Some(base), "selected", Some(2)).as_deref(),
+                Some(base)
+            );
+            assert_eq!(
+                grafana_panel_url(Some(base), "selected", None).as_deref(),
+                Some(base)
+            );
+        }
+        assert_eq!(
+            grafana_panel_url(Some("http://grafana.test/prefix/"), "selected", Some(2)).as_deref(),
+            Some("http://grafana.test/prefix/d/selected?viewPanel=2")
+        );
+        assert_eq!(
+            grafana_panel_url(Some("http://grafana.test/prefix/"), "selected", None).as_deref(),
+            Some("http://grafana.test/prefix/d/selected")
+        );
+        assert_eq!(
+            grafana_panel_url(Some("http://grafana.test/prefix/"), "selected", Some(0)).as_deref(),
+            Some("http://grafana.test/prefix/d/selected?viewPanel=0")
+        );
+        assert_eq!(grafana_panel_url(None, "selected", Some(2)), None);
+    }
 }
 
 fn panel_kind(
@@ -230,46 +281,91 @@ fn query_dialect(
     }
 }
 
+fn grafana_browser_forward(
+    service: Option<&(String, String, u16)>,
+    query_source: Option<&Arc<ServiceIdentity>>,
+) -> Option<k10s_provider::ForwardRequest> {
+    let (namespace, name, port) = service?;
+    let source = query_source.filter(|source| {
+        source.namespace == *namespace && source.name == *name && source.port == *port
+    })?;
+    Some(k10s_provider::ForwardRequest {
+        namespace: namespace.clone(),
+        name: name.clone(),
+        service: true,
+        service_port: Some(*port),
+        expected_service: Some(source.clone()),
+    })
+}
+
 fn flatten_dashboard(
     dashboard: &k10s_data::integrations::grafana::Dashboard,
     browser_base: Option<&str>,
-    browser_service: Option<&(String, String)>,
+    browser_service: Option<&(String, String, u16)>,
+    query_source: Option<&Arc<ServiceIdentity>>,
     into: &mut Vec<k10s_provider::GrafanaPanelRow>,
 ) {
-    for panel in &dashboard.panels {
+    let source = match dashboard.source {
+        k10s_data::integrations::grafana::DashboardSource::Grafana => {
+            k10s_provider::GrafanaRowSource::Grafana
+        }
+        k10s_data::integrations::grafana::DashboardSource::ConfigMap => {
+            k10s_provider::GrafanaRowSource::ConfigMap
+        }
+        k10s_data::integrations::grafana::DashboardSource::Unknown => {
+            k10s_provider::GrafanaRowSource::Unknown
+        }
+    };
+    for (position, panel) in dashboard.panels.iter().enumerate() {
+        let remaining = k10s_shell::table::MAX_ROWS.saturating_sub(into.len());
+        if remaining == 0 {
+            break;
+        }
+        let browser_panel_id = if source == k10s_provider::GrafanaRowSource::Grafana {
+            panel.id
+        } else {
+            None
+        };
         if panel.queries.is_empty() {
             into.push(k10s_provider::GrafanaPanelRow {
+                query_source: query_source.cloned(),
                 dashboard_uid: dashboard.uid.clone(),
                 dashboard_title: dashboard.title.clone(),
-                panel_id: panel.id,
+                identity: k10s_provider::GrafanaRowIdentity::Panel {
+                    id: panel.id,
+                    position,
+                },
+                source,
                 title: panel.title.clone(),
                 kind: panel_kind(panel.kind),
                 expr: String::new(),
                 dialect: k10s_provider::QueryDialect::Unknown,
                 transformed: panel.transformed,
-                browser_url: grafana_panel_url(browser_base, &dashboard.uid, panel.id),
-                browser_forward: browser_service.map(|(namespace, name)| {
-                    k10s_provider::ForwardRequest {
-                        namespace: namespace.clone(),
-                        name: name.clone(),
-                        service: true,
-                    }
-                }),
+                browser_url: grafana_panel_url(browser_base, &dashboard.uid, browser_panel_id),
+                browser_forward: grafana_browser_forward(browser_service, query_source),
                 datasource_uid: None,
                 ref_id: String::new(),
                 unit: panel.unit.clone(),
                 reducer: panel.reducer.clone(),
                 min_step: String::new(),
                 min_interval: panel.min_interval.clone(),
-                unsupported: panel.unsupported.clone(),
+                unsupported: panel
+                    .unsupported
+                    .clone()
+                    .or_else(|| Some("No readable Grafana query targets".to_string())),
             });
             continue;
         }
-        for query in &panel.queries {
+        for query in panel.queries.iter().take(remaining) {
             into.push(k10s_provider::GrafanaPanelRow {
+                query_source: query_source.cloned(),
                 dashboard_uid: dashboard.uid.clone(),
                 dashboard_title: dashboard.title.clone(),
-                panel_id: panel.id,
+                identity: k10s_provider::GrafanaRowIdentity::Panel {
+                    id: panel.id,
+                    position,
+                },
+                source,
                 title: if panel.title.is_empty() {
                     query.ref_id.clone()
                 } else {
@@ -279,14 +375,8 @@ fn flatten_dashboard(
                 expr: query.expr.clone(),
                 dialect: query_dialect(query.dialect),
                 transformed: panel.transformed,
-                browser_url: grafana_panel_url(browser_base, &dashboard.uid, panel.id),
-                browser_forward: browser_service.map(|(namespace, name)| {
-                    k10s_provider::ForwardRequest {
-                        namespace: namespace.clone(),
-                        name: name.clone(),
-                        service: true,
-                    }
-                }),
+                browser_url: grafana_panel_url(browser_base, &dashboard.uid, browser_panel_id),
+                browser_forward: grafana_browser_forward(browser_service, query_source),
                 datasource_uid: query.datasource.clone(),
                 ref_id: query.ref_id.clone(),
                 unit: panel.unit.clone(),
@@ -296,7 +386,23 @@ fn flatten_dashboard(
                 unsupported: panel
                     .unsupported
                     .clone()
-                    .or_else(|| query.unsupported.clone()),
+                    .or_else(|| query.unsupported.clone())
+                    .or_else(|| {
+                        use k10s_data::integrations::grafana::QueryDialect;
+                        match query.dialect {
+                            QueryDialect::PromQL => None,
+                            QueryDialect::LogQL => Some(
+                                "Grafana LogQL panel targets are unsupported; use a raw LogQL query or open in Grafana",
+                            ),
+                            QueryDialect::TraceQL => Some(
+                                "Grafana TraceQL panel targets are unsupported; open in Grafana",
+                            ),
+                            QueryDialect::Unknown => {
+                                Some("Grafana panel datasource query dialect is unknown")
+                            }
+                        }
+                        .map(str::to_string)
+                    }),
             });
         }
     }
@@ -310,45 +416,80 @@ pub(super) fn grafana_outcome(
             k10s_provider::GrafanaOutcome::Absent
         }
         Fetched::Ok(catalog) => {
-            let mut panels = Vec::new();
-            for dashboard in &catalog.dashboards {
-                flatten_dashboard(
-                    dashboard,
-                    catalog.browser_base.as_deref(),
-                    catalog.browser_service.as_ref(),
-                    &mut panels,
-                );
+            let candidates = catalog
+                .dashboards
+                .iter()
+                .flat_map(|dashboard| &dashboard.panels)
+                .map(|panel| panel.queries.len().max(1))
+                .sum::<usize>()
+                + catalog.extra_hits.len();
+            let mut panels = Vec::with_capacity(candidates.min(k10s_shell::table::MAX_ROWS));
+            let omitted = candidates.saturating_sub(k10s_shell::table::MAX_ROWS);
+            let mut truncated = catalog.truncated;
+            use k10s_data::integrations::grafana::DashboardSource;
+            for source in [
+                DashboardSource::Grafana,
+                DashboardSource::ConfigMap,
+                DashboardSource::Unknown,
+            ] {
+                for dashboard in catalog
+                    .dashboards
+                    .iter()
+                    .filter(|item| item.source == source)
+                {
+                    truncated |= dashboard.truncated;
+                    flatten_dashboard(
+                        dashboard,
+                        catalog.browser_base.as_deref(),
+                        catalog.browser_service.as_ref(),
+                        catalog.query_source.as_ref(),
+                        &mut panels,
+                    );
+                }
             }
-            for hit in catalog.extra_hits {
+            let remaining = k10s_shell::table::MAX_ROWS.saturating_sub(panels.len());
+            for hit in catalog.extra_hits.into_iter().take(remaining) {
+                let reason = match hit.reason {
+                    k10s_data::integrations::grafana::CatalogHitReason::FetchLimit => {
+                        "dashboard was not fetched at the catalog limit"
+                    }
+                    k10s_data::integrations::grafana::CatalogHitReason::Denied => {
+                        "Grafana dashboard read denied; see catalog details"
+                    }
+                    k10s_data::integrations::grafana::CatalogHitReason::Failed => {
+                        "Grafana dashboard read failed; see catalog details"
+                    }
+                };
+                let hit = hit.search;
                 panels.push(k10s_provider::GrafanaPanelRow {
+                    query_source: catalog.query_source.clone(),
                     dashboard_uid: hit.uid.clone(),
-                    dashboard_title: hit.title.clone(),
-                    panel_id: 0,
-                    title: hit.title,
+                    dashboard_title: hit.title,
+                    identity: k10s_provider::GrafanaRowIdentity::Dashboard,
+                    source: k10s_provider::GrafanaRowSource::Grafana,
+                    title: "Dashboard".into(),
                     kind: k10s_provider::GrafanaPanelKind::Unsupported,
                     expr: String::new(),
                     dialect: k10s_provider::QueryDialect::Unknown,
                     transformed: false,
-                    browser_url: grafana_panel_url(catalog.browser_base.as_deref(), &hit.uid, 0),
-                    browser_forward: catalog.browser_service.as_ref().map(|(namespace, name)| {
-                        k10s_provider::ForwardRequest {
-                            namespace: namespace.clone(),
-                            name: name.clone(),
-                            service: true,
-                        }
-                    }),
+                    browser_url: grafana_panel_url(catalog.browser_base.as_deref(), &hit.uid, None),
+                    browser_forward: grafana_browser_forward(
+                        catalog.browser_service.as_ref(),
+                        catalog.query_source.as_ref(),
+                    ),
                     datasource_uid: None,
                     ref_id: String::new(),
                     unit: String::new(),
                     reducer: String::new(),
                     min_step: String::new(),
                     min_interval: String::new(),
-                    unsupported: Some("dashboard was not fetched at the catalog limit".to_string()),
+                    unsupported: Some(reason.to_string()),
                 });
             }
             k10s_provider::GrafanaOutcome::Catalog {
                 panels,
-                truncated: catalog.truncated,
+                omitted,
+                truncated,
                 notices: catalog.errors,
             }
         }
@@ -403,8 +544,11 @@ pub(super) fn prom_outcome(
                 series,
                 truncated: result.truncated,
                 dropped_series: result.dropped_series,
+                possible_server_limit: result.possible_server_limit,
                 warnings: result.warnings,
                 infos: result.infos,
+                warnings_omitted: result.warnings_omitted,
+                infos_omitted: result.infos_omitted,
                 source: result.source,
                 step_ms: result.step_ms,
                 expr: result.expr,

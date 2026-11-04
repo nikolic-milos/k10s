@@ -72,4 +72,16 @@ pub fn keybindings() -> Vec<gpui::KeyBinding> {
 #[cfg(feature = "testing")]
 pub mod testing {
     pub use crate::frame::{FramePaths, FrameSink, IconJob, LabelFace, LabelJob, PaintSink, walk};
+
+    /// Counts from successful text paint calls, not evidence of visible pixels.
+    #[derive(Debug, Clone, Copy)]
+    pub struct PaintSnapshot {
+        /// Map paint entries since creation.
+        pub frames: u64,
+        pub paint_ok_lines: usize,
+        pub paint_ok_source_scalars: usize,
+        pub fit_refused: usize,
+        pub paint_errors: usize,
+        pub cache: k10s_atlas::TextCacheCounts,
+    }
 }

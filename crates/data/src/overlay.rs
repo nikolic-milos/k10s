@@ -349,13 +349,71 @@ pub fn from_prometheus(result: &prom::QueryResult) -> Frame {
             label: None,
         });
     }
-    Frame::of(
-        stamps,
-        result.truncated,
-        result
-            .truncated
-            .then(|| format!("kept {MAX_MARKS} series; the rest were not stamped")),
-    )
+    let mut note = String::new();
+    append_prometheus_notices(result, "Prometheus query", &mut note);
+    Frame::of(stamps, result.truncated, (!note.is_empty()).then_some(note))
+}
+
+pub(crate) fn append_prometheus_notices(
+    result: &prom::QueryResult,
+    source: &str,
+    text: &mut String,
+) {
+    use std::fmt::Write as _;
+
+    fn begin(text: &mut String, source: &str, level: &str) {
+        if !text.is_empty() {
+            text.push_str("; ");
+        }
+        text.push_str(source);
+        if !level.is_empty() {
+            text.push(' ');
+            text.push_str(level);
+        }
+        text.push_str(": ");
+    }
+    if result.truncated {
+        begin(text, source, "");
+        write!(
+            text,
+            "{} returned series omitted locally; overlay data is incomplete",
+            result.dropped_series
+        )
+        .expect("writing to a String");
+    }
+    if let Some(limit) = result.possible_server_limit {
+        begin(text, source, "");
+        write!(
+            text,
+            "range query reached the requested {limit}-series limit; completeness is unknown"
+        )
+        .expect("writing to a String");
+    }
+    for (level, omitted) in [
+        ("warning", result.warnings_omitted),
+        ("info", result.infos_omitted),
+    ] {
+        if omitted > 0 {
+            begin(text, source, "");
+            write!(
+                text,
+                "{omitted} {level} annotations omitted by the local limit"
+            )
+            .expect("writing to a String");
+        }
+    }
+    for (level, messages) in [("warnings", &result.warnings), ("info", &result.infos)] {
+        if messages.is_empty() {
+            continue;
+        }
+        begin(text, source, level);
+        for (index, message) in messages.iter().enumerate() {
+            if index > 0 {
+                text.push_str("; ");
+            }
+            text.push_str(message);
+        }
+    }
 }
 
 fn label(labels: &[(String, String)], name: &str) -> Option<String> {
@@ -390,7 +448,7 @@ pub fn from_mesh_declared(inventory: &mesh::MeshInventory) -> Frame {
 
 pub fn from_mesh_observed(edges: &[mesh::ObservedReach]) -> Frame {
     if edges.is_empty() {
-        return Frame::empty("no Istio, Hubble, or Linkerd request series");
+        return Frame::empty("no joinable mesh workload links could be derived");
     }
     let mut stamps = Vec::new();
     for edge in edges {
@@ -444,8 +502,11 @@ mod tests {
             }],
             truncated: false,
             dropped_series: 0,
+            possible_server_limit: None,
             warnings: Vec::new(),
             infos: Vec::new(),
+            warnings_omitted: 0,
+            infos_omitted: 0,
             source: String::new(),
             timing: Default::default(),
             step_ms: 0,
@@ -462,6 +523,32 @@ mod tests {
                 .iter()
                 .any(|(_, value)| *value == 50.0),
             "extrema survive downsample"
+        );
+    }
+
+    #[test]
+    fn prometheus_overlay_reports_omitted_series_even_without_kept_data() {
+        let result = prom::QueryResult {
+            result_type: prom::ResultType::Matrix,
+            series: Vec::new(),
+            truncated: true,
+            dropped_series: 1,
+            possible_server_limit: None,
+            warnings: Vec::new(),
+            infos: Vec::new(),
+            warnings_omitted: 0,
+            infos_omitted: 0,
+            source: String::new(),
+            timing: Default::default(),
+            step_ms: 0,
+            expr: String::new(),
+        };
+        let frame = from_prometheus(&result);
+        assert!(frame.stamps.is_empty());
+        assert!(frame.truncated);
+        assert_eq!(
+            frame.note.as_deref(),
+            Some("Prometheus query: 1 returned series omitted locally; overlay data is incomplete")
         );
     }
 
@@ -545,7 +632,7 @@ mod tests {
             frame
                 .note
                 .as_deref()
-                .is_some_and(|note| note.contains("no Istio")),
+                .is_some_and(|note| note.contains("no joinable mesh workload links")),
             "{:?}",
             frame.note
         );

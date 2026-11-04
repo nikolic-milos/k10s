@@ -111,10 +111,8 @@ pub async fn fetch(client: &Client, reach: &ToolReach) -> Fetched<Inventory> {
 
 fn unbound_why(unbound: &Unbound) -> String {
     let mut why = unbound.why.clone();
-    if let Some(url) = &unbound.browser_url {
-        why.push_str("; open ");
-        why.push_str(url);
-        why.push_str(" in the system browser");
+    if unbound.browser_url.is_some() {
+        why.push_str("; open the tool in the system browser");
     }
     why
 }

@@ -101,6 +101,8 @@ fn palette_visible(name: &str) -> bool {
             | "k10s_shell::DocPageDown"
             | "k10s_shell::DocHome"
             | "k10s_shell::DocEnd"
+            | "k10s_shell::NoticeFocusNext"
+            | "k10s_shell::NoticeFocusPrevious"
             | "k10s_shell::CommitInput"
             | "k10s_shell::CancelInput"
             | "k10s_shell::DeleteInputChar"
@@ -985,6 +987,8 @@ mod tests {
             "k10s_shell::RowDown",
             "k10s_shell::DocPageUp",
             "k10s_shell::DeleteInputChar",
+            "k10s_shell::NoticeFocusNext",
+            "k10s_shell::NoticeFocusPrevious",
         ] {
             assert!(!palette_visible(hidden), "{hidden}");
         }
@@ -993,6 +997,7 @@ mod tests {
             "k10s_shell::OpenBrowser",
             "k10s_shell::ToggleBottomDock",
             "k10s_shell::ToggleTimestamps",
+            "k10s_shell::OpenStatusDetails",
         ] {
             assert!(palette_visible(visible), "{visible}");
         }

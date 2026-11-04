@@ -109,6 +109,125 @@ fn an_error_status_is_a_failure_with_prometheus_text() {
 }
 
 #[test]
+fn annotation_limits_keep_full_prefixes_and_count_each_level_independently() {
+    for (warning_count, info_count) in [(0, 0), (255, 256), (256, 257), (257, 260), (4096, 4097)] {
+        let warnings: Vec<String> = (0..warning_count)
+            .map(|index| format!("warning {index}: complete 界"))
+            .collect();
+        let infos: Vec<String> = (0..info_count)
+            .map(|index| format!("info {index}: complete λ"))
+            .collect();
+        let body = serde_json::json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []},
+            "warnings": warnings,
+            "infos": infos,
+        })
+        .to_string();
+        let result = parse_response(body.as_bytes()).expect("bounded annotations");
+        assert_eq!(
+            result.warnings.as_slice(),
+            &warnings[..warning_count.min(MAX_ANNOTATIONS_PER_LEVEL)]
+        );
+        assert_eq!(
+            result.infos.as_slice(),
+            &infos[..info_count.min(MAX_ANNOTATIONS_PER_LEVEL)]
+        );
+        assert_eq!(
+            result.warnings_omitted,
+            warning_count.saturating_sub(MAX_ANNOTATIONS_PER_LEVEL)
+        );
+        assert_eq!(
+            result.infos_omitted,
+            info_count.saturating_sub(MAX_ANNOTATIONS_PER_LEVEL)
+        );
+    }
+}
+
+#[test]
+fn escaped_omitted_annotations_remain_validated_without_being_retained() {
+    let mut warnings = vec!["retained"; MAX_ANNOTATIONS_PER_LEVEL];
+    warnings.extend(["escaped \" quote \\ slash \n newline 界", "last warning"]);
+    let body = serde_json::json!({
+        "status": "success",
+        "data": {"resultType": "matrix", "result": []},
+        "warnings": warnings,
+    })
+    .to_string();
+    let result = parse_response(body.as_bytes()).expect("escaped skipped annotations");
+    assert_eq!(result.warnings.len(), MAX_ANNOTATIONS_PER_LEVEL);
+    assert!(result.warnings.iter().all(|message| message == "retained"));
+    assert_eq!(result.warnings_omitted, 2);
+    assert!(result.infos.is_empty());
+    assert_eq!(result.infos_omitted, 0);
+}
+
+#[test]
+fn non_string_annotations_after_the_limit_are_still_refused() {
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!(true),
+        serde_json::json!(42),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        for level in ["warnings", "infos"] {
+            let mut annotations = vec![serde_json::json!("kept"); MAX_ANNOTATIONS_PER_LEVEL];
+            annotations.push(invalid.clone());
+            let mut body = serde_json::json!({
+                "status": "success",
+                "data": {"resultType": "vector", "result": []},
+            });
+            body[level] = serde_json::Value::Array(annotations);
+            let error =
+                parse_response(body.to_string().as_bytes()).expect_err("non-string annotation");
+            assert!(error.contains("annotation string"), "{level}: {error}");
+        }
+    }
+}
+
+#[test]
+fn malformed_json_strings_after_the_limit_are_still_refused() {
+    let retained = "\"kept\",".repeat(MAX_ANNOTATIONS_PER_LEVEL);
+    for level in ["warnings", "infos"] {
+        for invalid in [
+            r#""bad\qescape""#,
+            r#""bad\uD800""#,
+            "\"raw\nnewline\"",
+            "\"unfinished",
+        ] {
+            let body = format!(
+                r#"{{"status":"success","data":{{"resultType":"vector","result":[]}},"{level}":[{retained}{invalid}]}}"#
+            );
+            assert!(
+                parse_response(body.as_bytes()).is_err(),
+                "{level}: {invalid:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn error_status_keeps_the_complete_server_sentence_when_annotations_exceed_the_limit() {
+    let sentence = format!(
+        "server refused query: {} exact end",
+        "detail 界 ".repeat(500)
+    );
+    let body = serde_json::json!({
+        "status": "error",
+        "errorType": "execution",
+        "error": sentence,
+        "warnings": vec!["warning"; MAX_ANNOTATIONS_PER_LEVEL + 1],
+        "infos": vec!["info"; MAX_ANNOTATIONS_PER_LEVEL + 2],
+    })
+    .to_string();
+    assert_eq!(
+        parse_response(body.as_bytes()).expect_err("server error"),
+        format!("execution: {sentence}")
+    );
+}
+
+#[test]
 fn a_native_histogram_result_is_refused() {
     let json = r#"{"status":"success","data":{"resultType":"histogram","result":[]}}"#;
     match parse_response(json.as_bytes()) {
@@ -177,6 +296,10 @@ fn series_past_256_are_counted_not_kept() {
     let result = parse_response(json.as_bytes()).expect("vector JSON");
     assert_eq!(result.series.len(), MAX_SERIES);
     assert!(result.truncated);
+    assert_eq!(
+        result.possible_server_limit, None,
+        "a parser call has no request limit context"
+    );
     assert_eq!(
         result.dropped_series, 3,
         "the overflow is counted, not dropped silently"

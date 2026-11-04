@@ -10,11 +10,11 @@
 //! because exec credential plugins leak their environment through `Debug`.
 //! The `kube::Client` seam is a `tower` service, which is what lets
 //! `tests/scripted_apiserver.rs` be the API server. A connection hands out two
-//! clients over one transport: a confirmed write, and every read that decides
-//! it, goes through the interactive one, which never resends a request it has
-//! written and answers within a deadline; watches, streams, follows and every
-//! list outside a confirmed write stay on the sync one, which retries 429, 503
-//! and 504 with backoff and waits as long as a stream needs.
+//! clients over one transport. Confirmed writes, the reads that decide them,
+//! and bounded interactive investigations use the interactive client, which
+//! does not retry requests and answers within a deadline. Watches, long-lived
+//! streams and bulk synchronization use the sync client, which retries 429,
+//! 503 and 504 with backoff and waits as long as a stream needs.
 
 pub mod apply;
 pub mod assemble;

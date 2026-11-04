@@ -400,10 +400,31 @@ fn direct_range_and_instant_urls_send_the_exact_categorized_request() {
         } else {
             "query?query=%7Bapp%3D%22api%22%7D&limit=10&direction=BACKWARD&time=2"
         };
-        let expected = format!(
-            "GET /named/loki/api/v1/{path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: application/json\r\nConnection: close\r\nX-Loki-Response-Encoding-Flags: categorize-labels\r\n\r\n"
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(body.is_empty());
+        let mut lines = head.split("\r\n");
+        let expected = format!("GET /named/loki/api/v1/{path} HTTP/1.1");
+        assert_eq!(lines.next(), Some(expected.as_str()));
+        let mut headers: Vec<_> = lines
+            .map(|line| {
+                let (name, value) = line.split_once(':').unwrap();
+                (name.to_ascii_lowercase(), value.trim().to_string())
+            })
+            .collect();
+        headers.sort_unstable();
+        assert_eq!(
+            headers,
+            vec![
+                ("accept".to_string(), "application/json".to_string()),
+                ("accept-encoding".to_string(), "identity".to_string()),
+                ("connection".to_string(), "close".to_string()),
+                ("host".to_string(), address.to_string()),
+                (
+                    "x-loki-response-encoding-flags".to_string(),
+                    "categorize-labels".to_string(),
+                ),
+            ]
         );
-        assert_eq!(request, expected);
     }
 }
 

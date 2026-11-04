@@ -4,7 +4,9 @@ use super::{Fetched, Reader};
 use crate::integrations::{alertmanager, grafana, loki, prom, traces};
 use crate::reach::{Bound, ReachSettings, ToolKind, ToolReach};
 use crate::{overlay, reach};
+use k10s_core::ServiceIdentity;
 use kube::Client;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod sources;
@@ -12,15 +14,37 @@ pub(super) use sources::Sources;
 
 /// Dashboards we can run as queries, plus a system-browser base for panels
 /// this process will not execute.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GrafanaCatalog {
     pub dashboards: Vec<grafana::Dashboard>,
-    pub extra_hits: Vec<grafana::SearchHit>,
+    /// Search results without a readable dashboard definition.
+    pub extra_hits: Vec<grafana::CatalogHit>,
     pub truncated: bool,
     pub browser_base: Option<String>,
-    pub browser_service: Option<(String, String)>,
+    /// Namespace, Service name and discovered Service port for a browser forward.
+    pub browser_service: Option<(String, String, u16)>,
+    /// The exact Grafana Service binding whose datasource UIDs these rows use.
+    pub query_source: Option<Arc<ServiceIdentity>>,
     pub served: bool,
     pub errors: Vec<String>,
+}
+
+impl std::fmt::Debug for GrafanaCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrafanaCatalog")
+            .field("dashboards", &self.dashboards)
+            .field("extra_hits", &self.extra_hits)
+            .field("truncated", &self.truncated)
+            .field(
+                "browser_base",
+                &self.browser_base.as_ref().map(|_| "[redacted]"),
+            )
+            .field("browser_service", &self.browser_service)
+            .field("query_source", &self.query_source)
+            .field("served", &self.served)
+            .field("errors", &self.errors)
+            .finish()
+    }
 }
 
 /// Whether an in-cluster tool answered a bind. [`Seen::Absent`] hides a pane.
@@ -125,10 +149,7 @@ impl Reader {
         self.telemetry.submit(
             &self.handle,
             async move {
-                let outcome =
-                    query_prometheus_optional(&client, Some(&sources), &expr, start, end, &step)
-                        .await;
-                sources.complete(outcome).await
+                query_prometheus_optional(&client, Some(&sources), &expr, start, end, &step).await
             },
             reply,
         )
@@ -143,10 +164,7 @@ impl Reader {
         let sources = self.observe_sources.clone();
         self.telemetry.submit(
             &self.handle,
-            async move {
-                let outcome = query_loki_optional(&client, Some(&sources), &query).await;
-                sources.complete(outcome).await
-            },
+            async move { query_loki_optional(&client, Some(&sources), &query).await },
             reply,
         )
     }
@@ -160,10 +178,7 @@ impl Reader {
         let sources = self.observe_sources.clone();
         self.telemetry.submit(
             &self.handle,
-            async move {
-                let outcome = lookup_trace_optional(&client, Some(&sources), &trace_id).await;
-                sources.complete(outcome).await
-            },
+            async move { lookup_trace_optional(&client, Some(&sources), &trace_id).await },
             reply,
         )
     }
@@ -176,27 +191,44 @@ impl Reader {
         let sources = self.observe_sources.clone();
         self.telemetry.submit(
             &self.handle,
-            async move {
-                let outcome = load_grafana_catalog(&client, Some(&sources)).await;
-                sources.complete(outcome).await
-            },
+            async move { load_grafana_catalog(&client, Some(&sources)).await },
             reply,
         )
     }
 
     pub fn observe_panel(
         &self,
+        source: Option<Arc<ServiceIdentity>>,
         target: grafana::PanelQuery,
         variables: grafana::Variables,
         reply: impl FnOnce(Fetched<Option<prom::QueryResult>>) + Send + 'static,
     ) -> crate::telemetry::RequestStop {
+        let Some(source) = source else {
+            reply(Fetched::Failed {
+                what: "grafana panel",
+                why: "this catalogue has no verified Grafana Service identity; refresh the catalogue or use a raw query".to_string(),
+            });
+            return crate::telemetry::RequestStop::noop();
+        };
         let client = self.interactive.clone();
         let sources = self.observe_sources.clone();
         self.telemetry.submit(
             &self.handle,
             async move {
-                let outcome = match sources.bind(&client, ToolKind::Grafana).await {
-                    ToolReach::Absent { .. } => Fetched::Ok(None),
+                let reach = match sources.bind_panel(&client, &source).await {
+                    Ok(reach) => reach,
+                    Err(why) => {
+                        return Fetched::Failed {
+                            what: "grafana panel",
+                            why,
+                        };
+                    }
+                };
+                match reach {
+                    ToolReach::Absent { .. } => Fetched::Failed {
+                        what: "grafana panel",
+                        why: "the selected Grafana Service is not served by this cluster; refresh the catalogue".to_string(),
+                    },
                     ToolReach::Unbound(unbound) => Fetched::Failed {
                         what: "grafana",
                         why: unbound.why,
@@ -204,11 +236,15 @@ impl Reader {
                     ToolReach::Bound(bound) => {
                         optional(grafana::query_target(&client, &bound, &target, &variables).await)
                     }
-                };
-                sources.complete(outcome).await
+                }
             },
             reply,
         )
+    }
+
+    /// Compare a browser route with the last verified source without waiting or fetching.
+    pub fn grafana_source_is_current(&self, source: &ServiceIdentity) -> bool {
+        self.observe_sources.grafana_is_current(source)
     }
 
     /// [`Fetched::Ok`]`None` is absence: the pane stays hidden.
@@ -390,8 +426,12 @@ async fn load_grafana_catalog(
     let mut dashboards = Vec::new();
     let mut truncated = false;
     let mut errors = Vec::new();
+    let mut denied = None;
+    let mut source_succeeded = false;
+    let mut dashboard_read_failed = false;
     match grafana::fetch_provisioned_from_configmaps(client).await {
         Fetched::Ok(provisioned) => {
+            source_succeeded = true;
             dashboards = provisioned.dashboards;
             truncated |= provisioned.truncated;
             errors.extend(
@@ -401,15 +441,22 @@ async fn load_grafana_catalog(
                     .map(|why| format!("provisioned dashboards: {why}")),
             );
         }
-        Fetched::Denied { what } => return Fetched::Denied { what },
+        Fetched::Denied { what } => {
+            denied = Some(what);
+            errors.push(format!(
+                "provisioned dashboards: {what}: access denied for this account"
+            ));
+        }
         Fetched::Failed { why, .. } => errors.push(format!("provisioned dashboards: {why}")),
     }
 
-    let reach = bind_observe_source(client, sources, ToolKind::Grafana).await;
-    let mut extra_hits = Vec::new();
+    let uncached = Sources::default();
+    let (reach, query_source) = sources.unwrap_or(&uncached).bind_catalog(client).await;
+    let mut extra_hits: Vec<grafana::CatalogHit> = Vec::new();
     let (browser_base, bound) = match &reach {
         ToolReach::Bound(bound) => (bound_browser_base(bound), true),
-        ToolReach::Unbound(unbound) => (unbound.browser_url.clone(), false),
+        // Automatic Service hints must not bypass the pinned browser-forward route.
+        ToolReach::Unbound(_) => (None, false),
         ToolReach::Absent { .. } => (None, false),
     };
 
@@ -417,44 +464,116 @@ async fn load_grafana_catalog(
         ToolReach::Bound(bound) => bound
             .found
             .as_ref()
-            .map(|found| (found.namespace.clone(), found.name.clone())),
+            .map(|found| (found.namespace.clone(), found.name.clone(), found.port)),
         _ => None,
     };
     if let ToolReach::Bound(bound) = reach {
         match grafana::fetch_search(client, &bound, &[]).await {
-            Fetched::Ok(hits) => {
-                let mut fetched = 0usize;
-                for hit in hits {
-                    if hit.uid.is_empty() {
+            Fetched::Ok(page) => {
+                source_succeeded = true;
+                denied = None;
+                if page.page_full {
+                    errors.insert(0, grafana::SEARCH_PAGE_FULL_NOTICE.to_string());
+                }
+                let mut attempted = Vec::new();
+                let mut invalid_uid = false;
+                for hit in page.hits {
+                    if !grafana::valid_dashboard_uid(&hit.uid) {
+                        if !invalid_uid {
+                            errors.push(grafana::INVALID_DASHBOARD_UID.to_string());
+                            invalid_uid = true;
+                        }
                         continue;
                     }
-                    if dashboards.iter().any(|dashboard| dashboard.uid == hit.uid) {
+                    if attempted.iter().any(|uid| uid == &hit.uid)
+                        || extra_hits.iter().any(|seen| seen.search.uid == hit.uid)
+                    {
                         continue;
                     }
-                    if fetched < grafana::MAX_NAMED_FROM_SEARCH {
-                        fetched += 1;
+                    if attempted.len() < grafana::MAX_NAMED_FROM_SEARCH {
+                        attempted.push(hit.uid.clone());
                         match grafana::fetch_dashboard(client, &bound, &hit.uid).await {
                             Fetched::Ok(dashboard) => {
+                                dashboards.retain(|file| {
+                                    file.source != grafana::DashboardSource::ConfigMap
+                                        || file.uid != hit.uid
+                                });
                                 dashboards.push(dashboard);
                             }
-                            Fetched::Denied { what } => return Fetched::Denied { what },
+                            Fetched::Denied { .. } => {
+                                dashboard_read_failed = true;
+                                errors.push(format!(
+                                    "Grafana dashboard {}: access denied for this account",
+                                    hit.uid
+                                ));
+                                extra_hits.push(grafana::CatalogHit {
+                                    search: hit,
+                                    reason: grafana::CatalogHitReason::Denied,
+                                });
+                            }
                             Fetched::Failed { why, .. } => {
-                                errors.push(format!("Grafana dashboard {}: {why}", hit.uid))
+                                dashboard_read_failed = true;
+                                errors.push(format!("Grafana dashboard {}: {why}", hit.uid));
+                                extra_hits.push(grafana::CatalogHit {
+                                    search: hit,
+                                    reason: grafana::CatalogHitReason::Failed,
+                                });
                             }
                         }
                     } else {
-                        extra_hits.push(hit);
+                        extra_hits.push(grafana::CatalogHit {
+                            search: hit,
+                            reason: grafana::CatalogHitReason::FetchLimit,
+                        });
                         truncated = true;
                     }
                 }
             }
-            Fetched::Denied { what } => return Fetched::Denied { what },
+            Fetched::Denied { .. } => {
+                if denied.is_some() {
+                    return Fetched::Denied {
+                        what: "provisioned dashboard configmaps and Grafana search",
+                    };
+                }
+                denied = Some("Grafana search");
+                errors.push("Grafana search: access denied for this account".to_string());
+            }
             Fetched::Failed { why, .. } => errors.push(format!("Grafana search: {why}")),
         }
     } else if let ToolReach::Unbound(unbound) = reach {
         errors.push(format!("Grafana binding: {}", unbound_why(&unbound)));
     }
 
+    if dashboard_read_failed
+        && dashboards.is_empty()
+        && truncated
+        && !extra_hits
+            .iter()
+            .any(|hit| hit.reason == grafana::CatalogHitReason::FetchLimit)
+    {
+        errors.insert(
+            0,
+            "Provisioned dashboard selection is incomplete".to_string(),
+        );
+    }
+    if !source_succeeded && !errors.is_empty() {
+        if errors.len() == 1
+            && let Some(what) = denied
+        {
+            return Fetched::Denied { what };
+        }
+        return Fetched::Failed {
+            what: "grafana",
+            why: errors.join("; "),
+        };
+    }
+    if dashboards.is_empty()
+        && extra_hits.is_empty()
+        && errors.len() == 1
+        && let Some(what) = denied
+    {
+        return Fetched::Denied { what };
+    }
     if !bound && dashboards.is_empty() && !errors.is_empty() {
         return Fetched::Failed {
             what: "grafana",
@@ -462,6 +581,26 @@ async fn load_grafana_catalog(
         };
     }
 
+    for dashboard in &dashboards {
+        if dashboard.truncated {
+            truncated = true;
+            let name = if !dashboard.uid.is_empty() {
+                dashboard.uid.as_str()
+            } else if !dashboard.title.is_empty() {
+                dashboard.title.as_str()
+            } else {
+                "(unnamed)"
+            };
+            let source = match dashboard.source {
+                grafana::DashboardSource::Grafana => "Grafana dashboard",
+                grafana::DashboardSource::ConfigMap => "ConfigMap dashboard",
+                grafana::DashboardSource::Unknown => "Dashboard",
+            };
+            errors.push(format!(
+                "{source} {name}: panel or target records were not fully inspected after local limits"
+            ));
+        }
+    }
     Fetched::Ok(GrafanaCatalog {
         served: bound || !dashboards.is_empty(),
         dashboards,
@@ -469,6 +608,7 @@ async fn load_grafana_catalog(
         truncated,
         browser_base,
         browser_service,
+        query_source,
         errors,
     })
 }
@@ -482,10 +622,8 @@ fn bound_browser_base(bound: &Bound) -> Option<String> {
 
 fn unbound_why(unbound: &reach::Unbound) -> String {
     let mut why = unbound.why.clone();
-    if let Some(url) = &unbound.browser_url {
-        why.push_str("; open ");
-        why.push_str(url);
-        why.push_str(" in the system browser");
+    if unbound.browser_url.is_some() {
+        why.push_str("; open the tool in the system browser");
     }
     why
 }
@@ -692,5 +830,30 @@ fn optional<T>(fetched: Fetched<T>) -> Fetched<Option<T>> {
         Fetched::Ok(value) => Fetched::Ok(Some(value)),
         Fetched::Denied { what } => Fetched::Denied { what },
         Fetched::Failed { what, why } => Fetched::Failed { what, why },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unbound_diagnostics_do_not_include_the_browser_location() {
+        let url = "https://example.test/private-path?token=private-query#private-fragment";
+        let unbound = reach::Unbound {
+            kind: ToolKind::Grafana,
+            found: None,
+            why: "Grafana needs a browser".into(),
+            browser_url: Some(url.into()),
+        };
+        let diagnostic = unbound_why(&unbound);
+        assert_eq!(
+            diagnostic,
+            "Grafana needs a browser; open the tool in the system browser"
+        );
+        for secret in ["private-path", "private-query", "private-fragment"] {
+            assert!(!diagnostic.contains(secret));
+        }
+        assert_eq!(unbound.browser_url.as_deref(), Some(url));
     }
 }

@@ -12,11 +12,10 @@
 //!
 //! Every method is fire-and-forget onto the data plane's runtime with the
 //! answer handed to a caller-supplied callback -- the render thread never
-//! blocks on the cluster -- and every outcome is a labelled [`Fetched`]: an
-//! account the cluster refuses -- 401 or 403, the same pair a watch calls
-//! forbidden -- arrives as `Denied`, never as an empty panel or an error string
-//! a person has to diagnose. Errors that reach text pass through the same
-//! redaction filter as everything else in this crate.
+//! blocks on the cluster -- and every outcome is a labelled [`Fetched`]. An
+//! individual read refused with 401 or 403 arrives as `Denied`. A result that
+//! combines independently attempted sources may instead return `Failed` with
+//! each denial and failure labelled, so no source is silently discarded.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -40,6 +39,7 @@ mod streams;
 pub use inventory::EcosystemFamily;
 pub use observe::{GrafanaCatalog, ObserveTools, Seen};
 
+/// A labelled read outcome, including aggregate failures from independent sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fetched<T> {
     Ok(T),

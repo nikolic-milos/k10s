@@ -252,6 +252,8 @@ pub struct FrameStats {
     pub labels_dropped: usize,
     /// Admitted whole-line jobs omitted after measuring their prepared glyphs.
     pub labels_fit_refused: usize,
+    #[cfg(feature = "testing")]
+    pub label_paint_errors: usize,
     pub icons_dropped: usize,
     pub text_cache: TextCacheCounts,
 }

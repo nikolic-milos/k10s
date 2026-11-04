@@ -125,6 +125,8 @@ struct Seen {
     // content type and its bytes are, and neither is visible from the path.
     content_type: String,
     body: String,
+    // An empty string alone cannot distinguish an empty body from an unread one.
+    body_collected: bool,
 }
 struct Route {
     method: &'static str,
@@ -359,6 +361,7 @@ impl Service<http::Request<Body>> for Script {
                     .to_string(),
                 content_type,
                 body: String::new(),
+                body_collected: false,
             });
 
             let routable = path.replacen("?&", "?", 1);
@@ -392,7 +395,8 @@ impl Service<http::Request<Body>> for Script {
         Box::pin(async move {
             let read = collect(body).await;
             if let Some(seen) = shared.lock().expect("script lock").seen.get_mut(at) {
-                seen.body = read;
+                seen.body_collected = read.is_some();
+                seen.body = read.unwrap_or_default();
             }
             let Some((fate, status, response, delay)) = answer else {
                 return std::future::pending().await;
@@ -429,12 +433,12 @@ fn header(request: &http::Request<Body>, name: http::header::HeaderName) -> Stri
         .unwrap_or("")
         .to_string()
 }
-async fn collect(body: Body) -> String {
+async fn collect(body: Body) -> Option<String> {
     use http_body_util::BodyExt;
-    match body.collect().await {
-        Ok(collected) => String::from_utf8_lossy(&collected.to_bytes()).to_string(),
-        Err(_) => String::new(),
-    }
+    body.collect()
+        .await
+        .ok()
+        .map(|collected| String::from_utf8_lossy(&collected.to_bytes()).to_string())
 }
 fn api_resource(kind: &str, plural: &str, namespaced: bool) -> String {
     verbed(

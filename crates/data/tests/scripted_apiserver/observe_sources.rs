@@ -1,6 +1,7 @@
 //! Native source reuse, identity verification and cancellation on the wire.
 
 use crate::*;
+use k10s_core::ServiceIdentity;
 use k10s_data::integrations::{grafana, loki, prom, traces};
 use k10s_data::read::{Fetched, ObserveTools, Reader};
 use k10s_data::telemetry::{RequestMetrics, request_metrics};
@@ -197,6 +198,56 @@ fn assert_trace_gets(rows: &[Seen], expected: &[(&str, &str)]) {
 }
 
 #[tokio::test(start_paused = true)]
+async fn native_probe_and_cached_query_keep_unusable_and_ambiguous_sources_visible() {
+    let cases: [(Vec<serde_json::Value>, &[&str]); 3] = [
+        (
+            vec![serde_json::json!({
+                "metadata":{"name":"prometheus","namespace":"observe"},
+                "spec":{}
+            })],
+            &["Prometheus Service observe/prometheus has no usable TCP port"],
+        ),
+        (
+            vec![serde_json::json!({
+                "metadata":{"name":"prometheus","namespace":"observe"},
+                "spec":{"ports":[{"port":9090,"protocol":"UDP"}]}
+            })],
+            &["Prometheus Service observe/prometheus has no usable TCP port"],
+        ),
+        (
+            vec![
+                service("prometheus", "source-uid", "10", 9090),
+                serde_json::json!({
+                    "metadata":{"name":"other-prometheus","namespace":"observe"},
+                    "spec":{"ports":[{"port":9090,"protocol":"UDP"}]}
+                }),
+            ],
+            &[
+                "Prometheus matches 2 Services",
+                "Prometheus Service observe/other-prometheus has no usable TCP port",
+                "without usable TCP ports: 1",
+            ],
+        ),
+    ];
+    for (services, expected) in cases {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        listed(&script, services);
+        let before = script.seen().len();
+
+        let tools = probe(&sync.reader).await;
+        assert_eq!(tools.prometheus, k10s_data::read::Seen::Unbound);
+        assert_eq!(tools.errors.len(), 1, "{tools:?}");
+        let why = failure(query(&sync.reader, "up").await.0);
+        for &part in expected {
+            assert!(tools.errors[0].contains(part), "{tools:?}");
+            assert!(why.contains(part), "{why}");
+        }
+        assert_trace_gets(&after_sync(&script, before), &[(SOURCE_LIST, "")]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn healthy_tempo_and_empty_success_keep_the_actual_source_without_jaeger_reads() {
     for empty in [false, true] {
         let script = Script::default();
@@ -274,6 +325,61 @@ async fn absent_tempo_still_uses_the_verified_jaeger_source() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_expired_known_tempo_disappearing_cannot_fall_back_before_refresh() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    healthy_jaeger(&script);
+    listed(&script, trace_services());
+    script.route("GET", TEMPO_READY, 200, "ready");
+    tempo_trace(&script, false);
+    assert!(matches!(
+        trace_reply(&sync.reader, false).await,
+        Fetched::Ok(Some(trace)) if trace.source == "Tempo / observe/tempo:3200"
+    ));
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    verified_tempo(&script);
+    listed(&script, vec![service("jaeger", "jaeger-uid", "20", 16686)]);
+    let before = script.seen().len();
+    let Fetched::Failed { what, why } = trace_reply(&sync.reader, false).await else {
+        panic!("a formerly verified Tempo must not be treated as initial absence");
+    };
+    assert_eq!(what, "tempo");
+    assert!(why.contains("refresh sources"), "{why}");
+    assert_trace_gets(
+        &after_sync(&script, before),
+        &[(TEMPO_GET, METADATA), (SOURCE_LIST, "")],
+    );
+
+    let before = script.seen().len();
+    assert!(matches!(
+        trace_reply(&sync.reader, false).await,
+        Fetched::Failed { what: "tempo", .. }
+    ));
+    assert!(after_sync(&script, before).is_empty());
+
+    listed(&script, vec![service("jaeger", "jaeger-uid", "20", 16686)]);
+    let before = script.seen().len();
+    assert_eq!(
+        probe(&sync.reader).await.traces,
+        k10s_data::read::Seen::Bound
+    );
+    assert!(matches!(
+        trace_reply(&sync.reader, false).await,
+        Fetched::Ok(Some(trace)) if trace.source == "Jaeger / observe/jaeger:16686"
+    ));
+    assert_trace_gets(
+        &after_sync(&script, before),
+        &[
+            (SOURCE_LIST, ""),
+            (JAEGER_READY, "application/json"),
+            (JAEGER_GET, METADATA),
+            (JAEGER_TRACE, "application/json"),
+        ],
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_failed_tempo_binding_cannot_be_hidden_by_a_healthy_jaeger() {
     for legacy in [false, true] {
         for status in [0, 403, 500] {
@@ -308,7 +414,7 @@ async fn a_failed_tempo_binding_cannot_be_hidden_by_a_healthy_jaeger() {
                 );
             }
             if status == 0 {
-                assert!(why.contains("matches 2 routed Services"), "{why}");
+                assert!(why.contains("matches 2 Services"), "{why}");
             }
             let expected = if status == 0 {
                 vec![(SOURCE_LIST, "")]
@@ -353,7 +459,7 @@ async fn tempo_ambiguity_and_probe_failures_never_probe_the_healthy_jaeger() {
             assert_eq!(tools.errors.len(), 1, "{tools:?}");
             assert!(tools.errors[0].starts_with("Tempo:"), "{tools:?}");
             if status == 0 {
-                assert!(tools.errors[0].contains("matches 2 routed Services"));
+                assert!(tools.errors[0].contains("matches 2 Services"));
             }
             if status == 500 {
                 assert!(tools.errors[0].contains("Tempo storage is unavailable"));
@@ -667,17 +773,12 @@ async fn refresh_and_expiry_detect_competing_services_without_choosing_one() {
         if refresh {
             let tools = probe(&sync.reader).await;
             assert_eq!(tools.prometheus, k10s_data::read::Seen::Unbound);
-            assert!(
-                tools
-                    .errors
-                    .iter()
-                    .any(|why| why.contains("2 routed Services"))
-            );
+            assert!(tools.errors.iter().any(|why| why.contains("2 Services")));
         } else {
             tokio::time::advance(Duration::from_secs(30)).await;
             verified(&script, "source-uid", "10");
         }
-        assert!(failure(query(&sync.reader, "up").await.0).contains("2 routed Services"));
+        assert!(failure(query(&sync.reader, "up").await.0).contains("2 Services"));
         let rows = after_sync(&script, before);
         assert_eq!(rows.len(), if refresh { 1 } else { 2 });
         for row in &rows {
@@ -732,6 +833,846 @@ async fn source_recreation_and_change_stop_the_query_until_sources_are_refreshed
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_query_error_keeps_the_verified_source_without_extra_discovery_or_probes() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    discovered(&script, "source-a", "10");
+    script.route("GET", QUERY, 200, RESULT);
+    assert!(matches!(
+        query(&sync.reader, "up").await.0,
+        Fetched::Ok(Some(_))
+    ));
+
+    verified(&script, "source-a", "10");
+    script.route("GET", QUERY, 500, r#"{"message":"query unavailable"}"#);
+    let before = script.seen().len();
+    assert_eq!(
+        failure(query(&sync.reader, "up").await.0),
+        "query unavailable"
+    );
+    let rows = after_sync(&script, before);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_trace_gets(&rows[..1], &[(SOURCE_GET, METADATA)]);
+    assert_query(&rows[1], "up");
+
+    verified(&script, "source-a", "10");
+    script.route("GET", QUERY, 200, RESULT);
+    let before = script.seen().len();
+    let (answer, metrics) = query(&sync.reader, "up").await;
+    assert!(matches!(answer, Fetched::Ok(Some(_))));
+    assert_eq!(metrics.requests, 2);
+    let rows = after_sync(&script, before);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_trace_gets(&rows[..1], &[(SOURCE_GET, METADATA)]);
+    assert_query(&rows[1], "up");
+}
+
+#[tokio::test(start_paused = true)]
+async fn query_and_metadata_errors_cannot_forget_a_known_source_before_retry() {
+    for metadata_failure in [false, true] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        discovered(&script, "source-a", "10");
+        script.route("GET", QUERY, 200, RESULT);
+        assert!(matches!(
+            query(&sync.reader, "up").await.0,
+            Fetched::Ok(Some(_))
+        ));
+
+        let before = script.seen().len();
+        if metadata_failure {
+            script.route_accepting(
+                "GET",
+                SOURCE_GET,
+                METADATA,
+                500,
+                r#"{"message":"Service metadata unavailable"}"#,
+            );
+        } else {
+            verified(&script, "source-a", "10");
+            script.route("GET", QUERY, 500, r#"{"message":"query unavailable"}"#);
+        }
+        let why = failure(query(&sync.reader, "up").await.0);
+        assert_eq!(
+            why,
+            if metadata_failure {
+                "Service metadata unavailable"
+            } else {
+                "query unavailable"
+            }
+        );
+        let rows = after_sync(&script, before);
+        assert_eq!(rows.len(), if metadata_failure { 1 } else { 2 });
+        assert_eq!(rows[0].path, SOURCE_GET);
+        assert_get(&rows[0], METADATA);
+        if !metadata_failure {
+            assert_query(&rows[1], "up");
+        }
+
+        verified(&script, "source-b", "20");
+        discovered(&script, "source-b", "20");
+        script.route("GET", QUERY, 200, RESULT);
+        let before = script.seen().len();
+        let answer = query(&sync.reader, "up").await.0;
+        assert_trace_gets(&after_sync(&script, before), &[(SOURCE_GET, METADATA)]);
+        assert!(failure(answer).contains("refresh sources"));
+
+        let before = script.seen().len();
+        assert_eq!(
+            probe(&sync.reader).await.prometheus,
+            k10s_data::read::Seen::Bound
+        );
+        verified(&script, "source-b", "20");
+        assert!(matches!(
+            query(&sync.reader, "up").await.0,
+            Fetched::Ok(Some(_))
+        ));
+        let rows = after_sync(&script, before);
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert_trace_gets(
+            &rows[..3],
+            &[
+                (SOURCE_LIST, ""),
+                (SOURCE_PROBE, "application/json"),
+                (SOURCE_GET, METADATA),
+            ],
+        );
+        assert_query(&rows[3], "up");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_or_ambiguous_expiry_cannot_forget_a_known_source_before_retry() {
+    for ambiguous in [false, true] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        discovered(&script, "source-a", "10");
+        script.route("GET", QUERY, 200, RESULT);
+        assert!(matches!(
+            query(&sync.reader, "up").await.0,
+            Fetched::Ok(Some(_))
+        ));
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        verified(&script, "source-a", "10");
+        listed(
+            &script,
+            if ambiguous {
+                vec![
+                    service("prometheus", "source-a", "10", 9090),
+                    service("other-prometheus", "competing", "30", 9090),
+                ]
+            } else {
+                Vec::new()
+            },
+        );
+        let before = script.seen().len();
+        let answer = query(&sync.reader, "up").await.0;
+        let why = failure(answer);
+        assert!(why.contains("refresh sources"), "{why}");
+        if ambiguous {
+            assert!(why.contains("2 Services"), "{why}");
+        }
+        assert_trace_gets(
+            &after_sync(&script, before),
+            &[(SOURCE_GET, METADATA), (SOURCE_LIST, "")],
+        );
+
+        discovered(&script, "source-b", "20");
+        script.route("GET", QUERY, 200, RESULT);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let before = script.seen().len();
+        let answer = query(&sync.reader, "up").await.0;
+        assert!(
+            after_sync(&script, before).is_empty(),
+            "an unresolved source must require an explicit refresh"
+        );
+        assert!(failure(answer).contains("refresh sources"));
+
+        let before = script.seen().len();
+        assert_eq!(
+            probe(&sync.reader).await.prometheus,
+            k10s_data::read::Seen::Bound
+        );
+        verified(&script, "source-b", "20");
+        assert!(matches!(
+            query(&sync.reader, "up").await.0,
+            Fetched::Ok(Some(_))
+        ));
+        let rows = after_sync(&script, before);
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert_trace_gets(
+            &rows[..3],
+            &[
+                (SOURCE_LIST, ""),
+                (SOURCE_PROBE, "application/json"),
+                (SOURCE_GET, METADATA),
+            ],
+        );
+        assert_query(&rows[3], "up");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_discovery_refresh_cannot_forget_a_known_source_before_retry() {
+    for explicit in [false, true] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        discovered(&script, "source-a", "10");
+        script.route("GET", QUERY, 200, RESULT);
+        assert!(matches!(
+            query(&sync.reader, "up").await.0,
+            Fetched::Ok(Some(_))
+        ));
+
+        if !explicit {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            verified(&script, "source-a", "10");
+        }
+        script.route(
+            "GET",
+            SOURCE_LIST,
+            500,
+            r#"{"message":"Service discovery unavailable"}"#,
+        );
+        let before = script.seen().len();
+        if explicit {
+            let tools = probe(&sync.reader).await;
+            assert_eq!(tools.prometheus, k10s_data::read::Seen::Unbound);
+            assert!(
+                tools
+                    .errors
+                    .iter()
+                    .all(|why| why.contains("Service discovery unavailable"))
+            );
+        } else {
+            assert_eq!(
+                failure(query(&sync.reader, "up").await.0),
+                "Service discovery unavailable"
+            );
+        }
+        let rows = after_sync(&script, before);
+        if explicit {
+            assert_trace_gets(&rows, &[(SOURCE_LIST, "")]);
+        } else {
+            assert_trace_gets(&rows, &[(SOURCE_GET, METADATA), (SOURCE_LIST, "")]);
+        }
+
+        verified(&script, "source-b", "20");
+        discovered(&script, "source-b", "20");
+        script.route("GET", QUERY, 200, RESULT);
+        let before = script.seen().len();
+        let answer = query(&sync.reader, "up").await.0;
+        assert_trace_gets(&after_sync(&script, before), &[(SOURCE_GET, METADATA)]);
+        assert!(failure(answer).contains("refresh sources"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_grafana_panel_error_cannot_forget_another_kinds_known_source() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    listed(
+        &script,
+        vec![
+            service("prometheus", "prometheus-a", "10", 9090),
+            service("grafana", "grafana-a", "20", 3000),
+        ],
+    );
+    script.route("GET", SOURCE_PROBE, 200, "ready");
+    script.route("GET", QUERY, 200, RESULT);
+    assert!(matches!(
+        query(&sync.reader, "up").await.0,
+        Fetched::Ok(Some(_))
+    ));
+
+    verified_grafana(&script, "grafana-a", "20");
+    script.route("GET", &format!("{GRAFANA_PROXY}api/health"), 200, "ready");
+    selected_catalog_rows(&script);
+    let catalog = selected_catalog(&sync.reader).await;
+    let target = catalog.dashboards[0].panels[0].queries[0].clone();
+    verified_grafana(&script, "grafana-a", "20");
+    script.route("GET", GRAFANA_DATASOURCE, 200, GRAFANA_DATASOURCE_JSON);
+    script.route(
+        "GET",
+        GRAFANA_RANGE,
+        500,
+        r#"{"message":"Grafana query unavailable"}"#,
+    );
+    let before = script.seen().len();
+    let why = failure(selected_query(&sync.reader, catalog.query_source.clone(), target).await);
+    assert!(why.contains("Grafana query unavailable"), "{why}");
+    assert_trace_gets(
+        &after_sync(&script, before),
+        &[
+            (GRAFANA_IDENTITY, METADATA),
+            (GRAFANA_DATASOURCE, "application/json"),
+            (GRAFANA_RANGE, "application/json"),
+        ],
+    );
+
+    verified(&script, "prometheus-b", "30");
+    discovered(&script, "prometheus-b", "30");
+    script.route("GET", QUERY, 200, RESULT);
+    let before = script.seen().len();
+    let answer = query(&sync.reader, "up").await.0;
+    assert_trace_gets(&after_sync(&script, before), &[(SOURCE_GET, METADATA)]);
+    assert!(failure(answer).contains("refresh sources"));
+    assert!(
+        sync.reader.grafana_source_is_current(
+            catalog
+                .query_source
+                .as_deref()
+                .expect("verified Grafana origin")
+        )
+    );
+}
+
+async fn selected_query(
+    reader: &Reader,
+    source: Option<Arc<ServiceIdentity>>,
+    target: grafana::PanelQuery,
+) -> Fetched<Option<prom::QueryResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _stop = reader.observe_panel(
+        source,
+        target,
+        grafana::Variables {
+            namespace: "prod".into(),
+            pods: vec!["api".into()],
+            node: None,
+            start_ms: 1000,
+            end_ms: 3000,
+            step_ms: 1000,
+            min_interval: String::new(),
+        },
+        move |answer| {
+            tx.send(answer).expect("selected panel reply");
+        },
+    );
+    rx.await.expect("selected panel callback")
+}
+
+const GRAFANA_IDENTITY: &str = "/api/v1/namespaces/observe/services/grafana";
+const GRAFANA_PROXY: &str = "/api/v1/namespaces/observe/services/grafana:3000/proxy/";
+const GRAFANA_DATASOURCE: &str =
+    "/api/v1/namespaces/observe/services/grafana:3000/proxy/api/datasources/uid/prom-main";
+const GRAFANA_RANGE: &str = "/api/v1/namespaces/observe/services/grafana:3000/proxy/api/datasources/proxy/uid/prom-main/api/v1/query_range?query=up&start=1&end=3&step=1s&limit=256";
+const GRAFANA_DATASOURCE_JSON: &str =
+    r#"{"uid":"prom-main","type":"prometheus","jsonData":{"timeInterval":"1s"}}"#;
+
+fn selected_catalog_rows(script: &Script) {
+    script.route(
+        "GET",
+        "/api/v1/configmaps?",
+        200,
+        r#"{"apiVersion":"v1","kind":"ConfigMapList","items":[]}"#,
+    );
+    script.route(
+        "GET",
+        &format!("{GRAFANA_PROXY}api/search?"),
+        200,
+        r#"[{"uid":"selected","title":"Selected","type":"dash-db"}]"#,
+    );
+    script.route(
+        "GET",
+        &format!("{GRAFANA_PROXY}api/dashboards/uid/selected"),
+        200,
+        r#"{"dashboard":{"uid":"selected","title":"Selected","panels":[{"id":1,"title":"Up","type":"timeseries","datasource":{"type":"prometheus","uid":"prom-main"},"targets":[{"refId":"A","expr":"up"}]}]}}"#,
+    );
+}
+
+fn verified_grafana(script: &Script, uid: &str, version: &str) {
+    script.route_accepting(
+        "GET", GRAFANA_IDENTITY, METADATA, 200,
+        serde_json::json!({"metadata":{"name":"grafana","namespace":"observe","uid":uid,"resourceVersion":version}}).to_string(),
+    );
+}
+
+async fn selected_catalog(reader: &Reader) -> k10s_data::read::GrafanaCatalog {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _stop = reader.observe_grafana(move |answer| {
+        tx.send(answer).expect("selected catalog reply");
+    });
+    match rx.await.expect("selected catalog callback") {
+        Fetched::Ok(catalog) => catalog,
+        other => panic!("the scripted Grafana catalog must answer: {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn selected_grafana_panel_cannot_rebind_after_source_changes_without_refresh() {
+    const GRAFANA_GET: &str = "/api/v1/namespaces/observe/services/grafana";
+    const PROXY: &str = "/api/v1/namespaces/observe/services/grafana:3000/proxy/";
+
+    for (uid, version) in [("replacement-uid", "10"), ("source-uid", "11")] {
+        let script = Script::default();
+        let (sync, _events) = connected(&script).await;
+        script.route(
+            "GET",
+            "/api/v1/configmaps?",
+            200,
+            r#"{"apiVersion":"v1","kind":"ConfigMapList","items":[]}"#,
+        );
+        listed(&script, vec![service("grafana", "source-uid", "10", 3000)]);
+        script.route("GET", &format!("{PROXY}api/health"), 200, "ready");
+        script.route(
+            "GET",
+            &format!("{PROXY}api/search?"),
+            200,
+            r#"[{"uid":"selected","title":"Selected","type":"dash-db"}]"#,
+        );
+        script.route(
+            "GET",
+            &format!("{PROXY}api/dashboards/uid/selected"),
+            200,
+            r#"{"dashboard":{"uid":"selected","title":"Selected","panels":[{"id":1,"title":"Up","type":"timeseries","datasource":{"type":"prometheus","uid":"prom-main"},"targets":[{"refId":"A","expr":"up"}]}]}}"#,
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let stop = sync.reader.observe_grafana(move |answer| {
+            tx.send(answer).expect("selected catalog reply");
+        });
+        let Fetched::Ok(catalog) = rx.await.expect("selected catalog callback") else {
+            panic!("the original Grafana catalog is readable");
+        };
+        drop(stop);
+        let dashboard = &catalog.dashboards[0];
+        assert_eq!(dashboard.source, grafana::DashboardSource::Grafana);
+        let selected = dashboard.panels[0].queries[0].clone();
+
+        let datasource = format!("{PROXY}api/datasources/uid/prom-main");
+        let range = format!(
+            "{PROXY}api/datasources/proxy/uid/prom-main/api/v1/query_range?query=up&start=1&end=3&step=1s&limit=256"
+        );
+        script.route_accepting(
+            "GET", GRAFANA_GET, METADATA, 200,
+            r#"{"metadata":{"name":"grafana","namespace":"observe","uid":"source-uid","resourceVersion":"10"}}"#,
+        );
+        script.route(
+            "GET",
+            &datasource,
+            200,
+            r#"{"uid":"prom-main","type":"prometheus","jsonData":{"timeInterval":"1s"}}"#,
+        );
+        script.route("GET", &range, 200, RESULT);
+        let before = script.seen().len();
+        assert!(matches!(
+            selected_query(&sync.reader, catalog.query_source.clone(), selected.clone()).await,
+            Fetched::Ok(Some(_))
+        ));
+        assert_trace_gets(
+            &after_sync(&script, before),
+            &[
+                (GRAFANA_GET, METADATA),
+                (&datasource, "application/json"),
+                (&range, "application/json"),
+            ],
+        );
+
+        script.route_accepting(
+            "GET", GRAFANA_GET, METADATA, 200,
+            serde_json::json!({"metadata":{"name":"grafana","namespace":"observe","uid":uid,"resourceVersion":version}}).to_string(),
+        );
+        let before = script.seen().len();
+        let why = failure(
+            selected_query(&sync.reader, catalog.query_source.clone(), selected.clone()).await,
+        );
+        assert!(why.contains("Grafana source Service observe/grafana was recreated or changed"));
+        assert_trace_gets(&after_sync(&script, before), &[(GRAFANA_GET, METADATA)]);
+
+        listed(&script, vec![service("grafana", uid, version, 3000)]);
+        script.route("GET", &format!("{PROXY}api/health"), 200, "ready");
+        script.route(
+            "GET",
+            &datasource,
+            200,
+            r#"{"uid":"prom-main","type":"prometheus","jsonData":{"timeInterval":"1s"}}"#,
+        );
+        script.route("GET", &range, 200, RESULT);
+        let before = script.seen().len();
+        let retry = selected_query(&sync.reader, catalog.query_source.clone(), selected).await;
+        let rows = after_sync(&script, before);
+        assert!(
+            rows.is_empty(),
+            "an unchanged selected panel contacted the replacement without a source refresh: {rows:?}"
+        );
+        assert!(failure(retry).contains("refresh sources"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn refreshing_sources_keeps_old_catalogue_rows_refused_without_invalidating_current_rows() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    listed(&script, vec![service("grafana", "source-a", "10", 3000)]);
+    script.route("GET", &format!("{GRAFANA_PROXY}api/health"), 200, "ready");
+    selected_catalog_rows(&script);
+    let old = selected_catalog(&sync.reader).await;
+    let old_source = old
+        .query_source
+        .clone()
+        .expect("the exact original binding");
+    let old_target = old.dashboards[0].panels[0].queries[0].clone();
+    assert!(sync.reader.grafana_source_is_current(&old_source));
+
+    listed(&script, vec![service("grafana", "source-b", "20", 3000)]);
+    let before = script.seen().len();
+    let _ = probe(&sync.reader).await;
+    assert_trace_gets(&after_sync(&script, before), &[(SOURCE_LIST, "")]);
+    assert!(!sync.reader.grafana_source_is_current(&old_source));
+    let before = script.seen().len();
+    let why =
+        failure(selected_query(&sync.reader, Some(old_source.clone()), old_target.clone()).await);
+    assert!(why.contains("no longer matches this catalogue"));
+    assert!(after_sync(&script, before).is_empty());
+
+    verified_grafana(&script, "source-b", "20");
+    script.route("GET", &format!("{GRAFANA_PROXY}api/health"), 200, "ready");
+    selected_catalog_rows(&script);
+    let current = selected_catalog(&sync.reader).await;
+    let current_source = current
+        .query_source
+        .clone()
+        .expect("the refreshed exact binding");
+    assert_ne!(old_source, current_source);
+    assert_eq!(old_target, current.dashboards[0].panels[0].queries[0]);
+    assert!(sync.reader.grafana_source_is_current(&current_source));
+
+    let before = script.seen().len();
+    assert!(
+        failure(selected_query(&sync.reader, Some(old_source), old_target).await)
+            .contains("no longer matches this catalogue")
+    );
+    assert!(after_sync(&script, before).is_empty());
+    assert!(sync.reader.grafana_source_is_current(&current_source));
+
+    verified_grafana(&script, "source-b", "20");
+    script.route("GET", GRAFANA_DATASOURCE, 200, GRAFANA_DATASOURCE_JSON);
+    script.route("GET", GRAFANA_RANGE, 200, RESULT);
+    let before = script.seen().len();
+    assert!(matches!(
+        selected_query(
+            &sync.reader,
+            Some(current_source),
+            current.dashboards[0].panels[0].queries[0].clone(),
+        )
+        .await,
+        Fetched::Ok(Some(_))
+    ));
+    assert_trace_gets(
+        &after_sync(&script, before),
+        &[
+            (GRAFANA_IDENTITY, METADATA),
+            (GRAFANA_DATASOURCE, "application/json"),
+            (GRAFANA_RANGE, "application/json"),
+        ],
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_older_grafana_query_failure_cannot_invalidate_a_refreshed_source() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    listed(&script, vec![service("grafana", "source-a", "10", 3000)]);
+    script.route("GET", &format!("{GRAFANA_PROXY}api/health"), 200, "ready");
+    selected_catalog_rows(&script);
+    let old = selected_catalog(&sync.reader).await;
+    let old_source = old
+        .query_source
+        .clone()
+        .expect("the exact original binding");
+    let old_target = old.dashboards[0].panels[0].queries[0].clone();
+    verified_grafana(&script, "source-a", "10");
+    script.route("GET", GRAFANA_DATASOURCE, 200, GRAFANA_DATASOURCE_JSON);
+    script.route_delayed(
+        "GET",
+        GRAFANA_RANGE,
+        500,
+        r#"{"message":"old Grafana query unavailable"}"#,
+        Duration::from_secs(2),
+    );
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let pending = sync.reader.observe_panel(
+        Some(old_source),
+        old_target,
+        grafana::Variables {
+            namespace: "prod".into(),
+            pods: vec!["api".into()],
+            node: None,
+            start_ms: 1000,
+            end_ms: 3000,
+            step_ms: 1000,
+            min_interval: String::new(),
+        },
+        move |answer| {
+            tx.send(answer).expect("old query reply");
+        },
+    );
+    while script.answered("GET", GRAFANA_RANGE).1 == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    listed(&script, vec![service("grafana", "source-b", "20", 3000)]);
+    let _ = probe(&sync.reader).await;
+    verified_grafana(&script, "source-b", "20");
+    script.route("GET", &format!("{GRAFANA_PROXY}api/health"), 200, "ready");
+    selected_catalog_rows(&script);
+    let current = selected_catalog(&sync.reader).await;
+    let current_source = current
+        .query_source
+        .clone()
+        .expect("the refreshed exact binding");
+    assert!(sync.reader.grafana_source_is_current(&current_source));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(
+        failure(rx.await.expect("old query callback")).contains("old Grafana query unavailable")
+    );
+    drop(pending);
+    assert!(sync.reader.grafana_source_is_current(&current_source));
+
+    verified_grafana(&script, "source-b", "20");
+    script.route("GET", GRAFANA_DATASOURCE, 200, GRAFANA_DATASOURCE_JSON);
+    script.route("GET", GRAFANA_RANGE, 200, RESULT);
+    let before = script.seen().len();
+    assert!(matches!(
+        selected_query(
+            &sync.reader,
+            Some(current_source),
+            current.dashboards[0].panels[0].queries[0].clone(),
+        )
+        .await,
+        Fetched::Ok(Some(_))
+    ));
+    assert_trace_gets(
+        &after_sync(&script, before),
+        &[
+            (GRAFANA_IDENTITY, METADATA),
+            (GRAFANA_DATASOURCE, "application/json"),
+            (GRAFANA_RANGE, "application/json"),
+        ],
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalogue_source_is_captured_before_its_dashboard_read_can_be_overtaken() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    listed(&script, vec![service("grafana", "source-a", "10", 3000)]);
+    script.route("GET", &format!("{GRAFANA_PROXY}api/health"), 200, "ready");
+    script.route(
+        "GET",
+        "/api/v1/configmaps?",
+        200,
+        r#"{"apiVersion":"v1","kind":"ConfigMapList","items":[]}"#,
+    );
+    script.route(
+        "GET",
+        &format!("{GRAFANA_PROXY}api/search?"),
+        200,
+        r#"[{"uid":"selected","title":"Selected","type":"dash-db"}]"#,
+    );
+    let dashboard = format!("{GRAFANA_PROXY}api/dashboards/uid/selected");
+    script.route_delayed(
+        "GET",
+        &dashboard,
+        200,
+        r#"{"dashboard":{"uid":"selected","title":"Selected","panels":[]}}"#,
+        Duration::from_secs(2),
+    );
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let pending = sync.reader.observe_grafana(move |answer| {
+        tx.send(answer).expect("older catalogue reply");
+    });
+    while script.answered("GET", &dashboard).1 == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    listed(&script, vec![service("grafana", "source-b", "20", 3000)]);
+    let _ = probe(&sync.reader).await;
+    verified_grafana(&script, "source-b", "20");
+    script.route("GET", &format!("{GRAFANA_PROXY}api/health"), 200, "ready");
+    selected_catalog_rows(&script);
+    let current = selected_catalog(&sync.reader).await;
+    let current_source = current
+        .query_source
+        .expect("the replacement catalogue source");
+    assert_eq!(current_source.uid, "source-b");
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let Fetched::Ok(old) = rx.await.expect("older catalogue callback") else {
+        panic!("the delayed original catalogue is still readable");
+    };
+    drop(pending);
+    let old_source = old.query_source.expect("the original catalogue source");
+    assert_eq!(old_source.uid, "source-a");
+    assert_eq!(old_source.resource_version, "10");
+    assert_ne!(old_source, current_source);
+    assert!(!sync.reader.grafana_source_is_current(&old_source));
+    assert!(sync.reader.grafana_source_is_current(&current_source));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unpinned_configmap_panels_stay_readable_without_blocking_direct_prometheus() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    script.route("GET", "/api/v1/configmaps?", 200,
+        serde_json::json!({"apiVersion":"v1","kind":"ConfigMapList","items":[{
+            "metadata":{"name":"dashboards","namespace":"observe"},
+            "data":{"selected.json":r#"{"uid":"selected","title":"Selected","panels":[{"id":1,"title":"Up","type":"timeseries","datasource":{"type":"prometheus","uid":"prom-main"},"targets":[{"refId":"A","expr":"up"}]}]}"#}
+        }]}).to_string());
+    discovered(&script, "prometheus-uid", "10");
+    let catalog = selected_catalog(&sync.reader).await;
+    assert!(catalog.served);
+    assert!(catalog.query_source.is_none());
+    assert_eq!(
+        catalog.dashboards[0].source,
+        grafana::DashboardSource::ConfigMap
+    );
+    let target = catalog.dashboards[0].panels[0].queries[0].clone();
+    let before = script.seen().len();
+    let why = failure(selected_query(&sync.reader, None, target).await);
+    assert!(why.contains("no verified Grafana Service identity"));
+    assert!(after_sync(&script, before).is_empty());
+
+    verified(&script, "prometheus-uid", "10");
+    script.route("GET", QUERY, 200, RESULT);
+    let before = script.seen().len();
+    assert!(matches!(
+        query(&sync.reader, "up").await.0,
+        Fetched::Ok(Some(_))
+    ));
+    assert_trace_gets(
+        &after_sync(&script, before),
+        &[
+            (SOURCE_GET, METADATA),
+            (SOURCE_PROBE, "application/json"),
+            (
+                &format!("{QUERY}query=up&start=1&end=3&step=1s&limit=256"),
+                "application/json",
+            ),
+        ],
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_automatic_service_hint_cannot_bypass_the_pinned_browser_route() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    script.route(
+        "GET",
+        "/api/v1/configmaps?",
+        200,
+        serde_json::json!({"apiVersion":"v1","kind":"ConfigMapList","items":[{
+            "metadata":{"name":"dashboards","namespace":"observe"},
+            "data":{"selected.json":r#"{"uid":"selected","title":"Selected","panels":[]}"#}
+        }]})
+        .to_string(),
+    );
+    listed(&script, vec![service("grafana", "source-a", "10", 3000)]);
+    script.route(
+        "GET",
+        &format!("{GRAFANA_PROXY}api/health"),
+        403,
+        r#"{"message":"Grafana proxy denied"}"#,
+    );
+    let before = script.seen().len();
+    let catalog = selected_catalog(&sync.reader).await;
+    assert_eq!(
+        catalog.dashboards[0].source,
+        grafana::DashboardSource::ConfigMap
+    );
+    assert!(catalog.query_source.is_none());
+    assert!(catalog.browser_service.is_none());
+    assert!(catalog.browser_base.is_none());
+    assert!(
+        catalog
+            .errors
+            .iter()
+            .any(|why| why.contains("access denied"))
+    );
+    let rows = after_sync(&script, before);
+    assert_eq!(rows.len(), 3);
+    assert_get(&rows[0], "");
+    assert!(rows[0].path.starts_with("/api/v1/configmaps?"));
+    assert_trace_gets(
+        &rows[1..],
+        &[
+            (SOURCE_LIST, ""),
+            (&format!("{GRAFANA_PROXY}api/health"), "application/json"),
+        ],
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_catalogue_failure_cannot_evict_a_newer_verified_source() {
+    let script = Script::default();
+    let (sync, _events) = connected(&script).await;
+    script.route(
+        "GET",
+        "/api/v1/configmaps?",
+        403,
+        r#"{"message":"ConfigMap read denied"}"#,
+    );
+    listed(&script, vec![service("grafana", "source-a", "10", 3000)]);
+    script.route("GET", &format!("{GRAFANA_PROXY}api/health"), 200, "ready");
+    let search = format!("{GRAFANA_PROXY}api/search?");
+    script.route_delayed(
+        "GET",
+        &search,
+        500,
+        r#"{"message":"old Grafana search unavailable"}"#,
+        Duration::from_secs(2),
+    );
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let pending = sync.reader.observe_grafana(move |answer| {
+        tx.send(answer).expect("old catalogue reply");
+    });
+    while script.answered("GET", &search).1 == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    listed(&script, vec![service("grafana", "source-b", "20", 3000)]);
+    let _ = probe(&sync.reader).await;
+    verified_grafana(&script, "source-b", "20");
+    script.route("GET", &format!("{GRAFANA_PROXY}api/health"), 200, "ready");
+    selected_catalog_rows(&script);
+    let current = selected_catalog(&sync.reader).await;
+    let current_source = current
+        .query_source
+        .clone()
+        .expect("the verified replacement");
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let Fetched::Failed { why, .. } = rx.await.expect("old catalogue callback") else {
+        panic!("both old catalogue acquisition paths failed");
+    };
+    assert!(why.contains("old Grafana search unavailable"));
+    drop(pending);
+    assert!(sync.reader.grafana_source_is_current(&current_source));
+
+    verified_grafana(&script, "source-b", "20");
+    script.route("GET", GRAFANA_DATASOURCE, 200, GRAFANA_DATASOURCE_JSON);
+    script.route("GET", GRAFANA_RANGE, 200, RESULT);
+    let before = script.seen().len();
+    assert!(matches!(
+        selected_query(
+            &sync.reader,
+            Some(current_source),
+            current.dashboards[0].panels[0].queries[0].clone(),
+        )
+        .await,
+        Fetched::Ok(Some(_))
+    ));
+    assert_trace_gets(
+        &after_sync(&script, before),
+        &[
+            (GRAFANA_IDENTITY, METADATA),
+            (GRAFANA_DATASOURCE, "application/json"),
+            (GRAFANA_RANGE, "application/json"),
+        ],
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn get_denial_uses_current_list_authority_and_does_not_redirect_recreated_sources() {
     for uid in ["source-uid", "recreated-uid"] {
         let script = Script::default();
@@ -773,7 +1714,7 @@ async fn get_denial_uses_current_list_authority_and_does_not_redirect_recreated_
 }
 
 #[tokio::test(start_paused = true)]
-async fn source_get_failures_keep_the_server_sentence_and_invalidate_reuse() {
+async fn source_get_failures_keep_the_server_sentence_until_an_explicit_refresh() {
     let script = Script::default();
     let (sync, _events) = connected(&script).await;
     discovered(&script, "source-uid", "10");
@@ -793,19 +1734,38 @@ async fn source_get_failures_keep_the_server_sentence_and_invalidate_reuse() {
         failure(query(&sync.reader, "up").await.0),
         "Service prometheus was deleted"
     );
+    script.route_accepting(
+        "GET",
+        SOURCE_GET,
+        METADATA,
+        404,
+        r#"{"message":"Service prometheus was deleted"}"#,
+    );
+    assert_eq!(
+        failure(query(&sync.reader, "up").await.0),
+        "Service prometheus was deleted"
+    );
     listed(&script, Vec::new());
+    assert_eq!(
+        probe(&sync.reader).await.prometheus,
+        k10s_data::read::Seen::Absent
+    );
     assert!(matches!(
         query(&sync.reader, "up").await.0,
         Fetched::Ok(None)
     ));
-    let rows = after_sync(&script, before);
-    assert_eq!(rows.len(), 2);
-    assert_get(&rows[0], METADATA);
-    assert_get(&rows[1], "");
+    assert_trace_gets(
+        &after_sync(&script, before),
+        &[
+            (SOURCE_GET, METADATA),
+            (SOURCE_GET, METADATA),
+            (SOURCE_LIST, ""),
+        ],
+    );
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_query_denial_clears_the_binding_and_preserves_its_resource_label() {
+async fn a_query_denial_retains_the_binding_and_preserves_its_resource_label() {
     let script = Script::default();
     let (sync, _events) = connected(&script).await;
     discovered(&script, "source-uid", "10");
@@ -821,19 +1781,18 @@ async fn a_query_denial_clears_the_binding_and_preserves_its_resource_label() {
         query(&sync.reader, "up").await.0,
         Fetched::Denied { what: "prometheus" }
     );
-    discovered(&script, "source-uid", "10");
+    verified(&script, "source-uid", "10");
     script.route("GET", QUERY, 200, RESULT);
     assert!(matches!(
         query(&sync.reader, "up").await.0,
         Fetched::Ok(Some(_))
     ));
     let rows = after_sync(&script, before);
-    assert_eq!(rows.len(), 5);
-    assert_get(&rows[0], METADATA);
+    assert_eq!(rows.len(), 4);
+    assert_trace_gets(&rows[..1], &[(SOURCE_GET, METADATA)]);
     assert_query(&rows[1], "up");
-    assert_get(&rows[2], "");
-    assert_get(&rows[3], "application/json");
-    assert_query(&rows[4], "up");
+    assert_trace_gets(&rows[2..3], &[(SOURCE_GET, METADATA)]);
+    assert_query(&rows[3], "up");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1038,6 +1997,13 @@ async fn native_log_trace_and_panel_queries_reuse_their_own_service_identity() {
                     },
                 ),
                 "grafana" => sync.reader.observe_panel(
+                    Some(Arc::new(ServiceIdentity {
+                        namespace: "observe".into(),
+                        name: "grafana".into(),
+                        port: 3000,
+                        uid: "source-uid".into(),
+                        resource_version: "10".into(),
+                    })),
                     grafana::PanelQuery {
                         ref_id: "A".into(),
                         expr: "up".into(),

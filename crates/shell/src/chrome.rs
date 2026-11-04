@@ -82,6 +82,7 @@ impl Workspace {
         width: f32,
         selection: Option<Selection>,
         loki: Option<ToolPresence>,
+        cx: &Context<Self>,
     ) -> impl IntoElement {
         let body = match selection {
             None => div()
@@ -124,6 +125,24 @@ impl Workspace {
                 }
                 if let Some(chart) = &self.observe_sparkline {
                     body = body.child(chart.clone());
+                    body = body.child(
+                        div()
+                            .id("inspector-chart-details")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .cursor_pointer()
+                            .text_size(px(fonts.small()))
+                            .text_color(rgb(theme.shell.text))
+                            .hover(|button| button.bg(rgb(theme.shell.element_hover)))
+                            .role(Role::Button)
+                            .aria_label("Open inspector chart details")
+                            .aria_description("Use Ctrl Alt I outside text input")
+                            .aria_keyshortcuts("Ctrl+Alt+I")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_inspector_chart_details(window, cx)
+                            }))
+                            .child("Chart details  Ctrl Alt I"),
+                    );
                 }
                 if selection.level == Level::Cell {
                     body = body.child(Self::posture_section(theme, &fonts, self.posture.as_ref()));
@@ -385,7 +404,9 @@ impl Workspace {
     }
 
     pub(crate) fn status_line(&self) -> String {
+        let loading = self.overlay_loading();
         status_line(Status {
+            leading_note: loading,
             connected: self.connected,
             context: self.context.as_deref(),
             selection: self
@@ -394,7 +415,12 @@ impl Workspace {
                 .map(|selection| (selection.kind, selection.name.as_ref())),
             folder: self.files_root.as_deref(),
             panels_below: self.bottom.len(),
-            note: self.status_note.as_deref(),
+            note: self.status_notes.general(),
+            overlay_note: if loading.is_none() {
+                self.status_notes.overlay()
+            } else {
+                None
+            },
         })
     }
 
@@ -1129,38 +1155,94 @@ pub(crate) fn retained_logs_available(
 /// says when nothing is connected and nothing is selected is the state a person
 /// sees most often, and it used to be reachable only by running the app.
 pub(crate) struct Status<'a> {
+    pub leading_note: Option<&'a str>,
     pub connected: bool,
     pub context: Option<&'a str>,
     pub selection: Option<(&'a str, &'a str)>,
     pub folder: Option<&'a std::path::Path>,
     pub panels_below: usize,
     pub note: Option<&'a str>,
+    pub overlay_note: Option<&'a str>,
+}
+
+const STATUS_NOTE_CHARS: usize = 128;
+// Space for fixed labels, separators, truncation marks and the panel count.
+const STATUS_FIXED_BYTES: usize = 128;
+
+fn status_preview(note: &str) -> (&str, bool) {
+    match note.char_indices().nth(STATUS_NOTE_CHARS) {
+        Some((end, _)) => (&note[..end], true),
+        None => (note, false),
+    }
 }
 
 pub(crate) fn status_line(status: Status<'_>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(match (status.connected, status.context) {
-        (true, Some(context)) => format!("connected to {context}"),
-        (true, None) => "connected in-cluster".to_string(),
-        (false, _) => "no cluster".to_string(),
+    use std::fmt::Write;
+
+    let leading = status.leading_note.map(status_preview);
+    let note = status.note.map(status_preview);
+    let overlay = status.overlay_note.map(status_preview);
+    let preview_len = |preview: Option<(&str, bool)>| preview.map_or(0, |(text, _)| text.len());
+    let selection_len = status
+        .selection
+        .map_or(0, |(kind, name)| kind.len() + name.len());
+    let folder_len = status.folder.map_or(0, |folder| {
+        folder
+            .to_str()
+            .map_or_else(|| folder.as_os_str().len() * 3, str::len)
     });
+    let capacity = STATUS_FIXED_BYTES
+        + if status.connected {
+            status.context.map_or(0, str::len)
+        } else {
+            0
+        }
+        + selection_len
+        + folder_len
+        + preview_len(leading)
+        + preview_len(note)
+        + preview_len(overlay);
+    let mut line = String::with_capacity(capacity);
+    let append_preview = |line: &mut String, (text, truncated): (&str, bool)| {
+        line.push_str(text);
+        if truncated {
+            line.push_str("...");
+        }
+    };
+    if let Some(note) = leading {
+        append_preview(&mut line, note);
+        line.push_str("  ·  ");
+    }
+    match (status.connected, status.context) {
+        (true, Some(context)) => write!(line, "connected to {context}"),
+        (true, None) => line.write_str("connected in-cluster"),
+        (false, _) => line.write_str("no cluster"),
+    }
+    .expect("writing a String cannot fail");
     if let Some((kind, name)) = status.selection {
-        parts.push(format!("{kind} {name}"));
+        write!(line, "  ·  {kind} {name}").expect("writing a String cannot fail");
     }
     if let Some(root) = status.folder {
-        parts.push(format!("folder {}", root.display()));
+        write!(line, "  ·  folder {}", root.display()).expect("writing a String cannot fail");
     }
     let open = status.panels_below;
     if open > 0 {
-        parts.push(format!(
-            "{open} panel{} below",
+        write!(
+            line,
+            "  ·  {open} panel{} below",
             if open == 1 { "" } else { "s" }
-        ));
+        )
+        .expect("writing a String cannot fail");
     }
-    if let Some(note) = status.note {
-        parts.push(note.to_string());
+    if let Some(note) = note {
+        line.push_str("  ·  ");
+        append_preview(&mut line, note);
     }
-    parts.join("  ·  ")
+    if let Some(overlay) = overlay {
+        line.push_str("  ·  overlay: ");
+        append_preview(&mut line, overlay);
+    }
+    line
 }
 
 /// The usage sample as the lines the inspector shows, pure so the sentences

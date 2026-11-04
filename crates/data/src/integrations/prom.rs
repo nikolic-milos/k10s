@@ -11,7 +11,11 @@
 //! [`crate::reach::MAX_BODY_BYTES`], the series count at [`MAX_SERIES`], and
 //! each series at [`MAX_POINTS_PER_SERIES`]. Overflow is refused or counted
 //! ([`QueryResult::truncated`] plus [`QueryResult::dropped_series`]), never
-//! applied silently: a prefix of a range is not the range.
+//! applied silently: a prefix of a range is not the range. A range answer at
+//! its requested server limit also reports possible truncation separately,
+//! without inventing a count of series omitted by the server.
+//! Warning and info lists retain at most [`MAX_ANNOTATIONS_PER_LEVEL`]
+//! messages each and report their separate omitted counts.
 //!
 //! Queries use GET so API-server proxy authorization requires only read access.
 //! Parameters are URL-encoded. The HTTP round trip is bounded by
@@ -38,6 +42,9 @@ pub const MAX_EXPR_BYTES: usize = 8 << 10;
 
 /// A vector or matrix wider than this is not a chart, it is a dump.
 pub const MAX_SERIES: usize = 256;
+
+/// Warning and info annotations have independent retention limits.
+pub const MAX_ANNOTATIONS_PER_LEVEL: usize = 256;
 
 /// One series denser than this chose a step that this view will not draw.
 pub const MAX_POINTS_PER_SERIES: usize = 5_000;
@@ -82,11 +89,18 @@ pub struct QueryResult {
     pub series: Vec<Series>,
     /// Some series the server returned were not kept.
     pub truncated: bool,
-    /// How many series were refused (over the series cap, over the point cap,
-    /// or not an object). Zero when [`Self::truncated`] is false.
+    /// How many returned series were refused by the series or point cap.
+    /// Zero when [`Self::truncated`] is false.
     pub dropped_series: usize,
+    /// The requested server limit when the raw range response reached that cap.
+    /// This does not establish that the server omitted any series.
+    pub possible_server_limit: Option<usize>,
     pub warnings: Vec<String>,
     pub infos: Vec<String>,
+    /// Server warning annotations omitted after the local limit.
+    pub warnings_omitted: usize,
+    /// Server info annotations omitted after the local limit.
+    pub infos_omitted: usize,
     pub source: String,
     pub timing: QueryTiming,
     pub step_ms: u64,
@@ -201,6 +215,8 @@ pub(crate) async fn query_range_path(
     };
     let start_text = unix_text(start);
     let end_text = unix_text(end);
+    // The server and decoder must use the same series limit.
+    const { assert!(MAX_SERIES == 256) };
     let rest = query_path(
         path,
         &[
@@ -222,6 +238,11 @@ pub(crate) async fn query_range_path(
                     network_ns,
                     decode_ns: decode_started.elapsed().as_nanos() as u64,
                 };
+                if matches!(result.result_type, ResultType::Vector | ResultType::Matrix)
+                    && result.series.len().saturating_add(result.dropped_series) >= MAX_SERIES
+                {
+                    result.possible_server_limit = Some(MAX_SERIES);
+                }
                 result.source = bound.source();
                 result.step_ms = step_ms;
                 result.expr = expr.to_string();

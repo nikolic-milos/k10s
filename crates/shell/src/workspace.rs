@@ -34,6 +34,7 @@ use crate::fs;
 use crate::hosting::Tab;
 use crate::launch::LaunchView;
 use crate::modal::ModalSlot;
+use crate::notice::{NoticeEvent, NoticeSnapshot, NoticeSource, NoticeView};
 use crate::overlay::{self, next_overlay};
 use crate::palette::{PaletteEvent, PaletteView};
 use crate::pane::Pane;
@@ -135,9 +136,123 @@ impl UsageState {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct StatusNotes {
+    general: Option<Rc<String>>,
+    overlay: Option<Rc<String>>,
+}
+
+impl StatusNotes {
+    pub(crate) fn set_general(&mut self, note: Option<String>) {
+        self.general = note.map(Rc::new);
+    }
+
+    pub(crate) fn set_overlay(&mut self, note: Option<String>) {
+        self.overlay = note.map(Rc::new);
+    }
+
+    pub(crate) fn general(&self) -> Option<&str> {
+        self.general.as_deref().map(String::as_str)
+    }
+
+    pub(crate) fn overlay(&self) -> Option<&str> {
+        self.overlay.as_deref().map(String::as_str)
+    }
+
+    pub(crate) fn any(&self) -> bool {
+        self.general.is_some() || self.overlay.is_some()
+    }
+
+    fn details(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl NoticeSource for StatusNotes {
+    fn notice_count(&self) -> usize {
+        usize::from(self.general.is_some()) + usize::from(self.overlay.is_some())
+    }
+
+    fn notice_at(&self, index: usize) -> Option<(&str, &str)> {
+        match (self.general(), self.overlay(), index) {
+            (Some(note), _, 0) => Some(("Status", note)),
+            (None, Some(note), 0) | (Some(_), Some(note), 1) => Some(("Overlay", note)),
+            _ => None,
+        }
+    }
+}
+
+fn overlay_note(note: Option<String>, truncated: bool) -> Option<String> {
+    if !truncated {
+        return note;
+    }
+    let mut note = note.unwrap_or_default();
+    if !note.is_empty() {
+        note.push_str("; ");
+    }
+    note.push_str("overlay data is incomplete; some objects may not be stamped");
+    Some(note)
+}
+
+fn inspector_chart_details_available(inspector_open: bool, selected: bool, chart: bool) -> bool {
+    inspector_open && selected && chart
+}
+
+#[derive(Default)]
+struct OverlayState {
+    kind: Option<OverlayKind>,
+    generation: u64,
+    loading: bool,
+    stop: Option<RequestStop>,
+}
+
+struct OverlayRefresh {
+    frame: OverlayFrame,
+    note: Option<String>,
+    request: Option<(OverlayKind, u64)>,
+}
+
+impl OverlayState {
+    fn refresh(&mut self, connected: bool) -> OverlayRefresh {
+        self.generation += 1;
+        self.stop = None;
+        self.loading = self.kind.is_some() && connected;
+        let frame = OverlayFrame {
+            kind: self.kind,
+            marks: Vec::new(),
+        };
+        let (note, request) = match (self.kind, connected) {
+            (None, _) => (None, None),
+            (Some(kind), false) => (
+                Some(format!("{} overlay needs a cluster", kind.badge())),
+                None,
+            ),
+            (Some(kind), true) => (
+                Some(format!("Loading {} overlay", kind.badge())),
+                Some((kind, self.generation)),
+            ),
+        };
+        OverlayRefresh {
+            frame,
+            note,
+            request,
+        }
+    }
+
+    fn finish(&mut self, generation: u64) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.stop = None;
+        self.loading = false;
+        true
+    }
+}
+
 pub struct Workspace {
     pub(crate) map: Entity<MapView>,
     pub(crate) palette: ModalSlot<PaletteView>,
+    pub(crate) notice: ModalSlot<NoticeView>,
     pub(crate) launch: ModalSlot<LaunchView>,
     pub(crate) launch_provider: Rc<dyn LaunchProvider>,
     pub(crate) center: Pane<Tab>,
@@ -163,7 +278,7 @@ pub struct Workspace {
     pub(crate) finder: ModalSlot<FileFinderView>,
     pub(crate) cluster_finder: ModalSlot<ClusterFinderView>,
     pub(crate) scratch_counter: usize,
-    pub(crate) status_note: Option<String>,
+    pub(crate) status_notes: StatusNotes,
     // The stored-manifest apply that is out, if one is. Kept here rather than in
     // the Releases view, so a tab closed and reopened meanwhile refuses a second
     // one and still shows the answer.
@@ -192,8 +307,7 @@ pub struct Workspace {
     pub(crate) usage: UsageState,
     pub(crate) usage_stop: Option<LogStop>,
     pub(crate) posture: Option<PostureOutcome>,
-    pub(crate) overlay_kind: Option<OverlayKind>,
-    pub(crate) overlay_generation: u64,
+    overlay: OverlayState,
     pub(crate) fetch_generation: u64,
     pub(crate) viewport: Viewport,
     _pick_subscription: Subscription,
@@ -231,6 +345,7 @@ impl Workspace {
         Workspace {
             map,
             palette: ModalSlot::default(),
+            notice: ModalSlot::default(),
             launch: ModalSlot::default(),
             launch_provider: launch_provider.unwrap_or_else(|| Rc::new(NullLaunchProvider)),
             center,
@@ -252,7 +367,7 @@ impl Workspace {
             finder: ModalSlot::default(),
             cluster_finder: ModalSlot::default(),
             scratch_counter: 0,
-            status_note: None,
+            status_notes: StatusNotes::default(),
             helm_in_flight: None,
             connected,
             context: None,
@@ -271,8 +386,7 @@ impl Workspace {
             usage: UsageState::default(),
             usage_stop: None,
             posture: None,
-            overlay_kind: None,
-            overlay_generation: 0,
+            overlay: OverlayState::default(),
             fetch_generation: 0,
             viewport: Viewport {
                 width: 1600.0,
@@ -588,11 +702,11 @@ impl Workspace {
     }
 
     pub(crate) fn cycle_overlay(&mut self, cx: &mut Context<Self>) {
-        self.set_overlay_kind(next_overlay(self.overlay_kind), cx);
+        self.set_overlay_kind(next_overlay(self.overlay.kind), cx);
     }
 
     pub(crate) fn set_overlay_kind(&mut self, kind: Option<OverlayKind>, cx: &mut Context<Self>) {
-        self.overlay_kind = kind;
+        self.overlay.kind = kind;
         self.refresh_overlay(cx);
     }
 
@@ -608,10 +722,10 @@ impl Workspace {
             Some(selection) => format!("a {} is selected", selection.kind),
             None => "nothing is selected".to_string(),
         };
-        self.status_note = Some(format!(
+        self.status_notes.set_general(Some(format!(
             "{verb} runs in a container, so it needs a pod -- {what}. Pick a pod, or press l for \
              this workload's merged logs."
-        ));
+        )));
         cx.notify();
     }
 
@@ -626,7 +740,7 @@ impl Workspace {
             map.fly_to(target, k10s_atlas::Motion::reduced_when(cx.reduce_motion()));
             cx.notify();
         });
-        self.status_note = Some(view.load_status());
+        self.status_notes.set_general(Some(view.load_status()));
         cx.notify();
     }
 
@@ -635,19 +749,20 @@ impl Workspace {
             Ok(text) => match crate::saved_views::parse_view(&text) {
                 Ok(view) => self.apply_saved_view(view, cx),
                 Err(error) => {
-                    self.status_note = Some(error.to_string());
+                    self.status_notes.set_general(Some(error.to_string()));
                     cx.notify();
                 }
             },
             Err(error) => {
-                self.status_note = Some(format!("saved view could not be read: {error}"));
+                self.status_notes
+                    .set_general(Some(format!("saved view could not be read: {error}")));
                 cx.notify();
             }
         }
     }
 
     pub(crate) fn open_saved_view_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.status_note = None;
+        self.status_notes.set_general(None);
         let seed = self
             .config
             .as_ref()
@@ -663,48 +778,41 @@ impl Workspace {
     }
 
     pub(crate) fn refresh_overlay(&mut self, cx: &mut Context<Self>) {
-        self.overlay_generation += 1;
-        let Some(kind) = self.overlay_kind else {
-            self.map
-                .update(cx, |map, cx| map.set_overlay(OverlayFrame::default(), cx));
-            cx.notify();
+        let refresh = self.overlay.refresh(self.connected);
+        self.map
+            .update(cx, |map, cx| map.set_overlay(refresh.frame, cx));
+        self.status_notes.set_overlay(refresh.note);
+        cx.notify();
+        let Some((kind, generation)) = refresh.request else {
             return;
         };
-        if !self.connected {
-            self.map.update(cx, |map, cx| {
-                map.set_overlay(
-                    OverlayFrame {
-                        kind: Some(kind),
-                        marks: Vec::new(),
-                    },
-                    cx,
-                );
-            });
-            self.status_note = Some(format!(
-                "{} overlay needs a cluster",
-                kind.badge().to_ascii_lowercase()
-            ));
-            cx.notify();
-            return;
-        }
-        let generation = self.overlay_generation;
         let (tx, rx) = futures::channel::oneshot::channel();
-        self.slot.fetch_overlay(
+        self.overlay.stop = Some(self.slot.fetch_overlay(
             kind,
             Box::new(move |outcome| {
                 let _ = tx.send(outcome);
             }),
-        );
+        ));
         cx.spawn(async move |this, cx| {
-            if let Ok(outcome) = rx.await {
-                let _ = this.update(cx, |this, cx| {
-                    if this.overlay_generation == generation {
-                        this.apply_overlay(kind, outcome, cx);
-                    }
-                });
-            }
+            let outcome = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.overlay.finish(generation) {
+                    let outcome = outcome.unwrap_or_else(|_| {
+                        OverlayOutcome::Failed("overlay request was dropped".to_string())
+                    });
+                    this.apply_overlay(kind, outcome, cx);
+                }
+            });
         })
         .detach();
+    }
+
+    pub(crate) fn overlay_loading(&self) -> Option<&str> {
+        if self.overlay.loading {
+            self.status_notes.overlay()
+        } else {
+            None
+        }
     }
 
     fn apply_overlay(
@@ -721,12 +829,7 @@ impl Workspace {
                 truncated,
             } => {
                 let frame = overlay::resolve_frame(kind, &stamps, &snapshot);
-                let note = if truncated && note.is_none() {
-                    Some("overlay truncated; not every object was stamped".to_string())
-                } else {
-                    note
-                };
-                (frame, note)
+                (frame, overlay_note(note, truncated))
             }
             OverlayOutcome::Denied(what) => (
                 OverlayFrame {
@@ -744,9 +847,7 @@ impl Workspace {
             ),
         };
         self.map.update(cx, |map, cx| map.set_overlay(frame, cx));
-        if let Some(note) = note {
-            self.status_note = Some(note);
-        }
+        self.status_notes.set_overlay(note);
         cx.notify();
     }
 
@@ -782,6 +883,7 @@ impl Workspace {
         if self.bench {
             return;
         }
+        self.close_notice(window, cx);
         // Three sheets, one place on screen: whichever is up yields before this
         // one goes down, and each hands its focus back on the way out so the
         // handle this records is the one from before any of them opened.
@@ -807,10 +909,10 @@ impl Workspace {
                                 editor.assign_path_and_save(path, cx);
                             }),
                             None => {
-                                this.status_note = Some(
+                                this.status_notes.set_general(Some(
                                     "that editor closed before the save; nothing was written"
                                         .to_string(),
-                                );
+                                ));
                                 cx.notify();
                             }
                         },
@@ -835,10 +937,12 @@ impl Workspace {
         if self.bench {
             return;
         }
+        self.close_notice(window, cx);
         let Some(root) = self.files_root.clone() else {
             // No folder open, so there is nothing to search: say which key
             // opens one rather than showing an empty list.
-            self.status_note = Some("no folder open; ctrl-shift-o opens one".to_string());
+            self.status_notes
+                .set_general(Some("no folder open; ctrl-shift-o opens one".to_string()));
             cx.notify();
             return;
         };
@@ -874,6 +978,7 @@ impl Workspace {
         if self.bench {
             return;
         }
+        self.close_notice(window, cx);
         self.close_palette(window, cx);
         self.close_picker(window, cx);
         self.close_finder(window, cx);
@@ -893,10 +998,11 @@ impl Workspace {
                         .map
                         .update(cx, |map, cx| map.select_and_reveal(&uid, window, cx));
                     if !found {
-                        this.status_note = Some("that object is not on the map".to_string());
+                        this.status_notes
+                            .set_general(Some("that object is not on the map".to_string()));
                         cx.notify();
                     } else {
-                        this.status_note = None;
+                        this.status_notes.set_general(None);
                     }
                 }
             },
@@ -909,6 +1015,81 @@ impl Workspace {
         if self.palette.close(window, cx) {
             cx.notify();
         }
+    }
+
+    pub(crate) fn close_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fallback = self.notice.previous_focus().and_then(|previous| {
+            let tab = self.center.active()?;
+            if tab.tag != ItemTag::Observe {
+                return None;
+            }
+            let view = tab
+                .view
+                .to_any()
+                .downcast::<crate::observe::ObserveView>()
+                .ok()?;
+            view.read(cx).notice_focus_fallback(previous, cx)
+        });
+        if let Some(focus) = fallback {
+            self.notice.rebase_focus(&focus);
+        }
+        if self.notice.close(window, cx) {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn open_notice(
+        &mut self,
+        title: &'static str,
+        notices: NoticeSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bench || self.has_modal() || notices.is_empty() {
+            return;
+        }
+        let view = cx.new(|cx| NoticeView::new(title, notices, cx).expect("nonempty notices"));
+        let subscription =
+            cx.subscribe_in(&view, window, |this, _, _: &NoticeEvent, window, cx| {
+                this.close_notice(window, cx)
+            });
+        self.notice.open(view, subscription, window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn open_status_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench || self.has_modal() {
+            return;
+        }
+        if self.status_notes.any() {
+            let notices = NoticeSnapshot::new(self.status_notes.details());
+            self.open_notice("Status details", notices, window, cx);
+        }
+    }
+
+    pub(crate) fn open_inspector_chart_details(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.inspector_chart_details_available() {
+            return;
+        }
+        let details = self
+            .observe_sparkline
+            .as_ref()
+            .and_then(|chart| chart.read(cx).notice_details());
+        if let Some(details) = details {
+            self.open_notice("Chart details", details, window, cx);
+        }
+    }
+
+    pub(crate) fn inspector_chart_details_available(&self) -> bool {
+        inspector_chart_details_available(
+            self.inspector_open,
+            self.selection.is_some(),
+            self.observe_sparkline.is_some(),
+        )
     }
 
     pub(crate) fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -938,7 +1119,8 @@ impl Workspace {
     }
 
     pub(crate) fn has_modal(&self) -> bool {
-        self.palette.is_open()
+        self.notice.is_open()
+            || self.palette.is_open()
             || self.launch.is_open()
             || self.picker.is_open()
             || self.finder.is_open()
@@ -956,12 +1138,14 @@ impl Workspace {
         self.picker.rebase_focus(&previous);
         self.finder.rebase_focus(&previous);
         self.cluster_finder.rebase_focus(&previous);
+        self.notice.rebase_focus(&previous);
     }
 
     fn toggle_palette_view(&mut self, surfaces: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.bench {
             return;
         }
+        self.close_notice(window, cx);
         if self
             .palette
             .view()
@@ -1032,7 +1216,7 @@ impl Workspace {
                         Ok(action) => window.dispatch_action(action, cx),
                         Err(error) => {
                             eprintln!("k10s: the palette cannot build {name:?}: {error}");
-                            this.status_note = Some(palette_note(name));
+                            this.status_notes.set_general(Some(palette_note(name)));
                             cx.notify();
                         }
                     }
@@ -1247,7 +1431,12 @@ pub(crate) fn palette_note(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::palette_note;
+    use super::{
+        OverlayState, StatusNotes, inspector_chart_details_available, overlay_note, palette_note,
+    };
+    use crate::notice::NoticeSnapshot;
+    use k10s_map::OverlayKind;
+    use std::rc::Rc;
 
     #[test]
     fn a_command_that_cannot_be_built_says_so_on_screen() {
@@ -1255,5 +1444,192 @@ mod tests {
             palette_note("k10s::OpenSettings"),
             "k10s::OpenSettings did not run; the reason is on stderr"
         );
+    }
+
+    #[test]
+    fn inspector_chart_details_require_a_selected_resource_and_visible_chart() {
+        assert!(!inspector_chart_details_available(true, false, true));
+        assert!(!inspector_chart_details_available(false, true, true));
+        assert!(!inspector_chart_details_available(true, true, false));
+        assert!(inspector_chart_details_available(true, true, true));
+    }
+
+    #[test]
+    fn overlay_status_is_owned_and_cleared_independently_of_general_status() {
+        let mut notes = StatusNotes::default();
+        assert!(!notes.any());
+        notes.set_general(Some("same sentence".to_string()));
+        notes.set_overlay(Some("same sentence".to_string()));
+        let first = NoticeSnapshot::new(notes.details());
+        assert_eq!(first.len(), 2);
+        assert_eq!(first.get(0), Some(("Status", "same sentence")));
+        assert_eq!(first.get(1), Some(("Overlay", "same sentence")));
+
+        notes.set_overlay(None);
+        assert!(notes.any());
+        assert_eq!(notes.overlay(), None);
+        assert_eq!(first.get(1), Some(("Overlay", "same sentence")));
+        let current = NoticeSnapshot::new(notes.details());
+        assert_eq!(current.len(), 1);
+        assert_eq!(current.get(0), Some(("Status", "same sentence")));
+
+        notes.set_overlay(Some("current overlay denial".to_string()));
+        notes.set_general(Some("unrelated later status".to_string()));
+        let current = NoticeSnapshot::new(notes.details());
+        assert_eq!(current.get(0), Some(("Status", "unrelated later status")));
+        assert_eq!(current.get(1), Some(("Overlay", "current overlay denial")));
+        notes.set_general(None);
+        let current = NoticeSnapshot::new(notes.details());
+        assert_eq!(current.get(0), Some(("Overlay", "current overlay denial")));
+        assert_eq!(current.get(1), None);
+        notes.set_general(Some("unrelated later status".to_string()));
+        notes.set_overlay(None);
+        assert_eq!(notes.general(), Some("unrelated later status"));
+        notes.set_general(None);
+        assert!(!notes.any());
+    }
+
+    #[test]
+    fn status_snapshot_retains_full_messages_after_replacement() {
+        let general = format!("cluster=\"{}\" connection failed", "é".repeat(500));
+        let overlay = format!("service=\"{}\" returned a warning", "é".repeat(500));
+        let general_pointer = general.as_ptr();
+        let overlay_pointer = overlay.as_ptr();
+        let mut notes = StatusNotes::default();
+        notes.set_general(Some(general));
+        notes.set_overlay(Some(overlay));
+        let general_retained = Rc::downgrade(notes.general.as_ref().unwrap());
+        let overlay_retained = Rc::downgrade(notes.overlay.as_ref().unwrap());
+        let details = NoticeSnapshot::new(notes.details());
+        assert_eq!(details.get(0).unwrap().1.as_ptr(), general_pointer);
+        assert_eq!(details.get(1).unwrap().1.as_ptr(), overlay_pointer);
+        notes.set_general(Some("new status".to_string()));
+        notes.set_overlay(None);
+        assert_eq!(notes.general(), Some("new status"));
+        assert!(details.get(0).unwrap().1.ends_with(" connection failed"));
+        assert!(details.get(1).unwrap().1.ends_with(" returned a warning"));
+        assert!(general_retained.upgrade().is_some());
+        assert!(overlay_retained.upgrade().is_some());
+        drop(details);
+        assert!(general_retained.upgrade().is_none());
+        assert!(overlay_retained.upgrade().is_none());
+    }
+
+    #[test]
+    fn truncated_overlay_keeps_both_the_source_note_and_the_limit() {
+        assert_eq!(overlay_note(None, false), None);
+        assert_eq!(
+            overlay_note(Some("source warning".into()), false).as_deref(),
+            Some("source warning")
+        );
+        assert_eq!(
+            overlay_note(None, true).as_deref(),
+            Some("overlay data is incomplete; some objects may not be stamped")
+        );
+        assert_eq!(
+            overlay_note(Some("source warning".into()), true).as_deref(),
+            Some("source warning; overlay data is incomplete; some objects may not be stamped")
+        );
+    }
+
+    #[test]
+    fn overlay_refresh_clears_old_marks_labels_loading_and_rejects_old_completions() {
+        let mut overlay = OverlayState {
+            kind: Some(OverlayKind::Sync),
+            ..OverlayState::default()
+        };
+        let first = overlay.refresh(true);
+        assert_eq!(first.frame.kind, Some(OverlayKind::Sync));
+        assert!(first.frame.marks.is_empty());
+        assert_eq!(first.note.as_deref(), Some("Loading SYNC overlay"));
+        let (_, old) = first.request.expect("connected refresh");
+        assert!(overlay.loading);
+
+        overlay.kind = Some(OverlayKind::Metrics);
+        let changed = overlay.refresh(true);
+        assert_eq!(changed.frame.kind, Some(OverlayKind::Metrics));
+        assert!(changed.frame.marks.is_empty());
+        assert_eq!(changed.note.as_deref(), Some("Loading METRICS overlay"));
+        let (_, current) = changed.request.expect("changed overlay request");
+        assert!(!overlay.finish(old));
+        assert!(overlay.loading);
+        assert!(overlay.finish(current));
+        assert!(!overlay.loading);
+
+        // A refresh of the same kind, including after connection adoption,
+        // clears the marks too and retires the preceding request.
+        let same = overlay.refresh(true);
+        assert_eq!(same.frame.kind, Some(OverlayKind::Metrics));
+        assert!(same.frame.marks.is_empty());
+        assert_eq!(same.note.as_deref(), Some("Loading METRICS overlay"));
+        let (_, pending) = same.request.expect("same kind refresh");
+        assert!(!overlay.finish(current));
+        assert!(overlay.loading);
+
+        overlay.kind = None;
+        let disabled = overlay.refresh(true);
+        assert_eq!(disabled.frame.kind, None);
+        assert!(disabled.frame.marks.is_empty());
+        assert!(disabled.note.is_none());
+        assert!(disabled.request.is_none());
+        assert!(!overlay.finish(pending));
+        assert!(!overlay.loading);
+
+        overlay.kind = Some(OverlayKind::Sync);
+        let disconnected = overlay.refresh(false);
+        assert_eq!(disconnected.frame.kind, Some(OverlayKind::Sync));
+        assert!(disconnected.frame.marks.is_empty());
+        assert_eq!(
+            disconnected.note.as_deref(),
+            Some("SYNC overlay needs a cluster")
+        );
+        assert!(disconnected.request.is_none());
+        assert!(!overlay.loading);
+    }
+
+    #[test]
+    fn overlay_replacement_cancels_only_the_owned_request() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let first_stops = Arc::new(AtomicUsize::new(0));
+        let second_stops = Arc::new(AtomicUsize::new(0));
+        let mut overlay = OverlayState {
+            kind: Some(OverlayKind::Metrics),
+            ..OverlayState::default()
+        };
+        let (_, first) = overlay.refresh(true).request.expect("first request");
+        let count = first_stops.clone();
+        overlay.stop = Some(k10s_provider::RequestStop::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        }));
+        let (_, second) = overlay.refresh(true).request.expect("replacement request");
+        assert_eq!(first_stops.load(Ordering::Relaxed), 1);
+        let count = second_stops.clone();
+        overlay.stop = Some(k10s_provider::RequestStop::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert!(!overlay.finish(first));
+        assert_eq!(second_stops.load(Ordering::Relaxed), 0);
+        assert!(overlay.finish(second));
+        assert_eq!(second_stops.load(Ordering::Relaxed), 1);
+
+        let disabled_stops = Arc::new(AtomicUsize::new(0));
+        overlay.refresh(true);
+        let count = disabled_stops.clone();
+        overlay.stop = Some(k10s_provider::RequestStop::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        }));
+        overlay.kind = None;
+        assert!(overlay.refresh(true).request.is_none());
+        assert_eq!(disabled_stops.load(Ordering::Relaxed), 1);
+
+        let dropped_stops = Arc::new(AtomicUsize::new(0));
+        let count = dropped_stops.clone();
+        overlay.stop = Some(k10s_provider::RequestStop::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        }));
+        drop(overlay);
+        assert_eq!(dropped_stops.load(Ordering::Relaxed), 1);
     }
 }

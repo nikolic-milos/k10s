@@ -1581,7 +1581,7 @@ async fn inspector_and_observe_share_capacity_and_cancel_queued_reads_before_tra
     assert_eq!(what, "telemetry");
     assert_eq!(
         why,
-        "telemetry is busy: two requests are active and four are waiting"
+        "telemetry is busy: request capacity is full; try again shortly"
     );
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _inspector = sync

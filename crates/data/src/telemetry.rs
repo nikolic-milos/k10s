@@ -74,7 +74,8 @@ pub struct Scope {
     pub pods: Vec<PodIdentity>,
 }
 
-/// Dropping a request releases its queue slot and aborts its in-flight I/O.
+/// Dropping a request signals cancellation. Admission remains occupied until
+/// the runtime drops the request task, which may happen later.
 #[must_use]
 pub struct RequestStop(Option<tokio::task::AbortHandle>);
 
@@ -96,6 +97,7 @@ impl Drop for RequestStop {
     }
 }
 
+/// Counts are sampled separately and do not form a single atomic snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScheduleCounts {
     pub admitted: usize,
@@ -106,7 +108,6 @@ pub struct ScheduleCounts {
 }
 
 pub(crate) struct Scheduler {
-    slots: Arc<Semaphore>,
     active_slots: Arc<Semaphore>,
     admitted: AtomicUsize,
     active: AtomicUsize,
@@ -118,7 +119,6 @@ pub(crate) struct Scheduler {
 impl Default for Scheduler {
     fn default() -> Self {
         Self {
-            slots: Arc::new(Semaphore::new(MAX_ACTIVE + MAX_WAITING)),
             active_slots: Arc::new(Semaphore::new(MAX_ACTIVE)),
             admitted: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
@@ -126,6 +126,28 @@ impl Default for Scheduler {
             peak_active: AtomicUsize::new(0),
             rejected: AtomicUsize::new(0),
         }
+    }
+}
+
+struct Admission(Arc<Scheduler>);
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.0.admitted.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+// An unpolled cancelled task drops its captures in an unspecified order.
+// Keep the admission last so its work and callback are dropped first.
+struct Admitted<W, R> {
+    work: W,
+    reply: R,
+    admission: Admission,
+}
+
+impl<W, R> Admitted<W, R> {
+    fn into_parts(self) -> (Admission, W, R) {
+        (self.admission, self.work, self.reply)
     }
 }
 
@@ -174,23 +196,30 @@ impl Scheduler {
         work: impl Future<Output = Fetched<T>> + Send + 'static,
         reply: impl FnOnce(Fetched<T>) + Send + 'static,
     ) -> RequestStop {
-        let Ok(slot) = self.slots.clone().try_acquire_owned() else {
+        let Ok(previous) =
+            self.admitted
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    (count < MAX_ACTIVE + MAX_WAITING).then_some(count + 1)
+                })
+        else {
             self.rejected.fetch_add(1, Ordering::Relaxed);
             reply(Fetched::Failed {
                 what: "telemetry",
-                why: "telemetry is busy: two requests are active and four are waiting".to_string(),
+                why: "telemetry is busy: request capacity is full; try again shortly".to_string(),
             });
             return RequestStop::noop();
         };
-        let scheduler = self.clone();
+        self.peak_admitted
+            .fetch_max(previous + 1, Ordering::Relaxed);
+        let request = Admitted {
+            work,
+            reply,
+            admission: Admission(self.clone()),
+        };
         let started = Instant::now();
         let task = handle.spawn(async move {
-            let _slot = slot;
-            let admitted = scheduler.admitted.fetch_add(1, Ordering::Relaxed) + 1;
-            scheduler
-                .peak_admitted
-                .fetch_max(admitted, Ordering::Relaxed);
-            let _admitted = CountGuard(&scheduler.admitted);
+            let (admission, work, reply) = request.into_parts();
+            let scheduler = &admission.0;
             let acquire = scheduler.active_slots.clone().acquire_owned();
             let _active_slot = match deadline {
                 Some(deadline) => match tokio::time::timeout_at(deadline, acquire).await {
@@ -459,28 +488,44 @@ pub async fn resolve_scope(
 mod tests {
     use super::*;
 
+    async fn wait_tasks_finished(handles: &[tokio::task::AbortHandle]) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handles.iter().any(|handle| !handle.is_finished()) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("request tasks have stopped");
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn a_queued_deadline_releases_admission_without_polling_its_work() {
+    async fn an_admitted_deadline_expires_without_polling_work() {
         let scheduler = Arc::new(Scheduler::default());
         let mut active = Vec::new();
+        let mut started = Vec::new();
         for _ in 0..MAX_ACTIVE {
+            let (tx, rx) = tokio::sync::oneshot::channel();
             active.push(scheduler.submit(
                 &tokio::runtime::Handle::current(),
-                std::future::pending::<Fetched<()>>(),
+                async move {
+                    let _ = tx.send(());
+                    std::future::pending::<Fetched<()>>().await
+                },
                 |_| panic!("cancelled active work must not reply"),
             ));
+            started.push(rx);
         }
-        for _ in 0..1_000 {
-            if scheduler.counts().active == MAX_ACTIVE {
-                break;
-            }
-            tokio::task::yield_now().await;
+        for signal in started {
+            tokio::time::timeout(std::time::Duration::from_secs(1), signal)
+                .await
+                .expect("active work reaches the scheduler")
+                .expect("active work starts");
         }
         assert_eq!(scheduler.counts().active, MAX_ACTIVE);
         let polled = Arc::new(AtomicUsize::new(0));
         let work_polled = polled.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _queued = scheduler.submit_until(
+        let waiting = scheduler.submit_until(
             &tokio::runtime::Handle::current(),
             tokio::time::Instant::now() + std::time::Duration::from_secs(1),
             async move {
@@ -489,15 +534,20 @@ mod tests {
             },
             move |answer| tx.send(answer).expect("queued deadline reply"),
         );
-        tokio::task::yield_now().await;
         assert_eq!(scheduler.counts().admitted, MAX_ACTIVE + 1);
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         assert_eq!(rx.await.expect("deadline reply"), request_expired());
+        let waiting_task = waiting.0.as_ref().expect("admitted task").clone();
+        wait_tasks_finished(&[waiting_task]).await;
         assert_eq!(polled.load(Ordering::Relaxed), 0);
         assert_eq!(scheduler.counts().active, MAX_ACTIVE);
         assert_eq!(scheduler.counts().admitted, MAX_ACTIVE);
+        let tasks: Vec<_> = active
+            .iter()
+            .map(|stop| stop.0.as_ref().expect("active task").clone())
+            .collect();
         drop(active);
-        tokio::task::yield_now().await;
+        wait_tasks_finished(&tasks).await;
         assert_eq!(scheduler.counts().admitted, 0);
     }
 
@@ -511,8 +561,9 @@ mod tests {
             async { panic!("cancelled work must not be polled") },
             move |answer: Fetched<()>| tx.send(answer).expect("no cancellation reply"),
         );
+        let task = stop.0.as_ref().expect("admitted task").clone();
         drop(stop);
-        tokio::task::yield_now().await;
+        wait_tasks_finished(&[task]).await;
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
@@ -527,6 +578,190 @@ mod tests {
             move |answer| tx.send(answer).expect("fresh reply"),
         );
         assert_eq!(rx.await.expect("fresh capacity"), Fetched::Ok(42));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_unpolled_requests_can_temporarily_fill_capacity() {
+        let scheduler = Arc::new(Scheduler::default());
+        let handle = tokio::runtime::Handle::current();
+        let mut completions = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..MAX_ACTIVE + MAX_WAITING {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let stop = scheduler.submit(
+                &handle,
+                async { panic!("cancelled work must not be polled") },
+                move |_: Fetched<()>| {
+                    let _ = tx.send(());
+                    panic!("cancelled work must not reply");
+                },
+            );
+            completions.push(rx);
+            tasks.push(stop.0.as_ref().expect("admitted task").clone());
+            drop(stop);
+        }
+        assert_eq!(scheduler.counts().active, 0);
+        assert_eq!(scheduler.counts().admitted, MAX_ACTIVE + MAX_WAITING);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _rejected = scheduler.submit(&handle, async { Fetched::Ok(()) }, move |answer| {
+            tx.send(answer).expect("capacity reply");
+        });
+        assert_eq!(
+            rx.await.expect("capacity refusal"),
+            Fetched::Failed {
+                what: "telemetry",
+                why: "telemetry is busy: request capacity is full; try again shortly".to_string(),
+            }
+        );
+
+        for completion in completions {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+                    .await
+                    .expect("cancelled callback is dropped")
+                    .is_err()
+            );
+        }
+        wait_tasks_finished(&tasks).await;
+        assert_eq!(scheduler.counts().admitted, 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _fresh = scheduler.submit(&handle, async { Fetched::Ok(42) }, move |answer| {
+            tx.send(answer).expect("fresh reply");
+        });
+        assert_eq!(rx.await.expect("fresh capacity"), Fetched::Ok(42));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_admission_counts_tasks_before_they_are_polled() {
+        const ATTEMPTS: usize = 12;
+        let scheduler = Arc::new(Scheduler::default());
+        let handle = tokio::runtime::Handle::current();
+        let barrier = Arc::new(std::sync::Barrier::new(ATTEMPTS + 1));
+        let guards = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..ATTEMPTS)
+                .map(|_| {
+                    let scheduler = scheduler.clone();
+                    let handle = handle.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let stop = scheduler.submit(
+                            &handle,
+                            std::future::pending::<Fetched<()>>(),
+                            move |answer| {
+                                let _ = tx.send(answer);
+                            },
+                        );
+                        (stop, rx)
+                    })
+                })
+                .collect();
+            barrier.wait();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("admission thread"))
+                .collect::<Vec<_>>()
+        });
+        let (guards, completions): (Vec<_>, Vec<_>) = guards.into_iter().unzip();
+        let counts = scheduler.counts();
+        assert_eq!(counts.admitted, MAX_ACTIVE + MAX_WAITING);
+        assert_eq!(counts.peak_admitted, MAX_ACTIVE + MAX_WAITING);
+        assert_eq!(counts.active, 0);
+        assert_eq!(counts.rejected, ATTEMPTS - MAX_ACTIVE - MAX_WAITING);
+
+        let tasks: Vec<_> = guards.iter().filter_map(|stop| stop.0.clone()).collect();
+        drop(guards);
+        assert_eq!(scheduler.counts().admitted, MAX_ACTIVE + MAX_WAITING);
+        for completion in completions {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+                .await
+                .expect("request callback is settled");
+            assert!(matches!(
+                result,
+                Err(_)
+                    | Ok(Fetched::Failed {
+                        what: "telemetry",
+                        ..
+                    })
+            ));
+        }
+        wait_tasks_finished(&tasks).await;
+        assert_eq!(scheduler.counts().admitted, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admission_outlives_cancelled_work_and_callback() {
+        struct Probe {
+            scheduler: Arc<Scheduler>,
+            sender: tokio::sync::mpsc::UnboundedSender<(usize, ScheduleCounts, usize)>,
+            index: usize,
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.sender.send((
+                    self.index,
+                    self.scheduler.counts(),
+                    self.scheduler.active_slots.available_permits(),
+                ));
+            }
+        }
+
+        for poll_work in [false, true] {
+            let scheduler = Arc::new(Scheduler::default());
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let work_probe = Probe {
+                scheduler: scheduler.clone(),
+                sender: tx.clone(),
+                index: 0,
+            };
+            let reply_probe = Probe {
+                scheduler: scheduler.clone(),
+                sender: tx,
+                index: 1,
+            };
+            let (started, work_started) = tokio::sync::oneshot::channel();
+            let stop = scheduler.submit(
+                &tokio::runtime::Handle::current(),
+                async move {
+                    let _probe = work_probe;
+                    let _ = started.send(());
+                    std::future::pending::<Fetched<()>>().await
+                },
+                move |_: Fetched<()>| {
+                    let _probe = reply_probe;
+                    panic!("cancelled work must not reply");
+                },
+            );
+            if poll_work {
+                tokio::time::timeout(std::time::Duration::from_secs(2), work_started)
+                    .await
+                    .expect("work is polled")
+                    .expect("work started");
+            }
+            assert_eq!(scheduler.counts().admitted, 1);
+            let task = stop.0.as_ref().expect("admitted task").clone();
+            drop(stop);
+
+            let mut observed = [false; 2];
+            for _ in 0..observed.len() {
+                let (index, counts, permits) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                        .await
+                        .expect("capture is dropped")
+                        .expect("probe message");
+                assert!(!observed[index]);
+                observed[index] = true;
+                assert_eq!(counts.admitted, 1);
+                assert_eq!(counts.active, usize::from(poll_work));
+                assert_eq!(permits, MAX_ACTIVE - usize::from(poll_work));
+            }
+            assert_eq!(observed, [true, true]);
+            wait_tasks_finished(&[task]).await;
+            assert_eq!(scheduler.counts().admitted, 0);
+        }
     }
 
     #[test]

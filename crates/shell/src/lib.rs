@@ -87,6 +87,7 @@ mod editor_io;
 mod editor_io_test;
 mod hosting;
 mod modal;
+mod notice;
 mod overlay;
 mod pane;
 mod render;

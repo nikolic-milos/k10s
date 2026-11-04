@@ -153,6 +153,45 @@ fn an_oversize_body_is_refused_not_truncated() {
 }
 
 #[test]
+fn panel_ids_are_retained_only_when_returned_as_integers() {
+    let dashboard = parse_dashboard(
+        br#"{"uid":"pilot","title":"Pilot","panels":[
+            {"id":0,"title":"zero","type":"timeseries"},
+            {"title":"missing","type":"timeseries"},
+            {"id":null,"title":"null","type":"timeseries"},
+            {"id":"7","title":"string","type":"timeseries"},
+            {"id":7,"title":"integer","type":"timeseries"}
+        ]}"#,
+    )
+    .expect("dashboard");
+    let ids: Vec<_> = dashboard.panels.iter().map(|panel| panel.id).collect();
+    assert_eq!(ids, [Some(0), None, None, None, Some(7)]);
+}
+
+#[test]
+fn dashboard_reports_panels_and_targets_beyond_local_limits() {
+    use serde_json::json;
+
+    for count in [MAX_QUERIES_PER_PANEL, MAX_QUERIES_PER_PANEL + 1] {
+        let targets = vec![json!({"expr": "up"}); count];
+        let input = json!({"uid": "pilot", "panels": [{"type": "timeseries", "targets": targets}]});
+        let dashboard = parse_dashboard(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(dashboard.truncated, count > MAX_QUERIES_PER_PANEL);
+        assert_eq!(
+            dashboard.panels[0].queries.len(),
+            count.min(MAX_QUERIES_PER_PANEL)
+        );
+    }
+    for count in [MAX_PANELS, MAX_PANELS + 1] {
+        let panels = vec![json!({"type": "timeseries"}); count];
+        let input = json!({"uid": "pilot", "panels": panels});
+        let dashboard = parse_dashboard(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(dashboard.truncated, count > MAX_PANELS);
+        assert_eq!(dashboard.panels.len(), count.min(MAX_PANELS));
+    }
+}
+
+#[test]
 fn folder_allowlist_drops_everything_outside_it_and_keeps_all_when_empty() {
     let hits = vec![
         SearchHit {
@@ -182,10 +221,45 @@ fn folder_allowlist_drops_everything_outside_it_and_keeps_all_when_empty() {
 
 #[test]
 fn search_json_keeps_the_folder_grafana_named() {
-    let hits =
+    let page =
         parse_search(br#"[{"uid":"a","title":"API","folderTitle":"Team A","type":"dash-db"}]"#)
             .expect("json");
-    assert_eq!(hits[0].folder_title, "Team A");
+    assert_eq!(page.hits[0].folder_title, "Team A");
+    assert!(!page.page_full);
+}
+
+#[test]
+fn search_path_and_page_limit_agree() {
+    let (_, limit) = SEARCH_PATH.rsplit_once("limit=").expect("search limit");
+    assert_eq!(limit.parse::<usize>().expect("numeric limit"), SEARCH_LIMIT);
+}
+
+#[test]
+fn dashboard_uids_are_validated_without_rejecting_missing_uids() {
+    for uid in [
+        serde_json::json!("../path"),
+        serde_json::json!("name?other=1"),
+        serde_json::json!("a".repeat(41)),
+        serde_json::json!(42),
+        serde_json::json!(false),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        let json = serde_json::json!({"uid":uid,"title":"Dashboard","panels":[]});
+        assert_eq!(
+            parse_dashboard(json.to_string().as_bytes()),
+            Err(DashboardError::InvalidUid),
+        );
+        assert_eq!(
+            DashboardError::InvalidUid.to_string(),
+            INVALID_DASHBOARD_UID
+        );
+    }
+    for uid in [serde_json::Value::Null, "".into(), "a".repeat(40).into()] {
+        let json = serde_json::json!({"uid":uid,"title":"Dashboard","panels":[]});
+        assert!(parse_dashboard(json.to_string().as_bytes()).is_ok());
+    }
+    assert!(parse_dashboard(br#"{"title":"Dashboard","panels":[]}"#).is_ok());
 }
 
 #[test]
@@ -439,7 +513,8 @@ fn multiple_visible_targets_cannot_impersonate_one_complete_panel() {
         "type": "timeseries",
         "targets": [{"refId":"A", "expr":"up"}, {"refId":"B", "expr":"down"}]
     });
-    let parsed = read_panel(&panel, 1);
+    let mut truncated = false;
+    let parsed = read_panel(&panel, &mut truncated);
     assert_eq!(parsed.queries.len(), 2);
     assert!(
         parsed
@@ -449,9 +524,83 @@ fn multiple_visible_targets_cannot_impersonate_one_complete_panel() {
     );
     let mut single = panel;
     single["targets"][1]["hide"] = serde_json::json!(true);
-    let parsed = read_panel(&single, 1);
+    let parsed = read_panel(&single, &mut truncated);
     assert_eq!(parsed.queries.len(), 1);
     assert!(parsed.unsupported.is_none());
     single["targets"][0]["format"] = serde_json::json!("table");
-    assert!(read_panel(&single, 1).queries[0].unsupported.is_some());
+    assert!(
+        read_panel(&single, &mut truncated).queries[0]
+            .unsupported
+            .is_some()
+    );
+    assert!(!truncated);
+}
+
+#[test]
+fn panel_time_overrides_cannot_run_in_the_observe_window() {
+    use serde_json::json;
+
+    for kind in ["timeseries", "stat"] {
+        for (field, reason) in [
+            (
+                "timeFrom",
+                "unsupported Grafana panel relative time override",
+            ),
+            ("timeShift", "unsupported Grafana panel time shift"),
+        ] {
+            for value in [
+                json!("5m"),
+                json!("1M/M"),
+                json!(" "),
+                json!(false),
+                json!(1),
+            ] {
+                let mut panel = json!({
+                    "id":7,"title":"Earlier period","type":kind,
+                    "datasource":{"type":"prometheus","uid":"prom"},
+                    "targets":[{"refId":"A","expr":"up"}]
+                });
+                panel[field] = value;
+                let document = json!({"uid":"period","panels":[panel]});
+                let parsed = parse_dashboard(&serde_json::to_vec(&document).unwrap()).unwrap();
+                assert_eq!(parsed.panels[0].unsupported.as_deref(), Some(reason));
+                assert_eq!(parsed.panels[0].id, Some(7));
+                assert_eq!(parsed.panels[0].queries[0].expr, "up");
+                assert!(!parsed.truncated);
+            }
+            for value in [json!(null), json!("")] {
+                let mut panel = json!({"type":kind,"targets":[{"expr":"up"}]});
+                panel[field] = value;
+                let mut truncated = false;
+                assert!(read_panel(&panel, &mut truncated).unsupported.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn stat_field_selection_cannot_impersonate_all_numeric_fields() {
+    use serde_json::json;
+
+    for value in [json!("/^requests$/"), json!(" "), json!(false), json!(1)] {
+        let panel = json!({
+            "type":"stat","targets":[{"expr":"up"}],
+            "options":{"reduceOptions":{"fields":value,"calcs":["lastNotNull"]}}
+        });
+        let mut truncated = false;
+        let parsed = read_panel(&panel, &mut truncated);
+        assert_eq!(
+            parsed.unsupported.as_deref(),
+            Some("unsupported Grafana stat field selection")
+        );
+        assert_eq!(parsed.queries[0].expr, "up");
+    }
+    for value in [json!(null), json!("")] {
+        let panel = json!({
+            "type":"stat","targets":[{"expr":"up"}],
+            "options":{"reduceOptions":{"fields":value,"calcs":["lastNotNull"]}}
+        });
+        let mut truncated = false;
+        assert!(read_panel(&panel, &mut truncated).unsupported.is_none());
+    }
 }

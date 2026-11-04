@@ -89,6 +89,16 @@ before replacing it. Full caret, selection and paste workflows are unavailable.
 [Prometheus range API](https://prometheus.io/docs/prometheus/latest/querying/api/),
 [Loki range API](https://grafana.com/docs/loki/latest/reference/loki-http-api/).
 
+Raw queries use the discovered Prometheus or Loki directly. Cached Service
+bindings verify UID and resourceVersion before reuse. A changed Service, or a
+previously bound source that becomes missing or ambiguous, requires **Refresh**
+in general Observe before another source can be used. Query and metadata
+failures retain the known identity; retrying cannot silently adopt a replacement
+with the same name. From a focused recorded-log view, return to general Observe
+with Shift+G from the map to refresh sources.
+[Kubernetes UIDs](https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids),
+[resource versions](https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions).
+
 Select a **Grafana panels** row and Enter or **Run panel**. Native support is one
 visible PromQL range target in `timeseries` or `stat`, through its verified
 Prometheus datasource UID. The resolved expression/source/unit remain visible.
@@ -97,7 +107,15 @@ samples. Missing stays missing. `percentunit` displays as percent; other unit ID
 do not imply Grafana's full formatting.
 Broken provisioned dashboard files carry their ConfigMap and filename beside
 healthy catalog rows. Invalid panel arrays produce a named failure.
-[Grafana datasource API](https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/data_source/),
+
+Catalogue queries and Service browser forwards retain the Grafana Service
+identity verified during catalogue loading, even if a replacement exposes
+identical dashboard and datasource UIDs. **Refresh**
+reloads sources and the catalogue; refreshing sources alone does not authorize
+old rows. Provisioned ConfigMap rows retain their file provenance and remain
+readable without a verified Grafana source, but native execution and Service
+browser forwarding stay unavailable until the catalogue has one.
+[Grafana datasource API](https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/api-legacy/data_source/),
 [calculation types](https://grafana.com/docs/grafana/latest/visualizations/panels-visualizations/query-transform-data/calculation-types/).
 
 | Panel variable | Native meaning and restriction |

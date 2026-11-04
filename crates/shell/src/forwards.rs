@@ -20,8 +20,8 @@ use crate::table::TableState;
 use crate::ui::{LIST_ROW_HEIGHT, STATUS_BAR_HEIGHT, Viewport, panel_header};
 use crate::{Refresh, RowDown, RowEnd, RowHome, RowPageDown, RowPageUp, RowUp, StopForward};
 use k10s_provider::{
-    ClusterProvider, ForwardOutcome, ForwardRequest, ForwardRow, ForwardState, TableColumn,
-    TablePage, TableRow,
+    ClusterProvider, ForwardLease, ForwardOutcome, ForwardRequest, ForwardRow, ForwardStartOutcome,
+    ForwardState, ForwardTerminal, ProviderSlot, RequestStop, TableColumn, TablePage, TableRow,
 };
 
 const TABLE_HEADER_HEIGHT: f32 = 28.0;
@@ -29,28 +29,43 @@ const NO_FORWARDS: &str = "no forwards open; F on a pod or service row in the br
 
 pub struct ForwardsView {
     focus: FocusHandle,
-    provider: Rc<dyn ClusterProvider>,
+    slot: Rc<ProviderSlot>,
     table: TableState,
     status: Option<String>,
     viewport: Viewport,
+    browser: Option<PendingBrowser>,
+    browser_watch: Option<BrowserWatch>,
     // Which start request the status line is about. Two opens can be in flight
     // at once and can answer out of order, and the sentence on screen has to be
     // about the one the user asked for last, not whichever finished last.
     generation: u64,
 }
 
+struct PendingBrowser {
+    _stop: RequestStop,
+    lease: Option<ForwardLease>,
+}
+
+struct BrowserWatch {
+    _stop: RequestStop,
+    id: u64,
+    provider: Rc<dyn ClusterProvider>,
+}
+
 impl ForwardsView {
     pub fn new(
-        provider: Rc<dyn ClusterProvider>,
+        slot: Rc<ProviderSlot>,
         start: Option<ForwardRequest>,
         cx: &mut Context<Self>,
     ) -> ForwardsView {
         let mut view = ForwardsView {
             focus: cx.focus_handle(),
-            provider,
+            slot,
             table: TableState::new(),
             status: None,
             viewport: Viewport::default(),
+            browser: None,
+            browser_watch: None,
             generation: 0,
         };
         view.refresh();
@@ -70,7 +85,7 @@ impl ForwardsView {
 
     fn refresh(&mut self) {
         self.table
-            .set_page(forwards_page(&self.provider.list_forwards()));
+            .set_page(forwards_page(&self.slot.current().list_forwards()));
     }
 
     pub fn start(&mut self, request: ForwardRequest, cx: &mut Context<Self>) {
@@ -89,12 +104,29 @@ impl ForwardsView {
     ) {
         self.generation += 1;
         let generation = self.generation;
-        self.status = Some(format!(
-            "opening a forward to {}/{}...",
-            request.namespace, request.name
-        ));
+        self.browser_watch = None;
+        if self.browser.take().is_some() {
+            self.refresh();
+        }
+        self.status = Some(if browser_path.is_some() {
+            format!(
+                "opening a forward to {}/{}; x cancels",
+                request.namespace, request.name
+            )
+        } else {
+            format!(
+                "opening a forward to {}/{}...",
+                request.namespace, request.name
+            )
+        });
+        let provider = self.slot.current();
+        if let Some(path) = browser_path {
+            self.start_browser(provider, request, path, generation, cx);
+            cx.notify();
+            return;
+        }
         let (tx, rx) = futures::channel::oneshot::channel();
-        self.provider.open_forward(
+        provider.open_forward(
             &request,
             Box::new(move |outcome| {
                 let _ = tx.send(outcome);
@@ -103,20 +135,10 @@ impl ForwardsView {
         cx.spawn(async move |this, cx| {
             if let Ok(outcome) = rx.await {
                 let _ = this.update(cx, |this, cx| {
-                    if this.generation == generation {
+                    if this.generation == generation && Rc::ptr_eq(&provider, &this.slot.current())
+                    {
                         this.status = Some(match outcome {
-                            ForwardOutcome::Opened(row) => {
-                                if let Some(path) = &browser_path {
-                                    cx.open_url(&format!(
-                                        "http://127.0.0.1:{}{path}",
-                                        row.local_port
-                                    ));
-                                }
-                                format!(
-                                    "forwarding 127.0.0.1:{} -> {}:{}",
-                                    row.local_port, row.pod, row.remote_port
-                                )
-                            }
+                            ForwardOutcome::Opened(row) => forward_status(&row),
                             ForwardOutcome::Denied(what) => {
                                 format!("{what}: access denied for this account")
                             }
@@ -132,7 +154,189 @@ impl ForwardsView {
         cx.notify();
     }
 
+    fn start_browser(
+        &mut self,
+        provider: Rc<dyn ClusterProvider>,
+        request: ForwardRequest,
+        path: String,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let stop = provider.open_forward_cancellable(
+            &request,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        self.browser = Some(PendingBrowser {
+            _stop: stop,
+            lease: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await.unwrap_or_else(|_| {
+                ForwardStartOutcome::Failed("the forward request ended without a result".into())
+            });
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    drop(outcome);
+                    this.refresh();
+                    cx.notify();
+                    return;
+                }
+                this.browser = None;
+                if !Rc::ptr_eq(&provider, &this.slot.current()) {
+                    drop(outcome);
+                    this.status = Some("connection changed before the browser opened".into());
+                } else {
+                    match outcome {
+                        ForwardStartOutcome::Started(lease) => {
+                            this.wait_for_browser(provider, lease, path, generation, cx);
+                        }
+                        ForwardStartOutcome::Denied(what) => {
+                            this.status = Some(format!("{what}: access denied for this account"));
+                        }
+                        ForwardStartOutcome::Failed(why) => this.status = Some(why),
+                    }
+                }
+                this.refresh();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn wait_for_browser(
+        &mut self,
+        provider: Rc<dyn ClusterProvider>,
+        lease: ForwardLease,
+        path: String,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.status = Some("waiting for the local forward listener; x cancels".into());
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let stop = provider.wait_forward_ready(
+            lease.row().id,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        self.browser = Some(PendingBrowser {
+            _stop: stop,
+            lease: Some(lease),
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await.unwrap_or_else(|_| {
+                ForwardOutcome::Failed("the listener wait ended without a result".into())
+            });
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                let Some(mut pending) = this.browser.take() else {
+                    return;
+                };
+                let Some(lease) = pending.lease.take() else {
+                    return;
+                };
+                drop(pending);
+                let provider_current = Rc::ptr_eq(&provider, &this.slot.current());
+                let (opened, status) = if !provider_current {
+                    (None, "connection changed before the browser opened".into())
+                } else {
+                    match browser_source_outcome(outcome, lease.row(), |source| {
+                        provider.grafana_source_is_current(source)
+                    }) {
+                        ForwardOutcome::Opened(row)
+                            if browser_handoff_allowed(
+                                &this.slot,
+                                &provider,
+                                lease.row(),
+                                &row,
+                                |id| provider.forward_active(id),
+                            ) =>
+                        {
+                            cx.open_url(&format!("http://127.0.0.1:{}{path}", row.local_port));
+                            (Some(row.id), format!(
+                                "local listener open on 127.0.0.1:{}; remote connection is not yet verified",
+                                row.local_port
+                            ))
+                        }
+                        ForwardOutcome::Opened(_) => {
+                            (None, "the local forward is no longer active; browser was not opened".into())
+                        }
+                        ForwardOutcome::Denied(what) => {
+                            (None, format!("{what}: access denied for this account"))
+                        }
+                        ForwardOutcome::Failed(why) => (None, why),
+                    }
+                };
+                if let Some(id) = opened {
+                    lease.keep();
+                    this.watch_browser(provider, id, generation, cx);
+                } else {
+                    drop(lease);
+                }
+                this.status = Some(status);
+                this.refresh();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn watch_browser(
+        &mut self,
+        provider: Rc<dyn ClusterProvider>,
+        id: u64,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let stop = provider.wait_forward_terminal(
+            id,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        self.browser_watch = Some(BrowserWatch {
+            _stop: stop,
+            id,
+            provider: provider.clone(),
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation
+                    || !Rc::ptr_eq(&provider, &this.slot.current())
+                    || !this.browser_watch.as_ref().is_some_and(|watch| {
+                        watch.id == id && Rc::ptr_eq(&watch.provider, &provider)
+                    })
+                {
+                    return;
+                }
+                this.browser_watch = None;
+                this.status = Some(match outcome {
+                    Ok(ForwardTerminal::Dead(why)) => format!("forward failed: {why}"),
+                    Ok(ForwardTerminal::Closed) => "forward closed".into(),
+                    Err(_) => "the forward status watch ended without a result".into(),
+                });
+                this.refresh();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn stop_selected(&mut self, cx: &mut Context<Self>) {
+        if self.browser.take().is_some() {
+            self.generation += 1;
+            self.status = Some("browser forward request cancelled".into());
+            self.refresh();
+            cx.notify();
+            return;
+        }
         let Some(id) = self
             .table
             .selected_row()
@@ -140,7 +344,16 @@ impl ForwardsView {
         else {
             return;
         };
-        if self.provider.close_forward(id) {
+        let provider = self.slot.current();
+        if provider.close_forward(id) {
+            if self
+                .browser_watch
+                .as_ref()
+                .is_some_and(|watch| watch.id == id && Rc::ptr_eq(&watch.provider, &provider))
+            {
+                self.generation += 1;
+                self.browser_watch = None;
+            }
             self.status = Some("forward closed".to_string());
         }
         self.refresh();
@@ -154,6 +367,61 @@ impl ForwardsView {
         let rows = self.viewport.rows(0.0, 0.0, LIST_ROW_HEIGHT, 400);
         self.table.set_viewport(rows);
         cx.notify();
+    }
+}
+
+fn browser_handoff_allowed(
+    slot: &ProviderSlot,
+    provider: &Rc<dyn ClusterProvider>,
+    expected: &ForwardRow,
+    ready: &ForwardRow,
+    is_active: impl FnOnce(u64) -> bool,
+) -> bool {
+    Rc::ptr_eq(provider, &slot.current())
+        && ready.state == ForwardState::Active
+        && expected.id == ready.id
+        && expected.namespace == ready.namespace
+        && expected.pod == ready.pod
+        && expected.local_port == ready.local_port
+        && expected.remote_port == ready.remote_port
+        && expected.expected_service == ready.expected_service
+        && is_active(ready.id)
+}
+
+fn browser_source_current(
+    row: &ForwardRow,
+    is_current: impl FnOnce(&k10s_core::ServiceIdentity) -> bool,
+) -> bool {
+    row.expected_service.as_deref().is_none_or(is_current)
+}
+
+fn browser_source_outcome(
+    outcome: ForwardOutcome,
+    row: &ForwardRow,
+    is_current: impl FnOnce(&k10s_core::ServiceIdentity) -> bool,
+) -> ForwardOutcome {
+    match outcome {
+        ForwardOutcome::Opened(_) if !browser_source_current(row, is_current) => {
+            ForwardOutcome::Failed(
+                "Grafana source is unverified or refreshing; refresh the catalogue before opening the browser"
+                    .into(),
+            )
+        }
+        outcome => outcome,
+    }
+}
+
+fn forward_status(row: &ForwardRow) -> String {
+    match &row.state {
+        ForwardState::Opening => format!(
+            "opening 127.0.0.1:{} -> {}:{}",
+            row.local_port, row.pod, row.remote_port
+        ),
+        ForwardState::Active => format!(
+            "local listener open on 127.0.0.1:{} -> {}:{}",
+            row.local_port, row.pod, row.remote_port
+        ),
+        ForwardState::Dead(why) => format!("forward failed: {why}"),
     }
 }
 
@@ -380,7 +648,7 @@ impl Render for ForwardsView {
                     .text_color(rgb(theme.shell.text_muted))
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .child("x stop · r refresh"),
+                    .child("x stop or cancel · r refresh"),
             )
     }
 }
@@ -388,6 +656,125 @@ impl Render for ForwardsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_refreshing_blocks_only_successful_listener_outcomes() {
+        let source = std::sync::Arc::new(k10s_core::ServiceIdentity {
+            namespace: "monitoring".into(),
+            name: "grafana".into(),
+            port: 3000,
+            uid: "grafana-a".into(),
+            resource_version: "1".into(),
+        });
+        let row = ForwardRow {
+            id: 7,
+            namespace: "monitoring".into(),
+            pod: "grafana".into(),
+            local_port: 3000,
+            remote_port: 3000,
+            expected_service: Some(source),
+            state: ForwardState::Active,
+        };
+        for outcome in [
+            ForwardOutcome::Denied("pods/portforward"),
+            ForwardOutcome::Failed("Address already in use (os error 98)".into()),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let expected = outcome.clone();
+            assert_eq!(
+                browser_source_outcome(outcome, &row, |_| {
+                    calls.set(calls.get() + 1);
+                    false
+                }),
+                expected,
+            );
+            assert_eq!(calls.get(), 0, "a failed listener needs no source check");
+        }
+        assert!(matches!(
+            browser_source_outcome(ForwardOutcome::Opened(row.clone()), &row, |_| false),
+            ForwardOutcome::Failed(why) if why.contains("unverified or refreshing")
+        ));
+        assert_eq!(
+            browser_source_outcome(ForwardOutcome::Opened(row.clone()), &row, |_| true),
+            ForwardOutcome::Opened(row),
+        );
+    }
+
+    #[test]
+    fn browser_handoff_requires_the_same_provider_and_active_forward() {
+        let original: Rc<dyn ClusterProvider> = Rc::new(k10s_provider::NullProvider);
+        let replacement: Rc<dyn ClusterProvider> = Rc::new(k10s_provider::NullProvider);
+        let slot = ProviderSlot::new(original.clone());
+        let expected = ForwardRow {
+            id: 0,
+            namespace: "monitoring".into(),
+            pod: "grafana".into(),
+            local_port: 3000,
+            remote_port: 3000,
+            expected_service: None,
+            state: ForwardState::Opening,
+        };
+        let mut ready = expected.clone();
+        ready.state = ForwardState::Active;
+        assert!(browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |id| id == 0
+        ));
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| false
+        ));
+        ready.local_port = 3001;
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| true
+        ));
+        ready.local_port = 3000;
+        ready.id = 1;
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| true
+        ));
+        ready.id = 0;
+        ready.pod = "other-grafana".into();
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| true
+        ));
+        ready.pod = "grafana".into();
+        ready.state = ForwardState::Dead("closed".into());
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| true
+        ));
+        ready.state = ForwardState::Active;
+        slot.set(replacement);
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| { panic!("a replaced provider must not be queried") }
+        ));
+    }
 
     #[test]
     fn a_forward_row_renders_its_lifecycle_state_including_death() {
@@ -398,6 +785,7 @@ mod tests {
                 pod: "api-1".to_string(),
                 local_port: 8080,
                 remote_port: 80,
+                expected_service: None,
                 state: ForwardState::Active,
             },
             ForwardRow {
@@ -406,6 +794,7 @@ mod tests {
                 pod: "web-1".to_string(),
                 local_port: 3000,
                 remote_port: 3000,
+                expected_service: None,
                 state: ForwardState::Dead("the pod is gone".to_string()),
             },
         ];
@@ -418,5 +807,63 @@ mod tests {
             page.rows[1].cells[4], "dead: the pod is gone",
             "a dead forward stays visible with its reason"
         );
+    }
+    #[test]
+    fn browser_handoff_keeps_its_origin_and_rechecks_the_verified_source() {
+        use std::sync::Arc;
+        let original: Rc<dyn ClusterProvider> = Rc::new(k10s_provider::NullProvider);
+        let slot = ProviderSlot::new(original.clone());
+        let source = Arc::new(k10s_core::ServiceIdentity {
+            namespace: "monitoring".into(),
+            name: "grafana".into(),
+            port: 3000,
+            uid: "grafana-a".into(),
+            resource_version: "1".into(),
+        });
+        let expected = ForwardRow {
+            id: 7,
+            namespace: "monitoring".into(),
+            pod: "grafana-pod".into(),
+            local_port: 3000,
+            remote_port: 3000,
+            expected_service: Some(source.clone()),
+            state: ForwardState::Opening,
+        };
+        let mut ready = expected.clone();
+        ready.state = ForwardState::Active;
+        assert!(browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| true
+        ));
+        assert!(browser_source_current(&expected, |identity| identity == source.as_ref()));
+        assert!(!browser_source_current(&expected, |_| false));
+        let mut replacement = source.as_ref().clone();
+        replacement.uid = "grafana-b".into();
+        replacement.resource_version = "2".into();
+        assert!(!browser_source_current(&expected, |identity| identity == &replacement));
+        ready.expected_service = Some(Arc::new(replacement));
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| panic!("another source must be refused before the listener check")
+        ));
+        ready.expected_service = None;
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| true
+        ));
+        let mut ordinary = expected;
+        ordinary.expected_service = None;
+        assert!(browser_source_current(&ordinary, |_| panic!(
+            "ordinary forwards have no catalogue source to verify"
+        )));
     }
 }

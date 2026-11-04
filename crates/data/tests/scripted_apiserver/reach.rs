@@ -132,6 +132,232 @@ fn grafana_is_bound_through_the_service_proxy_when_health_answers() {
 }
 
 #[test]
+fn grafana_discovery_probes_the_matching_tcp_port() {
+    let script = Script::default();
+    script.route(
+        "GET",
+        "/api/v1/services?",
+        200,
+        r#"{"kind":"ServiceList","apiVersion":"v1","items":[
+            {"metadata":{"name":"grafana","namespace":"monitoring"},
+             "spec":{"ports":[
+               {"name":"datagram","port":3000,"protocol":"UDP"},
+               {"name":"web","port":3000,"protocol":"TCP"}
+             ]}}
+        ]}"#,
+    );
+    let path = "/api/v1/namespaces/monitoring/services/grafana:web/proxy/api/health";
+    script.route("GET", path, 200, r#"{"database":"ok"}"#);
+    let reach = runtime().block_on(async {
+        bind(
+            &script.client(),
+            ToolKind::Grafana,
+            &ReachSettings::default(),
+        )
+        .await
+    });
+    let ToolReach::Bound(bound) = reach else {
+        panic!("{reach:?}");
+    };
+    let found = bound.found.expect("discovered service");
+    assert_eq!(found.port, 3000);
+    assert_eq!(found.port_name.as_deref(), Some("web"));
+    let lists = script.requests_for("/api/v1/services?");
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0].method, "GET");
+    assert_eq!(lists[0].accept, "");
+    assert!(lists[0].body.is_empty());
+    let probes = script.requests_for("/proxy/");
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].method, "GET");
+    assert_eq!(probes[0].path, path);
+    assert_eq!(probes[0].accept, "application/json");
+    assert!(probes[0].body.is_empty());
+}
+
+#[test]
+fn proxy_refuses_a_parseable_partial_response_instead_of_an_empty_catalog() {
+    use k10s_data::reach::{Bound, ToolAuth, Transport, tool_get};
+    use k10s_data::read::Fetched;
+
+    let script = Script::default();
+    let path = "/api/v1/namespaces/monitoring/services/grafana:3000/proxy/api/search";
+    script.route("GET", path, 206, "[]");
+    let bound = Bound {
+        kind: ToolKind::Grafana,
+        found: None,
+        transport: Transport::Proxy {
+            namespace: "monitoring".into(),
+            service: "grafana".into(),
+            port: 3000,
+        },
+        auth: ToolAuth::Anonymous,
+    };
+    let answer =
+        runtime().block_on(async { tool_get(&script.client(), &bound, "api/search").await });
+    assert!(matches!(
+        answer,
+        Fetched::Failed { what: "grafana", why } if why.contains("206 Partial Content")
+    ));
+    let requests = script.requests_for(path);
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, path);
+    assert_eq!(request.accept, "application/json");
+    assert_eq!(request.content_type, "");
+    assert!(request.body_collected);
+    assert!(request.body.is_empty());
+}
+
+#[test]
+fn matching_services_without_tcp_ports_are_labelled_for_binding_and_inventory() {
+    for spec in [
+        serde_json::json!({}),
+        serde_json::json!({"ports":[{"port":3000,"protocol":"UDP"}]}),
+    ] {
+        let script = Script::default();
+        let body = serde_json::json!({
+            "kind":"ServiceList", "apiVersion":"v1",
+            "items":[{"metadata":{"name":"grafana","namespace":"monitoring"},"spec":spec}]
+        })
+        .to_string();
+        for _ in 0..2 {
+            script.route("GET", "/api/v1/services?", 200, body.clone());
+        }
+        let (binding, inventory) = runtime().block_on(async {
+            let client = script.client();
+            (
+                bind(&client, ToolKind::Grafana, &ReachSettings::default()).await,
+                k10s_data::reach::find_services(&client, ToolKind::Grafana).await,
+            )
+        });
+        let ToolReach::Unbound(unbound) = binding else {
+            panic!("{binding:?}");
+        };
+        assert_eq!(
+            unbound.why,
+            "Grafana Service monitoring/grafana has no usable TCP port"
+        );
+        let k10s_data::read::Fetched::Failed { what, why } = inventory else {
+            panic!("{inventory:?}");
+        };
+        assert_eq!(what, "services");
+        assert!(why.contains("Grafana Service monitoring/grafana has no usable TCP port"));
+        assert!(why.contains("no partial source list returned"));
+        assert_service_lists(&script, 2);
+    }
+}
+
+#[test]
+fn usable_and_unusable_matches_do_not_select_a_source_or_hide_inventory_failure() {
+    let script = Script::default();
+    let body = r#"{"kind":"ServiceList","apiVersion":"v1","items":[
+        {"metadata":{"name":"a-grafana","namespace":"monitoring"},
+         "spec":{"ports":[{"port":3000}]}},
+        {"metadata":{"name":"b-grafana","namespace":"monitoring"},
+         "spec":{"ports":[{"port":3000,"protocol":"UDP"}]}}
+    ]}"#;
+    for _ in 0..2 {
+        script.route("GET", "/api/v1/services?", 200, body);
+    }
+    let (binding, inventory) = runtime().block_on(async {
+        let client = script.client();
+        (
+            bind(&client, ToolKind::Grafana, &ReachSettings::default()).await,
+            k10s_data::reach::find_services(&client, ToolKind::Grafana).await,
+        )
+    });
+    let ToolReach::Unbound(unbound) = binding else {
+        panic!("{binding:?}");
+    };
+    assert!(unbound.why.contains("Grafana matches 2 Services"));
+    assert!(
+        unbound
+            .why
+            .contains("Grafana Service monitoring/b-grafana has no usable TCP port")
+    );
+    assert!(unbound.why.contains("without usable TCP ports: 1"));
+    let k10s_data::read::Fetched::Failed { what, why } = inventory else {
+        panic!("{inventory:?}");
+    };
+    assert_eq!(what, "services");
+    assert!(why.contains("Grafana Service monitoring/b-grafana has no usable TCP port"));
+    assert!(why.contains("without usable TCP ports: 1"));
+    assert!(why.contains("no partial source list returned"));
+    assert_service_lists(&script, 2);
+}
+
+#[test]
+fn multiple_unusable_matches_are_counted_with_a_named_example() {
+    let script = Script::default();
+    let body = r#"{"kind":"ServiceList","apiVersion":"v1","items":[
+        {"metadata":{"name":"a-grafana","namespace":"monitoring"},"spec":{}},
+        {"metadata":{"name":"b-grafana","namespace":"monitoring"},
+         "spec":{"ports":[{"port":3000,"protocol":"UDP"}]}}
+    ]}"#;
+    for _ in 0..2 {
+        script.route("GET", "/api/v1/services?", 200, body);
+    }
+    let (binding, inventory) = runtime().block_on(async {
+        let client = script.client();
+        (
+            bind(&client, ToolKind::Grafana, &ReachSettings::default()).await,
+            k10s_data::reach::find_services(&client, ToolKind::Grafana).await,
+        )
+    });
+    let ToolReach::Unbound(unbound) = binding else {
+        panic!("{binding:?}");
+    };
+    assert!(unbound.why.contains("Grafana matches 2 Services"));
+    assert!(
+        unbound
+            .why
+            .contains("monitoring/a-grafana has no usable TCP port")
+    );
+    assert!(unbound.why.contains("without usable TCP ports: 2"));
+    let k10s_data::read::Fetched::Failed { what, why } = inventory else {
+        panic!("{inventory:?}");
+    };
+    assert_eq!(what, "services");
+    assert!(why.contains("monitoring/a-grafana has no usable TCP port"));
+    assert!(why.contains("without usable TCP ports: 2"));
+    assert_service_lists(&script, 2);
+}
+
+#[test]
+fn multiple_usable_headless_services_are_ambiguous_but_remain_inventory_entries() {
+    let script = Script::default();
+    let body = r#"{"kind":"ServiceList","apiVersion":"v1","items":[
+        {"metadata":{"name":"a-grafana","namespace":"monitoring"},
+         "spec":{"clusterIP":"None","ports":[{"port":3000}]}},
+        {"metadata":{"name":"b-grafana","namespace":"monitoring"},
+         "spec":{"clusterIP":"None","ports":[{"port":3000}]}}
+    ]}"#;
+    for _ in 0..2 {
+        script.route("GET", "/api/v1/services?", 200, body);
+    }
+    let (binding, inventory) = runtime().block_on(async {
+        let client = script.client();
+        (
+            bind(&client, ToolKind::Grafana, &ReachSettings::default()).await,
+            k10s_data::reach::find_services(&client, ToolKind::Grafana).await,
+        )
+    });
+    let ToolReach::Unbound(unbound) = binding else {
+        panic!("{binding:?}");
+    };
+    assert!(unbound.why.contains("Grafana matches 2 Services"));
+    let k10s_data::read::Fetched::Ok(found) = inventory else {
+        panic!("{inventory:?}");
+    };
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].name, "a-grafana");
+    assert_eq!(found[1].name, "b-grafana");
+    assert_service_lists(&script, 2);
+}
+
+#[test]
 fn a_cluster_with_no_matching_service_hides_the_section() {
     let script = Script::default();
     script.route(
@@ -281,5 +507,111 @@ fn the_monitoring_charts_exporter_is_not_the_prometheus_endpoint() {
             assert_eq!(seen[1].accept, "application/json");
             assert!(seen[1].body.is_empty());
         }
+    }
+}
+
+#[test]
+fn proxy_error_sentences_skip_unusable_message_fields_without_changing_the_request() {
+    use k10s_data::reach::{Bound, ToolAuth, Transport, tool_get};
+    use k10s_data::read::Fetched;
+    for message in [
+        serde_json::Value::Null,
+        serde_json::json!(7),
+        serde_json::json!(false),
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!(""),
+        serde_json::json!("   "),
+    ] {
+        let script = Script::default();
+        let path = "/api/v1/namespaces/observability/services/grafana:3000/proxy/api/health";
+        script.route(
+            "GET",
+            path,
+            500,
+            serde_json::json!({"message": message, "error": "disk is full"}).to_string(),
+        );
+        let bound = Bound {
+            kind: ToolKind::Grafana,
+            found: None,
+            transport: Transport::Proxy {
+                namespace: "observability".into(),
+                service: "grafana".into(),
+                port: 3000,
+            },
+            auth: ToolAuth::Anonymous,
+        };
+        let answer =
+            runtime().block_on(async { tool_get(&script.client(), &bound, "api/health").await });
+        assert_eq!(
+            answer,
+            Fetched::Failed {
+                what: "grafana",
+                why: "disk is full".into()
+            }
+        );
+        let requests = script.requests_for(path);
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, path);
+        assert_eq!(request.accept, "application/json");
+        assert_eq!(request.content_type, "");
+        assert!(request.body_collected);
+        assert!(request.body.is_empty());
+        assert!(script.requests_for("secrets").is_empty());
+    }
+}
+
+#[test]
+fn proxy_error_sentence_selection_preserves_the_error_cap_and_immediate_denials() {
+    use k10s_data::reach::{Bound, ToolAuth, Transport, tool_get};
+    use k10s_data::read::Fetched;
+    for (status, size) in [
+        (500, 32 << 10),
+        (500, (32 << 10) + 1),
+        (401, (32 << 10) + 1),
+        (403, (32 << 10) + 1),
+    ] {
+        let script = Script::default();
+        let path = "/api/v1/namespaces/observability/services/grafana:3000/proxy/api/health";
+        script.route_bytes("GET", path, status, vec![b'x'; size]);
+        let bound = Bound {
+            kind: ToolKind::Grafana,
+            found: None,
+            transport: Transport::Proxy {
+                namespace: "observability".into(),
+                service: "grafana".into(),
+                port: 3000,
+            },
+            auth: ToolAuth::Anonymous,
+        };
+        let answer =
+            runtime().block_on(async { tool_get(&script.client(), &bound, "api/health").await });
+        if matches!(status, 401 | 403) {
+            assert_eq!(answer, Fetched::Denied { what: "grafana" });
+        } else {
+            let Fetched::Failed {
+                what: "grafana",
+                why,
+            } = answer
+            else {
+                panic!("a non-success status must retain its bounded failure")
+            };
+            if size == 32 << 10 {
+                assert_eq!(why, "x".repeat(size));
+            } else {
+                assert!(why.contains("more than 32768 bytes"));
+            }
+        }
+        let requests = script.requests_for(path);
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, path);
+        assert_eq!(request.accept, "application/json");
+        assert_eq!(request.content_type, "");
+        assert!(request.body_collected);
+        assert!(request.body.is_empty());
     }
 }

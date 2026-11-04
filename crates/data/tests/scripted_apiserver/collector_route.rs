@@ -440,7 +440,7 @@ async fn collectors_share_inspector_and_observe_admission_without_queued_transpo
         answer,
         Fetched::Failed {
             what: "telemetry",
-            why: "telemetry is busy: two requests are active and four are waiting".to_string()
+            why: "telemetry is busy: request capacity is full; try again shortly".to_string()
         }
     );
     let (tx, rx) = tokio::sync::oneshot::channel();

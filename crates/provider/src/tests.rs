@@ -1,5 +1,11 @@
 use super::*;
 
+#[test]
+fn prom_reply_fits_in_256_bytes() {
+    let bytes = std::mem::size_of::<PromOutcome>();
+    assert!(bytes <= 256, "PromOutcome grew to {bytes} bytes");
+}
+
 fn take<T: Send + 'static, R>(call: impl FnOnce(Reply<T>) -> R) -> T {
     let (tx, rx) = std::sync::mpsc::channel();
     let _guard = call(Box::new(move |value| {
@@ -80,6 +86,14 @@ fn null_provider_labels_the_new_surfaces_and_hides_observe_tools() {
 #[test]
 fn grafana_routes_keep_reserved_characters_inside_the_uid_segment() {
     assert_eq!(
+        grafana_dashboard_path("pilot-native").as_deref(),
+        Some("/d/pilot-native")
+    );
+    assert_eq!(
+        grafana_panel_path("pilot-native", 0).as_deref(),
+        Some("/d/pilot-native?viewPanel=0")
+    );
+    assert_eq!(
         grafana_panel_path("pilot-native", 3).as_deref(),
         Some("/d/pilot-native?viewPanel=3")
     );
@@ -87,9 +101,62 @@ fn grafana_routes_keep_reserved_characters_inside_the_uid_segment() {
         grafana_panel_path("a/b?c#d", 7).as_deref(),
         Some("/d/a%2Fb%3Fc%23d?viewPanel=7")
     );
+    assert_eq!(
+        grafana_dashboard_path("a/b?c#d").as_deref(),
+        Some("/d/a%2Fb%3Fc%23d")
+    );
     for uid in ["", ".", ".."] {
         assert!(grafana_panel_path(uid, 1).is_none());
+        assert!(grafana_dashboard_path(uid).is_none());
     }
+}
+
+#[test]
+fn a_forward_lease_finishes_once_with_its_handoff_decision() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let closed = Arc::new(AtomicUsize::new(0));
+    let kept = Arc::new(AtomicUsize::new(0));
+    let row = ForwardRow {
+        id: 7,
+        namespace: "observability".into(),
+        pod: "grafana".into(),
+        local_port: 3000,
+        remote_port: 3000,
+        expected_service: None,
+        state: ForwardState::Opening,
+    };
+    let close = closed.clone();
+    let keep = kept.clone();
+    let lease = ForwardLease::new(row.clone(), move |retain| {
+        if retain {
+            keep.fetch_add(1, Ordering::SeqCst);
+        } else {
+            close.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(rx);
+    assert!(tx.send(ForwardStartOutcome::Started(lease)).is_err());
+    assert_eq!(closed.load(Ordering::SeqCst), 1);
+    assert_eq!(kept.load(Ordering::SeqCst), 0);
+
+    let close = closed.clone();
+    let keep = kept.clone();
+    let lease = ForwardLease::new(row.clone(), move |retain| {
+        if retain {
+            keep.fetch_add(1, Ordering::SeqCst);
+        } else {
+            close.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    assert_eq!(lease.row(), &row);
+    lease.keep();
+    assert_eq!(closed.load(Ordering::SeqCst), 1);
+    assert_eq!(kept.load(Ordering::SeqCst), 1);
 }
 
 #[test]

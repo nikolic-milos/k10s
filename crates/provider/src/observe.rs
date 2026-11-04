@@ -82,11 +82,30 @@ pub enum GrafanaPanelKind {
     Unsupported,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrafanaRowIdentity {
+    /// A search hit without a readable dashboard definition.
+    Dashboard,
+    /// A fetched panel. Position is the zero-based index in the decoded panel list.
+    /// Multiple target rows from the same panel share this position.
+    Panel { id: Option<i64>, position: usize },
+}
+
+/// Where the dashboard definition or search hit was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrafanaRowSource {
+    Grafana,
+    ConfigMap,
+    Unknown,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct GrafanaPanelRow {
+    pub query_source: Option<std::sync::Arc<k10s_core::ServiceIdentity>>,
     pub dashboard_uid: String,
     pub dashboard_title: String,
-    pub panel_id: i64,
+    pub identity: GrafanaRowIdentity,
+    pub source: GrafanaRowSource,
     pub title: String,
     pub kind: GrafanaPanelKind,
     pub expr: String,
@@ -103,10 +122,42 @@ pub struct GrafanaPanelRow {
     pub unsupported: Option<String>,
 }
 
+impl std::fmt::Debug for GrafanaPanelRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrafanaPanelRow")
+            .field("query_source", &self.query_source)
+            .field("dashboard_uid", &self.dashboard_uid)
+            .field("dashboard_title", &self.dashboard_title)
+            .field("identity", &self.identity)
+            .field("source", &self.source)
+            .field("title", &self.title)
+            .field("kind", &self.kind)
+            .field("expr", &self.expr)
+            .field("dialect", &self.dialect)
+            .field("transformed", &self.transformed)
+            .field(
+                "browser_url",
+                &self.browser_url.as_ref().map(|_| "[redacted]"),
+            )
+            .field("browser_forward", &self.browser_forward)
+            .field("datasource_uid", &self.datasource_uid)
+            .field("ref_id", &self.ref_id)
+            .field("unit", &self.unit)
+            .field("reducer", &self.reducer)
+            .field("min_step", &self.min_step)
+            .field("min_interval", &self.min_interval)
+            .field("unsupported", &self.unsupported)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrafanaOutcome {
     Catalog {
         panels: Vec<GrafanaPanelRow>,
+        /// Decoded candidate rows omitted by the local table limit.
+        omitted: usize,
+        /// The source catalog or a dashboard was truncated before projection.
         truncated: bool,
         notices: Vec<String>,
     },
@@ -116,7 +167,16 @@ pub enum GrafanaOutcome {
 }
 
 /// A dashboard UID occupies one path segment in both browser routes.
+pub fn grafana_dashboard_path(uid: &str) -> Option<String> {
+    grafana_path(uid, None)
+}
+
+/// A known panel ID opens that panel in the dashboard.
 pub fn grafana_panel_path(uid: &str, panel_id: i64) -> Option<String> {
+    grafana_path(uid, Some(panel_id))
+}
+
+fn grafana_path(uid: &str, panel_id: Option<i64>) -> Option<String> {
     use std::fmt::Write as _;
     if matches!(uid, "" | "." | "..") {
         return None;
@@ -134,7 +194,9 @@ pub fn grafana_panel_path(uid: &str, panel_id: i64) -> Option<String> {
             }
         }
     }
-    write!(path, "?viewPanel={panel_id}").expect("formatting into a String");
+    if let Some(panel_id) = panel_id {
+        write!(path, "?viewPanel={panel_id}").expect("formatting into a String");
+    }
     Some(path)
 }
 
@@ -147,13 +209,23 @@ pub struct PromSeriesView {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "The channel already allocates the reply; keep timing inline to avoid another allocation."
+)]
 pub enum PromOutcome {
     Series {
         series: Vec<PromSeriesView>,
         truncated: bool,
         dropped_series: usize,
+        /// The requested range series cap when more server data may exist.
+        possible_server_limit: Option<usize>,
         warnings: Vec<String>,
         infos: Vec<String>,
+        /// Warning annotations omitted after the local limit.
+        warnings_omitted: usize,
+        /// Info annotations omitted after the local limit.
+        infos_omitted: usize,
         source: String,
         step_ms: u64,
         expr: String,

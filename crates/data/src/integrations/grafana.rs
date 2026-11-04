@@ -12,12 +12,13 @@
 //! Fetch is Grafana's search and dashboard API through [`crate::reach::tool_get`],
 //! or labelled ConfigMaps when Grafana itself is not bound. Secrets are not
 //! read: the sidecar can watch those too, and this path refuses that. Parse is
-//! shared. The bytes are attacker-shaped. Caps refuse a dashboard rather than
-//! truncating one: a missing panel is visible, a silent drop is not.
+//! shared. The bytes are attacker-shaped. Oversize dashboards are refused;
+//! panels and targets past their limits are reported as truncated.
 //! Provisioned lists share an eight-MiB body budget and sixteen pages, with
-//! four seconds per exchange. A failed later page keeps healthy dashboards
-//! with a named error; denial remains an explicit denied result. Broken dashboard
-//! files retain named errors alongside healthy files, rather than appearing empty.
+//! four seconds per exchange. A failed or denied later page keeps healthy dashboards
+//! and named errors; a denial with nothing to keep remains an explicit denied result.
+//! Broken dashboard files retain named errors alongside healthy files, rather than
+//! appearing empty. Invalid nonempty dashboard UIDs are refused before use.
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::Client;
@@ -83,7 +84,8 @@ pub struct PanelQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Panel {
-    pub id: i64,
+    /// The panel ID returned by Grafana, if it is an integer.
+    pub id: Option<i64>,
     pub title: String,
     pub kind: PanelKind,
     pub queries: Vec<PanelQuery>,
@@ -97,12 +99,24 @@ pub struct Panel {
     pub unsupported: Option<String>,
 }
 
+/// The acquisition path of a dashboard definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardSource {
+    /// JSON parsed without an acquisition source.
+    Unknown,
+    /// A dashboard file read from a Kubernetes ConfigMap.
+    ConfigMap,
+    /// A dashboard returned by the Grafana API.
+    Grafana,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dashboard {
+    pub source: DashboardSource,
     pub uid: String,
     pub title: String,
     pub panels: Vec<Panel>,
-    /// Panels past [`MAX_PANELS`] were not walked.
+    /// Panels or targets beyond their local limits were not inspected.
     pub truncated: bool,
 }
 
@@ -112,6 +126,7 @@ pub enum DashboardError {
     NotJson(String),
     NotADashboard,
     InvalidPanels,
+    InvalidUid,
 }
 
 impl std::fmt::Display for DashboardError {
@@ -128,6 +143,7 @@ impl std::fmt::Display for DashboardError {
             DashboardError::InvalidPanels => {
                 write!(f, "Grafana panels member is not an array")
             }
+            DashboardError::InvalidUid => f.write_str(INVALID_DASHBOARD_UID),
         }
     }
 }
@@ -147,15 +163,19 @@ pub fn parse_dashboard(bytes: &[u8]) -> Result<Dashboard, DashboardError> {
         Some(inner) => inner,
         None => &value,
     };
+    let uid = match dashboard.get("uid") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(uid)) => uid.as_str(),
+        Some(_) => return Err(DashboardError::InvalidUid),
+    };
+    if !uid.is_empty() && !valid_dashboard_uid(uid) {
+        return Err(DashboardError::InvalidUid);
+    }
+    let uid = uid.to_string();
     let title = clip(
         dashboard.get("title").and_then(Value::as_str).unwrap_or(""),
         MAX_TITLE_CHARS,
     );
-    let uid = dashboard
-        .get("uid")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
     let panels = match dashboard.get("panels") {
         Some(Value::Array(panels)) => Some(panels),
         Some(_) => return Err(DashboardError::InvalidPanels),
@@ -166,6 +186,7 @@ pub fn parse_dashboard(bytes: &[u8]) -> Result<Dashboard, DashboardError> {
             return Err(DashboardError::NotADashboard);
         }
         return Ok(Dashboard {
+            source: DashboardSource::Unknown,
             uid,
             title,
             panels: Vec::new(),
@@ -177,6 +198,7 @@ pub fn parse_dashboard(bytes: &[u8]) -> Result<Dashboard, DashboardError> {
     let mut truncated = false;
     walk_panels(panels, &mut out, &mut truncated)?;
     Ok(Dashboard {
+        source: DashboardSource::Unknown,
         uid,
         title,
         panels: out,
@@ -203,16 +225,13 @@ fn walk_panels(
             }
             continue;
         }
-        out.push(read_panel(panel, out.len() as i64 + 1));
+        out.push(read_panel(panel, truncated));
     }
     Ok(())
 }
 
-fn read_panel(panel: &Value, fallback_id: i64) -> Panel {
-    let id = panel
-        .get("id")
-        .and_then(Value::as_i64)
-        .unwrap_or(fallback_id);
+fn read_panel(panel: &Value, truncated: &mut bool) -> Panel {
+    let id = panel.get("id").and_then(Value::as_i64);
     let title = clip(
         panel.get("title").and_then(Value::as_str).unwrap_or(""),
         MAX_TITLE_CHARS,
@@ -225,6 +244,7 @@ fn read_panel(panel: &Value, fallback_id: i64) -> Panel {
     let datasource = panel.get("datasource");
     let mut queries = Vec::new();
     if let Some(targets) = panel.get("targets").and_then(Value::as_array) {
+        *truncated |= targets.len() > MAX_QUERIES_PER_PANEL;
         for target in targets.iter().take(MAX_QUERIES_PER_PANEL) {
             if let Some(query) = read_query(target, datasource) {
                 queries.push(query);
@@ -278,6 +298,20 @@ fn panel_support_error(panel: &Value, kind: PanelKind, transformed: bool) -> Opt
     if !matches!(type_name, "timeseries" | "stat") {
         return Some(format!("unsupported Grafana panel type {type_name}"));
     }
+    for (field, why) in [
+        (
+            "timeFrom",
+            "unsupported Grafana panel relative time override",
+        ),
+        ("timeShift", "unsupported Grafana panel time shift"),
+    ] {
+        if panel
+            .get(field)
+            .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+        {
+            return Some(why.to_string());
+        }
+    }
     if panel
         .get("targets")
         .and_then(Value::as_array)
@@ -324,6 +358,12 @@ fn panel_support_error(panel: &Value, kind: PanelKind, transformed: bool) -> Opt
     }
     if kind == PanelKind::Stat {
         let options = panel.pointer("/options/reduceOptions");
+        if options
+            .and_then(|value| value.get("fields"))
+            .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+        {
+            return Some("unsupported Grafana stat field selection".to_string());
+        }
         if options
             .and_then(|value| value.get("values"))
             .and_then(Value::as_bool)
@@ -572,11 +612,46 @@ pub struct SearchHit {
     pub kind: String,
 }
 
-pub fn parse_search(bytes: &[u8]) -> Result<Vec<SearchHit>, DashboardError> {
+/// Why a search result has no readable dashboard definition in the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogHitReason {
+    /// The dashboard was beyond the catalog's fetch bound.
+    FetchLimit,
+    /// Grafana denied the dashboard read.
+    Denied,
+    /// The dashboard read failed; its full reason is retained in catalog notices.
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogHit {
+    pub search: SearchHit,
+    pub reason: CatalogHitReason,
+}
+
+const SEARCH_LIMIT: usize = 100;
+const SEARCH_PATH: &str = "api/search?type=dash-db&limit=100";
+pub(crate) const SEARCH_PAGE_FULL_NOTICE: &str =
+    "Grafana search returned its result limit; more dashboards may exist";
+
+/// A full page does not prove another result exists, but it cannot establish
+/// that the search has reached its end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    pub page_full: bool,
+}
+
+pub fn parse_search(bytes: &[u8]) -> Result<SearchPage, DashboardError> {
     if bytes.len() > MAX_DASHBOARD_BYTES {
         return Err(DashboardError::TooLarge { bytes: bytes.len() });
     }
-    serde_json::from_slice(bytes).map_err(|error| DashboardError::NotJson(error.to_string()))
+    let hits: Vec<SearchHit> = serde_json::from_slice(bytes)
+        .map_err(|error| DashboardError::NotJson(error.to_string()))?;
+    Ok(SearchPage {
+        page_full: hits.len() >= SEARCH_LIMIT,
+        hits,
+    })
 }
 
 /// Keep hits whose folder title is in the allowlist. An empty allowlist keeps
@@ -605,18 +680,35 @@ pub async fn fetch_search(
     client: &Client,
     bound: &Bound,
     folder_allowlist: &[String],
-) -> Fetched<Vec<SearchHit>> {
-    match into_parsed(
-        tool_get(client, bound, "api/search?type=dash-db&limit=100").await,
-        parse_search,
-    ) {
-        Fetched::Ok(hits) => Fetched::Ok(filter_folders(hits, folder_allowlist)),
+) -> Fetched<SearchPage> {
+    match into_parsed(tool_get(client, bound, SEARCH_PATH).await, parse_search) {
+        Fetched::Ok(page) => Fetched::Ok(SearchPage {
+            hits: filter_folders(page.hits, folder_allowlist),
+            page_full: page.page_full,
+        }),
         other => other,
     }
 }
 
+pub(crate) const INVALID_DASHBOARD_UID: &str =
+    "unsupported Grafana dashboard UID; expected 1 to 40 ASCII letters, digits, '-' or '_'";
+
+pub(crate) fn valid_dashboard_uid(uid: &str) -> bool {
+    !uid.is_empty()
+        && uid.len() <= 40
+        && uid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 /// One dashboard by uid, through the same bind as search, with its returned identity checked.
 pub async fn fetch_dashboard(client: &Client, bound: &Bound, uid: &str) -> Fetched<Dashboard> {
+    if !valid_dashboard_uid(uid) {
+        return Fetched::Failed {
+            what: "grafana",
+            why: INVALID_DASHBOARD_UID.to_string(),
+        };
+    }
     match into_parsed(
         tool_get(client, bound, &format!("api/dashboards/uid/{uid}")).await,
         parse_dashboard,
@@ -628,6 +720,10 @@ pub async fn fetch_dashboard(client: &Client, bound: &Bound, uid: &str) -> Fetch
                 dashboard.uid
             ),
         },
+        Fetched::Ok(mut dashboard) => {
+            dashboard.source = DashboardSource::Grafana;
+            Fetched::Ok(dashboard)
+        }
         other => other,
     }
 }
@@ -645,7 +741,7 @@ impl Provisioned {
     fn failed(mut self, why: String) -> Fetched<Self> {
         if self.dashboards.is_empty() && self.errors.is_empty() {
             return Fetched::Failed {
-                what: "grafana",
+                what: "configmaps",
                 why,
             };
         }
@@ -679,7 +775,7 @@ pub async fn fetch_provisioned_from_configmaps(client: &Client) -> Fetched<Provi
             .expect("fixed provisioning list parameters");
         let bytes = match crate::reach::bounded_request_with_status(
             client,
-            "grafana",
+            "configmaps",
             request,
             crate::reach::MAX_BODY_BYTES - body_bytes,
         )
@@ -687,7 +783,16 @@ pub async fn fetch_provisioned_from_configmaps(client: &Client) -> Fetched<Provi
         .1
         {
             Fetched::Ok(bytes) => bytes,
-            Fetched::Denied { what } => return Fetched::Denied { what },
+            Fetched::Denied { what } => {
+                if provisioned.dashboards.is_empty() && provisioned.errors.is_empty() {
+                    return Fetched::Denied { what };
+                }
+                provisioned
+                    .errors
+                    .push(format!("{what}: access denied for this account"));
+                provisioned.truncated = true;
+                return Fetched::Ok(provisioned);
+            }
             Fetched::Failed { why, .. } => return provisioned.failed(why),
         };
         body_bytes += bytes.len();
@@ -740,9 +845,16 @@ fn collect_from_configmap(cm: &ConfigMap, provisioned: &mut Provisioned, scanned
         }
         *scanned_keys += 1;
         match parse_dashboard(value.as_bytes()) {
-            Ok(dashboard) => provisioned.dashboards.push(dashboard),
+            Ok(mut dashboard) => {
+                dashboard.source = DashboardSource::ConfigMap;
+                provisioned.dashboards.push(dashboard);
+            }
             Err(error)
-                if key.ends_with(".json") || matches!(error, DashboardError::InvalidPanels) =>
+                if key.ends_with(".json")
+                    || matches!(
+                        error,
+                        DashboardError::InvalidPanels | DashboardError::InvalidUid
+                    ) =>
             {
                 provisioned.errors.push(format!(
                     "ConfigMap {}/{} key {:?}: {error}",

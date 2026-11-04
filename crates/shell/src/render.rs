@@ -27,11 +27,42 @@ use crate::{
     AttachSelection, ChooseCluster, ClearSelection, CloseItem, DescribeSelection, EditSelection,
     ExecSelection, FindCluster, FindFile, LoadSavedView, LogsSelection, NewFile, NextItem,
     OpenArgo, OpenBrowser, OpenCollectors, OpenDay2, OpenEcosystem, OpenFile, OpenFlux, OpenFolder,
-    OpenForwards, OpenHarbor, OpenKeymap, OpenMesh, OpenNodes, OpenObserve, OpenPalette,
-    OpenPolicy, OpenReleases, OpenSettings, OpenSurfaces, OpenTraces, PrevItem, Quit,
-    RetainedLogsSelection, ShowStarmap, SilenceSelection, ToggleBottomDock, ToggleInspector,
-    ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+    OpenForwards, OpenHarbor, OpenInspectorChartDetails, OpenKeymap, OpenMesh, OpenNodes,
+    OpenObserve, OpenPalette, OpenPolicy, OpenReleases, OpenSettings, OpenStatusDetails,
+    OpenSurfaces, OpenTraces, PrevItem, Quit, RetainedLogsSelection, ShowStarmap, SilenceSelection,
+    ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
 };
+
+// The reader is a child of the workspace, so its own actions run first. Every
+// workspace bubble handler goes through this listener: a custom keymap can bind
+// an action in any context, so keymap suppressors cannot provide this boundary.
+// Commands that replace the reader and Quit remain available.
+fn workspace_action_allowed(notice_open: bool, action: &dyn gpui::Action) -> bool {
+    if !notice_open {
+        return true;
+    }
+    let action = action.as_any();
+    action.is::<OpenPalette>()
+        || action.is::<OpenSurfaces>()
+        || action.is::<ChooseCluster>()
+        || action.is::<OpenFile>()
+        || action.is::<OpenFolder>()
+        || action.is::<FindFile>()
+        || action.is::<FindCluster>()
+        || action.is::<LoadSavedView>()
+        || action.is::<Quit>()
+}
+
+fn guard_action<A: gpui::Action>(
+    cx: &Context<Workspace>,
+    handler: impl Fn(&mut Workspace, &A, &mut Window, &mut Context<Workspace>) + 'static,
+) -> impl Fn(&A, &mut Window, &mut gpui::App) + 'static {
+    cx.listener(move |this, action: &A, window, cx| {
+        if workspace_action_allowed(this.notice.is_open(), action) {
+            handler(this, action, window, cx);
+        }
+    })
+}
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -143,6 +174,7 @@ impl Render for Workspace {
                 sizes.right,
                 self.selection.clone(),
                 self.retained_loki,
+                cx,
             )
         });
         let status = (!self.bench).then(|| {
@@ -173,6 +205,24 @@ impl Render for Workspace {
                         .overflow_hidden()
                         .child(SharedString::from(self.status_line())),
                 )
+                .children(self.status_notes.any().then(|| {
+                    div()
+                        .id("status-details-button")
+                        .flex_none()
+                        .px(px(6.0))
+                        .cursor_pointer()
+                        .role(Role::Button)
+                        .aria_label("Open status details")
+                        .aria_description(
+                            "Use Ctrl Alt S outside text input, or open status details from Commands",
+                        )
+                        .aria_keyshortcuts("Ctrl+Alt+S")
+                        .hover(|style| style.bg(rgb(theme.shell.element_hover)))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_status_notice(window, cx);
+                        }))
+                        .child("Details  Ctrl Alt S")
+                }))
                 .child(key_hint(&theme, &fonts, "Ctrl Shift P", "Commands"))
         });
         let viewport_observer = (!self.bench).then(|| {
@@ -270,6 +320,26 @@ impl Render for Workspace {
                 }),
             )
         });
+        let notice = self.notice.view().map(|view| {
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .p(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.close_notice(window, cx);
+                    }),
+                )
+                .child(view.clone())
+        });
         // The chooser stands down while it is asking for a file: two sheets at
         // the same place is one sheet with a lid on it. It is only unpainted, not
         // closed, so dismissing the picker brings back the list and the highlight
@@ -297,59 +367,99 @@ impl Render for Workspace {
             .text_size(px(fonts.ui_size))
             .text_color(rgb(theme.shell.text))
             .key_context("Workspace")
+            .when(!self.bench && self.status_notes.any(), |workspace| {
+                workspace.on_action(guard_action(
+                    cx,
+                    |this, _: &OpenStatusDetails, window, cx| {
+                        this.open_status_notice(window, cx);
+                    },
+                ))
+            })
+            .when(
+                !self.bench && self.inspector_chart_details_available(),
+                |workspace| {
+                    workspace.on_action(guard_action(
+                        cx,
+                        |this, _: &OpenInspectorChartDetails, window, cx| {
+                            this.open_inspector_chart_details(window, cx);
+                        },
+                    ))
+                },
+            )
             .on_drag_move(cx.listener(
                 |this, event: &DragMoveEvent<DraggedDockResize>, window, cx| {
                     this.resize_dock(event, window, cx);
                 },
             ))
-            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenPalette, window, cx| {
                 this.toggle_palette(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenSurfaces, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenSurfaces, window, cx| {
                 this.toggle_surface_picker(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ChooseCluster, window, cx| {
+            .on_action(guard_action(cx, |this, _: &ChooseCluster, window, cx| {
                 this.toggle_launch(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &k10s_map::ToggleChurn, _, cx| {
-                this.map.update(cx, |map, cx| map.toggle_churn(cx));
-            }))
-            .on_action(cx.listener(|this, _: &k10s_map::ToggleEdges, _, cx| {
-                this.map.update(cx, |map, cx| map.toggle_edges(cx));
-            }))
-            .on_action(cx.listener(|this, _: &k10s_map::ToggleHud, _, cx| {
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ToggleChurn, _, cx| {
+                    this.map.update(cx, |map, cx| map.toggle_churn(cx));
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ToggleEdges, _, cx| {
+                    this.map.update(cx, |map, cx| map.toggle_edges(cx));
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &k10s_map::ToggleHud, _, cx| {
                 this.map.update(cx, |map, cx| map.toggle_hud(cx));
             }))
-            .on_action(cx.listener(|this, _: &k10s_map::ToggleLegend, _, cx| {
-                this.map.update(cx, |map, cx| map.toggle_legend(cx));
-            }))
-            .on_action(cx.listener(|this, _: &k10s_map::CycleOverlay, _, cx| {
-                this.cycle_overlay(cx);
-            }))
-            .on_action(cx.listener(|this, _: &k10s_map::FitView, window, cx| {
-                this.map.update(cx, |map, cx| map.fit(window, cx));
-            }))
-            .on_action(cx.listener(|this, _: &k10s_map::ZoomIn, window, cx| {
-                this.map.update(cx, |map, cx| map.zoom_in(window, cx));
-            }))
-            .on_action(cx.listener(|this, _: &k10s_map::ZoomOut, window, cx| {
-                this.map.update(cx, |map, cx| map.zoom_out(window, cx));
-            }))
-            .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ToggleLegend, _, cx| {
+                    this.map.update(cx, |map, cx| map.toggle_legend(cx));
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::CycleOverlay, _, cx| {
+                    this.cycle_overlay(cx);
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::FitView, window, cx| {
+                    this.map.update(cx, |map, cx| map.fit(window, cx));
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ZoomIn, window, cx| {
+                    this.map.update(cx, |map, cx| map.zoom_in(window, cx));
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ZoomOut, window, cx| {
+                    this.map.update(cx, |map, cx| map.zoom_out(window, cx));
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &ToggleInspector, _, cx| {
                 this.toggle_inspector(cx);
             }))
-            .on_action(cx.listener(|this, _: &ToggleLeftDock, _, cx| {
+            .on_action(guard_action(cx, |this, _: &ToggleLeftDock, _, cx| {
                 this.left.toggle();
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ToggleRightDock, _, cx| {
+            .on_action(guard_action(cx, |this, _: &ToggleRightDock, _, cx| {
                 this.toggle_inspector(cx);
             }))
-            .on_action(cx.listener(|this, _: &ToggleBottomDock, _, cx| {
+            .on_action(guard_action(cx, |this, _: &ToggleBottomDock, _, cx| {
                 this.bottom.toggle();
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+            .on_action(guard_action(cx, |this, _: &ClearSelection, _, cx| {
                 if this.app_menu_open {
                     this.app_menu_open = false;
                     cx.notify();
@@ -365,78 +475,87 @@ impl Render for Workspace {
                     cx.notify();
                 }
             }))
-            .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
-            .on_action(cx.listener(|this, _: &ShowStarmap, window, cx| {
+            .on_action(guard_action(cx, |_, _: &Quit, _, cx| cx.quit()))
+            .on_action(guard_action(cx, |this, _: &ShowStarmap, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Starmap, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenBrowser, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenBrowser, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Resources, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenNodes, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenNodes, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Nodes, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenForwards, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenForwards, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Forwards, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenReleases, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenReleases, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Releases, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenArgo, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenArgo, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Argo, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenFlux, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenFlux, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Flux, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenDay2, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenDay2, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Day2, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenObserve, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenObserve, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Observe, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenCollectors, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenCollectors, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Collectors, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &RetainedLogsSelection, window, cx| {
-                this.open_retained_logs(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenPolicy, window, cx| {
+            .on_action(guard_action(
+                cx,
+                |this, _: &RetainedLogsSelection, window, cx| {
+                    this.open_retained_logs(window, cx);
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &OpenPolicy, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Policy, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenHarbor, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenHarbor, window, cx| {
                 this.open_harbor(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenMesh, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenMesh, window, cx| {
                 this.open_mesh(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenTraces, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenTraces, window, cx| {
                 this.open_traces(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenEcosystem, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenEcosystem, window, cx| {
                 this.activate_activity(crate::activity::ActivityId::Ecosystem, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &SilenceSelection, window, cx| {
-                this.open_silence(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
+            .on_action(guard_action(
+                cx,
+                |this, _: &SilenceSelection, window, cx| {
+                    this.open_silence(window, cx);
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &ToggleTerminal, window, cx| {
                 this.toggle_terminal(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &DescribeSelection, window, cx| {
-                if let Some(selection) = this.selection.clone() {
-                    this.open_doc(selection.describe_request(), window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &EditSelection, window, cx| {
+            .on_action(guard_action(
+                cx,
+                |this, _: &DescribeSelection, window, cx| {
+                    if let Some(selection) = this.selection.clone() {
+                        this.open_doc(selection.describe_request(), window, cx);
+                    }
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &EditSelection, window, cx| {
                 if let Some(selection) = this.selection.clone() {
                     this.open_editor(selection.describe_request(), window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &OpenFile, window, cx| {
-                this.status_note = None;
+            .on_action(guard_action(cx, |this, _: &OpenFile, window, cx| {
+                this.status_notes.set_general(None);
                 let seed = crate::workspace::seed_dir(this.files_root.as_deref());
                 this.open_picker(seed, PickerMode::OpenFile, PickerPurpose::Open, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenFolder, window, cx| {
-                this.status_note = None;
+            .on_action(guard_action(cx, |this, _: &OpenFolder, window, cx| {
+                this.status_notes.set_general(None);
                 let seed = crate::workspace::seed_dir(this.files_root.as_deref());
                 this.open_picker(
                     seed,
@@ -446,26 +565,26 @@ impl Render for Workspace {
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &FindFile, window, cx| {
+            .on_action(guard_action(cx, |this, _: &FindFile, window, cx| {
                 this.open_finder(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &FindCluster, window, cx| {
+            .on_action(guard_action(cx, |this, _: &FindCluster, window, cx| {
                 this.open_cluster_finder(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &NewFile, window, cx| {
-                this.status_note = None;
+            .on_action(guard_action(cx, |this, _: &NewFile, window, cx| {
+                this.status_notes.set_general(None);
                 this.new_file(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &LoadSavedView, window, cx| {
+            .on_action(guard_action(cx, |this, _: &LoadSavedView, window, cx| {
                 this.open_saved_view_picker(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenSettings, window, cx| {
                 this.open_config(ConfigFile::Settings, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenKeymap, window, cx| {
+            .on_action(guard_action(cx, |this, _: &OpenKeymap, window, cx| {
                 this.open_config(ConfigFile::Keymap, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &LogsSelection, window, cx| {
+            .on_action(guard_action(cx, |this, _: &LogsSelection, window, cx| {
                 match this.selection.as_ref().and_then(Selection::log_target) {
                     Some(LogTarget::Pod { namespace, name }) => {
                         this.open_logs(namespace, name, window, cx)
@@ -479,31 +598,31 @@ impl Render for Workspace {
                     None => {}
                 }
             }))
-            .on_action(cx.listener(|this, _: &ExecSelection, window, cx| {
+            .on_action(guard_action(cx, |this, _: &ExecSelection, window, cx| {
                 if let Some((namespace, name)) = this.selection.as_ref().and_then(Selection::pod) {
                     this.open_terminal(namespace, name, window, cx);
                 } else {
                     this.note_needs_a_pod("exec", cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &AttachSelection, window, cx| {
+            .on_action(guard_action(cx, |this, _: &AttachSelection, window, cx| {
                 if let Some((namespace, name)) = this.selection.as_ref().and_then(Selection::pod) {
                     this.open_attach(namespace, name, window, cx);
                 } else {
                     this.note_needs_a_pod("attach", cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &NextItem, window, cx| {
+            .on_action(guard_action(cx, |this, _: &NextItem, window, cx| {
                 if let Some(next) = this.center.next_index() {
                     this.activate_center(next, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &PrevItem, window, cx| {
+            .on_action(guard_action(cx, |this, _: &PrevItem, window, cx| {
                 if let Some(previous) = this.center.previous_index() {
                     this.activate_center(previous, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &CloseItem, window, cx| {
+            .on_action(guard_action(cx, |this, _: &CloseItem, window, cx| {
                 this.close_focused(window, cx);
             }))
             .children(viewport_observer)
@@ -529,6 +648,7 @@ impl Render for Workspace {
             .children(picker)
             .children(finder)
             .children(cluster_finder)
+            .children(notice)
     }
 }
 
@@ -541,5 +661,91 @@ impl Workspace {
         self.inspector_open = !self.inspector_open;
         self.refresh_detail(cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Action, KeyBinding, KeyContext, Keymap, Keystroke};
+
+    fn contexts() -> [KeyContext; 2] {
+        [
+            KeyContext::parse("Workspace").expect("workspace context"),
+            KeyContext::parse("NoticeDetails").expect("reader context"),
+        ]
+    }
+
+    #[test]
+    fn reader_blocks_default_workspace_actions_without_disabling_them_elsewhere() {
+        let keymap = Keymap::new(crate::keybindings());
+        for (key, expected) in [
+            ("b", "k10s_shell::OpenBrowser"),
+            ("l", "k10s_shell::LogsSelection"),
+            ("s", "k10s_shell::ExecSelection"),
+            ("shift-g", "k10s_shell::OpenObserve"),
+            ("ctrl-w", "k10s_shell::CloseItem"),
+            ("ctrl-tab", "k10s_shell::NextItem"),
+            ("ctrl-shift-tab", "k10s_shell::PrevItem"),
+        ] {
+            let bindings = keymap
+                .bindings_for_input(&[Keystroke::parse(key).expect("shortcut")], &contexts())
+                .0;
+            let action = bindings.first().expect("workspace action").action();
+            assert_eq!(action.name(), expected);
+            assert!(!workspace_action_allowed(true, action), "{key}");
+            assert!(workspace_action_allowed(false, action), "{key}");
+        }
+    }
+
+    #[test]
+    fn reader_policy_applies_after_unscoped_and_compound_keymap_resolution() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-alt-y", CloseItem, None),
+            KeyBinding::new("ctrl-alt-v", NextItem, Some("Workspace > NoticeDetails")),
+            KeyBinding::new(
+                "ctrl-alt-r",
+                EditSelection,
+                Some("NoticeDetails && !Typing"),
+            ),
+            KeyBinding::new("ctrl-alt-p", OpenPalette, None),
+            KeyBinding::new("ctrl-alt-q", Quit, Some("Workspace > NoticeDetails")),
+        ]);
+        for (key, expected, allowed) in [
+            ("ctrl-alt-y", "k10s_shell::CloseItem", false),
+            ("ctrl-alt-v", "k10s_shell::NextItem", false),
+            ("ctrl-alt-r", "k10s_shell::EditSelection", false),
+            ("ctrl-alt-p", "k10s_shell::OpenPalette", true),
+            ("ctrl-alt-q", "k10s_shell::Quit", true),
+        ] {
+            let bindings = keymap
+                .bindings_for_input(&[Keystroke::parse(key).expect("shortcut")], &contexts())
+                .0;
+            let action = bindings.first().expect("custom action").action();
+            assert_eq!(action.name(), expected);
+            assert_eq!(workspace_action_allowed(true, action), allowed, "{key}");
+            assert!(workspace_action_allowed(false, action), "{key}");
+        }
+    }
+
+    #[test]
+    fn reader_policy_allows_commands_that_close_or_replace_it_and_quit() {
+        let allowed: &[&dyn Action] = &[
+            &OpenPalette,
+            &OpenSurfaces,
+            &ChooseCluster,
+            &OpenFile,
+            &OpenFolder,
+            &FindFile,
+            &FindCluster,
+            &LoadSavedView,
+            &Quit,
+        ];
+        for action in allowed {
+            assert!(workspace_action_allowed(true, *action), "{}", action.name());
+        }
+        for action in [&CloseItem as &dyn Action, &NewFile, &ToggleTerminal] {
+            assert!(!workspace_action_allowed(true, action), "{}", action.name());
+        }
     }
 }

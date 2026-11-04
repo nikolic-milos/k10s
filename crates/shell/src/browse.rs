@@ -427,6 +427,8 @@ impl BrowseView {
             namespace,
             name: row.name.clone(),
             service: kind.kind == "Service",
+            service_port: None,
+            expected_service: None,
         }));
     }
 

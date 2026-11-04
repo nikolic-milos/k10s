@@ -44,6 +44,10 @@ impl<V: Overlay + 'static> ModalSlot<V> {
         self.shown.as_ref().map(|shown| &shown.view)
     }
 
+    pub(crate) fn previous_focus(&self) -> Option<&FocusHandle> {
+        self.shown.as_ref()?.previous_focus.as_ref()
+    }
+
     /// A retired or hidden view cannot receive focus when this overlay closes.
     pub(crate) fn rebase_focus(&mut self, focus: &FocusHandle) {
         if let Some(shown) = &mut self.shown {

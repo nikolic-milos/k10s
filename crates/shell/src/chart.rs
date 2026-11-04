@@ -5,6 +5,7 @@
 //! time and coalesces replacements. The inspector shares the same samples and
 //! time window, with its own resolution and explicit point cap.
 
+use std::borrow::Cow;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -16,6 +17,8 @@ use gpui::{
     px, rgb,
 };
 use k10s_provider::{FetchTiming, PromSeriesView, QueryWindow};
+
+use crate::notice::{NoticeSnapshot, NoticeSource};
 
 pub const MAX_DRAWN_SERIES: usize = 16;
 pub const MAX_TEXTURE_WIDTH: u32 = 2048;
@@ -98,6 +101,22 @@ struct RasterStorage {
     plot: k10s_theme::Plot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RasterError {
+    series: usize,
+    why: &'static str,
+}
+
+impl RasterError {
+    fn preview(self, data: &ChartData) -> String {
+        format!(
+            "{}: {}",
+            display_label(&data.series[self.series].labels),
+            self.why
+        )
+    }
+}
+
 pub struct ChartView {
     data: Option<Arc<ChartData>>,
     compact: bool,
@@ -106,6 +125,7 @@ pub struct ChartView {
     axis: SharedString,
     notice: SharedString,
     local_notices: Vec<String>,
+    raster_errors: Vec<RasterError>,
     paint_error: Option<SharedString>,
     legend: Vec<SharedString>,
     stats: Vec<SharedString>,
@@ -132,6 +152,7 @@ impl ChartView {
             axis: SharedString::default(),
             notice: SharedString::default(),
             local_notices: Vec::new(),
+            raster_errors: Vec::new(),
             paint_error: None,
             legend: Vec::new(),
             stats: Vec::new(),
@@ -163,9 +184,16 @@ impl ChartView {
         self.legend.clear();
         self.stats.clear();
         self.local_notices.clear();
+        self.raster_errors.clear();
         if let Some(data) = &data {
-            self.title = data.title.clone().into();
-            self.source = data.source.clone().into();
+            let title = display_label(&data.title);
+            self.title = if let Some(reducer) = &data.reducer {
+                format!("{title} ({})", display_label(reducer)).into()
+            } else {
+                title.into()
+            };
+            self.source = display_label(&data.source).into();
+            let unit = display_label(unit_name(&data.unit));
             let values = value_range(&data.series).map_or_else(
                 || "No finite values".to_string(),
                 |(min, max)| {
@@ -173,7 +201,7 @@ impl ChartView {
                         "{} to {} {}",
                         display_value(min, &data.unit),
                         display_value(max, &data.unit),
-                        unit_name(&data.unit)
+                        unit
                     )
                 },
             );
@@ -185,9 +213,6 @@ impl ChartView {
                 data.window.step_ms
             )
             .into();
-            if let Some(reducer) = &data.reducer {
-                self.title = format!("{} ({reducer})", data.title).into();
-            }
             let notices = &mut self.local_notices;
             if data.series.is_empty() {
                 notices.push("No series in this range".to_string());
@@ -217,11 +242,9 @@ impl ChartView {
                 if let Some(reducer) = &data.reducer {
                     self.stats.push(
                         match reduce(&series.points, reducer) {
-                            Ok(Some(value)) => format!(
-                                "{} {}",
-                                display_value(value, &data.unit),
-                                unit_name(&data.unit)
-                            ),
+                            Ok(Some(value)) => {
+                                format!("{} {}", display_value(value, &data.unit), unit)
+                            }
                             Ok(None) => "No finite value".to_string(),
                             Err(why) => why.to_string(),
                         }
@@ -242,6 +265,18 @@ impl ChartView {
     pub fn data(&self) -> Option<&Arc<ChartData>> {
         self.data.as_ref()
     }
+
+    pub(crate) fn notice_details(&self) -> Option<NoticeSnapshot> {
+        self.data.as_ref().map(|data| {
+            notice_details(
+                data.clone(),
+                &self.raster_errors,
+                &self.local_notices,
+                self.paint_error.clone(),
+            )
+        })
+    }
+
     pub fn preparation(&self) -> Preparation {
         self.preparation
     }
@@ -275,12 +310,17 @@ impl ChartView {
                 &mut storage,
                 Some(&cancel),
             );
-            preparation.prepare_ns = started.elapsed().as_nanos() as u64;
             let complete = !cancel.load(Ordering::Relaxed);
-            (storage, preparation, errors, complete)
+            let previews: Vec<String> = if complete {
+                errors.iter().map(|error| error.preview(&data)).collect()
+            } else {
+                Vec::new()
+            };
+            preparation.prepare_ns = started.elapsed().as_nanos() as u64;
+            (storage, preparation, errors, previews, complete)
         });
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
-            let (mut storage, preparation, errors, complete) = raster.await;
+            let (mut storage, preparation, errors, previews, complete) = raster.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.task = None;
                 this.cancel = None;
@@ -299,8 +339,9 @@ impl ChartView {
                         .as_ref()
                         .expect("a prepared texture has chart data");
                     this.notice =
-                        display_notice_groups(&[&errors, &this.local_notices, &data.notices])
+                        display_notice_groups(&[&previews, &this.local_notices, &data.notices])
                             .into();
+                    this.raster_errors = errors;
                     cx.notify();
                 }
                 this.storage = storage;
@@ -398,6 +439,79 @@ impl ChartView {
             cx.notify();
         }
     }
+}
+
+struct ChartNotices {
+    data: Arc<ChartData>,
+    raster_errors: Vec<RasterError>,
+    local_notices: Vec<String>,
+    paint_error: Option<SharedString>,
+    range: String,
+}
+
+impl NoticeSource for ChartNotices {
+    fn notice_count(&self) -> usize {
+        5 + self.raster_errors.len()
+            + self.local_notices.len()
+            + self.data.notices.len()
+            + usize::from(self.data.reducer.is_some())
+            + usize::from(self.paint_error.is_some())
+    }
+
+    fn notice_at(&self, index: usize) -> Option<(&str, &str)> {
+        match index {
+            0 => return Some(("Chart", &self.data.title)),
+            1 => return Some(("Source", &self.data.source)),
+            2 => return Some(("PromQL", &self.data.expr)),
+            3 => return Some(("Range", &self.range)),
+            4 => return Some(("Unit", &self.data.unit)),
+            _ => {}
+        }
+        let index = index - 5;
+        let index = match &self.data.reducer {
+            Some(reducer) if index == 0 => return Some(("Reducer", reducer)),
+            Some(_) => index - 1,
+            None => index,
+        };
+        if let Some(error) = self.raster_errors.get(index) {
+            return Some((error.why, &self.data.series[error.series].labels));
+        }
+        let index = index - self.raster_errors.len();
+        if let Some(notice) = self.local_notices.get(index) {
+            return Some(("", notice));
+        }
+        let index = index - self.local_notices.len();
+        if let Some(notice) = self.data.notices.get(index) {
+            return Some(("", notice));
+        }
+        let index = index - self.data.notices.len();
+        if index == 0 {
+            self.paint_error.as_deref().map(|error| ("", error))
+        } else {
+            None
+        }
+    }
+}
+
+fn notice_details(
+    data: Arc<ChartData>,
+    raster_errors: &[RasterError],
+    local_notices: &[String],
+    paint_error: Option<SharedString>,
+) -> NoticeSnapshot {
+    let range = format!(
+        "{} to {} UTC; resolution {} ms",
+        clock(data.window.start_ms),
+        clock(data.window.end_ms),
+        data.window.step_ms,
+    );
+    NoticeSnapshot::new(ChartNotices {
+        data,
+        raster_errors: raster_errors.to_vec(),
+        local_notices: local_notices.to_vec(),
+        paint_error,
+        range,
+    })
 }
 
 impl Drop for ChartView {
@@ -606,6 +720,10 @@ pub fn raster(
     let started = std::time::Instant::now();
     let mut storage = RasterStorage::default();
     let (mut preparation, errors) = render_pixels(data, width, height, palette, &mut storage, None);
+    let errors = errors
+        .into_iter()
+        .map(|error| error.preview(data))
+        .collect();
     preparation.prepare_ns = started.elapsed().as_nanos() as u64;
     (storage.pixels, preparation, errors)
 }
@@ -617,7 +735,7 @@ fn render_pixels(
     palette: [u32; 5],
     storage: &mut RasterStorage,
     cancel: Option<&AtomicBool>,
-) -> (Preparation, Vec<String>) {
+) -> (Preparation, Vec<RasterError>) {
     assert!(width > 0 && width <= MAX_TEXTURE_WIDTH && height > 0 && height <= MAX_TEXTURE_HEIGHT);
     let cancelled = || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed));
     if cancelled() {
@@ -657,7 +775,7 @@ fn render_pixels(
             values.0..values.1,
             width as usize * 2,
         ) {
-            errors.push(format!("{}: {why}", display_label(&series.labels)));
+            errors.push(RasterError { series: index, why });
             continue;
         }
         let plot = &storage.plot;
@@ -718,6 +836,7 @@ fn nearest_sample(series: &PromSeriesView, time_ms: i64, step_ms: u64) -> Option
 }
 
 fn hover_lines(data: &ChartData, time_ms: i64) -> Vec<String> {
+    let unit = display_label(unit_name(&data.unit));
     data.series
         .iter()
         .take(MAX_DRAWN_SERIES)
@@ -726,7 +845,7 @@ fn hover_lines(data: &ChartData, time_ms: i64) -> Vec<String> {
                 Some((time, value)) => format!(
                     "{} {} at {} UTC; {}",
                     display_value(value, &data.unit),
-                    unit_name(&data.unit),
+                    unit,
                     clock(time),
                     display_label(&series.labels),
                 ),
@@ -740,15 +859,15 @@ fn hover_lines(data: &ChartData, time_ms: i64) -> Vec<String> {
         .collect()
 }
 
-fn display_label(label: &str) -> String {
+fn display_label(label: &str) -> Cow<'_, str> {
     if label.len() <= MAX_LABEL_BYTES {
-        return label.to_string();
+        return Cow::Borrowed(label);
     }
     let mut end = MAX_LABEL_BYTES;
     while !label.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...", &label[..end])
+    Cow::Owned(format!("{}...", &label[..end]))
 }
 
 pub(crate) fn display_notice_groups(groups: &[&[String]]) -> String {
@@ -988,6 +1107,40 @@ mod tests {
     }
 
     #[test]
+    fn chart_details_borrow_full_metadata_after_bounded_previews() {
+        let mut chart = data(Vec::new(), 1_000, 500);
+        chart.title = format!("Panel {}", "é".repeat(600));
+        chart.source = format!("Source {}", "é".repeat(600));
+        chart.unit = format!("Unit {}", "é".repeat(600));
+        chart.reducer = Some(format!("Reducer {}", "é".repeat(600)));
+        let chart = Arc::new(chart);
+        let details = notice_details(chart.clone(), &[], &[], None);
+        for (index, original) in [
+            (0, &chart.title),
+            (1, &chart.source),
+            (4, &chart.unit),
+            (5, chart.reducer.as_ref().unwrap()),
+        ] {
+            assert!(display_label(original).ends_with("..."));
+            assert_eq!(details.get(index).unwrap().1, original.as_str());
+            assert_eq!(details.get(index).unwrap().1.as_ptr(), original.as_ptr());
+        }
+        assert_eq!(details.get(4).unwrap().0, "Unit");
+        assert_eq!(details.get(5).unwrap().0, "Reducer");
+    }
+
+    #[test]
+    fn hover_abbreviates_unknown_units_without_changing_the_data() {
+        let mut chart = data(vec![series(vec![(0, 1.0)], Vec::new())], 1_000, 500);
+        chart.unit = format!("unit=\"{}\"", "é".repeat(600));
+        let full_unit = chart.unit.clone();
+        let hover = hover_lines(&chart, 0);
+        assert!(hover[0].contains("... at "));
+        assert!(hover[0].len() < full_unit.len());
+        assert_eq!(chart.unit, full_unit);
+    }
+
+    #[test]
     fn notice_display_bounds_utf8_count_and_total_bytes_without_copying_raw_data() {
         let mut data = data(vec![series(vec![(0, 1.0)], Vec::new())], 10, 10);
         data.notices = vec!["界".repeat(100_000); 20];
@@ -1007,6 +1160,66 @@ mod tests {
         );
         assert_eq!(display_message(""), "Empty notice");
         assert!(display_message(&"界".repeat(1000)).len() <= MAX_NOTICE_BYTES);
+    }
+
+    #[test]
+    fn details_keep_query_identity_and_every_full_notice_in_display_order() {
+        let mut labelled = series(vec![(2_000, 1.0)], Vec::new());
+        labelled.labels = format!("service=\"{}\"", "é".repeat(1_000));
+        let mut chart = data(vec![labelled], 1_000, 500);
+        chart.notices = (0..12).map(|index| format!("warning {index}")).collect();
+        chart
+            .notices
+            .push(format!("Scrape warning: {}", "é".repeat(1_000)));
+        let mut storage = RasterStorage::default();
+        let (_, raster) = render_pixels(&chart, 41, 20, [1, 2, 3, 4, 5], &mut storage, None);
+        assert_eq!(raster.len(), 1);
+        assert_eq!(raster[0].series, 0);
+        assert_eq!(
+            raster[0].why,
+            "chart samples are outside the window or unordered"
+        );
+        let local = vec!["Some series labels are abbreviated".into()];
+
+        let preview = raster[0].preview(&chart);
+        assert!(preview.contains("...: chart samples are outside the window or unordered"));
+        assert!(preview.len() < chart.series[0].labels.len());
+        let chart = Arc::new(chart);
+        let retained = Arc::downgrade(&chart);
+        let label_pointer = chart.series[0].labels.as_ptr();
+        let warning_pointer = chart.notices.last().unwrap().as_ptr();
+        let details = notice_details(chart.clone(), &raster, &local, Some("paint failed".into()));
+        assert_eq!(details.get(0), Some(("Chart", "Test samples")));
+        assert_eq!(details.get(1), Some(("Source", "test source")));
+        assert_eq!(details.get(2), Some(("PromQL", "test_metric")));
+        assert_eq!(
+            details.get(3),
+            Some((
+                "Range",
+                "1970-01-01 00:00:00.000 to 1970-01-01 00:00:01.000 UTC; resolution 500 ms"
+            ))
+        );
+        assert_eq!(details.get(4), Some(("Unit", "none")));
+        assert_eq!(
+            details.get(5),
+            Some((raster[0].why, chart.series[0].labels.as_str()))
+        );
+        assert_eq!(details.get(5).unwrap().1.as_ptr(), label_pointer);
+        assert_eq!(details.get(6), Some(("", local[0].as_str())));
+        for (index, notice) in chart.notices.iter().enumerate() {
+            assert_eq!(details.get(7 + index), Some(("", notice.as_str())));
+        }
+        assert_eq!(
+            details.get(7 + chart.notices.len() - 1).unwrap().1.as_ptr(),
+            warning_pointer
+        );
+        assert_eq!(details.get(details.len() - 1), Some(("", "paint failed")));
+        assert_eq!(details.get(details.len()), None);
+        drop(chart);
+        assert!(retained.upgrade().is_some());
+        assert_eq!(details.get(5).unwrap().1.as_ptr(), label_pointer);
+        drop(details);
+        assert!(retained.upgrade().is_none());
     }
 
     #[test]

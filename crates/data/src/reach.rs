@@ -20,6 +20,9 @@
 //! anonymous-to-the-tool on purpose. A token binds through port-forward or a
 //! settings URL, where the header goes to Grafana rather than to kube.
 
+use std::future::Future;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -96,7 +99,7 @@ impl ToolKind {
 ///
 /// Cluster Secrets are metadata only. Credentials here come from the user's
 /// tool settings; this enum has no route to a cluster Secret payload.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum ToolAuth {
     #[default]
     Anonymous,
@@ -105,11 +108,29 @@ pub enum ToolAuth {
     NamedToken(String),
 }
 
+impl std::fmt::Debug for ToolAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anonymous => f.write_str("Anonymous"),
+            Self::NamedToken(_) => f.debug_tuple("NamedToken").field(&"[redacted]").finish(),
+        }
+    }
+}
+
 /// A URL and optional token the user named for one tool. Empty means "find it".
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct ToolOverride {
     pub url: Option<String>,
     pub auth: ToolAuth,
+}
+
+impl std::fmt::Debug for ToolOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolOverride")
+            .field("url", &self.url.as_ref().map(|_| "[redacted]"))
+            .field("auth", &self.auth)
+            .finish()
+    }
 }
 
 /// Per-tool overrides keyed the same way settings will key them.
@@ -154,8 +175,59 @@ pub struct FoundService {
     pub port_name: Option<String>,
 }
 
-/// How bytes actually move once a tool is bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnusableService {
+    pub(crate) kind: ToolKind,
+    pub(crate) namespace: String,
+    pub(crate) name: String,
+}
+
+impl UnusableService {
+    pub(crate) fn why(&self) -> String {
+        format!(
+            "{} Service {}/{} has no usable TCP port",
+            self.kind.as_str(),
+            self.namespace,
+            self.name
+        )
+    }
+
+    pub(crate) fn summary(&self, count: usize) -> String {
+        format!(
+            "{}; matching Services without usable TCP ports: {count}",
+            self.why()
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServiceCandidate {
+    Usable(FoundService),
+    Unusable(UnusableService),
+}
+
+impl ServiceCandidate {
+    fn name(&self) -> (&str, &str) {
+        match self {
+            Self::Usable(found) => (&found.namespace, &found.name),
+            Self::Unusable(found) => (&found.namespace, &found.name),
+        }
+    }
+}
+
+pub(crate) fn unusable_candidates(
+    candidates: &[ServiceCandidate],
+) -> Option<(&UnusableService, usize)> {
+    let mut unusable = candidates.iter().filter_map(|candidate| match candidate {
+        ServiceCandidate::Unusable(service) => Some(service),
+        ServiceCandidate::Usable(_) => None,
+    });
+    let first = unusable.next()?;
+    Some((first, 1 + unusable.count()))
+}
+
+/// How bytes actually move once a tool is bound.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Transport {
     /// API-server service proxy. Fetch goes through [`tool_get`].
     Proxy {
@@ -173,6 +245,34 @@ pub enum Transport {
     /// A URL the user named. `http` can be fetched here; `https` is a browser
     /// hole until a TLS client exists in the lock without a new package.
     Url { base: String },
+}
+
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proxy {
+                namespace,
+                service,
+                port,
+            } => f
+                .debug_struct("Proxy")
+                .field("namespace", namespace)
+                .field("service", service)
+                .field("port", port)
+                .finish(),
+            Self::NeedsForward {
+                namespace,
+                name,
+                port,
+            } => f
+                .debug_struct("NeedsForward")
+                .field("namespace", namespace)
+                .field("name", name)
+                .field("port", port)
+                .finish(),
+            Self::Url { .. } => f.debug_struct("Url").field("base", &"[redacted]").finish(),
+        }
+    }
 }
 
 /// A tool we can see and have a way to talk to.
@@ -197,19 +297,46 @@ impl Bound {
                 name,
                 port,
             } => format!("{namespace}/{name}:{port} (forward required)"),
-            Transport::Url { base } => base.clone(),
+            Transport::Url { base } => url_source(base),
         }
     }
 }
 
+fn url_source(base: &str) -> String {
+    let Ok(uri) = settings_uri(base) else {
+        return "configured tool URL [redacted]".to_string();
+    };
+    let scheme = uri.scheme_str().expect("a settings URL has a scheme");
+    let authority = uri.authority().expect("a settings URL has an authority");
+    if matches!(uri.path(), "" | "/") && uri.query().is_none() {
+        format!("{scheme}://{authority}")
+    } else {
+        format!("{scheme}://{authority}/[path or query redacted]")
+    }
+}
+
 /// Why a visible tool still has no section.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Unbound {
     pub kind: ToolKind,
     pub found: Option<FoundService>,
     pub why: String,
     /// Open in the system browser. Never an iframe, never a webview.
     pub browser_url: Option<String>,
+}
+
+impl std::fmt::Debug for Unbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Unbound")
+            .field("kind", &self.kind)
+            .field("found", &self.found)
+            .field("why", &self.why)
+            .field(
+                "browser_url",
+                &self.browser_url.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 /// One tool's reachability. [`ToolReach::Absent`] is the one that must not
@@ -351,22 +478,38 @@ fn fingerprint(kind: ToolKind) -> &'static Fingerprint {
         .expect("every ToolKind has a fingerprint")
 }
 
-/// Whether this Service is that tool, and which port to speak to.
+/// Whether this Service is that tool and advertises a usable TCP port.
 pub fn match_service(kind: ToolKind, svc: &Service) -> Option<FoundService> {
+    match service_candidate(kind, svc)? {
+        ServiceCandidate::Usable(found) => Some(found),
+        ServiceCandidate::Unusable(_) => None,
+    }
+}
+
+fn service_candidate(kind: ToolKind, svc: &Service) -> Option<ServiceCandidate> {
     let spec = fingerprint(kind);
     let name = svc.metadata.name.as_deref()?;
-    let namespace = svc.metadata.namespace.as_deref().unwrap_or("").to_string();
     if !name_or_labels_match(name, svc.metadata.labels.as_ref(), spec) {
         return None;
     }
-    let port = pick_port(svc.spec.as_ref().and_then(|s| s.ports.as_deref()), spec)?;
-    Some(FoundService {
-        kind,
-        namespace,
-        name: name.to_string(),
-        port: port.port,
-        port_name: port.name,
-    })
+    let namespace = svc.metadata.namespace.as_deref().unwrap_or("").to_string();
+    let name = name.to_string();
+    Some(
+        match pick_port(svc.spec.as_ref().and_then(|s| s.ports.as_deref()), spec) {
+            Some(port) => ServiceCandidate::Usable(FoundService {
+                kind,
+                namespace,
+                name,
+                port: port.port,
+                port_name: port.name,
+            }),
+            None => ServiceCandidate::Unusable(UnusableService {
+                kind,
+                namespace,
+                name,
+            }),
+        },
+    )
 }
 
 fn name_or_labels_match(
@@ -409,42 +552,65 @@ struct PickedPort {
 
 fn pick_port(ports: Option<&[ServicePort]>, spec: &Fingerprint) -> Option<PickedPort> {
     let ports = ports.unwrap_or(&[]);
-    if ports.is_empty() {
-        let port = *spec.ports.first()?;
-        return Some(PickedPort { port, name: None });
-    }
+    let tcp_port = |port: &ServicePort| {
+        if !matches!(port.protocol.as_deref(), None | Some("TCP")) {
+            return None;
+        }
+        let number = u16::try_from(port.port).ok()?;
+        (number != 0).then_some(number)
+    };
     for want in spec.ports {
-        if let Some(found) = ports.iter().find(|p| p.port == *want as i32) {
+        if let Some(found) = ports.iter().find(|p| tcp_port(p) == Some(*want)) {
             return Some(PickedPort {
-                port: found.port as u16,
+                port: *want,
                 name: found.name.clone(),
             });
         }
     }
     for want in spec.port_names {
         if let Some(found) = ports.iter().find(|p| {
-            p.name
-                .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(want))
+            tcp_port(p).is_some()
+                && p.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(want))
         }) {
             return Some(PickedPort {
-                port: found.port as u16,
+                port: tcp_port(found)?,
                 name: found.name.clone(),
             });
         }
     }
-    let first = ports.first()?;
+    let first = ports.iter().find(|p| tcp_port(p).is_some())?;
     Some(PickedPort {
-        port: first.port as u16,
+        port: tcp_port(first)?,
         name: first.name.clone(),
     })
 }
 
 /// List Services and keep the ones that match a fingerprint. Cluster-wide,
 /// paged, capped: a tool hunt is not a watch and must not grow without bound.
+/// If any retained match has no usable TCP port, the list fails and names one
+/// such Service rather than silently omitting it.
 pub async fn find_services(client: &Client, kind: ToolKind) -> Fetched<Vec<FoundService>> {
     match discover_services(client).await {
-        Fetched::Ok(services) => Fetched::Ok(service_candidates(kind, &services)),
+        Fetched::Ok(services) => {
+            let candidates = service_candidates(kind, &services);
+            if let Some((first, count)) = unusable_candidates(&candidates) {
+                return Fetched::Failed {
+                    what: "services",
+                    why: format!("{}; no partial source list returned", first.summary(count)),
+                };
+            }
+            Fetched::Ok(
+                candidates
+                    .into_iter()
+                    .filter_map(|candidate| match candidate {
+                        ServiceCandidate::Usable(found) => Some(found),
+                        ServiceCandidate::Unusable(_) => None,
+                    })
+                    .collect(),
+            )
+        }
         Fetched::Denied { what } => Fetched::Denied { what },
         Fetched::Failed { what, why } => Fetched::Failed { what, why },
     }
@@ -528,11 +694,11 @@ pub(crate) async fn discover_services(client: &Client) -> Fetched<Vec<Service>> 
     }
 }
 
-pub(crate) fn service_candidates(kind: ToolKind, services: &[Service]) -> Vec<FoundService> {
+pub(crate) fn service_candidates(kind: ToolKind, services: &[Service]) -> Vec<ServiceCandidate> {
     let mut found: Vec<_> = services
         .iter()
         .filter_map(|service| {
-            match_service(kind, service).map(|found| {
+            service_candidate(kind, service).map(|found| {
                 (
                     found,
                     service
@@ -550,7 +716,7 @@ pub(crate) fn service_candidates(kind: ToolKind, services: &[Service]) -> Vec<Fo
         found.retain(|(_, headless)| !headless);
     }
     let mut found: Vec<_> = found.into_iter().map(|(found, _)| found).collect();
-    found.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    found.sort_by(|a, b| a.name().cmp(&b.name()));
     found
 }
 
@@ -562,8 +728,8 @@ pub async fn bind(client: &Client, kind: ToolKind, settings: &ReachSettings) -> 
         return bind_url(kind, url, over.auth.clone());
     }
 
-    let found = match find_services(client, kind).await {
-        Fetched::Ok(list) => list,
+    let found = match discover_services(client).await {
+        Fetched::Ok(services) => service_candidates(kind, &services),
         Fetched::Denied { what } => {
             return ToolReach::Unbound(Unbound {
                 kind,
@@ -589,22 +755,38 @@ pub(crate) async fn bind_candidates(
     client: &Client,
     kind: ToolKind,
     over: &ToolOverride,
-    found: Vec<FoundService>,
+    found: Vec<ServiceCandidate>,
 ) -> ToolReach {
     if found.len() > 1 {
+        let mut why = format!(
+            "{} matches {} Services; name a source URL in settings before querying",
+            kind.as_str(),
+            found.len()
+        );
+        if let Some((service, count)) = unusable_candidates(&found) {
+            why.push_str("; ");
+            why.push_str(&service.summary(count));
+        }
         return ToolReach::Unbound(Unbound {
             kind,
             found: None,
             browser_url: None,
-            why: format!(
-                "{} matches {} routed Services; name a source URL in settings before querying",
-                kind.as_str(),
-                found.len()
-            ),
+            why,
         });
     }
-    let Some(service) = found.into_iter().next() else {
+    let Some(candidate) = found.into_iter().next() else {
         return ToolReach::Absent { kind };
+    };
+    let service = match candidate {
+        ServiceCandidate::Usable(service) => service,
+        ServiceCandidate::Unusable(service) => {
+            return ToolReach::Unbound(Unbound {
+                kind,
+                found: None,
+                why: service.why(),
+                browser_url: None,
+            });
+        }
     };
 
     if matches!(over.auth, ToolAuth::NamedToken(_)) {
@@ -651,22 +833,33 @@ pub(crate) async fn bind_candidates(
 
 fn bind_url(kind: ToolKind, url: &str, auth: ToolAuth) -> ToolReach {
     let trimmed = url.trim();
-    if http::Uri::try_from(trimmed)
-        .ok()
-        .and_then(|uri| {
-            uri.authority()
-                .map(|authority| authority.as_str().contains('@'))
-        })
-        .unwrap_or(false)
+    if trimmed.len() > MAX_URL_BYTES
+        || trimmed
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
     {
         return ToolReach::Unbound(Unbound {
             kind,
             found: None,
-            why: "tool URLs must not contain credentials; use named authentication".into(),
+            why: "the settings URL is too long or malformed".into(),
             browser_url: None,
         });
     }
-    if trimmed.starts_with("https://") {
+    let validation = trimmed
+        .split_once('#')
+        .map_or(trimmed, |(prefix, _)| prefix);
+    let uri = match settings_uri(validation) {
+        Ok(uri) => uri,
+        Err(why) => {
+            return ToolReach::Unbound(Unbound {
+                kind,
+                found: None,
+                why: why.into(),
+                browser_url: None,
+            });
+        }
+    };
+    if uri.scheme_str() == Some("https") {
         return ToolReach::Unbound(Unbound {
             kind,
             found: None,
@@ -678,14 +871,18 @@ fn bind_url(kind: ToolKind, url: &str, auth: ToolAuth) -> ToolReach {
             browser_url: Some(trimmed.to_string()),
         });
     }
-    if !trimmed.starts_with("http://") {
+    if trimmed.contains('#') || uri.query().is_some() {
+        return ToolReach::Unbound(Unbound {
+            kind, found: None,
+            why: "the settings HTTP base URL must not contain a query or fragment; use a tool URL prefix".into(),
+            browser_url: None,
+        });
+    }
+    if let Err(why) = authorization(&auth) {
         return ToolReach::Unbound(Unbound {
             kind,
             found: None,
-            why: format!(
-                "{} settings URL must be http:// or https://, not {trimmed}",
-                kind.as_str()
-            ),
+            why: why.into(),
             browser_url: None,
         });
     }
@@ -788,6 +985,7 @@ pub(crate) async fn tool_get_with_status(
         ),
         Transport::Url { base } => {
             plaintext_http_get_with_status(
+                bound.kind.slug(),
                 base,
                 rest,
                 &bound.auth,
@@ -898,6 +1096,7 @@ pub(crate) async fn bounded_request(
 
 /// Absence and version fallback statuses require a complete bounded body.
 /// Denied statuses are returned without reading the body.
+/// Partial responses are refused without exposing a fallback status.
 pub(crate) async fn bounded_request_with_status(
     client: &Client,
     what: &'static str,
@@ -916,6 +1115,12 @@ pub(crate) async fn bounded_request_with_status(
         if matches!(status.as_u16(), 401 | 403) {
             response_status = Some(status);
             return Fetched::Denied { what };
+        }
+        if status == http::StatusCode::PARTIAL_CONTENT {
+            return Fetched::Failed {
+                what,
+                why: format!("{what} returned 206 Partial Content; partial responses are refused"),
+            };
         }
         let cap = if status.is_success() {
             body_limit
@@ -950,24 +1155,7 @@ pub(crate) async fn bounded_request_with_status(
         if status.is_success() {
             return Fetched::Ok(bytes);
         }
-        let text = String::from_utf8_lossy(&bytes);
-        let sentence = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("message")
-                    .or_else(|| value.get("error"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| {
-                if text.trim().is_empty() {
-                    status.to_string()
-                } else {
-                    text.trim().to_string()
-                }
-            });
+        let sentence = http_failure_sentence(&bytes, status);
         Fetched::Failed {
             what,
             why: sentence,
@@ -983,7 +1171,252 @@ pub(crate) async fn bounded_request_with_status(
     (response_status, outcome)
 }
 
+fn http_failure_sentence(bytes: &[u8], status: http::StatusCode) -> String {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            ["message", "error"].into_iter().find_map(|field| {
+                value
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| {
+            let text = String::from_utf8_lossy(bytes);
+            if text.trim().is_empty() {
+                status.to_string()
+            } else {
+                text.trim().to_string()
+            }
+        })
+}
+
+const MAX_URL_BYTES: usize = u16::MAX as usize - 1;
+const MAX_HTTP_BUFFER_BYTES: usize = 32 << 10;
+const MAX_HTTP_HEADER_CONTENT_BYTES: usize = 32 << 10;
+const MAX_HTTP_ERROR_BYTES: usize = 32 << 10;
+// A system resolver already running in the blocking pool cannot be aborted.
+// Its permit must outlive a cancelled request and stay with the lookup itself.
+// Four is a process-wide safety bound for direct URL DNS, not a tuned value.
+const MAX_DIRECT_DNS_LOOKUPS: usize = 4;
+
+static DIRECT_DNS_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_DIRECT_DNS_LOOKUPS)));
+
+#[derive(Clone)]
+struct DirectResolver {
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+type DnsAnswer = std::io::Result<std::vec::IntoIter<SocketAddr>>;
+
+enum DirectLookup {
+    Running(tokio::task::JoinHandle<DnsAnswer>),
+    AtCapacity,
+}
+
+impl Future for DirectLookup {
+    type Output = DnsAnswer;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match &mut *self {
+            Self::Running(task) => std::pin::Pin::new(task)
+                .poll(cx)
+                .map(|answer| match answer {
+                    Ok(answer) => answer,
+                    Err(_) => Err(std::io::Error::other("the direct DNS lookup worker failed")),
+                }),
+            Self::AtCapacity => std::task::Poll::Ready(Err(std::io::Error::other(
+                "direct DNS lookup capacity is full; try again shortly",
+            ))),
+        }
+    }
+}
+
+impl Drop for DirectLookup {
+    fn drop(&mut self) {
+        if let Self::Running(task) = self {
+            task.abort();
+        }
+    }
+}
+
+fn bounded_dns_lookup<F>(slots: Arc<tokio::sync::Semaphore>, lookup: F) -> DirectLookup
+where
+    F: FnOnce() -> DnsAnswer + Send + 'static,
+{
+    let Ok(permit) = slots.try_acquire_owned() else {
+        return DirectLookup::AtCapacity;
+    };
+    DirectLookup::Running(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        lookup()
+    }))
+}
+
+impl tower::Service<hyper_util::client::legacy::connect::dns::Name> for DirectResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = std::io::Error;
+    type Future = DirectLookup;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
+        let slots = self.slots.clone();
+        bounded_dns_lookup(slots, move || (name.as_str(), 0).to_socket_addrs())
+    }
+}
+
+fn header_content_within_limit(headers: &http::HeaderMap) -> bool {
+    headers
+        .iter()
+        .try_fold(MAX_HTTP_HEADER_CONTENT_BYTES, |remaining, (name, value)| {
+            remaining
+                .checked_sub(name.as_str().len())?
+                .checked_sub(value.as_bytes().len())
+        })
+        .is_some()
+}
+
+fn identity_content_encoding(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value.to_str().is_ok_and(|value| {
+                value.split(',').all(|coding| {
+                    let coding = coding.trim_matches([' ', '\t']);
+                    coding.is_empty() || coding.eq_ignore_ascii_case("identity")
+                })
+            })
+        })
+}
+
+fn settings_uri(value: &str) -> Result<http::Uri, &'static str> {
+    if value.len() > MAX_URL_BYTES {
+        return Err("the settings URL is too long");
+    }
+    if value.contains('#') {
+        return Err("the settings URL must not contain a fragment");
+    }
+    let uri = http::Uri::try_from(value).map_err(|_| "the settings URL is malformed")?;
+    let authority = uri.authority().ok_or("the settings URL has no host")?;
+    if authority.as_str().contains('@') {
+        return Err("tool URLs must not contain credentials; use named authentication");
+    }
+    if authority.host().is_empty() {
+        return Err("the settings URL has no host");
+    }
+    let host = authority.host();
+    if host.contains(['[', ']']) {
+        let literal = host
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .ok_or("the settings URL has stray host brackets")?;
+        if literal.contains('%') {
+            return Err("settings URL IPv6 zone identifiers are unsupported");
+        }
+        if literal.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("the settings URL bracketed host must be an IPv6 address");
+        }
+    }
+    let suffix = &authority.as_str()[host.len()..];
+    if !suffix.is_empty() {
+        let port = suffix
+            .strip_prefix(':')
+            .ok_or("the settings URL authority is malformed")?;
+        if port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return Err("the settings URL has an invalid explicit port");
+        }
+    }
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return Err("the settings URL must use http:// or https://");
+    }
+    Ok(uri)
+}
+
+fn authorization(auth: &ToolAuth) -> Result<Option<http::HeaderValue>, &'static str> {
+    let ToolAuth::NamedToken(token) = auth else {
+        return Ok(None);
+    };
+    let unpadded = token.trim_end_matches('=');
+    if token.len() > MAX_HTTP_BUFFER_BYTES - "Bearer ".len()
+        || unpadded.is_empty()
+        || !unpadded.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+    {
+        return Err("the named tool token is not a valid bounded Bearer token");
+    }
+    let mut header = http::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| "the named tool token is not a valid HTTP header")?;
+    header.set_sensitive(true);
+    Ok(Some(header))
+}
+
+fn redact_named_token(message: String, auth: &ToolAuth) -> String {
+    match auth {
+        ToolAuth::NamedToken(token) if !token.is_empty() && message.contains(token) => {
+            message.replace(token, "[redacted]")
+        }
+        _ => message,
+    }
+}
+
+fn settings_request(
+    base: &str,
+    rest: &str,
+    auth: &ToolAuth,
+    categorize_labels: bool,
+) -> Result<http::Request<kube::client::Body>, &'static str> {
+    let base_uri = settings_uri(base)?;
+    if base_uri.scheme_str() != Some("http") {
+        return Err("https settings URLs open in the system browser; they are not fetched here");
+    }
+    if base_uri.query().is_some() {
+        return Err("the settings base URL must not contain a query; use a tool URL prefix");
+    }
+    let base = base.trim_end_matches('/');
+    let rest = rest.trim_start_matches('/');
+    if base
+        .len()
+        .checked_add(1)
+        .and_then(|n| n.checked_add(rest.len()))
+        .is_none_or(|n| n > MAX_URL_BYTES)
+    {
+        return Err("the settings request URL is too long");
+    }
+    let url = settings_uri(&join_url(base, rest))?;
+    let mut request = http::Request::get(url)
+        .header(http::header::ACCEPT, "application/json")
+        .header(http::header::ACCEPT_ENCODING, "identity")
+        .header(http::header::CONNECTION, "close");
+    if categorize_labels {
+        request = request.header("x-loki-response-encoding-flags", "categorize-labels");
+    }
+    if let Some(header) = authorization(auth)? {
+        request = request.header(http::header::AUTHORIZATION, header);
+    }
+    request
+        .body(kube::client::Body::empty())
+        .map_err(|_| "the settings HTTP request is malformed")
+}
+
 async fn plaintext_http_get_with_status(
+    what: &'static str,
     base: &str,
     rest: &str,
     auth: &ToolAuth,
@@ -991,14 +1424,22 @@ async fn plaintext_http_get_with_status(
 ) -> (Option<http::StatusCode>, Fetched<Vec<u8>>) {
     let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
     let mut status = None;
-    let outcome =
-        plaintext_http_get_until(base, rest, auth, categorize_labels, deadline, &mut status).await;
+    let outcome = plaintext_http_get_until(
+        what,
+        base,
+        rest,
+        auth,
+        categorize_labels,
+        deadline,
+        &mut status,
+    )
+    .await;
     (status, outcome)
 }
 
-/// One deadline bounds the whole exchange -- connect, write, and every read --
-/// so a server dripping bytes cannot hold the fetch open past it.
+/// One deadline includes connection, request, headers and the complete body.
 async fn plaintext_http_get_until(
+    what: &'static str,
     base: &str,
     rest: &str,
     auth: &ToolAuth,
@@ -1006,170 +1447,125 @@ async fn plaintext_http_get_until(
     deadline: tokio::time::Instant,
     response_status: &mut Option<http::StatusCode>,
 ) -> Fetched<Vec<u8>> {
-    let Ok(url) = http::Uri::try_from(join_url(base, rest)) else {
-        return Fetched::Failed {
-            what: "url",
-            why: format!("not a URL: {base}"),
-        };
-    };
-    if url.scheme_str() != Some("http") {
-        return Fetched::Failed {
-            what: "url",
-            why: "https settings URLs open in the system browser; they are not fetched here"
-                .to_string(),
-        };
-    }
-    let host = match url.host() {
-        Some(host) => host.to_string(),
-        None => {
+    *response_status = None;
+    let request = match settings_request(base, rest, auth, categorize_labels) {
+        Ok(request) => request,
+        Err(why) => {
             return Fetched::Failed {
-                what: "url",
-                why: "the settings URL has no host".to_string(),
+                what,
+                why: why.into(),
             };
         }
     };
-    let port = url.port_u16().unwrap_or(80);
-    let path = url.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let mut request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nConnection: close\r\n"
-    );
-    if categorize_labels {
-        request.push_str("X-Loki-Response-Encoding-Flags: categorize-labels\r\n");
-    }
-    if let ToolAuth::NamedToken(token) = auth {
-        request.push_str("Authorization: Bearer ");
-        request.push_str(token);
-        request.push_str("\r\n");
-    }
-    request.push_str("\r\n");
-
-    let connect = tokio::time::timeout_at(
-        deadline,
-        tokio::net::TcpStream::connect((host.as_str(), port)),
-    )
-    .await;
-    let mut stream = match connect {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            return Fetched::Failed {
-                what: "url",
-                why: error.to_string(),
-            };
-        }
-        Err(_) => {
-            return Fetched::Failed {
-                what: "url",
-                why: format!("{host}:{port} did not accept a connection within 4 seconds"),
-            };
-        }
-    };
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    match tokio::time::timeout_at(deadline, stream.write_all(request.as_bytes())).await {
-        Err(_) => {
-            return Fetched::Failed {
-                what: "url",
-                why: "the settings URL did not answer within 4 seconds".to_string(),
-            };
-        }
-        Ok(Err(error)) => {
-            return Fetched::Failed {
-                what: "url",
-                why: error.to_string(),
-            };
-        }
-        Ok(Ok(())) => {}
-    }
-    let mut buf = Vec::new();
-    loop {
-        if buf.len() > MAX_BODY_BYTES + 4096 {
-            return Fetched::Failed {
-                what: "url",
-                why: format!("the answer exceeded {MAX_BODY_BYTES} bytes; it is hidden"),
-            };
-        }
-        let mut chunk = [0u8; 8192];
-        match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
-            Err(_) => {
+    let started = std::time::Instant::now();
+    let mut received_bytes = 0usize;
+    let exchange = async {
+        let connector =
+            hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(DirectResolver {
+                slots: DIRECT_DNS_SLOTS.clone(),
+            });
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .pool_max_idle_per_host(0)
+                .retry_canceled_requests(false)
+                .http1_max_buf_size(MAX_HTTP_BUFFER_BYTES)
+                .build(connector);
+        let response = match client.request(request).await {
+            Ok(response) => response,
+            Err(error) => {
                 return Fetched::Failed {
-                    what: "url",
-                    why: "the settings URL did not answer within 4 seconds".to_string(),
+                    what,
+                    why: redact_named_token(crate::connect::describe(&error), auth),
                 };
             }
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-            Ok(Err(error)) => {
-                return Fetched::Failed {
-                    what: "url",
-                    why: error.to_string(),
-                };
-            }
+        };
+        let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            *response_status = Some(status);
+            return Fetched::Denied { what };
         }
-    }
-    let (status, outcome) = split_http_body_with_status(&buf);
-    *response_status = status;
+        if status == http::StatusCode::PARTIAL_CONTENT {
+            return Fetched::Failed {
+                what,
+                why: format!("{what} returned 206 Partial Content; partial responses are refused"),
+            };
+        }
+        // A complete head can arrive in a read larger than Hyper's buffer target.
+        if !header_content_within_limit(response.headers()) {
+            return Fetched::Failed {
+                what,
+                why: format!(
+                    "{what} response header names and values exceed {MAX_HTTP_HEADER_CONTENT_BYTES} bytes; the response is refused"
+                ),
+            };
+        }
+        if !identity_content_encoding(response.headers()) {
+            return Fetched::Failed {
+                what,
+                why: format!(
+                    "{what} returned unsupported Content-Encoding; the response is refused"
+                ),
+            };
+        }
+        let cap = if status.is_success() {
+            MAX_BODY_BYTES
+        } else {
+            MAX_HTTP_ERROR_BYTES
+        };
+        let oversized = || Fetched::Failed {
+            what,
+            why: format!("{what} answered with more than {cap} bytes; the body is refused"),
+        };
+        if response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > cap as u64)
+        {
+            return oversized();
+        }
+        let mut body = response.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    return Fetched::Failed {
+                        what,
+                        why: redact_named_token(crate::connect::describe(&error), auth),
+                    };
+                }
+            };
+            received_bytes += chunk.len();
+            if chunk.len() > cap.saturating_sub(bytes.len()) {
+                return oversized();
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        *response_status = Some(status);
+        if status.is_success() {
+            return Fetched::Ok(bytes);
+        }
+        let sentence = http_failure_sentence(&bytes, status);
+        Fetched::Failed {
+            what,
+            why: redact_named_token(sentence, auth),
+        }
+    };
+    let outcome = tokio::time::timeout_at(deadline, exchange)
+        .await
+        .unwrap_or_else(|_| Fetched::Failed {
+            what,
+            why: format!("{what} did not answer within 4 seconds"),
+        });
+    crate::telemetry::record_request(started.elapsed().as_nanos() as u64, received_bytes);
     outcome
 }
 
 fn join_url(base: &str, rest: &str) -> String {
     let rest = rest.trim_start_matches('/');
-    if rest.is_empty() {
-        format!("{}/", base.trim_end_matches('/'))
-    } else {
-        format!("{}/{rest}", base.trim_end_matches('/'))
-    }
-}
-
-#[cfg(test)]
-fn split_http_body(raw: &[u8]) -> Fetched<Vec<u8>> {
-    split_http_body_with_status(raw).1
-}
-
-fn split_http_body_with_status(raw: &[u8]) -> (Option<http::StatusCode>, Fetched<Vec<u8>>) {
-    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return (
-            None,
-            Fetched::Failed {
-                what: "url",
-                why: "the settings URL answered with no HTTP header terminator".to_string(),
-            },
-        );
-    };
-    let headers = &raw[..split];
-    let body = &raw[split + 4..];
-    let status = headers
-        .split(|&b| b == b'\n')
-        .next()
-        .and_then(|line| {
-            let line = std::str::from_utf8(line).ok()?.trim();
-            line.split_whitespace().nth(1)?.parse::<u16>().ok()
-        })
-        .unwrap_or(0);
-    let response_status = (body.len() <= MAX_BODY_BYTES)
-        .then(|| http::StatusCode::from_u16(status).ok())
-        .flatten();
-    if matches!(status, 401 | 403) {
-        return (response_status, Fetched::Denied { what: "url" });
-    }
-    if !(200..300).contains(&status) {
-        return (
-            response_status,
-            Fetched::Failed {
-                what: "url",
-                why: format!("the settings URL answered {status}"),
-            },
-        );
-    }
-    if body.len() > MAX_BODY_BYTES {
-        return (
-            None,
-            Fetched::Failed {
-                what: "url",
-                why: format!("the answer exceeded {MAX_BODY_BYTES} bytes; it is hidden"),
-            },
-        );
-    }
-    (response_status, Fetched::Ok(body.to_vec()))
+    format!("{}/{rest}", base.trim_end_matches('/'))
 }
 
 /// Bytes that must not outlive the action that revealed them.

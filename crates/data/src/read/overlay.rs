@@ -22,20 +22,25 @@ impl Reader {
         });
     }
 
-    /// Overlay inventories, assembled off the paint path. Binding a tool never
-    /// delays the scene's first publish.
+    /// Overlay inventories share bounded telemetry admission off the paint path.
+    /// One deadline covers the queue and the complete inventory. Dropping the
+    /// guard cancels queued or in-flight work.
     pub fn fetch_overlay(
         &self,
         kind: overlay::Kind,
         settings: ReachSettings,
         reply: impl FnOnce(Fetched<overlay::Frame>) + Send + 'static,
-    ) {
-        let client = self.client.clone();
+    ) -> crate::telemetry::RequestStop {
+        let client = self.interactive.clone();
         let netpol = self.netpol.clone();
         let targets = self.targets.clone();
-        self.handle.spawn(async move {
-            reply(load_overlay(&client, &targets, &netpol, kind, settings).await);
-        });
+        let deadline = tokio::time::Instant::now() + crate::connect::INTERACTIVE_DEADLINE;
+        self.telemetry.submit_until(
+            &self.handle,
+            deadline,
+            async move { load_overlay(&client, &targets, &netpol, kind, settings).await },
+            reply,
+        )
     }
 
     /// Isolation and named ports for one pod. Not a traffic verdict.
@@ -106,25 +111,38 @@ async fn load_netpol(
 }
 
 async fn load_metrics(client: &Client, settings: ReachSettings) -> Fetched<overlay::Frame> {
-    let named = grafana_named_promql(client, &settings).await;
+    let (named, notices) = grafana_named_promql(client, &settings).await;
     let expr = named.as_deref().unwrap_or(overlay::CPU_EXPR);
     match query_prometheus(client, &settings, expr).await {
         Fetched::Ok(result) => {
             let mut frame = overlay::from_prometheus(&result);
-            if frame.note.is_none() {
-                frame.note = Some(if named.is_some() {
-                    "PromQL named by Grafana".to_string()
-                } else {
-                    "cadvisor CPU; Grafana has not named a PromQL".to_string()
-                });
+            let origin = if named.is_some() {
+                "PromQL named by Grafana"
+            } else {
+                "cadvisor CPU; Grafana has not named a PromQL"
+            };
+            if let Some(note) = frame.note.as_mut() {
+                note.push_str("; ");
+                note.push_str(origin);
+            } else {
+                frame.note = Some(origin.to_string());
             }
+            frame.note = metrics_note(frame.note, notices);
             Fetched::Ok(frame)
         }
-        Fetched::Denied { what } => Fetched::Denied { what },
+        Fetched::Denied { what } if notices.text.is_empty() => Fetched::Denied { what },
+        Fetched::Denied { what } => Fetched::Failed {
+            what,
+            why: metrics_note(
+                Some(format!("{what}: access denied for this account")),
+                notices,
+            )
+            .expect("the denial supplies a note"),
+        },
         Fetched::Failed { why, .. } => Fetched::Ok(overlay::Frame {
             stamps: Vec::new(),
             truncated: false,
-            note: Some(why),
+            note: metrics_note(Some(why), notices),
         }),
     }
 }
@@ -149,85 +167,189 @@ async fn load_mesh_observed(client: &Client, settings: ReachSettings) -> Fetched
     );
 
     let mut labels = Vec::new();
-    let mut denied = None;
-    let mut failed = None;
-    let mut ok = false;
-    for (fetched, fallback) in [
-        (istio, "istio_requests_total"),
-        (hubble, "hubble_flows_processed_total"),
-        (linkerd, "response_total"),
+    let mut notices = MetricSourceNotes::default();
+    let mut truncated = false;
+    let mut failures = Vec::new();
+    let mut available = false;
+    for (fetched, source, fallback) in [
+        (istio, "Istio query", "istio_requests_total"),
+        (hubble, "Hubble query", "hubble_flows_processed_total"),
+        (linkerd, "Linkerd query", "response_total"),
     ] {
         match fetched {
             Fetched::Ok(result) => {
-                ok = true;
-                labels.extend(mesh_series(&result, fallback));
+                available = true;
+                truncated |= result.truncated;
+                overlay::append_prometheus_notices(&result, source, &mut notices.text);
+                labels.extend(mesh_series(result.series, fallback));
             }
-            Fetched::Denied { what } => denied = Some(what),
-            Fetched::Failed { why, .. } => failed = Some(why),
+            Fetched::Denied { what } => {
+                failures.push(format!("{source}: {what}: access denied for this account"));
+            }
+            Fetched::Failed { what, why } => {
+                failures.push(format!("{source}: {what}: {why}"));
+            }
         }
     }
-    if !ok {
-        if let Some(what) = denied {
-            return Fetched::Denied { what };
-        }
-        return Fetched::Ok(overlay::Frame {
-            stamps: Vec::new(),
-            truncated: false,
-            note: failed,
-        });
+    let mut frame = overlay::from_mesh_observed(&mesh::observed_from_series(&labels));
+    if !failures.is_empty() {
+        let state = if available {
+            "incomplete"
+        } else {
+            "unavailable"
+        };
+        frame.note = Some(format!(
+            "Mesh observations are {state}; {}",
+            failures.join("; ")
+        ));
     }
-    Fetched::Ok(overlay::from_mesh_observed(&mesh::observed_from_series(
-        &labels,
-    )))
+    frame.truncated |= truncated;
+    frame.note = metrics_note(frame.note, notices);
+    Fetched::Ok(frame)
 }
 
 /// Provisioned ConfigMaps first: they are already on the API server, so the
 /// overlay does not wait on a Grafana bind. Live search is the fallback when
 /// those dashboards name nothing joinable.
-async fn grafana_named_promql(client: &Client, settings: &ReachSettings) -> Option<String> {
-    if let Fetched::Ok(provisioned) = grafana::fetch_provisioned_from_configmaps(client).await
-        && let Some(expr) = grafana::name_overlay_promql(&provisioned.dashboards)
-    {
-        return Some(expr.to_string());
+async fn grafana_named_promql(
+    client: &Client,
+    settings: &ReachSettings,
+) -> (Option<String>, MetricSourceNotes) {
+    let mut notices = MetricSourceNotes::default();
+    match grafana::fetch_provisioned_from_configmaps(client).await {
+        Fetched::Ok(provisioned) => {
+            if provisioned.truncated {
+                notices.push(&["Provisioned ConfigMap dashboard selection is incomplete"]);
+            }
+            for why in &provisioned.errors {
+                notices.push(&["provisioned dashboards: ", why]);
+            }
+            if let Some(expr) = grafana::name_overlay_promql(&provisioned.dashboards) {
+                return (Some(expr.to_string()), notices);
+            }
+        }
+        Fetched::Denied { what } => notices.push(&[
+            "provisioned dashboards: ",
+            what,
+            ": access denied for this account",
+        ]),
+        Fetched::Failed { why, .. } => {
+            notices.push(&["provisioned dashboards: ", &why]);
+        }
     }
 
-    let ToolReach::Bound(bound) = reach::bind(client, ToolKind::Grafana, settings).await else {
-        return None;
-    };
-    let Fetched::Ok(hits) = grafana::fetch_search(client, &bound, &[]).await else {
-        return None;
-    };
-    let mut dashboards = Vec::new();
-    for hit in hits.into_iter().take(grafana::MAX_NAMED_FROM_SEARCH) {
-        if hit.uid.is_empty() {
-            continue;
+    let bound = match reach::bind(client, ToolKind::Grafana, settings).await {
+        ToolReach::Bound(bound) => bound,
+        ToolReach::Absent { .. } => return (None, notices),
+        ToolReach::Unbound(unbound) => {
+            notices.push(&["Grafana binding: ", &unbound.why]);
+            return (None, notices);
         }
-        let Fetched::Ok(dash) = grafana::fetch_dashboard(client, &bound, &hit.uid).await else {
-            continue;
+    };
+    let mut page = match grafana::fetch_search(client, &bound, &[]).await {
+        Fetched::Ok(page) => page,
+        Fetched::Denied { what } => {
+            notices.push(&["Grafana search: ", what, ": access denied for this account"]);
+            return (None, notices);
+        }
+        Fetched::Failed { why, .. } => {
+            notices.push(&["Grafana search: ", &why]);
+            return (None, notices);
+        }
+    };
+    let mut invalid_uid = false;
+    page.hits.retain(|hit| {
+        let valid = grafana::valid_dashboard_uid(&hit.uid);
+        invalid_uid |= !valid;
+        valid
+    });
+    if invalid_uid {
+        notices.push(&[grafana::INVALID_DASHBOARD_UID]);
+    }
+    let more_hits = page.hits.len() > grafana::MAX_NAMED_FROM_SEARCH;
+    for hit in page.hits.into_iter().take(grafana::MAX_NAMED_FROM_SEARCH) {
+        let dashboard = match grafana::fetch_dashboard(client, &bound, &hit.uid).await {
+            Fetched::Ok(dash) => dash,
+            Fetched::Denied { what } => {
+                notices.push(&[
+                    "Grafana dashboard ",
+                    &hit.uid,
+                    ": ",
+                    what,
+                    ": access denied for this account",
+                ]);
+                continue;
+            }
+            Fetched::Failed { why, .. } => {
+                notices.push(&["Grafana dashboard ", &hit.uid, ": ", &why]);
+                continue;
+            }
         };
-        dashboards.push(dash);
-        if let Some(expr) = grafana::name_overlay_promql(&dashboards) {
-            return Some(expr.to_string());
+        if let Some(expr) = grafana::name_overlay_promql(std::slice::from_ref(&dashboard)) {
+            return (Some(expr.to_string()), notices);
         }
     }
-    None
+    if more_hits {
+        notices.prioritize("Grafana dashboard search-hit selection is incomplete");
+    }
+    if page.page_full {
+        notices.prioritize(grafana::SEARCH_PAGE_FULL_NOTICE);
+    }
+    (None, notices)
 }
 
-fn mesh_series(result: &prom::QueryResult, fallback: &str) -> Vec<mesh::SeriesLabels> {
-    result
-        .series
-        .iter()
-        .map(|series| mesh::SeriesLabels {
-            name: series
-                .labels
-                .iter()
-                .find(|(key, _)| key == "__name__")
-                .map(|(_, value)| value.clone())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| fallback.to_string()),
-            labels: series.labels.clone(),
-        })
-        .collect()
+#[derive(Default)]
+struct MetricSourceNotes {
+    // The adapters cap dashboard keys, fetched dashboards and response bodies.
+    text: String,
+}
+
+impl MetricSourceNotes {
+    fn push(&mut self, parts: &[&str]) {
+        if !self.text.is_empty() {
+            self.text.push_str("; ");
+        }
+        for part in parts {
+            self.text.push_str(part);
+        }
+    }
+
+    fn prioritize(&mut self, notice: &str) {
+        if !self.text.is_empty() {
+            self.text.insert_str(0, "; ");
+        }
+        self.text.insert_str(0, notice);
+    }
+}
+
+fn metrics_note(note: Option<String>, notices: MetricSourceNotes) -> Option<String> {
+    if notices.text.is_empty() {
+        return note;
+    }
+    let Some(mut note) = note else {
+        return Some(notices.text);
+    };
+    if !note.is_empty() {
+        note.push_str("; ");
+    }
+    note.push_str(&notices.text);
+    Some(note)
+}
+
+fn mesh_series(
+    series: Vec<prom::Series>,
+    fallback: &str,
+) -> impl Iterator<Item = mesh::SeriesLabels> + '_ {
+    series.into_iter().map(move |series| mesh::SeriesLabels {
+        name: series
+            .labels
+            .iter()
+            .find(|(key, _)| key == "__name__")
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| fallback.to_string()),
+        labels: series.labels,
+    })
 }
 
 async fn load_pod_inspection(

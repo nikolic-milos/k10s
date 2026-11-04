@@ -1356,6 +1356,8 @@ fn a_port_forward_carries_real_bytes_from_the_pod() {
             namespace: namespace(),
             name: pod.clone(),
             service: false,
+            service_port: None,
+            expected_service: None,
         },
         move |fetched| {
             let _ = tx.send(fetched);
@@ -1549,6 +1551,8 @@ fn closing_a_port_forward_ends_an_established_remote_connection() {
             namespace: namespace(),
             name: pod.clone(),
             service: false,
+            service_port: None,
+            expected_service: None,
         },
         move |answer| {
             let _ = tx.send(answer);
@@ -1710,6 +1714,7 @@ fn a_port_refusal_after_upgrade_preserves_the_kubelets_sentence() {
             pod,
             local_port,
             remote_port,
+            expected_service: None,
         })
         .expect("the managed refusal is registered");
     let owned = OwnedForward(registry, row.id);

@@ -7,6 +7,39 @@
 use super::*;
 
 #[test]
+fn prometheus_annotation_omissions_cross_the_provider_without_copying_messages() {
+    use k10s_data::integrations::prom::{MAX_ANNOTATIONS_PER_LEVEL, parse_response};
+    use k10s_provider::PromOutcome;
+
+    let body = serde_json::json!({
+        "status": "success",
+        "data": {"resultType": "vector", "result": []},
+        "warnings": vec!["warning from the server"; MAX_ANNOTATIONS_PER_LEVEL + 1],
+        "infos": vec!["info from the server"; MAX_ANNOTATIONS_PER_LEVEL + 2],
+    })
+    .to_string();
+    let result = parse_response(body.as_bytes()).expect("numeric Prometheus response");
+    let warning_pointer = result.warnings[0].as_ptr();
+    let info_pointer = result.infos[0].as_ptr();
+    let PromOutcome::Series {
+        warnings,
+        infos,
+        warnings_omitted,
+        infos_omitted,
+        ..
+    } = prom_outcome(Fetched::Ok(Some(result)))
+    else {
+        panic!("successful numeric result")
+    };
+    assert_eq!(warnings.len(), MAX_ANNOTATIONS_PER_LEVEL);
+    assert_eq!(infos.len(), MAX_ANNOTATIONS_PER_LEVEL);
+    assert_eq!(warnings_omitted, 1);
+    assert_eq!(infos_omitted, 2);
+    assert_eq!(warnings[0].as_ptr(), warning_pointer);
+    assert_eq!(infos[0].as_ptr(), info_pointer);
+}
+
+#[test]
 fn a_loki_only_probe_preserves_missing_denied_and_failed_states() {
     use k10s_data::read::Seen;
     use k10s_provider::ToolPresence;
@@ -493,6 +526,7 @@ fn the_arms_that_only_carry_a_label_still_carry_it() {
             pod: "api-1".to_string(),
             local_port: 8080,
             remote_port: 80,
+            expected_service: None,
         },
         state: k10s_data::forward::ForwardState::Opening,
     };
@@ -622,6 +656,7 @@ fn a_dead_forward_keeps_the_reason_it_died() {
             pod: "api-1".to_string(),
             local_port: 8080,
             remote_port: 80,
+            expected_service: None,
         },
         state: k10s_data::forward::ForwardState::Dead {
             why: "pod is gone".to_string(),
@@ -730,6 +765,7 @@ fn policy_harbor_and_mesh_absence_hide_the_pane() {
             truncated: false,
             browser_base: None,
             browser_service: None,
+            query_source: None,
             served: false,
             errors: Vec::new(),
         })),
@@ -807,10 +843,11 @@ fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
     let catalog = k10s_data::read::GrafanaCatalog {
         errors: Vec::new(),
         dashboards: vec![k10s_data::integrations::grafana::Dashboard {
+            source: k10s_data::integrations::grafana::DashboardSource::Grafana,
             uid: "node".to_string(),
             title: "Node".to_string(),
             panels: vec![k10s_data::integrations::grafana::Panel {
-                id: 2,
+                id: Some(2),
                 title: "CPU".to_string(),
                 kind: k10s_data::integrations::grafana::PanelKind::Timeseries,
                 unit: String::new(),
@@ -832,18 +869,755 @@ fn grafana_queries_cross_as_panel_rows_and_unsupported_keep_a_browser_url() {
         extra_hits: Vec::new(),
         truncated: false,
         browser_base: Some("http://grafana.mon.svc:3000".to_string()),
-        browser_service: None,
+        browser_service: Some(("monitoring".into(), "grafana".into(), 3000)),
+        query_source: Some(test_grafana_service(3000)),
         served: true,
     };
+    let mut browser_only = catalog.clone();
+    browser_only.browser_service = None;
+    let browser_url = "https://grafana.test/d/private-path?token=private-query#private-fragment";
+    browser_only.browser_base = Some(browser_url.to_string());
+    let diagnostic = format!("{browser_only:?}");
+    for secret in ["private-path", "private-query", "private-fragment"] {
+        assert!(!diagnostic.contains(secret));
+    }
+    let browser_outcome = grafana_outcome(Fetched::Ok(browser_only));
+    let diagnostic = format!("{browser_outcome:?}");
+    for secret in ["private-path", "private-query", "private-fragment"] {
+        assert!(!diagnostic.contains(secret));
+    }
+    let k10s_provider::GrafanaOutcome::Catalog { panels, .. } = browser_outcome else {
+        panic!("the browser-only catalog keeps its panel");
+    };
+    assert_eq!(panels[0].browser_url.as_deref(), Some(browser_url));
     match grafana_outcome(Fetched::Ok(catalog)) {
         k10s_provider::GrafanaOutcome::Catalog { panels, .. } => {
             assert_eq!(panels[0].expr, "rate(cpu[1m])");
+            assert_eq!(
+                panels[0].browser_forward,
+                Some(k10s_provider::ForwardRequest {
+                    namespace: "monitoring".into(),
+                    name: "grafana".into(),
+                    service: true,
+                    service_port: Some(3000),
+                    expected_service: Some(test_grafana_service(3000)),
+                })
+            );
             assert_eq!(
                 panels[0].browser_url.as_deref(),
                 Some("http://grafana.mon.svc:3000/d/node?viewPanel=2")
             );
         }
         other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn grafana_unfetched_dashboard_and_real_zero_panel_keep_distinct_routes() {
+    use k10s_data::integrations::grafana::{
+        CatalogHit, CatalogHitReason, Dashboard, Panel, PanelKind, SearchHit,
+    };
+
+    let catalog = k10s_data::read::GrafanaCatalog {
+        dashboards: vec![Dashboard {
+            source: k10s_data::integrations::grafana::DashboardSource::Grafana,
+            uid: "with-zero".into(),
+            title: "Known dashboard".into(),
+            panels: vec![Panel {
+                id: Some(0),
+                title: "Known zero panel".into(),
+                kind: PanelKind::Timeseries,
+                queries: Vec::new(),
+                transformed: false,
+                unit: String::new(),
+                reducer: String::new(),
+                min_interval: String::new(),
+                unsupported: None,
+            }],
+            truncated: false,
+        }],
+        extra_hits: vec![CatalogHit {
+            search: SearchHit {
+                uid: "not-fetched".into(),
+                title: "Unfetched dashboard".into(),
+                folder_title: String::new(),
+                kind: "dash-db".into(),
+            },
+            reason: CatalogHitReason::FetchLimit,
+        }],
+        truncated: true,
+        browser_base: Some("http://grafana.test/prefix/".into()),
+        browser_service: Some(("monitoring".into(), "grafana".into(), 3333)),
+        query_source: Some(test_grafana_service(3333)),
+        served: true,
+        errors: Vec::new(),
+    };
+    let k10s_provider::GrafanaOutcome::Catalog { panels, .. } =
+        grafana_outcome(Fetched::Ok(catalog))
+    else {
+        panic!("the catalog must preserve both rows");
+    };
+    assert_eq!(panels.len(), 2);
+    assert_eq!(
+        panels[0].identity,
+        k10s_provider::GrafanaRowIdentity::Panel {
+            id: Some(0),
+            position: 0,
+        }
+    );
+    assert_eq!(
+        panels[0].browser_url.as_deref(),
+        Some("http://grafana.test/prefix/d/with-zero?viewPanel=0")
+    );
+    assert_eq!(
+        panels[0].unsupported.as_deref(),
+        Some("No readable Grafana query targets")
+    );
+    assert_eq!(
+        panels[1].identity,
+        k10s_provider::GrafanaRowIdentity::Dashboard
+    );
+    assert_eq!(panels[1].dashboard_title, "Unfetched dashboard");
+    assert_eq!(panels[1].title, "Dashboard");
+    assert_eq!(
+        panels[1].browser_url.as_deref(),
+        Some("http://grafana.test/prefix/d/not-fetched")
+    );
+    assert_eq!(
+        panels[1].unsupported.as_deref(),
+        Some("dashboard was not fetched at the catalog limit")
+    );
+    let expected_forward = k10s_provider::ForwardRequest {
+        namespace: "monitoring".into(),
+        name: "grafana".into(),
+        service: true,
+        service_port: Some(3333),
+        expected_service: Some(test_grafana_service(3333)),
+    };
+    assert!(
+        panels
+            .iter()
+            .all(|panel| panel.browser_forward.as_ref() == Some(&expected_forward))
+    );
+}
+
+#[test]
+fn grafana_unreadable_search_hits_keep_browser_routes_and_catalog_reasons() {
+    use k10s_data::integrations::grafana::{CatalogHit, CatalogHitReason, SearchHit};
+    use k10s_provider::{GrafanaOutcome, GrafanaRowIdentity};
+
+    for (reason, state, notice) in [
+        (
+            CatalogHitReason::Denied,
+            "Grafana dashboard read denied; see catalog details",
+            "Grafana dashboard locked: access denied for this account",
+        ),
+        (
+            CatalogHitReason::Failed,
+            "Grafana dashboard read failed; see catalog details",
+            "Grafana dashboard locked: dashboard store unavailable",
+        ),
+    ] {
+        let catalog = k10s_data::read::GrafanaCatalog {
+            dashboards: Vec::new(),
+            extra_hits: vec![CatalogHit {
+                search: SearchHit {
+                    uid: "locked".into(),
+                    title: "Locked dashboard".into(),
+                    folder_title: String::new(),
+                    kind: "dash-db".into(),
+                },
+                reason,
+            }],
+            truncated: false,
+            browser_base: Some("http://grafana.test".into()),
+            browser_service: Some(("monitoring".into(), "grafana".into(), 3000)),
+            query_source: Some(test_grafana_service(3000)),
+            served: true,
+            errors: vec![notice.into()],
+        };
+        let GrafanaOutcome::Catalog {
+            panels, notices, ..
+        } = grafana_outcome(Fetched::Ok(catalog))
+        else {
+            panic!("the search hit must remain browseable");
+        };
+        assert_eq!(panels.len(), 1);
+        assert_eq!(panels[0].identity, GrafanaRowIdentity::Dashboard);
+        assert_eq!(
+            panels[0].browser_url.as_deref(),
+            Some("http://grafana.test/d/locked")
+        );
+        assert_eq!(
+            panels[0]
+                .browser_forward
+                .as_ref()
+                .and_then(|r| r.service_port),
+            Some(3000)
+        );
+        assert_eq!(panels[0].unsupported.as_deref(), Some(state));
+        assert_eq!(notices, [notice]);
+    }
+}
+
+fn test_grafana_service(port: u16) -> std::sync::Arc<k10s_core::ServiceIdentity> {
+    std::sync::Arc::new(k10s_core::ServiceIdentity {
+        namespace: "monitoring".into(),
+        name: "grafana".into(),
+        port,
+        uid: "uid-grafana".into(),
+        resource_version: "42".into(),
+    })
+}
+
+fn dashboard_with_query_rows(
+    source: k10s_data::integrations::grafana::DashboardSource,
+    rows: usize,
+    truncated: bool,
+) -> k10s_data::integrations::grafana::Dashboard {
+    use k10s_data::integrations::grafana::{
+        Dashboard, MAX_QUERIES_PER_PANEL, Panel, PanelKind, PanelQuery, QueryDialect,
+    };
+
+    let panels = (0..rows)
+        .step_by(MAX_QUERIES_PER_PANEL)
+        .map(|start| Panel {
+            id: None,
+            title: "Panel".into(),
+            kind: PanelKind::Timeseries,
+            queries: (0..(rows - start).min(MAX_QUERIES_PER_PANEL))
+                .map(|target| PanelQuery {
+                    ref_id: format!("Q{target}"),
+                    expr: "up".into(),
+                    dialect: QueryDialect::PromQL,
+                    datasource: None,
+                    min_step: String::new(),
+                    unsupported: None,
+                })
+                .collect(),
+            transformed: false,
+            unit: String::new(),
+            reducer: String::new(),
+            min_interval: String::new(),
+            unsupported: None,
+        })
+        .collect();
+    Dashboard {
+        source,
+        uid: "pilot".into(),
+        title: "Pilot".into(),
+        panels,
+        truncated,
+    }
+}
+
+#[test]
+fn grafana_projection_caps_the_ordered_prefix_inside_a_panel() {
+    use k10s_data::integrations::grafana::{DashboardSource, MAX_QUERIES_PER_PANEL};
+    use k10s_provider::{GrafanaOutcome, GrafanaRowIdentity};
+
+    let limit = k10s_shell::table::MAX_ROWS;
+    for (rows, source_truncated) in [(limit - 1, false), (limit, true), (limit + 1, false)] {
+        let catalog = k10s_data::read::GrafanaCatalog {
+            dashboards: vec![dashboard_with_query_rows(
+                DashboardSource::Grafana,
+                rows,
+                source_truncated,
+            )],
+            extra_hits: Vec::new(),
+            truncated: false,
+            browser_base: None,
+            browser_service: None,
+            query_source: None,
+            served: true,
+            errors: Vec::new(),
+        };
+        let GrafanaOutcome::Catalog {
+            panels,
+            omitted,
+            truncated,
+            ..
+        } = grafana_outcome(Fetched::Ok(catalog))
+        else {
+            panic!("the catalog must retain the decoded rows");
+        };
+        let retained = rows.min(limit);
+        assert_eq!(panels.len(), retained);
+        assert_eq!(omitted, rows - retained);
+        assert_eq!(truncated, source_truncated);
+        let last = panels.last().expect("the retained prefix is nonempty");
+        assert_eq!(
+            last.identity,
+            GrafanaRowIdentity::Panel {
+                id: None,
+                position: (retained - 1) / MAX_QUERIES_PER_PANEL,
+            }
+        );
+        assert_eq!(
+            last.ref_id,
+            format!("Q{}", (retained - 1) % MAX_QUERIES_PER_PANEL)
+        );
+    }
+}
+
+#[test]
+fn grafana_projection_counts_later_sources_and_search_hits() {
+    use k10s_data::integrations::grafana::{
+        CatalogHit, CatalogHitReason, DashboardSource, MAX_QUERIES_PER_PANEL, Panel, PanelKind,
+        SearchHit,
+    };
+    use k10s_provider::{GrafanaOutcome, GrafanaRowIdentity, GrafanaRowSource};
+
+    let empty_panel = || Panel {
+        id: None,
+        title: "No targets".into(),
+        kind: PanelKind::Unsupported,
+        queries: Vec::new(),
+        transformed: false,
+        unit: String::new(),
+        reducer: String::new(),
+        min_interval: String::new(),
+        unsupported: None,
+    };
+    let limit = k10s_shell::table::MAX_ROWS;
+    let mut grafana = dashboard_with_query_rows(DashboardSource::Grafana, limit + 4, false);
+    grafana.panels.push(empty_panel());
+    let mut configmap = dashboard_with_query_rows(DashboardSource::ConfigMap, 0, true);
+    configmap.panels.push(empty_panel());
+    let unknown = dashboard_with_query_rows(DashboardSource::Unknown, 2, false);
+    let hits = (0..2)
+        .map(|index| CatalogHit {
+            search: SearchHit {
+                uid: format!("hit-{index}"),
+                title: "Search result".into(),
+                folder_title: String::new(),
+                kind: "dash-db".into(),
+            },
+            reason: CatalogHitReason::FetchLimit,
+        })
+        .collect();
+    let catalog = k10s_data::read::GrafanaCatalog {
+        dashboards: vec![configmap, unknown, grafana],
+        extra_hits: hits,
+        truncated: false,
+        browser_base: None,
+        browser_service: None,
+        query_source: None,
+        served: true,
+        errors: vec!["An upstream catalog notice".into()],
+    };
+    let GrafanaOutcome::Catalog {
+        panels,
+        omitted,
+        truncated,
+        notices,
+    } = grafana_outcome(Fetched::Ok(catalog))
+    else {
+        panic!("the catalog must retain the decoded rows");
+    };
+    assert_eq!(panels.len(), limit);
+    assert_eq!(omitted, 10);
+    assert!(truncated);
+    assert_eq!(notices, ["An upstream catalog notice"]);
+    assert!(
+        panels
+            .iter()
+            .all(|row| row.source == GrafanaRowSource::Grafana)
+    );
+    assert_eq!(
+        panels.last().unwrap().identity,
+        GrafanaRowIdentity::Panel {
+            id: None,
+            position: (limit - 1) / MAX_QUERIES_PER_PANEL,
+        }
+    );
+    assert_eq!(
+        panels.last().unwrap().ref_id,
+        format!("Q{}", (limit - 1) % MAX_QUERIES_PER_PANEL)
+    );
+}
+
+#[test]
+fn grafana_projection_keeps_the_search_hit_prefix_at_the_limit() {
+    use k10s_data::integrations::grafana::{
+        CatalogHit, CatalogHitReason, DashboardSource, SearchHit,
+    };
+    use k10s_provider::{GrafanaOutcome, GrafanaRowIdentity};
+
+    let limit = k10s_shell::table::MAX_ROWS;
+    let hits = (0..4)
+        .map(|index| CatalogHit {
+            search: SearchHit {
+                uid: format!("hit-{index}"),
+                title: "Search result".into(),
+                folder_title: String::new(),
+                kind: "dash-db".into(),
+            },
+            reason: CatalogHitReason::Denied,
+        })
+        .collect();
+    let catalog = k10s_data::read::GrafanaCatalog {
+        dashboards: vec![dashboard_with_query_rows(
+            DashboardSource::Grafana,
+            limit - 2,
+            false,
+        )],
+        extra_hits: hits,
+        truncated: false,
+        browser_base: None,
+        browser_service: None,
+        query_source: None,
+        served: true,
+        errors: Vec::new(),
+    };
+    let GrafanaOutcome::Catalog {
+        panels,
+        omitted,
+        truncated,
+        ..
+    } = grafana_outcome(Fetched::Ok(catalog))
+    else {
+        panic!("the search hits must remain represented");
+    };
+    assert_eq!(panels.len(), limit);
+    assert_eq!(omitted, 2);
+    assert!(!truncated);
+    assert_eq!(panels[limit - 2].identity, GrafanaRowIdentity::Dashboard);
+    assert_eq!(panels[limit - 2].dashboard_uid, "hit-0");
+    assert_eq!(panels[limit - 1].identity, GrafanaRowIdentity::Dashboard);
+    assert_eq!(panels[limit - 1].dashboard_uid, "hit-1");
+}
+
+#[test]
+fn grafana_missing_panel_ids_and_repeated_targets_keep_local_row_positions() {
+    use k10s_data::integrations::grafana::{Dashboard, Panel, PanelKind, PanelQuery, QueryDialect};
+    use k10s_provider::GrafanaRowIdentity;
+
+    let query = |expr: &str| PanelQuery {
+        ref_id: "A".into(),
+        expr: expr.into(),
+        dialect: QueryDialect::PromQL,
+        datasource: None,
+        min_step: String::new(),
+        unsupported: None,
+    };
+    let panel = |title: &str, queries| Panel {
+        id: None,
+        title: title.into(),
+        kind: PanelKind::Timeseries,
+        queries,
+        transformed: false,
+        unit: String::new(),
+        reducer: String::new(),
+        min_interval: String::new(),
+        unsupported: None,
+    };
+    let catalog = k10s_data::read::GrafanaCatalog {
+        dashboards: vec![Dashboard {
+            source: k10s_data::integrations::grafana::DashboardSource::Grafana,
+            uid: "pilot".into(),
+            title: "Pilot dashboard".into(),
+            panels: vec![
+                panel("First", vec![query("up"), query("down")]),
+                panel("Second", vec![query("ready")]),
+            ],
+            truncated: false,
+        }],
+        extra_hits: Vec::new(),
+        truncated: false,
+        browser_base: Some("http://grafana.test".into()),
+        browser_service: None,
+        query_source: None,
+        served: true,
+        errors: Vec::new(),
+    };
+    let k10s_provider::GrafanaOutcome::Catalog { panels, .. } =
+        grafana_outcome(Fetched::Ok(catalog))
+    else {
+        panic!("the catalog must preserve all targets");
+    };
+    assert_eq!(panels.len(), 3);
+    for (position, panel) in [0, 0, 1].into_iter().zip(&panels) {
+        assert_eq!(
+            panel.identity,
+            GrafanaRowIdentity::Panel { id: None, position }
+        );
+        assert_eq!(panel.ref_id, "A");
+        assert_eq!(
+            panel.browser_url.as_deref(),
+            Some("http://grafana.test/d/pilot")
+        );
+    }
+    assert_eq!(panels[0].expr, "up");
+    assert_eq!(panels[1].expr, "down");
+    assert_eq!(panels[2].expr, "ready");
+}
+
+#[test]
+fn grafana_rows_label_unsupported_target_dialects() {
+    use k10s_data::integrations::grafana::{Dashboard, Panel, PanelKind, PanelQuery, QueryDialect};
+
+    let panel = |dialect, unsupported| Panel {
+        id: Some(1),
+        title: "Panel".into(),
+        kind: PanelKind::Timeseries,
+        queries: vec![PanelQuery {
+            ref_id: "A".into(),
+            expr: "query".into(),
+            dialect,
+            datasource: None,
+            min_step: String::new(),
+            unsupported,
+        }],
+        transformed: false,
+        unit: String::new(),
+        reducer: String::new(),
+        min_interval: String::new(),
+        unsupported: None,
+    };
+    let catalog = k10s_data::read::GrafanaCatalog {
+        dashboards: vec![Dashboard {
+            source: k10s_data::integrations::grafana::DashboardSource::Grafana,
+            uid: "pilot".into(),
+            title: "Pilot".into(),
+            panels: vec![
+                panel(QueryDialect::PromQL, None),
+                panel(QueryDialect::LogQL, None),
+                panel(QueryDialect::TraceQL, None),
+                panel(QueryDialect::Unknown, None),
+                panel(QueryDialect::LogQL, Some("specific target failure".into())),
+            ],
+            truncated: false,
+        }],
+        extra_hits: Vec::new(),
+        truncated: false,
+        browser_base: None,
+        browser_service: None,
+        query_source: None,
+        served: true,
+        errors: Vec::new(),
+    };
+    let k10s_provider::GrafanaOutcome::Catalog { panels, .. } =
+        grafana_outcome(Fetched::Ok(catalog))
+    else {
+        panic!("the catalog must retain its panel targets");
+    };
+    let reasons: Vec<_> = panels
+        .iter()
+        .map(|panel| panel.unsupported.as_deref())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            None,
+            Some(
+                "Grafana LogQL panel targets are unsupported; use a raw LogQL query or open in Grafana"
+            ),
+            Some("Grafana TraceQL panel targets are unsupported; open in Grafana"),
+            Some("Grafana panel datasource query dialect is unknown"),
+            Some("specific target failure"),
+        ]
+    );
+}
+
+#[test]
+fn grafana_panel_rows_keep_source_and_only_link_verified_panels() {
+    use k10s_data::integrations::grafana::{
+        Dashboard, DashboardSource, Panel, PanelKind, PanelQuery, QueryDialect,
+    };
+    use k10s_provider::GrafanaRowSource;
+
+    let dashboard = |source, uid: &str, id, expr: &str| Dashboard {
+        source,
+        uid: uid.into(),
+        title: "Pilot".into(),
+        panels: vec![Panel {
+            id,
+            title: "CPU".into(),
+            kind: PanelKind::Timeseries,
+            queries: vec![PanelQuery {
+                ref_id: "A".into(),
+                expr: expr.into(),
+                dialect: QueryDialect::PromQL,
+                datasource: None,
+                min_step: String::new(),
+                unsupported: None,
+            }],
+            transformed: false,
+            unit: String::new(),
+            reducer: String::new(),
+            min_interval: String::new(),
+            unsupported: None,
+        }],
+        truncated: false,
+    };
+    let catalog = k10s_data::read::GrafanaCatalog {
+        dashboards: vec![
+            dashboard(DashboardSource::ConfigMap, "same", Some(9), "file_query"),
+            dashboard(DashboardSource::Grafana, "same", Some(5), "live_query"),
+            dashboard(DashboardSource::ConfigMap, "", Some(7), "uidless_query"),
+            dashboard(DashboardSource::Unknown, "other", Some(3), "unknown_query"),
+        ],
+        extra_hits: Vec::new(),
+        truncated: false,
+        browser_base: Some("http://grafana.test/prefix".into()),
+        browser_service: Some(("monitoring".into(), "grafana".into(), 3000)),
+        query_source: Some(test_grafana_service(3000)),
+        served: true,
+        errors: Vec::new(),
+    };
+    let mut browser_only = catalog.clone();
+    let configured = "https://grafana.test/custom?orgId=1#panel";
+    browser_only.browser_base = Some(configured.into());
+    browser_only.browser_service = None;
+    let k10s_provider::GrafanaOutcome::Catalog { panels, .. } =
+        grafana_outcome(Fetched::Ok(catalog))
+    else {
+        panic!("the source rows must remain available");
+    };
+    assert_eq!(panels.len(), 4);
+    assert_eq!(panels[0].source, GrafanaRowSource::Grafana);
+    assert_eq!(panels[0].expr, "live_query");
+    assert_eq!(
+        panels[0].browser_url.as_deref(),
+        Some("http://grafana.test/prefix/d/same?viewPanel=5")
+    );
+    assert_eq!(panels[1].source, GrafanaRowSource::ConfigMap);
+    assert_eq!(panels[1].expr, "file_query");
+    assert_eq!(
+        panels[1].browser_url.as_deref(),
+        Some("http://grafana.test/prefix/d/same")
+    );
+    assert_eq!(panels[2].source, GrafanaRowSource::ConfigMap);
+    assert_eq!(panels[2].dashboard_uid, "");
+    assert_eq!(
+        panels[2].browser_url.as_deref(),
+        Some("http://grafana.test/prefix")
+    );
+    assert_eq!(
+        panels[2]
+            .browser_forward
+            .as_ref()
+            .and_then(|r| r.service_port),
+        Some(3000)
+    );
+    assert_eq!(panels[3].source, GrafanaRowSource::Unknown);
+    assert_eq!(
+        panels[3].browser_url.as_deref(),
+        Some("http://grafana.test/prefix/d/other")
+    );
+
+    let k10s_provider::GrafanaOutcome::Catalog { panels, .. } =
+        grafana_outcome(Fetched::Ok(browser_only))
+    else {
+        panic!("the configured browser destination must remain available");
+    };
+    assert!(
+        panels
+            .iter()
+            .all(|panel| panel.browser_url.as_deref() == Some(configured))
+    );
+    assert!(panels.iter().all(|panel| panel.browser_forward.is_none()));
+}
+
+#[test]
+fn grafana_unimplemented_time_and_field_semantics_keep_browser_routes() {
+    use k10s_data::integrations::grafana::{DashboardSource, parse_dashboard};
+    use serde_json::json;
+
+    for (mut panel, reason) in [
+        (
+            json!({"type":"timeseries","timeFrom":"5m"}),
+            "unsupported Grafana panel relative time override",
+        ),
+        (
+            json!({"type":"timeseries","timeShift":"1d"}),
+            "unsupported Grafana panel time shift",
+        ),
+        (
+            json!({
+                "type":"stat",
+                "options":{"reduceOptions":{"fields":"/^requests$/","calcs":["lastNotNull"]}}
+            }),
+            "unsupported Grafana stat field selection",
+        ),
+    ] {
+        panel["id"] = json!(7);
+        panel["title"] = json!("Requests");
+        panel["datasource"] = json!({"type":"prometheus","uid":"prom"});
+        panel["targets"] = json!([{"refId":"A","expr":"up"}]);
+        let document = json!({"uid":"requests","title":"Service","panels":[panel]});
+        let dashboard = parse_dashboard(&serde_json::to_vec(&document).unwrap()).unwrap();
+        for (source, browser_url) in [
+            (
+                DashboardSource::Grafana,
+                "http://grafana.test/d/requests?viewPanel=7",
+            ),
+            (DashboardSource::ConfigMap, "http://grafana.test/d/requests"),
+        ] {
+            let mut dashboard = dashboard.clone();
+            dashboard.source = source;
+            let catalog = k10s_data::read::GrafanaCatalog {
+                dashboards: vec![dashboard],
+                extra_hits: Vec::new(),
+                truncated: false,
+                browser_base: Some("http://grafana.test".into()),
+                browser_service: Some(("monitoring".into(), "grafana".into(), 3000)),
+                query_source: Some(test_grafana_service(3000)),
+                served: true,
+                errors: Vec::new(),
+            };
+            let k10s_provider::GrafanaOutcome::Catalog { panels, .. } =
+                grafana_outcome(Fetched::Ok(catalog))
+            else {
+                panic!("unsupported semantics must keep the dashboard available");
+            };
+            assert_eq!(panels.len(), 1);
+            assert_eq!(panels[0].unsupported.as_deref(), Some(reason));
+            assert_eq!(panels[0].expr, "up");
+            assert_eq!(panels[0].datasource_uid.as_deref(), Some("prom"));
+            assert_eq!(panels[0].browser_url.as_deref(), Some(browser_url));
+            assert_eq!(
+                panels[0].browser_forward,
+                Some(k10s_provider::ForwardRequest {
+                    namespace: "monitoring".into(),
+                    name: "grafana".into(),
+                    service: true,
+                    service_port: Some(3000),
+                    expected_service: Some(test_grafana_service(3000)),
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn grafana_catalog_reports_source_and_dashboard_truncation() {
+    use k10s_data::integrations::grafana::Dashboard;
+
+    for (source_truncated, dashboard_truncated) in [(false, false), (true, false), (false, true)] {
+        let catalog = k10s_data::read::GrafanaCatalog {
+            dashboards: vec![Dashboard {
+                source: k10s_data::integrations::grafana::DashboardSource::Grafana,
+                uid: "pilot".into(),
+                title: "Pilot".into(),
+                panels: Vec::new(),
+                truncated: dashboard_truncated,
+            }],
+            extra_hits: Vec::new(),
+            truncated: source_truncated,
+            browser_base: None,
+            browser_service: None,
+            query_source: None,
+            served: true,
+            errors: Vec::new(),
+        };
+        let k10s_provider::GrafanaOutcome::Catalog { truncated, .. } =
+            grafana_outcome(Fetched::Ok(catalog))
+        else {
+            panic!("the catalog must retain the dashboard result");
+        };
+        assert_eq!(truncated, source_truncated || dashboard_truncated);
     }
 }
 
@@ -857,6 +1631,7 @@ fn grafana_catalog_failures_survive_projection_instead_of_appearing_absent() {
             truncated: false,
             browser_base: None,
             browser_service: None,
+            query_source: None,
             served,
             errors: errors.clone(),
         };
@@ -870,6 +1645,27 @@ fn grafana_catalog_failures_survive_projection_instead_of_appearing_absent() {
             other => panic!("a named catalog source failed: {other:?}"),
         }
     }
+}
+
+#[test]
+fn grafana_multiple_denial_labels_survive_projection() {
+    let what = "provisioned dashboard configmaps and Grafana search";
+    assert_eq!(
+        grafana_outcome(Fetched::Denied { what }),
+        k10s_provider::GrafanaOutcome::Denied(what)
+    );
+}
+
+#[test]
+fn grafana_multiple_source_failures_survive_projection() {
+    let why = "provisioned dashboards: store unavailable; Grafana search: access denied";
+    assert_eq!(
+        grafana_outcome(Fetched::Failed {
+            what: "grafana",
+            why: why.to_string(),
+        }),
+        k10s_provider::GrafanaOutcome::Failed(why.to_string())
+    );
 }
 
 #[test]
@@ -1338,4 +2134,74 @@ fn parsed_only_log_fields_do_not_create_correlation_identity() {
             assert_eq!(entries[0].attribute(key), None);
         }
     }
+}
+
+#[test]
+fn grafana_rows_share_the_verified_source_and_never_create_an_unpinned_browser_request() {
+    use k10s_data::integrations::grafana::{
+        CatalogHit, CatalogHitReason, DashboardSource, SearchHit,
+    };
+    use k10s_provider::{GrafanaOutcome, GrafanaRowSource};
+    use std::sync::Arc;
+
+    let source = test_grafana_service(3000);
+    let mut catalog = k10s_data::read::GrafanaCatalog {
+        dashboards: vec![dashboard_with_query_rows(
+            DashboardSource::ConfigMap,
+            2,
+            false,
+        )],
+        extra_hits: vec![CatalogHit {
+            search: SearchHit {
+                uid: "search-only".into(),
+                title: "Search only".into(),
+                folder_title: String::new(),
+                kind: "dash-db".into(),
+            },
+            reason: CatalogHitReason::FetchLimit,
+        }],
+        truncated: false,
+        browser_base: Some("http://grafana.test".into()),
+        browser_service: Some((source.namespace.clone(), source.name.clone(), source.port)),
+        query_source: Some(source.clone()),
+        served: true,
+        errors: Vec::new(),
+    };
+    let GrafanaOutcome::Catalog { panels, .. } = grafana_outcome(Fetched::Ok(catalog.clone()))
+    else {
+        panic!("the source catalogue must project");
+    };
+    assert_eq!(panels.len(), 3);
+    assert_eq!(panels[0].source, GrafanaRowSource::ConfigMap);
+    assert_eq!(panels[1].source, GrafanaRowSource::ConfigMap);
+    assert_eq!(panels[2].source, GrafanaRowSource::Grafana);
+    for panel in &panels {
+        assert!(Arc::ptr_eq(panel.query_source.as_ref().unwrap(), &source));
+        let request = panel
+            .browser_forward
+            .as_ref()
+            .expect("the verified browser source");
+        assert!(Arc::ptr_eq(
+            request.expected_service.as_ref().unwrap(),
+            &source
+        ));
+    }
+    catalog.query_source = None;
+    let GrafanaOutcome::Catalog { panels, .. } = grafana_outcome(Fetched::Ok(catalog.clone()))
+    else {
+        panic!("unverified definitions stay readable");
+    };
+    assert_eq!(panels.len(), 3);
+    assert!(
+        panels
+            .iter()
+            .all(|panel| panel.query_source.is_none() && panel.browser_forward.is_none())
+    );
+    assert!(panels.iter().all(|panel| panel.browser_url.is_some()));
+    catalog.query_source = Some(source);
+    catalog.browser_service.as_mut().unwrap().1 = "another-grafana".into();
+    let GrafanaOutcome::Catalog { panels, .. } = grafana_outcome(Fetched::Ok(catalog)) else {
+        panic!("mismatched browser routing keeps the catalogue readable");
+    };
+    assert!(panels.iter().all(|panel| panel.browser_forward.is_none()));
 }

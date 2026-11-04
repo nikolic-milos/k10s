@@ -32,9 +32,9 @@ mod telemetry;
 mod trace_logs;
 pub use observe::{
     AlertMatcher, AlertPodOutcome, AlertmanagerEndpoint, AlertmanagerOutcome, GrafanaOutcome,
-    GrafanaPanelKind, GrafanaPanelRow, LogEntry, LokiOutcome, ObserveReach, PromOutcome,
-    PromSeriesView, QueryDialect, SilenceOutcome, SilenceRequest, SpanView, ToolPresence,
-    TraceOutcome, grafana_panel_path,
+    GrafanaPanelKind, GrafanaPanelRow, GrafanaRowIdentity, GrafanaRowSource, LogEntry, LokiOutcome,
+    ObserveReach, PromOutcome, PromSeriesView, QueryDialect, SilenceOutcome, SilenceRequest,
+    SpanView, ToolPresence, TraceOutcome, grafana_dashboard_path, grafana_panel_path,
 };
 pub use telemetry::{
     FetchTiming, LokiRequest, ObserveScope, PodIdentity, PromRequest, QueryWindow, RequestStop,
@@ -61,7 +61,10 @@ pub use usage::{
 };
 
 mod forward;
-pub use forward::{ForwardOutcome, ForwardRequest, ForwardRow, ForwardState};
+pub use forward::{
+    ForwardLease, ForwardOutcome, ForwardRequest, ForwardRow, ForwardStartOutcome, ForwardState,
+    ForwardTerminal,
+};
 
 mod exec;
 pub use exec::{ExecEvent, ExecRequest, ExecSession, NullExecSession};
@@ -151,6 +154,19 @@ cluster_provider! {
         on_update: Box<dyn Fn(UsageOutcome) + Send + Sync>,
     ) -> LogStop;
     fn open_forward(&self, request: &ForwardRequest, reply: Reply<ForwardOutcome>);
+    /// Start or reuse an exact forward. Dropping the guard cancels unfinished
+    /// resolution. Each reply holds a pending claim; discarding the last claim
+    /// closes a forward unless a handoff or managed open retained it.
+    fn open_forward_cancellable(&self, request: &ForwardRequest, reply: Reply<ForwardStartOutcome>) -> RequestStop;
+    /// Wait for a local listener, not for a remote response. Dropping the guard
+    /// cancels the wait without closing the managed forward.
+    fn wait_forward_ready(&self, id: u64, reply: Reply<ForwardOutcome>) -> RequestStop;
+    /// Observe a terminal state without polling an active listener.
+    fn wait_forward_terminal(&self, id: u64, reply: Reply<ForwardTerminal>) -> RequestStop;
+    /// A point-in-time local listener state, without a cluster request.
+    fn forward_active(&self, id: u64) -> bool;
+    /// The last verified Grafana source, without waiting, allocation or I/O.
+    fn grafana_source_is_current(&self, source: &k10s_core::ServiceIdentity) -> bool;
     /// Local registry state: synchronous, no cluster round trip.
     fn list_forwards(&self) -> Vec<ForwardRow>;
     fn close_forward(&self, id: u64) -> bool;
@@ -159,9 +175,9 @@ cluster_provider! {
         request: &ExecRequest,
         on_event: Box<dyn Fn(ExecEvent) + Send + Sync>,
     ) -> Box<dyn ExecSession>;
-    /// Overlay stamps assembled off the paint path. Empty Ready is a missing
-    /// adapter, not a hole in the cluster.
-    fn fetch_overlay(&self, kind: OverlayKind, reply: Reply<OverlayOutcome>);
+    /// Overlay stamps assembled off the paint path. Dropping the guard cancels
+    /// an unwanted read. Empty Ready is a missing adapter, not a hole in the cluster.
+    fn fetch_overlay(&self, kind: OverlayKind, reply: Reply<OverlayOutcome>) -> RequestStop;
     /// Isolation and named ports. Not an allow or deny: that needs a source,
     /// protocol, and destination port.
     fn fetch_pod_posture(&self, namespace: &str, name: &str, reply: Reply<PostureOutcome>);
@@ -322,6 +338,33 @@ impl ClusterProvider for NullProvider {
         reply(ForwardOutcome::Failed(NO_CLUSTER.to_string()));
     }
 
+    fn open_forward_cancellable(
+        &self,
+        _: &ForwardRequest,
+        reply: Reply<ForwardStartOutcome>,
+    ) -> RequestStop {
+        reply(ForwardStartOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
+    }
+
+    fn wait_forward_ready(&self, _: u64, reply: Reply<ForwardOutcome>) -> RequestStop {
+        reply(ForwardOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
+    }
+
+    fn wait_forward_terminal(&self, _: u64, reply: Reply<ForwardTerminal>) -> RequestStop {
+        reply(ForwardTerminal::Closed);
+        RequestStop::noop()
+    }
+
+    fn forward_active(&self, _: u64) -> bool {
+        false
+    }
+
+    fn grafana_source_is_current(&self, _: &k10s_core::ServiceIdentity) -> bool {
+        false
+    }
+
     fn list_forwards(&self) -> Vec<ForwardRow> {
         Vec::new()
     }
@@ -339,8 +382,9 @@ impl ClusterProvider for NullProvider {
         Box::new(NullExecSession)
     }
 
-    fn fetch_overlay(&self, _: OverlayKind, reply: Reply<OverlayOutcome>) {
+    fn fetch_overlay(&self, _: OverlayKind, reply: Reply<OverlayOutcome>) -> RequestStop {
         reply(OverlayOutcome::Failed(NO_CLUSTER.to_string()));
+        RequestStop::noop()
     }
 
     fn fetch_pod_posture(&self, _: &str, _: &str, reply: Reply<PostureOutcome>) {

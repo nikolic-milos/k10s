@@ -43,9 +43,20 @@ pub fn keybindings() -> Vec<KeyBinding> {
     let typing = Some("Typing");
     let editor = Some("Editor");
     let diff = Some("Diff");
+    let details = Some("NoticeDetails");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-p", OpenPalette, workspace),
         KeyBinding::new("ctrl-alt-p", OpenSurfaces, workspace),
+        KeyBinding::new("ctrl-alt-s", OpenStatusDetails, workspace),
+        KeyBinding::new("ctrl-alt-s", NoAction, typing),
+        KeyBinding::new("ctrl-alt-s", NoAction, editor),
+        KeyBinding::new("ctrl-alt-s", NoAction, Some("Terminal")),
+        KeyBinding::new("ctrl-alt-s", NoAction, Some("Palette")),
+        KeyBinding::new("ctrl-alt-i", OpenInspectorChartDetails, workspace),
+        KeyBinding::new("ctrl-alt-i", NoAction, typing),
+        KeyBinding::new("ctrl-alt-i", NoAction, editor),
+        KeyBinding::new("ctrl-alt-i", NoAction, Some("Terminal")),
+        KeyBinding::new("ctrl-alt-i", NoAction, Some("Palette")),
         KeyBinding::new("i", ToggleInspector, workspace),
         KeyBinding::new("escape", ClearSelection, workspace),
         KeyBinding::new("b", OpenBrowser, workspace),
@@ -121,8 +132,30 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("o", ObserveOtlpLogs, observe),
         KeyBinding::new("shift-o", ObservePodLabelLogs, observe),
         KeyBinding::new("g", ObserveOpenGrafana, observe),
-        KeyBinding::new("tab", ObserveFocusLogs, observe),
-        KeyBinding::new("shift-tab", ObserveFocusPanels, observe),
+        KeyBinding::new("tab", ObserveFocusNext, observe),
+        KeyBinding::new("shift-tab", ObserveFocusPrevious, observe),
+        KeyBinding::new("ctrl-alt-g", ObserveCatalogDetails, observe),
+        KeyBinding::new("ctrl-alt-q", OpenQueryDetails, observe),
+        KeyBinding::new("ctrl-alt-k", ObserveScopeDetails, observe),
+        KeyBinding::new("ctrl-alt-d", ObserveSourceDetails, observe),
+        KeyBinding::new("tab", ObserveFocusNext, Some("ObserveInput")),
+        KeyBinding::new("shift-tab", ObserveFocusPrevious, Some("ObserveInput")),
+        KeyBinding::new("tab", ObserveFocusNext, Some("ObserveNoticeControl")),
+        KeyBinding::new(
+            "shift-tab",
+            ObserveFocusPrevious,
+            Some("ObserveNoticeControl"),
+        ),
+        KeyBinding::new("escape", CancelInput, Some("ObserveNoticeControl")),
+        KeyBinding::new("left", RowUp, details),
+        KeyBinding::new("right", RowDown, details),
+        KeyBinding::new("up", DocScrollUp, details),
+        KeyBinding::new("down", DocScrollDown, details),
+        KeyBinding::new("pageup", DocPageUp, details),
+        KeyBinding::new("pagedown", DocPageDown, details),
+        KeyBinding::new("escape", CancelInput, details),
+        KeyBinding::new("tab", NoticeFocusNext, details),
+        KeyBinding::new("shift-tab", NoticeFocusPrevious, details),
         KeyBinding::new("up", DocScrollUp, doc),
         KeyBinding::new("down", DocScrollDown, doc),
         KeyBinding::new("pageup", DocPageUp, doc),
@@ -235,6 +268,7 @@ pub fn keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", CancelInput, Some("Palette")),
         KeyBinding::new("backspace", DeleteInputChar, Some("Palette")),
         KeyBinding::new("ctrl-up", PickParent, Some("Palette")),
+        KeyBinding::new("enter", NoAction, Some("ObserveNoticeControl")),
     ];
     bindings.extend(k10s_map::keybindings());
     let suppressors = input_suppressors(bindings.iter());
@@ -242,12 +276,10 @@ pub fn keybindings() -> Vec<KeyBinding> {
     bindings
 }
 
-/// The contexts in which a keystroke means the character it prints rather than
-/// the command someone bound to it.
+/// Contexts that capture plain workspace keys for text input.
 const INPUT_CONTEXTS: [&str; 4] = ["Typing", "Palette", "Terminal", "Editor"];
 
-/// Produce the deeper-context guards that keep an ancestor workspace command
-/// from stealing keystrokes that type text (plain and shifted alike). This is
+/// Produce deeper-context guards for plain and shifted workspace keys. This is
 /// derived rather than listed by hand so newly added default and user
 /// bindings are safe automatically. Explicit bindings in an input context win
 /// and are never replaced.
@@ -462,10 +494,36 @@ mod tests {
     fn observe_commands_are_scoped_to_the_observe_surface() {
         let bindings = keybindings();
         let observe: Vec<_> = scoped_to(&bindings, "Observe").collect();
-        assert_eq!(observe.len(), 10);
+        assert_eq!(observe.len(), 14);
+        let input: Vec<_> = scoped_to(&bindings, "ObserveInput").collect();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0].action().name(), "k10s_shell::ObserveFocusNext");
+        assert_eq!(input[1].action().name(), "k10s_shell::ObserveFocusPrevious");
+        for action in [
+            "k10s_shell::ObserveCatalogDetails",
+            "k10s_shell::OpenQueryDetails",
+            "k10s_shell::ObserveScopeDetails",
+            "k10s_shell::ObserveSourceDetails",
+        ] {
+            assert!(
+                observe
+                    .iter()
+                    .any(|binding| binding.action().name() == action)
+            );
+        }
         for binding in &bindings {
             if binding.action().name().starts_with("k10s_shell::Observe") {
-                assert_eq!(context_of(binding).as_deref(), Some("Observe"));
+                let context = context_of(binding);
+                assert!(
+                    context.as_deref() == Some("Observe")
+                        || (matches!(
+                            context.as_deref(),
+                            Some("ObserveInput" | "ObserveNoticeControl")
+                        ) && matches!(
+                            binding.action().name(),
+                            "k10s_shell::ObserveFocusNext" | "k10s_shell::ObserveFocusPrevious"
+                        ))
+                );
             }
         }
         assert!(KEY_CONTEXTS.contains(&"Observe"));

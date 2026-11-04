@@ -175,6 +175,8 @@ struct LabelCounts {
     lines: usize,
     glyphs: usize,
     fit_refused: usize,
+    #[cfg(feature = "testing")]
+    paint_errors: usize,
 }
 
 impl LabelCounts {
@@ -641,6 +643,10 @@ pub(super) fn paint_prepared_map(
         if painted.is_ok() {
             label_counts.count(&line.text);
         }
+        #[cfg(feature = "testing")]
+        if painted.is_err() {
+            label_counts.paint_errors += 1;
+        }
     }
     let cache_delta = text_cache.borrow().stats().since(cache_before);
     let text_end = std::time::Instant::now();
@@ -663,6 +669,10 @@ pub(super) fn paint_prepared_map(
         };
         st.labels_dropped = counts.labels_dropped;
         st.labels_fit_refused = label_counts.fit_refused;
+        #[cfg(feature = "testing")]
+        {
+            st.label_paint_errors = label_counts.paint_errors;
+        }
         st.icons_dropped = counts.icons_dropped;
         st.text_cache.hits = cache_delta.hits;
         st.text_cache.misses = cache_delta.misses;

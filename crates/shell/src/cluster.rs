@@ -44,7 +44,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.scene_chosen = true;
-        self.status_note = Some("connecting to the cluster".to_string());
+        self.status_notes
+            .set_general(Some("connecting to the cluster".to_string()));
         cx.notify();
         cx.spawn(async move |this, cx| {
             let outcome = reply.await;
@@ -53,7 +54,7 @@ impl Workspace {
                 Ok(ConnectOutcome::Failed(why)) => {
                     on_failure();
                     eprintln!("k10s: {why}");
-                    this.status_note = Some(why);
+                    this.status_notes.set_general(Some(why));
                     cx.notify();
                     cx.quit();
                 }
@@ -61,7 +62,7 @@ impl Workspace {
                     on_failure();
                     let why = "the connection attempt was dropped".to_string();
                     eprintln!("k10s: {why}");
-                    this.status_note = Some(why);
+                    this.status_notes.set_general(Some(why));
                     cx.notify();
                     cx.quit();
                 }
@@ -81,7 +82,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.scene_chosen = true;
-        self.status_note = Some("building the starmap".to_string());
+        self.status_notes
+            .set_general(Some("building the starmap".to_string()));
         cx.notify();
         cx.spawn(async move |this, cx| {
             let outcome = reply.await;
@@ -89,12 +91,13 @@ impl Workspace {
                 Ok(DemoOutcome::Started(summary)) => this.land_generated(summary, cx),
                 Ok(DemoOutcome::Failed(why)) => {
                     this.scene_chosen = false;
-                    this.status_note = Some(why);
+                    this.status_notes.set_general(Some(why));
                     cx.notify();
                 }
                 Err(_) => {
                     this.scene_chosen = false;
-                    this.status_note = Some("the generator was dropped".to_string());
+                    this.status_notes
+                        .set_general(Some("the generator was dropped".to_string()));
                     cx.notify();
                 }
             });
@@ -113,6 +116,7 @@ impl Workspace {
         if self.bench || self.launch.is_open() {
             return;
         }
+        self.close_notice(window, cx);
         self.close_palette(window, cx);
         self.close_picker(window, cx);
         self.close_finder(window, cx);
@@ -154,8 +158,9 @@ impl Workspace {
         let nothing_chosen = !self.scene_chosen;
         self.close_launch(window, cx);
         if nothing_chosen {
-            self.status_note =
-                Some("nothing chosen; ctrl-k ctrl-c picks a cluster or the starmap".to_string());
+            self.status_notes.set_general(Some(
+                "nothing chosen; ctrl-k ctrl-c picks a cluster or the starmap".to_string(),
+            ));
             cx.notify();
         }
     }
@@ -303,13 +308,14 @@ impl Workspace {
 
     /// What both doors do once the connection state behind them is settled.
     fn land_scene(&mut self, note: String, cx: &mut Context<Self>) {
+        self.status_notes.set_overlay(None);
         self.observability_navigation = Default::default();
         self.refresh_surface_picker(cx);
         if let Some(tab) = self.center.active() {
             self.rebase_modal_focus(&tab.view.focus_handle(cx), cx);
         }
         self.chose_scene(cx);
-        self.status_note = Some(note);
+        self.status_notes.set_general(Some(note));
         self.refresh_detail(cx);
         self.refresh_overlay(cx);
         cx.notify();

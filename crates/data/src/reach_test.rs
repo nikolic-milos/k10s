@@ -60,6 +60,107 @@ fn grafana_matches_on_name_and_on_the_app_label() {
 }
 
 #[test]
+fn discovery_selects_only_declared_tcp_ports() {
+    let mut svc = service(
+        "grafana",
+        "monitoring",
+        &[],
+        &[(3000, "udp"), (3000, "web"), (8080, "admin")],
+    );
+    let ports = svc.spec.as_mut().unwrap().ports.as_mut().unwrap();
+    ports[0].protocol = Some("UDP".into());
+    ports[1].protocol = Some("TCP".into());
+    let hit = match_service(ToolKind::Grafana, &svc).expect("TCP port");
+    assert_eq!(hit.port, 3000);
+    assert_eq!(hit.port_name.as_deref(), Some("web"));
+
+    let ports = svc.spec.as_mut().unwrap().ports.as_mut().unwrap();
+    ports[1].protocol = Some("SCTP".into());
+    let hit = match_service(ToolKind::Grafana, &svc).expect("default TCP port");
+    assert_eq!(hit.port, 8080);
+    assert_eq!(hit.port_name.as_deref(), Some("admin"));
+
+    let ports = svc.spec.as_mut().unwrap().ports.as_mut().unwrap();
+    ports[2].protocol = Some("UDP".into());
+    assert_eq!(match_service(ToolKind::Grafana, &svc), None);
+    svc.spec.as_mut().unwrap().ports = Some(Vec::new());
+    assert_eq!(match_service(ToolKind::Grafana, &svc), None);
+}
+
+#[test]
+fn discovery_does_not_wrap_invalid_service_port_numbers() {
+    let svc = service(
+        "grafana",
+        "monitoring",
+        &[],
+        &[(0, "zero"), (-1, "negative"), (65_536, "large")],
+    );
+    assert_eq!(match_service(ToolKind::Grafana, &svc), None);
+}
+
+#[test]
+fn discovery_retains_matching_services_without_a_usable_tcp_port() {
+    let mut udp = service("udp-grafana", "monitoring", &[], &[(3000, "web")]);
+    udp.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].protocol = Some("UDP".into());
+    let absent = service("empty-grafana", "monitoring", &[], &[]);
+    let found = service_candidates(ToolKind::Grafana, &[udp, absent]);
+
+    assert_eq!(found.len(), 2);
+    assert_eq!(
+        found,
+        vec![
+            ServiceCandidate::Unusable(UnusableService {
+                kind: ToolKind::Grafana,
+                namespace: "monitoring".into(),
+                name: "empty-grafana".into(),
+            }),
+            ServiceCandidate::Unusable(UnusableService {
+                kind: ToolKind::Grafana,
+                namespace: "monitoring".into(),
+                name: "udp-grafana".into(),
+            }),
+        ]
+    );
+}
+
+#[test]
+fn discovery_counts_usable_and_unusable_routed_identities() {
+    let usable = service("a-grafana", "monitoring", &[], &[(3000, "web")]);
+    let mut udp = service("b-grafana", "monitoring", &[], &[(3000, "web")]);
+    udp.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].protocol = Some("UDP".into());
+    let found = service_candidates(ToolKind::Grafana, &[usable, udp]);
+
+    assert_eq!(found.len(), 2);
+    assert!(matches!(&found[0], ServiceCandidate::Usable(service) if service.name == "a-grafana"));
+    assert!(
+        matches!(&found[1], ServiceCandidate::Unusable(service) if service.name == "b-grafana")
+    );
+}
+
+#[test]
+fn discovery_prefers_routed_identity_before_judging_port_usability() {
+    let routed = service("routed-grafana", "monitoring", &[], &[]);
+    let mut headless = service("headless-grafana", "monitoring", &[], &[(3000, "web")]);
+    headless.spec.as_mut().unwrap().cluster_ip = Some("None".into());
+    let found = service_candidates(ToolKind::Grafana, &[headless, routed]);
+
+    assert!(matches!(
+        found.as_slice(),
+        [ServiceCandidate::Unusable(service)] if service.name == "routed-grafana"
+    ));
+
+    let routed = service("routed-grafana", "monitoring", &[], &[(3000, "web")]);
+    let mut headless = service("headless-grafana", "monitoring", &[], &[]);
+    headless.spec.as_mut().unwrap().cluster_ip = Some("None".into());
+    let found = service_candidates(ToolKind::Grafana, &[headless, routed]);
+
+    assert!(matches!(
+        found.as_slice(),
+        [ServiceCandidate::Usable(service)] if service.name == "routed-grafana"
+    ));
+}
+
+#[test]
 fn a_frontend_named_api_is_not_grafana() {
     let svc = service("api", "prod", &[("app", "checkout")], &[(80, "http")]);
     assert_eq!(match_service(ToolKind::Grafana, &svc), None);
@@ -313,36 +414,14 @@ fn a_named_token_never_chooses_the_service_proxy() {
 }
 
 #[test]
-fn join_and_split_http_cover_the_localhost_client() {
+fn join_http_url_keeps_the_tool_prefix_and_encoded_query() {
     assert_eq!(
-        join_url("http://127.0.0.1:9090", "api/v1/query"),
-        "http://127.0.0.1:9090/api/v1/query"
+        join_url(
+            "http://127.0.0.1:9090/base/",
+            "/api/v1/query?query=up%7B%7D"
+        ),
+        "http://127.0.0.1:9090/base/api/v1/query?query=up%7B%7D"
     );
-    let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"success\"}";
-    match split_http_body(raw) {
-        Fetched::Ok(body) => assert_eq!(body, br#"{"status":"success"}"#),
-        other => panic!("{other:?}"),
-    }
-    let denied = b"HTTP/1.1 401 Unauthorized\r\n\r\nno";
-    assert!(matches!(
-        split_http_body(denied),
-        Fetched::Denied { what: "url" }
-    ));
-}
-
-#[test]
-fn completed_http_url_statuses_preserve_the_public_transport_outcome() {
-    for (code, reason) in [(404, "Not Found"), (500, "Internal Server Error")] {
-        let raw = format!("HTTP/1.1 {code} {reason}\r\n\r\nserver sentence");
-        let (status, outcome) = split_http_body_with_status(raw.as_bytes());
-        assert_eq!(status.map(|status| status.as_u16()), Some(code));
-        assert_eq!(outcome, split_http_body(raw.as_bytes()));
-    }
-    let mut raw = b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec();
-    raw.resize(raw.len() + MAX_BODY_BYTES + 1, b'x');
-    let (status, outcome) = split_http_body_with_status(&raw);
-    assert_eq!(status, None, "an oversize body does not authorize fallback");
-    assert_eq!(outcome, split_http_body(&raw));
 }
 
 #[tokio::test]
@@ -371,6 +450,7 @@ async fn a_settings_url_dripping_bytes_is_cut_off_at_one_total_deadline() {
     let started = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
     let fetched = plaintext_http_get_until(
+        "url",
         &format!("http://{addr}"),
         "",
         &ToolAuth::Anonymous,
@@ -392,3 +472,6 @@ async fn a_settings_url_dripping_bytes_is_cut_off_at_one_total_deadline() {
     );
     server.join().unwrap();
 }
+
+#[path = "transport_loopback_test.rs"]
+mod http_loopback;

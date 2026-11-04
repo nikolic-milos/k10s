@@ -33,7 +33,8 @@ use inventory::{argo_outcome, flux_outcome, harbor_outcome, mesh_outcome, policy
 mod streams;
 
 use streams::{
-    ExecSessionAdapter, adapt_chunk, adapt_forward, exec_event, forward_outcome, usage_outcome,
+    ExecSessionAdapter, adapt_chunk, adapt_forward, exec_event, forward_outcome,
+    forward_start_outcome, usage_outcome,
 };
 
 mod overlay;
@@ -299,9 +300,69 @@ impl k10s_provider::ClusterProvider for PlaneProvider {
             namespace: request.namespace.clone(),
             name: request.name.clone(),
             service: request.service,
+            service_port: request.service_port,
+            expected_service: request.expected_service.clone(),
         };
         self.reader
             .open_forward(request, move |fetched| reply(forward_outcome(fetched)));
+    }
+
+    fn open_forward_cancellable(
+        &self,
+        request: &k10s_provider::ForwardRequest,
+        reply: k10s_provider::Reply<k10s_provider::ForwardStartOutcome>,
+    ) -> k10s_provider::RequestStop {
+        let request = k10s_data::forward::ForwardRequest {
+            namespace: request.namespace.clone(),
+            name: request.name.clone(),
+            service: request.service,
+            service_port: request.service_port,
+            expected_service: request.expected_service.clone(),
+        };
+        let stop = self
+            .reader
+            .open_forward_cancellable(request, move |fetched| {
+                reply(forward_start_outcome(fetched));
+            });
+        k10s_provider::RequestStop::new(move || drop(stop))
+    }
+
+    fn wait_forward_ready(
+        &self,
+        id: u64,
+        reply: k10s_provider::Reply<k10s_provider::ForwardOutcome>,
+    ) -> k10s_provider::RequestStop {
+        let wait = self
+            .reader
+            .wait_forward_ready(id, move |fetched| reply(forward_outcome(fetched)));
+        k10s_provider::RequestStop::new(move || wait.abort())
+    }
+
+    fn wait_forward_terminal(
+        &self,
+        id: u64,
+        reply: k10s_provider::Reply<k10s_provider::ForwardTerminal>,
+    ) -> k10s_provider::RequestStop {
+        let wait = self.reader.wait_forward_terminal(id, move |outcome| {
+            let outcome = match outcome {
+                k10s_data::forward::ForwardTerminal::Dead(why) => {
+                    k10s_provider::ForwardTerminal::Dead(why)
+                }
+                k10s_data::forward::ForwardTerminal::Closed => {
+                    k10s_provider::ForwardTerminal::Closed
+                }
+            };
+            reply(outcome);
+        });
+        k10s_provider::RequestStop::new(move || wait.abort())
+    }
+
+    fn forward_active(&self, id: u64) -> bool {
+        self.reader.forwards().is_active(id)
+    }
+
+    fn grafana_source_is_current(&self, source: &k10s_core::ServiceIdentity) -> bool {
+        self.reader.grafana_source_is_current(source)
     }
 
     fn list_forwards(&self) -> Vec<k10s_provider::ForwardRow> {
@@ -338,12 +399,13 @@ impl k10s_provider::ClusterProvider for PlaneProvider {
         &self,
         kind: k10s_map::OverlayKind,
         reply: k10s_provider::Reply<k10s_provider::OverlayOutcome>,
-    ) {
-        self.reader.fetch_overlay(
+    ) -> k10s_provider::RequestStop {
+        let stop = self.reader.fetch_overlay(
             kind,
             k10s_data::reach::ReachSettings::default(),
             move |fetched| reply(overlay_outcome(fetched)),
         );
+        k10s_provider::RequestStop::new(move || drop(stop))
     }
 
     fn fetch_pod_posture(
@@ -464,11 +526,11 @@ impl k10s_provider::ClusterProvider for PlaneProvider {
             min_step: panel.min_step,
             unsupported: None,
         };
-        let stop = self
-            .reader
-            .observe_panel(target, variables, move |fetched| {
-                reply(prom_outcome(fetched))
-            });
+        let stop =
+            self.reader
+                .observe_panel(panel.query_source, target, variables, move |fetched| {
+                    reply(prom_outcome(fetched))
+                });
         k10s_provider::RequestStop::new(move || drop(stop))
     }
 

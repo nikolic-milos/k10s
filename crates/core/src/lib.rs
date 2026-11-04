@@ -39,6 +39,17 @@ pub use overlay::OverlayKind;
 pub use prepared::{PreparedNamespace, PreparedPod, PreparedSat, PreparedScene, PreparedWorkload};
 pub use replay::RecordedStream;
 
+/// The Service revision that a catalogue's queries and browser routes belong to.
+/// Sharing this metadata prevents an old selection from targeting a replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceIdentity {
+    pub namespace: String,
+    pub name: String,
+    pub port: u16,
+    pub uid: String,
+    pub resource_version: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NsExt {
     pub unhealthy_frac: f32,

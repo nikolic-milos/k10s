@@ -5,7 +5,10 @@ use serde::Deserialize;
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
 use serde_json::value::RawValue;
 
-use super::{MAX_POINTS_PER_SERIES, MAX_SERIES, QueryResult, QueryTiming, ResultType, Series};
+use super::{
+    MAX_ANNOTATIONS_PER_LEVEL, MAX_POINTS_PER_SERIES, MAX_SERIES, QueryResult, QueryTiming,
+    ResultType, Series,
+};
 use crate::reach::MAX_BODY_BYTES;
 
 #[derive(Deserialize)]
@@ -18,9 +21,63 @@ struct Envelope<'a> {
     #[serde(default, rename = "errorType")]
     error_type: String,
     #[serde(default)]
-    warnings: Vec<String>,
+    warnings: Annotations,
     #[serde(default)]
-    infos: Vec<String>,
+    infos: Annotations,
+}
+
+#[derive(Default)]
+struct Annotations {
+    kept: Vec<String>,
+    omitted: usize,
+}
+
+impl<'de> Deserialize<'de> for Annotations {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct List;
+        impl<'de> Visitor<'de> for List {
+            type Value = Annotations;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an array of annotation strings")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Annotations, A::Error> {
+                let mut result = Annotations::default();
+                while result.kept.len() < MAX_ANNOTATIONS_PER_LEVEL {
+                    let Some(message) = seq.next_element()? else {
+                        return Ok(result);
+                    };
+                    result.kept.push(message);
+                }
+                while seq.next_element::<SkippedAnnotation>()?.is_some() {
+                    result.omitted += 1;
+                }
+                Ok(result)
+            }
+        }
+        deserializer.deserialize_seq(List)
+    }
+}
+
+struct SkippedAnnotation;
+
+impl<'de> Deserialize<'de> for SkippedAnnotation {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StringOnly;
+        impl Visitor<'_> for StringOnly {
+            type Value = SkippedAnnotation;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an annotation string")
+            }
+
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<SkippedAnnotation, E> {
+                Ok(SkippedAnnotation)
+            }
+        }
+        deserializer.deserialize_str(StringOnly)
+    }
 }
 
 #[derive(Deserialize)]
@@ -270,8 +327,11 @@ pub(super) fn parse(bytes: &[u8]) -> Result<QueryResult, String> {
         series,
         truncated: dropped_series > 0,
         dropped_series,
-        warnings: envelope.warnings,
-        infos: envelope.infos,
+        possible_server_limit: None,
+        warnings: envelope.warnings.kept,
+        infos: envelope.infos.kept,
+        warnings_omitted: envelope.warnings.omitted,
+        infos_omitted: envelope.infos.omitted,
         source: String::new(),
         timing: QueryTiming::default(),
         step_ms: 0,

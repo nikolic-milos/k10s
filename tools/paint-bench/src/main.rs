@@ -37,21 +37,105 @@ struct Allocation {
     cache: TextCacheCounts,
 }
 
-fn measure(app: &mut HeadlessAppContext, window: WindowHandle<MapView>) -> Allocation {
-    let region = stats_alloc::Region::new(GLOBAL);
-    for _ in 0..ITERS {
-        draw(app, window);
+fn paint_snapshot(
+    app: &HeadlessAppContext,
+    window: WindowHandle<MapView>,
+) -> k10s_map::testing::PaintSnapshot {
+    window
+        .read_with(app, |map, _| map.testing_paint_snapshot())
+        .expect("read map paint counters after draw")
+}
+
+fn measure(
+    app: &mut HeadlessAppContext,
+    window: WindowHandle<MapView>,
+    cached: bool,
+) -> Allocation {
+    let mut before = paint_snapshot(app, window);
+    let mut allocations = 0;
+    let mut reallocations = 0;
+    let mut bytes = 0;
+    let mut lines = 0;
+    let mut scalars = 0;
+    let mut fit_refused = 0;
+    let mut paint_errors = 0;
+    let mut cache = TextCacheCounts::default();
+    for sample in 0..ITERS {
+        let allocation = {
+            let region = stats_alloc::Region::new(GLOBAL);
+            draw(app, window);
+            region.change()
+        };
+        let after = paint_snapshot(app, window);
+        assert_eq!(
+            after.frames,
+            before.frames + 1,
+            "sample {sample} must enter exactly one map paint callback"
+        );
+        assert!(
+            after.paint_ok_lines > 0,
+            "sample {sample} made no successful text paint calls"
+        );
+        assert!(
+            after.paint_ok_source_scalars > 0,
+            "sample {sample} had no source scalars in successful paint calls"
+        );
+        assert_eq!(
+            after.paint_errors, 0,
+            "sample {sample} failed to paint a line"
+        );
+        if cached {
+            assert!(
+                after.cache.hits > 0,
+                "sample {sample} did not reuse prepared text"
+            );
+            assert_eq!(
+                after.cache.misses, 0,
+                "sample {sample} missed its warm cache"
+            );
+            assert_eq!(
+                after.cache.evictions, 0,
+                "sample {sample} evicted warm text"
+            );
+        } else {
+            assert!(
+                after.cache.misses > 0,
+                "sample {sample} shaped no uncached text"
+            );
+            assert_eq!(
+                after.cache.hits, 0,
+                "sample {sample} used the disabled cache"
+            );
+            assert_eq!(
+                after.cache.evictions, 0,
+                "sample {sample} evicted from the disabled cache"
+            );
+        }
+        allocations += allocation.allocations;
+        reallocations += allocation.reallocations;
+        bytes += allocation.bytes_allocated;
+        lines += after.paint_ok_lines;
+        scalars += after.paint_ok_source_scalars;
+        fit_refused += after.fit_refused;
+        paint_errors += after.paint_errors;
+        cache.hits += after.cache.hits;
+        cache.misses += after.cache.misses;
+        cache.evictions += after.cache.evictions;
+        before = after;
     }
-    let allocation = region.change();
-    let cache = window
-        .read_with(app, |map, _| map.testing_text_cache())
-        .expect("read measured text-cache counters");
+    eprintln!(
+        "k10s paint coverage: cache={} draws={ITERS} successful_line_calls={lines} source_scalars_in_successful_calls={scalars} fit_refused={fit_refused} paint_errors={paint_errors} hits={} misses={} evictions={}",
+        if cached { "cached" } else { "uncached-control" },
+        cache.hits,
+        cache.misses,
+        cache.evictions,
+    );
     let calls = ITERS as f64;
     Allocation {
-        allocations: allocation.allocations as f64 / calls,
-        reallocations: allocation.reallocations as f64 / calls,
-        bytes: allocation.bytes_allocated as f64 / calls,
-        cache,
+        allocations: allocations as f64 / calls,
+        reallocations: reallocations as f64 / calls,
+        bytes: bytes as f64 / calls,
+        cache: before.cache,
     }
 }
 
@@ -90,6 +174,11 @@ fn main() {
         })
         .expect("set the benchmark camera");
 
+    eprintln!(
+        "k10s paint sizes: ShapedLine={} LabelJob={}",
+        std::mem::size_of::<gpui::ShapedLine>(),
+        std::mem::size_of::<k10s_map::testing::LabelJob>(),
+    );
     for _ in 0..WARMUP {
         draw(&mut app, window);
     }
@@ -99,26 +188,14 @@ fn main() {
     assert!(warm_cache.hits > 0, "warm paints must reuse shaped labels");
     assert_eq!(warm_cache.misses, 0, "the label cache must be warm");
 
-    let cached = measure(&mut app, window);
-    assert_eq!(
-        cached.cache.misses, 0,
-        "steady label shaping missed its cache"
-    );
-    assert_eq!(
-        cached.cache.evictions, 0,
-        "steady label shaping evicted an entry"
-    );
+    let cached = measure(&mut app, window, true);
     window
         .update(&mut app, |map, _, cx| {
             map.testing_enable_text_cache(false);
             cx.notify();
         })
         .expect("disable the cache control");
-    let uncached = measure(&mut app, window);
-    assert!(
-        uncached.cache.misses > 0,
-        "the uncached control shaped no labels"
-    );
+    let uncached = measure(&mut app, window, false);
     black_box((cached, uncached));
 
     if json {

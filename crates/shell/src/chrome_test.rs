@@ -146,12 +146,14 @@ fn the_title_bar_names_the_cluster_rather_than_the_fact_of_one() {
 
 fn nothing() -> Status<'static> {
     Status {
+        leading_note: None,
         connected: false,
         context: None,
         selection: None,
         folder: None,
         panels_below: 0,
         note: None,
+        overlay_note: None,
     }
 }
 
@@ -186,19 +188,66 @@ fn the_status_line_always_says_which_cluster_first() {
 }
 
 #[test]
+fn overlay_loading_precedes_long_status_information() {
+    assert_eq!(
+        status_line(Status {
+            leading_note: Some("Loading METRICS overlay"),
+            connected: true,
+            context: Some("a-long-cluster-name"),
+            note: Some("an unrelated status"),
+            ..nothing()
+        }),
+        "Loading METRICS overlay  ·  connected to a-long-cluster-name  ·  an unrelated status"
+    );
+}
+
+#[test]
 fn the_status_line_joins_what_is_true_in_a_fixed_order() {
     let line = status_line(Status {
+        leading_note: None,
         connected: true,
         context: Some("staging"),
         selection: Some(("pod", "api-7d9f")),
         folder: Some(std::path::Path::new("/home/k/charts")),
         panels_below: 2,
         note: Some("nothing chosen"),
+        overlay_note: None,
     });
     assert_eq!(
         line,
         "connected to staging  ·  pod api-7d9f  ·  folder /home/k/charts  ·  \
              2 panels below  ·  nothing chosen"
+    );
+}
+
+#[test]
+fn status_notes_are_bounded_previews_at_unicode_boundaries() {
+    let long = format!("{} tail", "界".repeat(128));
+    let line = status_line(Status {
+        note: Some(&long),
+        overlay_note: Some(&long),
+        ..nothing()
+    });
+    let preview = format!("{}...", "界".repeat(128));
+    assert_eq!(
+        line,
+        format!("no cluster  ·  {preview}  ·  overlay: {preview}")
+    );
+    assert!(long.ends_with(" tail"));
+    let exact = "界".repeat(128);
+    assert_eq!(
+        status_line(Status {
+            note: Some(&exact),
+            ..nothing()
+        }),
+        format!("no cluster  ·  {exact}")
+    );
+    assert_eq!(
+        status_line(Status {
+            overlay_note: Some("ready"),
+            ..nothing()
+        }),
+        "no cluster  ·  overlay: ready"
     );
 }
 
