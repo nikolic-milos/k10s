@@ -796,7 +796,8 @@ impl Render for MapView {
             let state = chrome::State::resolve(chrome::Overlay {
                 scene: &scene,
                 camera,
-                policy: lod(),
+                displayed_stage: self.displayed_stage,
+                hud_on,
                 hovered: marks.hovered,
                 summary,
                 edges_on,

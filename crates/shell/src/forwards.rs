@@ -382,7 +382,9 @@ fn browser_handoff_allowed(
         && expected.id == ready.id
         && expected.namespace == ready.namespace
         && expected.pod == ready.pod
-        && expected.local_port == ready.local_port
+        && ready.local_port != 0
+        && (expected.local_port == ready.local_port
+            || (expected.local_port == 0 && expected.state == ForwardState::Opening))
         && expected.remote_port == ready.remote_port
         && expected.expected_service == ready.expected_service
         && is_active(ready.id)
@@ -411,8 +413,19 @@ fn browser_source_outcome(
     }
 }
 
+fn local_address(port: u16) -> String {
+    if port == 0 {
+        "auto".into()
+    } else {
+        format!("127.0.0.1:{port}")
+    }
+}
+
 fn forward_status(row: &ForwardRow) -> String {
     match &row.state {
+        ForwardState::Opening if row.local_port == 0 => {
+            format!("opening auto -> {}:{}", row.pod, row.remote_port)
+        }
         ForwardState::Opening => format!(
             "opening 127.0.0.1:{} -> {}:{}",
             row.local_port, row.pod, row.remote_port
@@ -447,7 +460,7 @@ fn forwards_page(rows: &[ForwardRow]) -> TablePage {
             cells: vec![
                 row.namespace.clone(),
                 row.pod.clone(),
-                format!("127.0.0.1:{}", row.local_port),
+                local_address(row.local_port),
                 row.remote_port.to_string(),
                 state_text(&row.state),
             ],
@@ -773,6 +786,88 @@ mod tests {
             &expected,
             &ready,
             |_| { panic!("a replaced provider must not be queried") }
+        ));
+    }
+
+    #[test]
+    fn automatic_browser_handoff_requires_the_exact_owned_nonzero_listener() {
+        let original: Rc<dyn ClusterProvider> = Rc::new(k10s_provider::NullProvider);
+        let replacement: Rc<dyn ClusterProvider> = Rc::new(k10s_provider::NullProvider);
+        let slot = ProviderSlot::new(original.clone());
+        let source = std::sync::Arc::new(k10s_core::ServiceIdentity {
+            namespace: "monitoring".into(),
+            name: "grafana".into(),
+            port: 80,
+            uid: "service-a".into(),
+            resource_version: "1".into(),
+        });
+        let expected = ForwardRow {
+            id: 7,
+            namespace: "monitoring".into(),
+            pod: "grafana-a".into(),
+            local_port: 0,
+            remote_port: 3000,
+            expected_service: Some(source),
+            state: ForwardState::Opening,
+        };
+        let mut ready = expected.clone();
+        ready.local_port = 43123;
+        ready.state = ForwardState::Active;
+        assert!(browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| true
+        ));
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| false
+        ));
+        for changed in 0..7 {
+            let mut invalid = ready.clone();
+            match changed {
+                0 => invalid.local_port = 0,
+                1 => invalid.id += 1,
+                2 => invalid.namespace = "other".into(),
+                3 => invalid.pod = "grafana-b".into(),
+                4 => invalid.remote_port = 3001,
+                5 => {
+                    std::sync::Arc::make_mut(invalid.expected_service.as_mut().unwrap()).uid =
+                        "service-b".into()
+                }
+                6 => invalid.state = ForwardState::Opening,
+                _ => unreachable!(),
+            }
+            assert!(!browser_handoff_allowed(
+                &slot,
+                &original,
+                &expected,
+                &invalid,
+                |_| true
+            ));
+        }
+        let mut dead = expected.clone();
+        dead.state = ForwardState::Dead("closed before handoff".into());
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &dead,
+            &ready,
+            |_| true
+        ));
+        assert_eq!(local_address(expected.local_port), "auto");
+        assert_eq!(local_address(ready.local_port), "127.0.0.1:43123");
+        slot.set(replacement);
+        assert!(!browser_handoff_allowed(
+            &slot,
+            &original,
+            &expected,
+            &ready,
+            |_| panic!("a replaced provider must not be queried")
         ));
     }
 

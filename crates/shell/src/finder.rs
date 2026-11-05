@@ -11,15 +11,14 @@
 //! replacement characters names nothing, so tab and enter say so on that row
 //! rather than walking into a folder that is not there.
 //!
-//! A keystroke costs no syscall, but `enter` may: [`PickerState::confirm`]
-//! answers from the rows only while they are authoritative -- the listing for
-//! the directory the input names has landed, and it succeeded -- and asks the
-//! `Fs` otherwise, because a listing still in flight or a folder that will not
-//! list must not turn a path that exists into "no such path". That is one
-//! question on one deliberate keystroke, which is what makes it affordable
-//! there and nowhere else. A typed path is absolute or refused, since a bare
-//! name would resolve against whatever directory the process was started in,
-//! and a folder is never a save target.
+//! A keystroke costs no syscall. Cached rows can answer a positive selection,
+//! but a successful listing's miss is not current proof that a path is absent.
+//! Explicit typed confirmation without a cached answer checks the filesystem on
+//! the background executor. One check stays owned until it completes; edits
+//! invalidate its reply without starting overlapping filesystem calls. Closing
+//! the picker cancels delivery, not an operating-system call already in progress.
+//! A typed path is absolute or refused, since a relative path would resolve against
+//! the process's starting directory, and a folder is never a save target.
 //!
 //! The path picker is a modal over typed paths -- the trailing segment
 //! filters its directory's entries and tab completes the highlighted one --
@@ -52,6 +51,7 @@ use crate::reveal::ClusterFinder;
 use crate::ui::{MODAL_MAX_HEIGHT, MODAL_WIDTH};
 use crate::{CancelInput, CommitInput, DeleteInputChar, PickParent, RowDown, RowUp};
 
+const CHECKING_PATH: &str = "Checking path...";
 const VISIBLE_ROWS: usize = 10;
 const MAX_SCANNED_FILES: usize = 10_000;
 pub(crate) const MAX_SCAN_DEPTH: usize = 16;
@@ -92,6 +92,69 @@ pub enum PickerAction {
     Reject(String),
 }
 
+#[derive(Debug)]
+pub(crate) enum Confirmation {
+    Ready(PickerAction),
+    Check(PathCheck),
+}
+
+#[derive(Debug)]
+pub(crate) struct PathCheck {
+    generation: u64,
+    input: String,
+    mode: PickerMode,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PathStatus {
+    exists: bool,
+    is_dir: bool,
+}
+
+impl PathCheck {
+    #[cfg(test)]
+    pub(crate) fn input_buffer(&self) -> *const u8 {
+        self.input.as_ptr()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate(&self) -> PathCheck {
+        PathCheck {
+            generation: self.generation,
+            input: self.input.clone(),
+            mode: self.mode,
+            selected: self.selected,
+        }
+    }
+
+    pub(crate) fn run(&self, fs: &dyn Fs) -> PathStatus {
+        let path = Path::new(&self.input);
+        let exists = fs.exists(path);
+        PathStatus {
+            exists,
+            is_dir: exists && fs.is_dir(path),
+        }
+    }
+}
+
+fn confirmed_path(mode: PickerMode, input: String, status: PathStatus) -> PickerAction {
+    if mode == PickerMode::Save {
+        return if status.is_dir {
+            PickerAction::Reject(format!("{input} is a folder; type a file name"))
+        } else {
+            PickerAction::Open(PathBuf::from(input))
+        };
+    }
+    match (mode, status.exists, status.is_dir) {
+        (PickerMode::OpenFolder, true, true) => PickerAction::Open(PathBuf::from(input)),
+        (PickerMode::OpenFolder, _, _) => PickerAction::Reject(format!("no such folder: {input}")),
+        (_, true, true) => PickerAction::Descend(format!("{input}/")),
+        (_, true, false) => PickerAction::Open(PathBuf::from(input)),
+        (_, false, _) => PickerAction::Reject(format!("no such path: {input}")),
+    }
+}
+
 // What came back for one listing request, or nothing while it is still in
 // flight. A failure keeps its message, because the note it puts on screen has
 // to outlive the keystrokes that follow inside the same folder.
@@ -122,6 +185,9 @@ pub struct PickerState {
     // Where `entries` came from, so a keystroke inside a directory already
     // listed costs no syscall and `confirm` knows whether the rows can answer.
     listing: Option<Listing>,
+    confirm_generation: u64,
+    pending_confirm: Option<u64>,
+    closed: bool,
 }
 
 impl PickerState {
@@ -138,6 +204,9 @@ impl PickerState {
             note: None,
             mode,
             listing: None,
+            confirm_generation: 0,
+            pending_confirm: None,
+            closed: false,
         }
     }
 
@@ -155,7 +224,18 @@ impl PickerState {
     // asked for. The rows are dropped first, so a keystroke never filters
     // another folder's entries.
     pub fn begin_listing(&mut self) -> Option<String> {
+        self.invalidate_confirmation();
         let (dir, _) = self.split();
+        if !Path::new(&dir).is_absolute() {
+            self.entries.clear();
+            self.matches.clear();
+            self.selected = 0;
+            self.listing = None;
+            if self.note.as_deref() != Some("type an absolute path") {
+                self.note = Some("type an absolute path".into());
+            }
+            return None;
+        }
         if let Some(listing) = self.listing.as_ref().filter(|listing| listing.dir == dir) {
             // Inside the folder already asked for, the only note that still
             // applies is the one that folder produced: anything else is the
@@ -283,34 +363,36 @@ impl PickerState {
         }
     }
 
-    pub fn confirm(&self, fs: &dyn Fs) -> PickerAction {
-        let (dir, segment) = self.split();
-        // Everything below joins onto the typed directory, and an empty one is
-        // a bare name: it would land wherever the process happens to have been
-        // started, which is never the folder the user is looking at.
-        if dir.is_empty() {
-            return PickerAction::Reject("type an absolute path".to_string());
+    fn ready_confirmation(&self) -> Option<PickerAction> {
+        if !Path::new(&self.input).is_absolute() {
+            return Some(PickerAction::Reject("type an absolute path".into()));
         }
+        let (dir, segment) = self
+            .input
+            .split_at(self.input.rfind('/').map_or(0, |slash| slash + 1));
         // A highlighted row is what the eye is on, so it wins -- except while
         // saving, where a typed name that is not the highlighted row is the
         // new file the user means to create.
         if let Some(entry) = self.selected_entry()
-            && !(self.mode == PickerMode::Save && (segment.is_empty() || entry.label() != segment))
+            && !(self.mode == PickerMode::Save
+                && (segment.is_empty() || entry.name.to_string_lossy() != segment))
         {
             if entry.name == std::ffi::OsStr::new(HERE) {
-                let here = dir.trim_end_matches('/');
-                return if here.is_empty() {
-                    PickerAction::Open(PathBuf::from("/"))
+                let here = if Path::new(dir).parent().is_none() {
+                    dir
                 } else {
-                    PickerAction::Open(PathBuf::from(here))
+                    dir.trim_end_matches('/')
                 };
+                return Some(PickerAction::Open(PathBuf::from(here)));
             }
             // Joined from the name, never from the row's lossy label: a file
             // whose name is not valid UTF-8 has to open the file it names, not
             // a path spelled with replacement characters.
-            let path = Path::new(&dir).join(&entry.name);
-            return match (entry.is_dir, self.mode) {
-                (true, PickerMode::OpenFolder) => PickerAction::Open(path),
+            return Some(match (entry.is_dir, self.mode) {
+                (true, PickerMode::OpenFolder)
+                | (false, PickerMode::OpenFile | PickerMode::Save) => {
+                    PickerAction::Open(Path::new(dir).join(&entry.name))
+                }
                 (true, _) => match entry.name.to_str() {
                     Some(name) => PickerAction::Descend(format!("{dir}{name}/")),
                     None => PickerAction::Reject(untypable(&entry.label())),
@@ -318,56 +400,110 @@ impl PickerState {
                 (false, PickerMode::OpenFolder) => {
                     PickerAction::Reject(format!("{} is a file; pick a folder", entry.label()))
                 }
-                (false, _) => PickerAction::Open(path),
-            };
-        }
-        if segment.is_empty() {
-            return PickerAction::Reject(match self.mode {
-                PickerMode::OpenFolder => "pick a folder".to_string(),
-                _ => "type a file name".to_string(),
             });
         }
-        // The rows answer for the typed name only while they are this
-        // directory's contents; otherwise the disk does. One stat on an
-        // explicit `enter` is affordable, and answering "no such path" about a
-        // file that is sitting there is not.
-        let authoritative = self.listing_is_authoritative();
-        let listed = if authoritative {
-            self.entries.iter().find(|entry| entry.label() == segment)
-        } else {
-            None
-        };
-        // A name tab-completed from a lossy label is that entry's name, so the
-        // path is built from the entry here too.
-        let path = match listed {
-            Some(entry) => Path::new(&dir).join(&entry.name),
-            None => PathBuf::from(self.input.clone()),
-        };
-        let (exists, is_dir) = match (authoritative, listed) {
-            (true, Some(entry)) => (true, entry.is_dir),
-            (true, None) => (false, false),
-            (false, _) => (fs.exists(&path), fs.is_dir(&path)),
-        };
-        if self.mode == PickerMode::Save {
-            // A folder cannot be written to, and accepting one only moves the
-            // failure into the editor's save.
-            return if is_dir {
-                PickerAction::Reject(format!("{} is a folder; type a file name", self.input))
-            } else {
-                PickerAction::Open(path)
-            };
+        if segment.is_empty() {
+            return Some(PickerAction::Reject(match self.mode {
+                PickerMode::OpenFolder => "pick a folder".into(),
+                _ => "type a file name".into(),
+            }));
         }
-        match (self.mode, exists, is_dir) {
-            (PickerMode::OpenFolder, true, true) => PickerAction::Open(path),
-            (PickerMode::OpenFolder, _, _) => {
-                PickerAction::Reject(format!("no such folder: {}", self.input))
+        if self.listing.as_ref().is_some_and(|listing| {
+            listing.dir == dir && matches!(listing.answer, Some(Answer::Listed))
+        }) && let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.name.to_string_lossy() == segment)
+        {
+            return Some(match (self.mode, entry.is_dir) {
+                (PickerMode::Save, true) => {
+                    PickerAction::Reject(format!("{} is a folder; type a file name", self.input))
+                }
+                (PickerMode::OpenFolder, false) => {
+                    PickerAction::Reject(format!("no such folder: {}", self.input))
+                }
+                (PickerMode::OpenFile, true) => PickerAction::Descend(format!("{}/", self.input)),
+                (_, _) => PickerAction::Open(Path::new(dir).join(&entry.name)),
+            });
+        }
+        None
+    }
+
+    pub(crate) fn begin_confirm(&mut self) -> Option<Confirmation> {
+        if self.closed {
+            return None;
+        }
+        if let Some(action) = self.ready_confirmation() {
+            self.invalidate_confirmation();
+            return Some(Confirmation::Ready(action));
+        }
+        if self.pending_confirm.is_some() {
+            if self.note.as_deref() != Some(CHECKING_PATH) {
+                self.note = Some(CHECKING_PATH.into());
             }
-            // A typed folder gets the answer a highlighted one gets: step into
-            // it, rather than hand the editor a directory to read.
-            (_, true, true) => PickerAction::Descend(format!("{}/", self.input)),
-            (_, true, false) => PickerAction::Open(path),
-            (_, false, _) => PickerAction::Reject(format!("no such path: {}", self.input)),
+            return None;
         }
+        self.confirm_generation += 1;
+        let check = PathCheck {
+            generation: self.confirm_generation,
+            input: self.input.clone(),
+            mode: self.mode,
+            selected: self.selected,
+        };
+        self.pending_confirm = Some(check.generation);
+        self.note = Some(CHECKING_PATH.into());
+        Some(Confirmation::Check(check))
+    }
+
+    pub(crate) fn finish_confirm(
+        &mut self,
+        check: PathCheck,
+        status: PathStatus,
+    ) -> Option<PickerAction> {
+        if self.pending_confirm != Some(check.generation) {
+            return None;
+        }
+        self.pending_confirm = None;
+        if self.note.as_deref() == Some(CHECKING_PATH) {
+            self.note = None;
+        }
+        if self.closed
+            || self.confirm_generation != check.generation
+            || self.input != check.input
+            || self.mode != check.mode
+            || self.selected != check.selected
+        {
+            return None;
+        }
+        Some(confirmed_path(check.mode, check.input, status))
+    }
+
+    pub(crate) fn invalidate_confirmation(&mut self) {
+        self.confirm_generation += 1;
+        if self.note.as_deref() == Some(CHECKING_PATH) {
+            self.note = None;
+        }
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.invalidate_confirmation();
+        self.closed = true;
+        self.pending_confirm = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm(&self, fs: &dyn Fs) -> PickerAction {
+        if let Some(action) = self.ready_confirmation() {
+            return action;
+        }
+        let check = PathCheck {
+            generation: self.confirm_generation,
+            input: self.input.clone(),
+            mode: self.mode,
+            selected: self.selected,
+        };
+        let status = check.run(fs);
+        confirmed_path(check.mode, check.input, status)
     }
 
     // A half-typed name goes before the folder does, because ctrl-up on a typo
@@ -390,6 +526,7 @@ pub struct PathPickerView {
     fs: Arc<dyn Fs>,
     state: PickerState,
     title: &'static str,
+    confirm_task: Option<gpui::Task<()>>,
 }
 
 impl gpui::EventEmitter<PickerEvent> for PathPickerView {}
@@ -411,6 +548,7 @@ impl PathPickerView {
             fs,
             state: PickerState::new(&seed, mode),
             title,
+            confirm_task: None,
         };
         view.input_changed(cx);
         view
@@ -430,18 +568,6 @@ impl PathPickerView {
             return;
         };
         cx.notify();
-        if dir.is_empty() {
-            self.state.listed(
-                &dir,
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "type an absolute path",
-                )),
-            );
-            self.state.refilter();
-            cx.notify();
-            return;
-        }
         let fs = self.fs.clone();
         cx.spawn(async move |this, cx| {
             let read = {
@@ -462,13 +588,45 @@ impl PathPickerView {
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        let action = self.state.confirm(self.fs.as_ref());
+        let Some(confirmation) = self.state.begin_confirm() else {
+            cx.notify();
+            return;
+        };
+        match confirmation {
+            Confirmation::Ready(action) => self.apply_confirmation(action, cx),
+            Confirmation::Check(check) => {
+                let fs = self.fs.clone();
+                self.confirm_task = Some(cx.spawn(async move |this, cx| {
+                    let (check, status) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let status = check.run(fs.as_ref());
+                            (check, status)
+                        })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(action) = this.state.finish_confirm(check, status) {
+                            this.apply_confirmation(action, cx);
+                        } else {
+                            cx.notify();
+                        }
+                    });
+                }));
+                cx.notify();
+            }
+        }
+    }
+
+    fn apply_confirmation(&mut self, action: PickerAction, cx: &mut Context<Self>) {
         match action {
             PickerAction::Descend(input) => {
                 self.state.input = input;
                 self.input_changed(cx);
             }
-            PickerAction::Open(path) => cx.emit(PickerEvent::Confirmed(path)),
+            PickerAction::Open(path) => {
+                self.state.close();
+                cx.emit(PickerEvent::Confirmed(path));
+            }
             PickerAction::Reject(note) => self.state.note = Some(note),
         }
         cx.notify();
@@ -527,10 +685,12 @@ impl Render for PathPickerView {
             .role(Role::Dialog)
             .aria_label(SharedString::from(self.title))
             .on_action(cx.listener(|this, _: &RowUp, _, cx| {
+                this.state.invalidate_confirmation();
                 this.state.selected = this.state.selected.saturating_sub(1);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RowDown, _, cx| {
+                this.state.invalidate_confirmation();
                 if this.state.selected + 1 < this.state.matches.len() {
                     this.state.selected += 1;
                 }
@@ -539,7 +699,9 @@ impl Render for PathPickerView {
             .on_action(cx.listener(|this, _: &CommitInput, _, cx| {
                 this.confirm(cx);
             }))
-            .on_action(cx.listener(|_, _: &CancelInput, _, cx| {
+            .on_action(cx.listener(|this, _: &CancelInput, _, cx| {
+                this.state.close();
+                this.confirm_task = None;
                 cx.emit(PickerEvent::Dismissed);
             }))
             .on_action(cx.listener(|this, _: &DeleteInputChar, _, cx| {
@@ -556,6 +718,7 @@ impl Render for PathPickerView {
                     return;
                 }
                 if keystroke.key == "tab" {
+                    this.state.invalidate_confirmation();
                     if this.state.complete_selected() {
                         this.input_changed(cx);
                         cx.stop_propagation();

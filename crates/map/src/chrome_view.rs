@@ -33,7 +33,7 @@ impl Render for Chrome {
         div()
             .size_full()
             .relative()
-            .children((state.density != Density::Minimal).then(|| {
+            .children(state.summary_shown().then(|| {
                 summary_panel(
                     state.summary,
                     state.band,

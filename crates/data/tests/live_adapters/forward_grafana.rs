@@ -136,12 +136,26 @@ struct OwnedForward {
 
 impl OwnedForward {
     fn close(&mut self) {
-        drop(self.reservation.take().expect("the fixture owns a forward"));
+        if let Some(reservation) = self.reservation.take() {
+            drop(reservation);
+        } else {
+            assert!(self.registry.close(self.row.id));
+        }
         assert!(self.registry.list().iter().all(|row| row.id != self.row.id));
     }
 }
 
-fn open(reader: &Reader, request: ForwardRequest) -> (OwnedForward, ForwardOpenStop) {
+impl Drop for OwnedForward {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            drop(reservation);
+        } else {
+            self.registry.close(self.row.id);
+        }
+    }
+}
+
+fn open_browser(reader: &Reader, request: ForwardRequest) -> (OwnedForward, ForwardOpenStop) {
     assert!(
         reader.forwards().list().is_empty(),
         "the isolated live-test Reader must have no forwards to reuse"
@@ -164,6 +178,29 @@ fn open(reader: &Reader, request: ForwardRequest) -> (OwnedForward, ForwardOpenS
         .expect("forward resolution callback")
         .expect("a new fixture forward");
     (owned, stop)
+}
+
+fn open_fixed(reader: &Reader, request: ForwardRequest) -> OwnedForward {
+    assert!(
+        reader.forwards().list().is_empty(),
+        "the isolated Reader has no forwards"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let registry = reader.forwards().clone();
+    reader.open_forward(request, move |answer| {
+        let result = match answer {
+            Fetched::Ok(row) => Ok(OwnedForward {
+                registry,
+                row,
+                reservation: None,
+            }),
+            other => Err(format!("the fixed Service forward did not open: {other:?}")),
+        };
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(REQUEST_BUDGET)
+        .expect("fixed resolution callback")
+        .expect("a new fixed fixture forward")
 }
 
 fn ready(reader: &Reader, id: u64) -> Fetched<ForwardRow> {
@@ -279,11 +316,19 @@ enum TargetPortForm {
 #[ignore = "needs the live Grafana fixture and permission to create and delete two Services"]
 fn selected_grafana_service_port_forwards_real_bytes_and_reports_listener_collision() {
     for form in [TargetPortForm::Numeric, TargetPortForm::Named] {
-        selected_grafana_target_port(form);
+        selected_grafana_target_port(form, false);
     }
 }
 
-fn selected_grafana_target_port(form: TargetPortForm) {
+#[test]
+#[ignore = "needs the live Grafana fixture; creates UID-pinned Services on port80 and uses an automatic local listener"]
+fn browser_service_port80_forwards_numeric_and_named_targets_on_an_owned_local_port() {
+    for form in [TargetPortForm::Numeric, TargetPortForm::Named] {
+        selected_grafana_target_port(form, true);
+    }
+}
+
+fn selected_grafana_target_port(form: TargetPortForm, browser: bool) {
     assert!(
         std::env::var_os("KUBECONFIG").is_some(),
         "set KUBECONFIG to the lab cluster"
@@ -414,13 +459,15 @@ fn selected_grafana_target_port(form: TargetPortForm) {
         ),
     };
 
-    let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("an owned loopback listener");
-    let address = reservation.local_addr().expect("its local address");
-    let selected = address.port();
-    assert!(
-        selected >= 1024,
-        "the selected local port must be unprivileged"
-    );
+    let reservation = if browser {
+        None
+    } else {
+        Some(TcpListener::bind(("127.0.0.1", 0)).expect("an owned loopback listener"))
+    };
+    let selected = reservation
+        .as_ref()
+        .map(|listener| listener.local_addr().expect("its local address").port())
+        .unwrap_or(80);
     let first = if selected == 18080 { 18081 } else { 18080 };
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -533,40 +580,52 @@ fn selected_grafana_target_port(form: TargetPortForm) {
         expected_service: Some(expected_service.clone()),
     };
 
-    let (mut collision, collision_stop) = open(&sync.reader, request.clone());
-    let Fetched::Failed { what, why } = ready(&sync.reader, collision.row.id) else {
-        panic!("the owned listener must refuse a second bind");
-    };
-    assert_eq!(what, "port-forward");
-    assert!(why.contains("cannot listen on 127.0.0.1"), "{why}");
-    assert!(sync.reader.forwards().list().iter().any(|row| {
-        row.id == collision.row.id && matches!(row.state, ForwardState::Dead { .. })
-    }));
-    {
+    if let Some(reservation) = reservation {
+        let address = reservation
+            .local_addr()
+            .expect("the owned occupied address");
+        let mut collision = open_fixed(&sync.reader, request.clone());
+        let Fetched::Failed { what, why } = ready(&sync.reader, collision.row.id) else {
+            panic!("the owned listener must refuse a second bind");
+        };
+        assert_eq!(what, "port-forward");
+        assert!(why.contains("cannot listen on 127.0.0.1"), "{why}");
+        assert!(sync.reader.forwards().list().iter().any(|row| {
+            row.id == collision.row.id && matches!(row.state, ForwardState::Dead { .. })
+        }));
         let connected = TcpStream::connect_timeout(&address, Duration::from_secs(2))
             .expect("the test's original listener still accepts connections");
-        assert_eq!(
-            connected.peer_addr().expect("the test connection peer"),
-            address
+        assert_eq!(connected.peer_addr().unwrap(), address);
+        drop(connected);
+        collision.close();
+        assert!(
+            upgrades
+                .lock()
+                .expect("actual upgrade request log")
+                .is_empty()
         );
+        drop(reservation);
     }
-    collision.close();
-    drop(collision_stop);
-    assert!(
-        upgrades
-            .lock()
-            .expect("actual upgrade request log")
-            .is_empty()
-    );
-    drop(reservation);
 
-    let (mut forward, forward_stop) = open(&sync.reader, request);
+    let (mut forward, forward_stop) = if browser {
+        let (owned, stop) = open_browser(&sync.reader, request);
+        (owned, Some(stop))
+    } else {
+        (open_fixed(&sync.reader, request), None)
+    };
     let row = match ready(&sync.reader, forward.row.id) {
         Fetched::Ok(row) => row,
         other => panic!("the selected listener must become ready: {other:?}"),
     };
     assert_eq!(row.state, ForwardState::Active);
-    assert_eq!(row.spec.local_port, selected);
+    if browser {
+        assert_eq!(selected, 80);
+        assert_ne!(row.spec.local_port, 0);
+    } else {
+        assert_eq!(row.spec.local_port, selected);
+    }
+    let local_port = row.spec.local_port;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], local_port));
     assert!(Arc::ptr_eq(
         row.spec.expected_service.as_ref().unwrap(),
         &expected_service
@@ -597,7 +656,7 @@ fn selected_grafana_target_port(form: TargetPortForm) {
         kind: ToolKind::Grafana,
         found: None,
         transport: Transport::Url {
-            base: format!("http://127.0.0.1:{selected}"),
+            base: format!("http://127.0.0.1:{local_port}"),
         },
         auth: ToolAuth::Anonymous,
     };
@@ -655,7 +714,7 @@ fn selected_grafana_target_port(form: TargetPortForm) {
         other => panic!("the closed forward retained the owned connection: {other:?}"),
     }
     drop(connection);
-    listener_released(&runtime, selected);
+    listener_released(&runtime, local_port);
     let current = runtime.block_on(async {
         tokio::time::timeout(REQUEST_BUDGET, fixture.api.get(&fixture.name))
             .await

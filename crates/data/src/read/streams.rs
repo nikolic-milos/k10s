@@ -65,7 +65,7 @@ impl Reader {
         });
     }
 
-    /// Resolve within four seconds, then reserve an exact target for the reply.
+    /// Resolve within four seconds, then reserve an automatic local listener for the browser.
     /// A reply already being delivered may run after cancellation; discarding
     /// its reservation releases this caller's claim without closing other users.
     pub fn open_forward_cancellable(
@@ -177,17 +177,20 @@ async fn open_cancellable(
         return;
     }
     match result {
-        Fetched::Ok(spec) => match registry.reserve(spec) {
-            Ok(reservation) => {
-                if !cancelled.load(Ordering::Acquire) {
-                    reply(Fetched::Ok(reservation));
+        Fetched::Ok(mut spec) => {
+            spec.local_port = 0;
+            match registry.reserve(spec) {
+                Ok(reservation) => {
+                    if !cancelled.load(Ordering::Acquire) {
+                        reply(Fetched::Ok(reservation));
+                    }
                 }
+                Err(error) => reply(Fetched::Failed {
+                    what: "port-forward",
+                    why: error.to_string(),
+                }),
             }
-            Err(error) => reply(Fetched::Failed {
-                what: "port-forward",
-                why: error.to_string(),
-            }),
-        },
+        }
         Fetched::Denied { what } => reply(Fetched::Denied { what }),
         Fetched::Failed { what, why } => reply(Fetched::Failed { what, why }),
     }
@@ -227,6 +230,31 @@ mod tests {
             remote_port: port,
             expected_service: None,
         }
+    }
+
+    #[tokio::test]
+    async fn browser_resolution_keeps_the_remote_port_and_requests_an_automatic_listener() {
+        let registry = ForwardRegistry::new(Arc::new(TestForwarder {
+            starts: AtomicUsize::new(0),
+            cancel_second: None,
+        }));
+        let cancelled = AtomicBool::new(false);
+        open_cancellable(
+            &registry,
+            std::future::ready(Fetched::Ok(spec("grafana", 80))),
+            &cancelled,
+            |result| {
+                let Fetched::Ok(reservation) = result else {
+                    panic!("the browser reservation");
+                };
+                assert_eq!(reservation.row().spec.local_port, 0);
+                assert_eq!(reservation.row().spec.remote_port, 80);
+                assert_eq!(reservation.row().spec.pod, "grafana");
+                assert_eq!(reservation.row().spec.namespace, "prod");
+            },
+        )
+        .await;
+        assert!(registry.list().is_empty());
     }
 
     #[tokio::test]

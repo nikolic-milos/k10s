@@ -579,7 +579,7 @@ pub mod fake {
             let state = self.state.lock().expect("fake fs lock");
             // Every answer comes from the map already held here: the lock is
             // not reentrant, so reaching back through `self.is_dir` deadlocks.
-            let is_directory = path.as_os_str() == "/"
+            let is_directory = (path.has_root() && path.parent().is_none())
                 || state.files.keys().any(|file| {
                     file.strip_prefix(path)
                         .is_ok_and(|rest| !rest.as_os_str().is_empty())
@@ -608,7 +608,7 @@ pub mod fake {
 
         fn is_dir(&self, path: &Path) -> bool {
             let state = self.state.lock().expect("fake fs lock");
-            path.as_os_str() == "/"
+            (path.has_root() && path.parent().is_none())
                 || state.files.keys().any(|file| {
                     file.strip_prefix(path)
                         .is_ok_and(|rest| !rest.as_os_str().is_empty())

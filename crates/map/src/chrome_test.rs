@@ -1,21 +1,6 @@
 use super::*;
 
 #[test]
-fn semantic_bands_follow_the_shipping_lod_thresholds() {
-    let policy = crate::lod::policy(Default::default());
-    assert_eq!(
-        detail_band(&policy, policy.stage_block * 0.5),
-        DetailBand::Orbit
-    );
-    assert_eq!(detail_band(&policy, policy.stage_block), DetailBand::Region);
-    assert_eq!(detail_band(&policy, policy.stage_cell), DetailBand::System);
-    assert_eq!(
-        detail_band(&policy, policy.stage_cell_label),
-        DetailBand::Instance
-    );
-}
-
-#[test]
 fn overlay_density_never_allows_full_chrome_to_collide_in_a_tiny_view() {
     assert_eq!(density(320.0, 200.0), Density::Minimal);
     assert_eq!(density(700.0, 480.0), Density::Compact);
@@ -57,6 +42,7 @@ fn identical_chrome_state_does_not_dirty_its_reactive_boundary() {
         hover: None,
         edges_on: false,
         legend_on: true,
+        hud_on: false,
         empty: false,
         overlay_kind: None,
     };
@@ -243,7 +229,8 @@ fn chrome_overlay<'a>(
             cy: 60.0,
             zoom: 1.0,
         },
-        policy: crate::lod::lod(),
+        displayed_stage: 1,
+        hud_on: false,
         hovered,
         summary: "1 namespace  ·  1 workload  ·  1 pod".into(),
         edges_on: false,
@@ -258,15 +245,14 @@ fn overlay_kind_is_named_apart_from_the_lod_band() {
     let mut scene = hover_scene();
     overlay_ids(&mut scene);
     let empty = OverlayFrame::default();
-    let policy = crate::lod::lod();
-    for (zoom, band, label) in [
-        (policy.stage_block * 0.5, DetailBand::Orbit, "Namespaces"),
-        (policy.stage_block, DetailBand::Region, "Workloads"),
-        (policy.stage_cell, DetailBand::System, "Pods"),
-        (policy.stage_cell_label, DetailBand::Instance, "Pod details"),
+    for (displayed_stage, band, label) in [
+        (0, DetailBand::Orbit, "Namespaces"),
+        (1, DetailBand::Orbit, "Namespaces"),
+        (2, DetailBand::System, "Pods"),
+        (3, DetailBand::Instance, "Pod details"),
     ] {
         let mut overlay = chrome_overlay(&scene, None, &empty);
-        overlay.camera.zoom = zoom;
+        overlay.displayed_stage = displayed_stage;
         let none = State::resolve(overlay);
         assert_eq!(none.overlay_kind, None);
         assert_eq!(none.band, band);
@@ -278,7 +264,7 @@ fn overlay_kind_is_named_apart_from_the_lod_band() {
                 marks: Vec::new(),
             };
             let mut overlay = chrome_overlay(&scene, None, &frame);
-            overlay.camera.zoom = zoom;
+            overlay.displayed_stage = displayed_stage;
             let state = State::resolve(overlay);
             assert_eq!(state.overlay_kind, Some(kind));
             assert_eq!(state.band, band);
@@ -412,4 +398,138 @@ fn mesh_declared_and_observed_stay_apart_on_the_hover_card() {
         OverlayKind::MeshDeclared.blurb(),
         OverlayKind::MeshObserved.blurb()
     );
+}
+
+#[test]
+fn semantic_band_matches_paint_pick_and_overlay_during_handoff_and_hysteresis() {
+    use crate::frame::tests::{Collect, VH, VW, viewport};
+    use crate::frame::{FrameOpts, walk};
+    use crate::overlay::{OverlayKind, OverlayMark, StampCache};
+    use k10s_atlas::{StageBlend, StageMachine};
+
+    let mut scene = hover_scene();
+    scene.card_header = crate::frame::tests::CARD_HEADER_FIXTURE;
+    scene.blocks[0].rect = k10s_core::Rect::new(10.0, 10.0, 130.0, 100.0);
+    scene.blocks[0].inner = k10s_core::Rect::new(10.0, 10.0, 100.0, 100.0);
+    scene.bounds = scene.regions[0].rect;
+    scene.cells[0].rect = k10s_core::Rect::new(40.0, 58.0, 10.0, 10.0);
+    overlay_ids(&mut scene);
+    scene.rebuild_spatial_index();
+    let policy = crate::lod::policy(Default::default());
+    let frame = OverlayFrame {
+        kind: Some(OverlayKind::Policy),
+        marks: vec![OverlayMark {
+            uid: "wl-checkout".into(),
+            tint: Some(Severity::Warn),
+            sparkline: None,
+            label: None,
+        }],
+    };
+    let check = |zoom, blend: StageBlend, expected| {
+        let camera = Camera {
+            cx: 45.0,
+            cy: 63.0,
+            zoom,
+        };
+        let mut overlay = chrome_overlay(&scene, None, &frame);
+        overlay.camera = camera;
+        overlay.viewport = (VW, VH);
+        overlay.displayed_stage = blend.walk_stage();
+        let chrome = State::resolve(overlay);
+        assert_eq!(chrome.band.label(), expected);
+        let opts = FrameOpts {
+            theme: &k10s_theme::K10S_DARK.map,
+            policy: &policy,
+            type_: k10s_theme::MapType::default(),
+            edges_on: false,
+            skip_blocks: false,
+            hex: false,
+        };
+        let mut sink = Collect::default();
+        let counts = walk(viewport(), &scene, camera, blend, opts, &mut sink);
+        assert_eq!(
+            counts,
+            crate::lod::cull(&scene, &camera, blend, VW, VH, opts)
+        );
+        let children_shown = expected != "Namespaces";
+        assert_eq!(counts.drawn_blocks > 0, children_shown);
+        assert_eq!(counts.drawn_cells > 0, children_shown);
+        let (x, y) = camera.w2s(45.0, 63.0, VW, VH);
+        let picked = crate::pick::pick(&scene, &camera, &policy, blend, VW, VH, x, y)
+            .expect("the displayed namespace or its child remains pickable");
+        assert_eq!(picked.block.is_some(), children_shown);
+        assert_eq!(picked.cell.is_some(), children_shown);
+        assert_eq!(
+            frame
+                .visible_stamps_typed(
+                    &mut StampCache::default(),
+                    &scene,
+                    camera,
+                    &policy,
+                    blend,
+                    VW,
+                    VH,
+                    k10s_theme::MapType::default(),
+                )
+                .is_empty(),
+            !children_shown
+        );
+    };
+    for (stage, zoom, label) in [
+        (0, policy.stage_block * 0.5, "Namespaces"),
+        (1, policy.stage_block, "Namespaces"),
+        (2, policy.stage_cell, "Pods"),
+        (3, policy.stage_cell_label, "Pod details"),
+    ] {
+        check(zoom, StageBlend::settled(stage), label);
+    }
+    for (from, to) in [(1, 2), (2, 1)] {
+        for t in [0.0, 0.49, 0.5, 0.51, 1.0] {
+            let blend = StageBlend { from, to, t };
+            let label = if blend.walk_stage() == 1 {
+                "Namespaces"
+            } else {
+                "Pods"
+            };
+            check(policy.stage_cell, blend, label);
+        }
+    }
+    let mut machine = StageMachine::new(crate::lod::STAGE_FADE_SECS);
+    machine.settle(&policy, policy.stage_cell);
+    let held_zoom = policy.stage_cell * 0.95;
+    assert_eq!(policy.stage_for_zoom(held_zoom), 1);
+    let held = machine.settle(&policy, held_zoom);
+    assert_eq!(held.walk_stage(), 2);
+    check(held_zoom, held, "Pods");
+    let exit_zoom = policy.stage_cell * policy.stage_exit - 0.001;
+    let exited = machine.settle(&policy, exit_zoom);
+    assert_eq!(exited.walk_stage(), 1);
+    check(exit_zoom, exited, "Namespaces");
+}
+
+#[test]
+fn explicit_diagnostic_hud_hides_only_the_normal_summary() {
+    let scene = hover_scene();
+    let frame = OverlayFrame::default();
+    for viewport in [(1280.0, 720.0), (700.0, 480.0), (320.0, 200.0)] {
+        let mut overlay = chrome_overlay(&scene, None, &frame);
+        overlay.viewport = viewport;
+        let normal = State::resolve(overlay);
+        assert_eq!(normal.summary_shown(), normal.density != Density::Minimal);
+        let mut overlay = chrome_overlay(&scene, None, &frame);
+        overlay.viewport = viewport;
+        overlay.hud_on = true;
+        let diagnostic = State::resolve(overlay);
+        assert!(!diagnostic.summary_shown());
+        assert_eq!(diagnostic.summary, normal.summary);
+        assert_eq!(diagnostic.band, normal.band);
+        assert_eq!(diagnostic.legend_on, normal.legend_on);
+        assert_eq!(diagnostic.edges_on, normal.edges_on);
+        assert_eq!(diagnostic.hover, normal.hover);
+        let mut chrome = Chrome::default();
+        chrome.replace(normal.clone());
+        assert!(chrome.replace(diagnostic.clone()));
+        assert!(!chrome.replace(diagnostic));
+        assert!(chrome.replace(normal));
+    }
 }

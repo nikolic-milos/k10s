@@ -6,7 +6,7 @@
 //! the map calm at idle and keeps cluster size out of interaction cost.
 
 use gpui::{Context, SharedString, rgb};
-use k10s_atlas::{Camera, LodPolicy};
+use k10s_atlas::Camera;
 use k10s_core::{BUILTIN_KINDS, SceneSnapshot, Severity, Totals};
 use k10s_theme::{Theme, sparkline};
 
@@ -22,38 +22,27 @@ const EDGE_MARGIN: f32 = 12.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DetailBand {
     Orbit,
-    Region,
     System,
     Instance,
 }
 
 impl DetailBand {
-    const ALL: [DetailBand; 4] = [
-        DetailBand::Orbit,
-        DetailBand::Region,
-        DetailBand::System,
-        DetailBand::Instance,
-    ];
+    const ALL: [DetailBand; 3] = [DetailBand::Orbit, DetailBand::System, DetailBand::Instance];
 
     fn label(self) -> &'static str {
         match self {
             DetailBand::Orbit => "Namespaces",
-            DetailBand::Region => "Workloads",
             DetailBand::System => "Pods",
             DetailBand::Instance => "Pod details",
         }
     }
 }
 
-pub(crate) fn detail_band(policy: &LodPolicy, zoom: f32) -> DetailBand {
-    if zoom < policy.stage_block {
-        DetailBand::Orbit
-    } else if zoom < policy.stage_cell {
-        DetailBand::Region
-    } else if zoom < policy.stage_cell_label {
-        DetailBand::System
-    } else {
-        DetailBand::Instance
+pub(crate) fn detail_band(displayed_stage: u8) -> DetailBand {
+    match displayed_stage {
+        0 | 1 => DetailBand::Orbit,
+        2 => DetailBand::System,
+        _ => DetailBand::Instance,
     }
 }
 
@@ -262,7 +251,8 @@ fn hover_anchor(
 pub(crate) struct Overlay<'a> {
     pub(crate) scene: &'a SceneSnapshot,
     pub(crate) camera: Camera,
-    pub(crate) policy: &'a LodPolicy,
+    pub(crate) displayed_stage: u8,
+    pub(crate) hud_on: bool,
     pub(crate) hovered: Option<PickPath>,
     pub(crate) summary: SharedString,
     pub(crate) edges_on: bool,
@@ -279,11 +269,16 @@ pub(crate) struct State {
     hover: Option<(HoverInfo, HoverAnchor)>,
     edges_on: bool,
     legend_on: bool,
+    hud_on: bool,
     empty: bool,
     overlay_kind: Option<OverlayKind>,
 }
 
 impl State {
+    fn summary_shown(&self) -> bool {
+        !self.hud_on && self.density != Density::Minimal
+    }
+
     pub(crate) fn resolve(overlay: Overlay<'_>) -> State {
         let hover = overlay.hovered.and_then(|path| {
             let mut info = HoverInfo::resolve(overlay.scene, path)?;
@@ -312,11 +307,12 @@ impl State {
         });
         State {
             summary: overlay.summary,
-            band: detail_band(overlay.policy, overlay.camera.zoom),
+            band: detail_band(overlay.displayed_stage),
             density: density(overlay.viewport.0, overlay.viewport.1),
             hover,
             edges_on: overlay.edges_on,
             legend_on: overlay.legend_on,
+            hud_on: overlay.hud_on,
             empty: overlay.scene.rev > 0 && overlay.scene.totals.regions == 0,
             overlay_kind: overlay.map_overlay.kind,
         }
@@ -332,6 +328,7 @@ impl Default for State {
             hover: None,
             edges_on: false,
             legend_on: true,
+            hud_on: false,
             empty: false,
             overlay_kind: None,
         }

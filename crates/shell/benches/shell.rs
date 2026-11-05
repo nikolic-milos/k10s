@@ -24,6 +24,20 @@ use k10s_shell::fs::Fs;
 use k10s_shell::fs::fake::FakeFs;
 use k10s_shell::reveal::{ClusterFinder, MapIndex};
 
+#[cfg(windows)]
+macro_rules! native_path {
+    ($path:literal) => {
+        concat!("C:", $path)
+    };
+}
+
+#[cfg(not(windows))]
+macro_rules! native_path {
+    ($path:literal) => {
+        $path
+    };
+}
+
 // One 60 Hz frame: what a keystroke's share of the work has to fit inside. The
 // cases a person waits on are gated against it absolutely, not only against the
 // last recording, because a ratio gate accepts whatever the last recording was.
@@ -128,7 +142,7 @@ fn tree_fs(paths: &[String]) -> FakeFs {
 // One flat directory, which is what a picker filters on every keystroke.
 fn flat_fs() -> FakeFs {
     let names: Vec<String> = (0..FLAT_ENTRIES)
-        .map(|index| format!("/work/flat/deployment-{index:05}.yaml"))
+        .map(|index| format!("{}/deployment-{index:05}.yaml", native_path!("/work/flat")))
         .collect();
     let seeded: Vec<(&str, &str)> = names.iter().map(|path| (path.as_str(), "x")).collect();
     FakeFs::with_files(&seeded)
@@ -191,14 +205,14 @@ fn file_tree(rows: &mut Vec<Row>) {
 
 fn picker(rows: &mut Vec<Row>) {
     let fs = flat_fs();
-    let mut state = PickerState::new(Path::new("/work/flat"), PickerMode::OpenFile);
+    let mut state = PickerState::new(Path::new(native_path!("/work/flat")), PickerMode::OpenFile);
     let dir = state.begin_listing().expect("a folder to read");
     let listed = fs.list_dir(Path::new(&dir));
     assert!(state.listed(&dir, listed), "the listing is the one wanted");
     let entries = state.entries.len();
     // A keystroke inside a listed directory: filtering only, which is the whole
     // point of listing once.
-    state.input = "/work/flat/deployment-007".to_string();
+    state.input = native_path!("/work/flat/deployment-007").to_string();
     let mut matched = 0usize;
     let samples = measure(FAST, || {
         state.refilter();

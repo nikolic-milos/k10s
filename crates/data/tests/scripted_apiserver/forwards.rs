@@ -822,3 +822,96 @@ fn a_pinned_forward_cannot_change_its_requested_service_or_omit_identity() {
     assert!(script.requests_for("labelSelector").is_empty());
     drop(runtime);
 }
+
+#[test]
+fn a_browser_service_port80_uses_an_automatic_listener_without_changing_api_requests() {
+    use k10s_data::forward::ForwardRequest;
+    use std::sync::Arc;
+
+    for target in [serde_json::json!(8080), serde_json::json!("web")] {
+        let script = Script::default();
+        script_discovery(&script);
+        script_rules_review(&script);
+        script_access_reviews(&script, true, 32);
+        script_lists(&script);
+        let service = serde_json::json!({
+            "metadata":{"name":"grafana", "namespace":"prod", "uid":"service-a", "resourceVersion":"1"},
+            "spec":{"selector":{"app":"grafana"}, "ports":[{"port":80, "targetPort":target}]}
+        }).to_string();
+        script.route(
+            "GET",
+            "/api/v1/namespaces/prod/services/grafana",
+            200,
+            &service,
+        );
+        script.route("GET", "/api/v1/namespaces/prod/pods?", 200,
+            r#"{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[
+              {"metadata":{"name":"grafana-pod","namespace":"prod","uid":"pod-a"},
+               "spec":{"containers":[{"name":"grafana","ports":[{"name":"web","containerPort":8080}]}]},
+               "status":{"phase":"Running"}}]}"#);
+        let runtime = runtime();
+        let (sync, _live) = sync_on(&runtime, &script);
+        let source = Arc::new(k10s_core::ServiceIdentity {
+            namespace: "prod".into(),
+            name: "grafana".into(),
+            port: 80,
+            uid: "service-a".into(),
+            resource_version: "1".into(),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _stop = sync.reader.open_forward_cancellable(
+            ForwardRequest {
+                namespace: "prod".into(),
+                name: "grafana".into(),
+                service: true,
+                service_port: Some(80),
+                expected_service: Some(source.clone()),
+            },
+            move |outcome| {
+                let _ = tx.send(outcome);
+            },
+        );
+        let Fetched::Ok(reservation) = wait(&rx) else {
+            panic!("the browser target must resolve and reserve");
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ready = sync
+            .reader
+            .wait_forward_ready(reservation.row().id, move |outcome| {
+                let _ = tx.send(outcome);
+            });
+        let Fetched::Ok(row) = wait(&rx) else {
+            panic!("the automatic listener must bind");
+        };
+        assert_ne!(row.spec.local_port, 0);
+        assert_eq!(row.spec.remote_port, 8080);
+        assert_eq!(row.spec.pod, "grafana-pod");
+        assert!(Arc::ptr_eq(
+            row.spec.expected_service.as_ref().unwrap(),
+            &source
+        ));
+        drop(reservation);
+        assert!(sync.reader.forwards().list().is_empty());
+        let services = script.requests_for("/api/v1/namespaces/prod/services/grafana");
+        assert_eq!(services.len(), 1);
+        let pods = script.requests_for("/api/v1/namespaces/prod/pods?");
+        assert_eq!(pods.len(), 1);
+        for (request, path) in [
+            (&services[0], "/api/v1/namespaces/prod/services/grafana"),
+            (
+                &pods[0],
+                "/api/v1/namespaces/prod/pods?labelSelector=app%3Dgrafana&limit=10",
+            ),
+        ] {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path.replacen("?&", "?", 1), path);
+            assert_eq!(request.accept, "");
+            assert!(request.body_collected && request.body.is_empty());
+        }
+        assert!(
+            script.requests_for("/portforward").is_empty(),
+            "listener readiness never claims a kubelet upgrade"
+        );
+        drop(runtime);
+    }
+}

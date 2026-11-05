@@ -34,6 +34,7 @@ pub const MAX_CONNECTIONS_PER_FORWARD: usize = 16;
 pub struct ForwardSpec {
     pub namespace: String,
     pub pod: String,
+    /// Zero requests an automatic listener; Active rows carry its bound port.
     pub local_port: u16,
     pub remote_port: u16,
     pub expected_service: Option<Arc<k10s_core::ServiceIdentity>>,
@@ -106,7 +107,7 @@ pub enum ForwardTerminal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardEvent {
-    Ready,
+    Ready(u16),
     Dead(String),
 }
 
@@ -457,8 +458,16 @@ fn named_container_port(pod: &Pod, name: &str) -> Option<u16> {
     })
 }
 
+fn same_target(left: &ForwardSpec, right: &ForwardSpec) -> bool {
+    left.namespace == right.namespace
+        && left.pod == right.pod
+        && left.remote_port == right.remote_port
+        && left.expected_service == right.expected_service
+}
+
 struct Entry {
     row: ForwardRow,
+    requested_port: u16,
     guard: ForwardGuard,
     changed: Option<tokio::sync::watch::Sender<()>>,
     retained: bool,
@@ -526,10 +535,14 @@ impl ForwardRegistry {
             // A dead forward no longer binds its port, so only live rows
             // collide.
             if let Some(holder) = inner.entries.iter_mut().find(|e| {
-                e.row.spec.local_port == spec.local_port
-                    && !matches!(e.row.state, ForwardState::Dead { .. })
+                !matches!(e.row.state, ForwardState::Dead { .. })
+                    && if reuse && spec.local_port == 0 {
+                        same_target(&e.row.spec, &spec)
+                    } else {
+                        spec.local_port != 0 && e.row.spec.local_port == spec.local_port
+                    }
             }) {
-                if reuse && holder.row.spec == spec {
+                if reuse && same_target(&holder.row.spec, &spec) {
                     if retained {
                         holder.retained = true;
                     } else {
@@ -556,6 +569,7 @@ impl ForwardRegistry {
                     spec: spec.clone(),
                     state: ForwardState::Opening,
                 },
+                requested_port: spec.local_port,
                 guard: ForwardGuard::noop(),
                 changed: None,
                 retained,
@@ -570,22 +584,36 @@ impl ForwardRegistry {
                 let Some(inner) = inner.upgrade() else {
                     return;
                 };
-                let changed = {
+                let (changed, retired) = {
                     let mut inner = inner.lock().expect("forward registry lock");
                     if let Some(entry) = inner.entries.iter_mut().find(|e| e.row.id == id) {
                         match event {
-                            ForwardEvent::Ready => {
+                            ForwardEvent::Ready(port) => {
                                 if entry.row.state == ForwardState::Opening {
-                                    entry.row.state = ForwardState::Active;
+                                    if port != 0
+                                        && (entry.requested_port == 0
+                                            || entry.requested_port == port)
+                                    {
+                                        entry.row.spec.local_port = port;
+                                        entry.row.state = ForwardState::Active;
+                                    } else {
+                                        entry.row.state = ForwardState::Dead {
+                                            why: "the listener reported an unexpected local port"
+                                                .into(),
+                                        };
+                                    }
                                 }
                             }
                             ForwardEvent::Dead(why) => entry.row.state = ForwardState::Dead { why },
                         }
-                        entry.changed.clone()
+                        let retired = matches!(entry.row.state, ForwardState::Dead { .. })
+                            .then(|| std::mem::replace(&mut entry.guard, ForwardGuard::noop()));
+                        (entry.changed.clone(), retired)
                     } else {
-                        None
+                        (None, None)
                     }
                 };
+                drop(retired);
                 if let Some(changed) = changed {
                     changed.send_replace(());
                 }
@@ -594,12 +622,22 @@ impl ForwardRegistry {
         let mut inner = self.inner.lock().expect("forward registry lock");
         match inner.entries.iter_mut().find(|e| e.row.id == id) {
             Some(entry) => {
-                entry.guard = guard;
-                Ok((entry.row.clone(), true))
+                let row = entry.row.clone();
+                if matches!(row.state, ForwardState::Dead { .. }) {
+                    drop(inner);
+                    drop(guard);
+                } else {
+                    entry.guard = guard;
+                }
+                Ok((row, true))
             }
             // Closed in the window between the two locks: cancel what was
-            // just started by dropping its guard.
-            None => Err(OpenError::Closed),
+            // just started outside the lock.
+            None => {
+                drop(inner);
+                drop(guard);
+                Err(OpenError::Closed)
+            }
         }
     }
 
@@ -796,7 +834,16 @@ impl KubeForwarder {
                     return;
                 }
             };
-            on_event(ForwardEvent::Ready);
+            let port = match listener.local_addr() {
+                Ok(address) => address.port(),
+                Err(error) => {
+                    on_event(ForwardEvent::Dead(format!(
+                        "cannot read the local listener address: {error}"
+                    )));
+                    return;
+                }
+            };
+            on_event(ForwardEvent::Ready(port));
             let api: Api<Pod> = Api::namespaced(client, &spec.namespace);
             let (dead_tx, mut dead) = tokio::sync::mpsc::channel::<String>(1);
             let mut connections: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
@@ -892,7 +939,7 @@ mod tests {
     struct FakeState {
         started: Vec<ForwardSpec>,
         cancelled: Vec<ForwardSpec>,
-        events: Vec<Box<dyn Fn(ForwardEvent) + Send + Sync>>,
+        events: Vec<Arc<dyn Fn(ForwardEvent) + Send + Sync>>,
     }
 
     #[derive(Clone, Default)]
@@ -909,10 +956,18 @@ mod tests {
             self.state.lock().unwrap().cancelled.clone()
         }
 
+        fn ready(&self, at: usize) {
+            let (report, port) = {
+                let state = self.state.lock().unwrap();
+                (state.events[at].clone(), state.started[at].local_port)
+            };
+            report(ForwardEvent::Ready(port));
+        }
+
         // Drives the seam from the test: the nth started forward reports.
         fn report(&self, at: usize, event: ForwardEvent) {
-            let state = self.state.lock().unwrap();
-            (state.events[at])(event);
+            let report = self.state.lock().unwrap().events[at].clone();
+            report(event);
         }
     }
 
@@ -924,7 +979,7 @@ mod tests {
         ) -> ForwardGuard {
             let mut state = self.state.lock().unwrap();
             state.started.push(spec.clone());
-            state.events.push(on_event);
+            state.events.push(Arc::from(on_event));
             let shared = self.state.clone();
             let spec = spec.clone();
             ForwardGuard::new(move || {
@@ -966,7 +1021,7 @@ mod tests {
         assert!(!registry.is_active(row.id));
         assert_eq!(fake.started(), 1);
 
-        fake.report(0, ForwardEvent::Ready);
+        fake.ready(0);
         let listed = registry.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].state, ForwardState::Active);
@@ -1027,7 +1082,7 @@ mod tests {
         let first = registry.open(spec("api-1", 8080, 80)).expect("opens");
         let mut waiter = Box::pin(registry.wait_ready(first.id));
         assert!(futures::poll!(waiter.as_mut()).is_pending());
-        fake.report(0, ForwardEvent::Ready);
+        fake.ready(0);
         let Fetched::Ok(active) = waiter.await else {
             panic!("the registered waiter sees the listener");
         };
@@ -1035,7 +1090,7 @@ mod tests {
         assert_eq!(active.state, ForwardState::Active);
 
         let second = registry.open(spec("api-2", 8081, 81)).expect("opens");
-        fake.report(1, ForwardEvent::Ready);
+        fake.ready(1);
         let Fetched::Ok(active) = registry.wait_ready(second.id).await else {
             panic!("a listener ready before registration is observed");
         };
@@ -1081,7 +1136,7 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         let mut waiter = Box::pin(registry.wait_ready(row.id));
         assert!(waiter.as_mut().poll(&mut context).is_pending());
-        fake.report(0, ForwardEvent::Ready);
+        fake.ready(0);
         assert!(signal.called.load(Ordering::Acquire));
         assert!(matches!(waiter.await, Fetched::Ok(_)));
     }
@@ -1136,7 +1191,7 @@ mod tests {
             }
         );
         assert_eq!(registry.list()[0].state, ForwardState::Opening);
-        fake.report(0, ForwardEvent::Ready);
+        fake.ready(0);
         assert!(matches!(registry.wait_ready(row.id).await, Fetched::Ok(_)));
     }
 
@@ -1153,7 +1208,7 @@ mod tests {
         assert!(registry.inner.lock().unwrap().entries[0].changed.is_none());
 
         let second = registry.open(spec("api-2", 8081, 81)).expect("opens");
-        fake.report(1, ForwardEvent::Ready);
+        fake.ready(1);
         let mut waiter = Box::pin(registry.wait_terminal(second.id));
         assert!(futures::poll!(waiter.as_mut()).is_pending());
         fake.report(1, ForwardEvent::Dead("kubelet denied the upgrade".into()));
@@ -1203,7 +1258,7 @@ mod tests {
             fake.cancelled().is_empty(),
             "one remaining registry keeps its forward open"
         );
-        fake.report(0, ForwardEvent::Ready);
+        fake.ready(0);
         assert_eq!(remaining.list()[0].state, ForwardState::Active);
 
         drop(remaining);
@@ -1212,13 +1267,291 @@ mod tests {
             vec![target.clone()],
             "retained callbacks cannot keep the last registry's guard alive"
         );
-        fake.report(0, ForwardEvent::Ready);
+        fake.ready(0);
         fake.report(0, ForwardEvent::Dead("a late server sentence".into()));
         assert_eq!(
             fake.cancelled(),
             vec![target],
             "late callbacks return safely without another cancellation"
         );
+    }
+
+    #[test]
+    fn automatic_reservations_share_the_exact_target_before_and_after_binding() {
+        let fake = FakeForwarder::default();
+        let registry = ForwardRegistry::new(Arc::new(fake.clone()));
+        let target = spec("api-1", 0, 80);
+        let first = registry.reserve(target.clone()).expect("first claim");
+        let second = registry
+            .reserve(target.clone())
+            .expect("duplicate pending claim");
+        assert_eq!(first.row().id, second.row().id);
+        assert_eq!(fake.started(), 1);
+        fake.report(0, ForwardEvent::Ready(43123));
+        let third = registry
+            .reserve(target.clone())
+            .expect("duplicate active claim");
+        assert_eq!(first.row().id, third.row().id);
+        assert_eq!(third.row().spec.local_port, 43123);
+        assert_eq!(third.row().state, ForwardState::Active);
+        assert_eq!(fake.started(), 1);
+        drop(first);
+        drop(second);
+        assert_eq!(registry.list(), vec![third.row().clone()]);
+        assert!(fake.cancelled().is_empty());
+        drop(third);
+        assert!(registry.list().is_empty());
+        assert_eq!(fake.cancelled(), vec![target]);
+    }
+
+    #[test]
+    fn automatic_requests_distinguish_targets_and_reuse_an_exact_fixed_listener() {
+        let fake = FakeForwarder::default();
+        let registry = ForwardRegistry::new(Arc::new(fake.clone()));
+        let fixed = registry
+            .open(spec("api-1", 8080, 80))
+            .expect("fixed listener");
+        fake.ready(0);
+        let shared = registry
+            .reserve(spec("api-1", 0, 80))
+            .expect("same exact target");
+        assert_eq!(shared.row().id, fixed.id);
+        assert_eq!(shared.row().spec.local_port, 8080);
+        let mut distinct = Vec::new();
+        for target in [spec("api-2", 0, 80), spec("api-1", 0, 81)] {
+            distinct.push(
+                registry
+                    .reserve(target)
+                    .expect("unrelated automatic target"),
+            );
+        }
+        let mut other_namespace = spec("api-1", 0, 80);
+        other_namespace.namespace = "other".into();
+        distinct.push(
+            registry
+                .reserve(other_namespace)
+                .expect("another namespace"),
+        );
+        let mut other_origin = spec("api-1", 0, 80);
+        other_origin.expected_service = Some(Arc::new(k10s_core::ServiceIdentity {
+            namespace: "prod".into(),
+            name: "service".into(),
+            port: 80,
+            uid: "service-a".into(),
+            resource_version: "1".into(),
+        }));
+        distinct.push(
+            registry
+                .reserve(other_origin.clone())
+                .expect("verified origin"),
+        );
+        Arc::make_mut(other_origin.expected_service.as_mut().unwrap()).resource_version =
+            "2".into();
+        distinct.push(registry.reserve(other_origin).expect("changed origin"));
+        assert_eq!(fake.started(), 6);
+        assert_eq!(registry.list().len(), 6);
+        drop(shared);
+        drop(distinct);
+        assert_eq!(registry.list().len(), 1);
+        assert_eq!(registry.list()[0].id, fixed.id);
+    }
+
+    #[test]
+    fn listener_ports_are_verified_and_dead_or_active_rows_cannot_be_rebound() {
+        for (requested, reported) in [(0, 0), (8080, 8081), (8080, 0)] {
+            let fake = FakeForwarder::default();
+            let registry = ForwardRegistry::new(Arc::new(fake.clone()));
+            let row = registry
+                .open(spec("api-1", requested, 80))
+                .expect("registered");
+            fake.report(0, ForwardEvent::Ready(reported));
+            assert!(matches!(
+                registry.list()[0].state,
+                ForwardState::Dead { .. }
+            ));
+            fake.report(0, ForwardEvent::Ready(8080));
+            assert!(
+                !registry.is_active(row.id),
+                "a rejected listener cannot resurrect"
+            );
+        }
+        let fake = FakeForwarder::default();
+        let registry = ForwardRegistry::new(Arc::new(fake.clone()));
+        let row = registry.open(spec("api-1", 0, 80)).expect("registered");
+        fake.report(0, ForwardEvent::Ready(43123));
+        fake.report(0, ForwardEvent::Ready(43124));
+        assert_eq!(registry.list()[0].spec.local_port, 43123);
+        fake.report(0, ForwardEvent::Dead("listener ended".into()));
+        fake.report(0, ForwardEvent::Ready(43125));
+        assert!(!registry.is_active(row.id));
+        assert_eq!(registry.list()[0].spec.local_port, 43123);
+    }
+
+    #[test]
+    fn rejected_and_dead_listeners_release_owned_sockets_outside_the_registry_lock() {
+        use std::sync::atomic::{AtomicU16, AtomicUsize};
+
+        type EventReport = Arc<dyn Fn(ForwardEvent) + Send + Sync>;
+
+        struct OwnedListenerForwarder {
+            synchronous: bool,
+            event: ForwardEvent,
+            report: Mutex<Option<EventReport>>,
+            registry: Mutex<Option<std::sync::Weak<Mutex<Entries>>>>,
+            port: AtomicU16,
+            cancelled: Arc<AtomicUsize>,
+        }
+        impl Forwarder for OwnedListenerForwarder {
+            fn start(
+                &self,
+                _: &ForwardSpec,
+                on_event: Box<dyn Fn(ForwardEvent) + Send + Sync>,
+            ) -> ForwardGuard {
+                let listener =
+                    std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an owned test listener");
+                self.port
+                    .store(listener.local_addr().unwrap().port(), Ordering::Release);
+                let report: Arc<dyn Fn(ForwardEvent) + Send + Sync> = Arc::from(on_event);
+                *self.report.lock().unwrap() = Some(report.clone());
+                if self.synchronous {
+                    report(self.event.clone());
+                }
+                let registry = self.registry.lock().unwrap().as_ref().unwrap().clone();
+                let cancelled = self.cancelled.clone();
+                ForwardGuard::new(move || {
+                    let inner = registry.upgrade().expect("the registry remains owned");
+                    assert!(
+                        inner.try_lock().is_ok(),
+                        "cancellation may reenter the registry"
+                    );
+                    cancelled.fetch_add(1, Ordering::AcqRel);
+                    drop(listener);
+                })
+            }
+        }
+        for synchronous in [false, true] {
+            for event in [
+                ForwardEvent::Ready(0),
+                ForwardEvent::Dead("listener refused".into()),
+            ] {
+                let forwarder = Arc::new(OwnedListenerForwarder {
+                    synchronous,
+                    event: event.clone(),
+                    report: Mutex::new(None),
+                    registry: Mutex::new(None),
+                    port: AtomicU16::new(0),
+                    cancelled: Arc::new(AtomicUsize::new(0)),
+                });
+                let registry = ForwardRegistry::new(forwarder.clone());
+                *forwarder.registry.lock().unwrap() = Some(Arc::downgrade(&registry.inner));
+                let row = registry
+                    .open(spec("api-1", 0, 80))
+                    .expect("registered listener");
+                let port = forwarder.port.load(Ordering::Acquire);
+                assert_ne!(port, 0);
+                if !synchronous {
+                    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+                    let report = forwarder.report.lock().unwrap().as_ref().unwrap().clone();
+                    report(event);
+                }
+                assert!(matches!(
+                    registry.list()[0].state,
+                    ForwardState::Dead { .. }
+                ));
+                let released = std::net::TcpListener::bind(("127.0.0.1", port))
+                    .expect("a rejected owned listener must release its actual port");
+                assert_eq!(forwarder.cancelled.load(Ordering::Acquire), 1);
+                assert!(registry.close(row.id));
+                assert_eq!(forwarder.cancelled.load(Ordering::Acquire), 1);
+                drop(released);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_automatic_claims_share_one_registration_and_cancel_once() {
+        let fake = FakeForwarder::default();
+        let registry = ForwardRegistry::new(Arc::new(fake.clone()));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let tasks: Vec<_> = (0..2)
+            .map(|_| {
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry
+                        .reserve(spec("api-1", 0, 80))
+                        .expect("automatic claim")
+                })
+            })
+            .collect();
+        barrier.wait();
+        let mut claims: Vec<_> = tasks.into_iter().map(|task| task.join().unwrap()).collect();
+        assert_eq!(claims[0].row().id, claims[1].row().id);
+        assert_eq!(fake.started(), 1);
+        drop(claims.pop());
+        assert_eq!(registry.list().len(), 1);
+        assert!(fake.cancelled().is_empty());
+        drop(claims);
+        assert!(registry.list().is_empty());
+        assert_eq!(fake.cancelled(), vec![spec("api-1", 0, 80)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_listener_reports_its_owned_port_and_releases_it_on_last_claim() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let occupied_port = occupied.local_addr().unwrap().port();
+            let (reached, _requests) = tokio::sync::mpsc::unbounded_channel();
+            let registry = ForwardRegistry::new(Arc::new(KubeForwarder::new(
+                hanging_client(reached),
+                tokio::runtime::Handle::current(),
+            )));
+            let target = spec("api-1", 0, occupied_port);
+            let first = registry
+                .reserve(target.clone())
+                .expect("automatic listener");
+            let Fetched::Ok(active) = registry.wait_ready(first.row().id).await else {
+                panic!("the automatic listener must bind");
+            };
+            let port = active.spec.local_port;
+            assert_ne!(port, 0);
+            assert_ne!(port, occupied_port);
+            assert_eq!(active.spec.remote_port, occupied_port);
+            let second = registry.reserve(target).expect("duplicate active claim");
+            assert_eq!(second.row().id, active.id);
+            drop(first);
+            assert!(registry.is_active(active.id));
+            assert!(
+                tokio::net::TcpListener::bind(("127.0.0.1", port))
+                    .await
+                    .is_err()
+            );
+            drop(second);
+            loop {
+                match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(listener) => {
+                        drop(listener);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(error) => panic!("the automatic listener was not released: {error}"),
+                }
+            }
+            assert!(registry.list().is_empty());
+            assert!(
+                tokio::net::TcpListener::bind(("127.0.0.1", occupied_port))
+                    .await
+                    .is_err(),
+                "the separate owned listener remains held"
+            );
+        })
+        .await
+        .expect("automatic listener lifecycle deadline");
     }
 
     #[test]
@@ -1255,7 +1588,7 @@ mod tests {
             registry.open_or_reuse(target.clone()),
             Ok(ForwardStart::Reused(row.clone()))
         );
-        fake.report(0, ForwardEvent::Ready);
+        fake.ready(0);
         let active = registry.list()[0].clone();
         assert_eq!(
             registry.open_or_reuse(target.clone()),
@@ -1459,7 +1792,7 @@ mod tests {
         let fake = FakeForwarder::default();
         let registry = ForwardRegistry::new(Arc::new(fake.clone()));
         let row = registry.open(spec("api-1", 8080, 80)).expect("opens");
-        fake.report(0, ForwardEvent::Ready);
+        fake.ready(0);
         fake.report(0, ForwardEvent::Dead("the pod is gone".to_string()));
         assert!(!registry.is_active(row.id));
 
@@ -1471,7 +1804,7 @@ mod tests {
             },
             "death is shown, not hidden"
         );
-        fake.report(0, ForwardEvent::Ready);
+        fake.ready(0);
         assert!(
             matches!(registry.list()[0].state, ForwardState::Dead { .. }),
             "a late Ready cannot resurrect a dead forward"
@@ -1533,7 +1866,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
                 .await
                 .expect("the listener binds"),
-            Some(ForwardEvent::Ready)
+            Some(ForwardEvent::Ready(port))
         );
 
         let mut connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -1584,7 +1917,7 @@ mod tests {
                 }),
                 async move { Ok(listener) },
             );
-            assert_eq!(events.recv().await, Some(ForwardEvent::Ready));
+            assert_eq!(events.recv().await, Some(ForwardEvent::Ready(port)));
 
             let mut connections = Vec::with_capacity(MAX_CONNECTIONS_PER_FORWARD);
             for _ in 0..MAX_CONNECTIONS_PER_FORWARD {
