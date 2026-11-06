@@ -260,3 +260,45 @@ fn a_churn_rate_set_after_spawn_is_what_the_world_spends() {
     ctrl_tx.send(WorldCtrl::Shutdown).unwrap();
     world.join().unwrap();
 }
+
+#[test]
+fn both_empty_sources_replace_the_initial_empty_world() {
+    for (source, replacement) in [
+        ("cluster", WorldCtrl::Rebuild(Vec::new())),
+        ("generated", WorldCtrl::RebuildPrepared(Default::default())),
+    ] {
+        let scene = k10s_core::new_shared_scene();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
+        let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
+        let world = spawn_world(
+            Vec::new(),
+            crossbeam_channel::never(),
+            scene.clone(),
+            ctrl_rx,
+            2,
+            0.0,
+            LayoutMode::Spread,
+            move || {
+                let _ = wake_tx.send(());
+            },
+        );
+        wake_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the initial empty world publishes");
+        assert_eq!(scene.load().rev, 1, "{source} starts behind the bootstrap");
+        assert_eq!(scene.load().totals, Default::default());
+
+        ctrl_tx
+            .send(replacement)
+            .expect("the empty source is chosen");
+        wake_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the empty chosen source publishes");
+        let chosen = scene.load_full();
+        assert_eq!(chosen.rev, 2, "{source} replaces the empty bootstrap");
+        assert_eq!(chosen.totals, Default::default());
+
+        ctrl_tx.send(WorldCtrl::Shutdown).expect("sent");
+        world.join().expect("the world thread ends cleanly");
+    }
+}

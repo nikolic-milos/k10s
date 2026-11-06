@@ -313,7 +313,7 @@ impl State {
             edges_on: overlay.edges_on,
             legend_on: overlay.legend_on,
             hud_on: overlay.hud_on,
-            empty: overlay.scene.rev > 0 && overlay.scene.totals.regions == 0,
+            empty: overlay.scene.rev > 1 && overlay.scene.totals.regions == 0,
             overlay_kind: overlay.map_overlay.kind,
         }
     }

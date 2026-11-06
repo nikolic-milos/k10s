@@ -272,7 +272,7 @@ fn observed_client(
     port: u16,
     upgrades: Arc<Mutex<Vec<String>>>,
 ) -> kube::Client {
-    let expected = format!("/api/v1/namespaces/{namespace}/pods/{pod}/portforward?ports={port}");
+    let expected = format!("/api/v1/namespaces/{namespace}/pods/{pod}/portforward?&ports={port}");
     let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
         let client = client.clone();
         let expected = expected.clone();

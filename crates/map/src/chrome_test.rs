@@ -533,3 +533,39 @@ fn explicit_diagnostic_hud_hides_only_the_normal_summary() {
         assert!(chrome.replace(normal));
     }
 }
+
+#[test]
+fn empty_notice_waits_for_a_source_replacement_in_both_viewport_sizes() {
+    let frame = OverlayFrame::default();
+    for viewport in [(1280.0, 720.0), (640.0, 480.0)] {
+        for (label, revision, has_namespace, expected) in [
+            ("unpublished", 0, false, false),
+            ("initial empty world", 1, false, false),
+            ("empty source replacement", 2, false, true),
+            ("later empty source", 8, false, true),
+            ("nonempty source", 2, true, false),
+        ] {
+            let mut scene = if has_namespace {
+                hover_scene()
+            } else {
+                SceneSnapshot::default()
+            };
+            scene.rev = revision;
+            scene.totals = Totals {
+                regions: scene.regions.len() as u32,
+                blocks: scene.blocks.len() as u32,
+                cells: scene.cells.len() as u32,
+                sats: scene.sats.len() as u32,
+                edges: 0,
+            };
+            let mut overlay = chrome_overlay(&scene, None, &frame);
+            overlay.viewport = viewport;
+            overlay.summary = SummaryCache::default().line(scene.totals);
+            assert_eq!(
+                State::resolve(overlay).empty,
+                expected,
+                "{label} in {viewport:?}"
+            );
+        }
+    }
+}

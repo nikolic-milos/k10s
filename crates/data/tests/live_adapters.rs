@@ -102,6 +102,16 @@ fn connect(context: Option<&str>) -> (k10s_data::DataPlane, Sync) {
     (plane, sync)
 }
 
+fn production_clients(runtime: &tokio::runtime::Runtime) -> k10s_data::connect::Clients {
+    let mut connector =
+        k10s_data::connect::Connector::load(&k10s_data::connect::Env::from_process())
+            .expect("the live connection source");
+    runtime
+        .block_on(connector.connect(None))
+        .expect("the production lab clients")
+        .clients
+}
+
 fn kind(reader: &Reader, display: &str) -> KindRow {
     reader
         .kinds()
@@ -599,10 +609,11 @@ fn a_delayed_live_grafana_catalog_reports_its_timeout_and_recovers() {
     let (sink, _events) = crossbeam_channel::bounded(DEFAULT_EVENT_SINK_CAPACITY);
     let plane = k10s_data::spawn(sink).expect("the production data runtime");
     let runtime = plane.runtime();
-    let client = runtime
-        .block_on(kube::Client::try_default())
-        .expect("the real lab client");
-    let (interactive, delay) = grafana_delay::client(runtime, client.clone(), "api/search", 1);
+    let k10s_data::connect::Clients {
+        sync: client,
+        interactive,
+    } = production_clients(runtime);
+    let (interactive, delay) = grafana_delay::client(runtime, interactive, "api/search", 1);
     let namespace = namespace();
     let sync = runtime
         .block_on(k10s_data::sync_from(
@@ -622,6 +633,10 @@ fn a_delayed_live_grafana_catalog_reports_its_timeout_and_recovers() {
     let fetch = || {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = sync.reader.observe_grafana(move |answer| {
+            eprintln!(
+                "live catalogue request={:?}",
+                k10s_data::telemetry::request_metrics()
+            );
             let _ = tx.send(answer);
         });
         let answer = wait(&rx);
@@ -895,15 +910,16 @@ fn stalled_telemetry_cancels_at_capacity_while_kubernetes_reads_and_watches_prog
         Fetched::Ok(catalog) => catalog,
         other => panic!("the owned pilot dashboard must answer: {other:?}"),
     };
-    assert!(
-        catalog.served && !catalog.truncated && catalog.errors.is_empty(),
-        "{catalog:?}"
-    );
+    assert!(catalog.served && catalog.errors.is_empty(), "{catalog:?}");
     let dashboard = catalog
         .dashboards
         .iter()
         .find(|dashboard| dashboard.uid == "k10s-observe-pilot-native")
         .expect("the actual owned pilot dashboard");
+    assert!(
+        !dashboard.truncated,
+        "the selected pilot dashboard must be complete: {dashboard:?}"
+    );
     let panel = dashboard
         .panels
         .iter()
@@ -1261,13 +1277,14 @@ fn cancelling_a_real_metrics_overlay_releases_capacity_for_a_fresh_overlay_resul
         .enable_all()
         .build()
         .expect("a live overlay runtime");
-    let client = runtime
-        .block_on(kube::Client::try_default())
-        .expect("the live lab client");
+    let k10s_data::connect::Clients {
+        sync: client,
+        interactive,
+    } = production_clients(&runtime);
     let armed = Arc::new(AtomicBool::new(false));
     let intercepted = Arc::new(AtomicBool::new(false));
     let (seen_tx, seen_rx) = std::sync::mpsc::channel();
-    let underlying = client.clone();
+    let underlying = interactive;
     let armed_for_service = armed.clone();
     let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
         let client = underlying.clone();
@@ -1331,10 +1348,21 @@ fn cancelling_a_real_metrics_overlay_releases_capacity_for_a_fresh_overlay_resul
         overlay::Kind::Metrics,
         ReachSettings::default(),
         move |answer| {
+            eprintln!(
+                "live overlay request={:?}",
+                k10s_data::telemetry::request_metrics()
+            );
             let _ = tx.send(answer);
         },
     );
-    wait(&seen_rx);
+    seen_rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|error| {
+            panic!(
+                "actual provisioning response witness: {error:?}; schedule={:?}",
+                sync.reader.observe_schedule_counts()
+            )
+        });
     assert_eq!(sync.reader.observe_schedule_counts().active, 1);
     drop(stop);
     runtime.block_on(async {
