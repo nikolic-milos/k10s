@@ -144,7 +144,7 @@ fn search_goes_through_the_service_proxy() {
 
 #[test]
 fn search_page_fullness_precedes_folder_filtering() {
-    for count in [99, 100] {
+    for count in [99, 100, 101] {
         let script = Script::default();
         let hits: Vec<_> = (0..count)
             .map(|index| {
@@ -167,7 +167,7 @@ fn search_page_fullness_precedes_folder_filtering() {
             panic!("search must resolve: {fetched:?}");
         };
         assert!(page.hits.is_empty());
-        assert_eq!(page.page_full, count == 100);
+        assert_eq!(page.page_full, count >= 100);
         assert_eq!(script.seen().len(), 1);
         assert_proxy_get(&script, "api/search?type=dash-db&limit=100");
     }
@@ -827,7 +827,7 @@ fn assert_proxy_get(script: &Script, rest: &str) {
 fn a_full_search_page_keeps_file_sources_and_fetches_a_bounded_live_prefix() {
     use k10s_data::integrations::grafana::MAX_NAMED_FROM_SEARCH;
 
-    for count in [99, 100] {
+    for count in [99, 100, 101] {
         let script = Script::default();
         let runtime = runtime();
         let (sync, _live) = catalog_connection(&runtime, &script);
@@ -874,9 +874,12 @@ fn a_full_search_page_keeps_file_sources_and_fetches_a_bounded_live_prefix() {
         };
         assert!(catalog.served);
         assert_eq!(catalog.dashboards.len(), count);
-        assert_eq!(catalog.extra_hits.len(), count - MAX_NAMED_FROM_SEARCH);
+        assert_eq!(
+            catalog.extra_hits.len(),
+            count.min(100) - MAX_NAMED_FROM_SEARCH
+        );
         assert!(catalog.truncated);
-        if count == 100 {
+        if count >= 100 {
             assert_eq!(
                 catalog.errors,
                 ["Grafana search returned its result limit; more dashboards may exist"]

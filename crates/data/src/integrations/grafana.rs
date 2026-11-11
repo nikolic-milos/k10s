@@ -14,6 +14,7 @@
 //! read: the sidecar can watch those too, and this path refuses that. Parse is
 //! shared. The bytes are attacker-shaped. Oversize dashboards are refused;
 //! panels and targets past their limits are reported as truncated.
+//! Search retains at most the requested hundred hits and labels a full page.
 //! Provisioned lists share an eight-MiB body budget and sixteen pages, with
 //! four seconds per exchange. A failed or denied later page keeps healthy dashboards
 //! and named errors; a denial with nothing to keep remains an explicit denied result.
@@ -24,7 +25,9 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use kube::Client;
 use kube::api::{ListParams, ObjectList, Request};
 use serde::Deserialize;
+use serde::de::{SeqAccess, Visitor};
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 use crate::reach::{Bound, tool_get};
 use crate::read::Fetched;
@@ -642,16 +645,46 @@ pub struct SearchPage {
     pub page_full: bool,
 }
 
+impl<'de> Deserialize<'de> for SearchPage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Search;
+
+        impl<'de> Visitor<'de> for Search {
+            type Value = SearchPage;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of Grafana search results")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<SearchPage, A::Error> {
+                let mut hits = Vec::new();
+                while hits.len() < SEARCH_LIMIT {
+                    let Some(hit) = sequence.next_element()? else {
+                        return Ok(SearchPage {
+                            hits,
+                            page_full: false,
+                        });
+                    };
+                    hits.push(hit);
+                }
+                // Validate the rest of the array without retaining more hits.
+                while sequence.next_element::<&RawValue>()?.is_some() {}
+                Ok(SearchPage {
+                    hits,
+                    page_full: true,
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(Search)
+    }
+}
+
 pub fn parse_search(bytes: &[u8]) -> Result<SearchPage, DashboardError> {
     if bytes.len() > MAX_DASHBOARD_BYTES {
         return Err(DashboardError::TooLarge { bytes: bytes.len() });
     }
-    let hits: Vec<SearchHit> = serde_json::from_slice(bytes)
-        .map_err(|error| DashboardError::NotJson(error.to_string()))?;
-    Ok(SearchPage {
-        page_full: hits.len() >= SEARCH_LIMIT,
-        hits,
-    })
+    serde_json::from_slice(bytes).map_err(|error| DashboardError::NotJson(error.to_string()))
 }
 
 /// Keep hits whose folder title is in the allowlist. An empty allowlist keeps

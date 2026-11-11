@@ -229,6 +229,36 @@ fn search_json_keeps_the_folder_grafana_named() {
 }
 
 #[test]
+fn search_overflow_validates_the_array_without_decoding_more_hits() {
+    let hits: Vec<_> = (0..SEARCH_LIMIT)
+        .map(|index| serde_json::json!({"uid":format!("item-{index}")}))
+        .collect();
+    let mut prefix = serde_json::to_vec(&hits).expect("search fixture");
+    assert_eq!(prefix.pop(), Some(b']'));
+    let mut input = prefix.clone();
+    input.extend_from_slice(br#",{"uid":42}]"#);
+    let page = parse_search(&input).expect("valid JSON beyond the hit limit");
+    assert_eq!(page.hits.len(), SEARCH_LIMIT);
+    assert!(page.page_full);
+    for (index, hit) in page.hits.iter().enumerate() {
+        assert_eq!(hit.uid, format!("item-{index}"));
+    }
+
+    for invalid_tail in [
+        b",{\"uid\":]".as_slice(),
+        b",{\"uid\":\"\xff\"}]",
+        b"] true",
+    ] {
+        let mut input = prefix.clone();
+        input.extend_from_slice(invalid_tail);
+        assert!(matches!(
+            parse_search(&input),
+            Err(DashboardError::NotJson(_))
+        ));
+    }
+}
+
+#[test]
 fn search_path_and_page_limit_agree() {
     let (_, limit) = SEARCH_PATH.rsplit_once("limit=").expect("search limit");
     assert_eq!(limit.parse::<usize>().expect("numeric limit"), SEARCH_LIMIT);
