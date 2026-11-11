@@ -17,7 +17,7 @@ dist/linux/build-appimage.sh
 
 Outputs land in `target/dist/`. The scripts never invoke cargo, never start
 the GUI, and never run a benchmark. They require `target/release/k10s` and
-`crates/k10s-assets/assets/linux/k10s.desktop`.
+`crates/assets/assets/linux/k10s.desktop`.
 
 Icon notices travel with the binary (`k10s --attribution`) and are copied
 into `/usr/share/doc/k10s/ATTRIBUTION.md` inside the Linux packages.

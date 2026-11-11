@@ -13,6 +13,9 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is build-time-only through image/exr/pulp; upstream has no safe upgrade" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser is pinned by GPUI/fontdb/usvg; track until GPUI moves to skrifa" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz is pinned by GPUI/usvg; track until GPUI completes the harfrust migration" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant was merged into zbus 6; zbus 5 is pinned by GPUI's Linux portal and accessibility stack" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names was merged into zbus 6; zbus 5 is pinned by GPUI's Linux portal and accessibility stack" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive was merged into zbus 6; zbus 5 is pinned by GPUI's Linux portal and accessibility stack" },
 ]
 
 [licenses]
@@ -76,7 +79,7 @@ unused-allowed-source = "allow"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/nikolic-milos/zed",
-    # proptest is a git dep of the excluded tools/k10s-paint-bench graph, which
+    # proptest is a git dep of the excluded tools/paint-bench graph, which
     # security.yml checks with --config deny.toml; it is absent from the
     # workspace lock on purpose.
     "https://github.com/proptest-rs/proptest",

@@ -10,9 +10,9 @@
       "iters": 335,
       "samples": 335,
       "batch_size": 1,
-      "p50_rmad": 0.009830,
-      "p50_ns": 896010.000,
-      "p99_ns": 951442.000
+      "p50_rmad": 0.009584,
+      "p50_ns": 897194.000,
+      "p99_ns": 922033.000
     },
     {
       "scenario": "tree-5k",
@@ -22,9 +22,9 @@
       "iters": 134,
       "samples": 134,
       "batch_size": 1,
-      "p50_rmad": 0.008815,
-      "p50_ns": 899072.000,
-      "p99_ns": 948633.000
+      "p50_rmad": 0.007386,
+      "p50_ns": 900333.000,
+      "p99_ns": 924808.000
     },
     {
       "scenario": "dir-2k",
@@ -34,9 +34,9 @@
       "iters": 435,
       "samples": 435,
       "batch_size": 1,
-      "p50_rmad": 0.015038,
-      "p50_ns": 279089.000,
-      "p99_ns": 313749.000
+      "p50_rmad": 0.014102,
+      "p50_ns": 278963.000,
+      "p99_ns": 291389.000
     },
     {
       "scenario": "scan-5k",
@@ -46,21 +46,21 @@
       "iters": 20,
       "samples": 20,
       "batch_size": 1,
-      "p50_rmad": 0.000908,
-      "p50_ns": 38672162.000,
-      "p99_ns": 38882001.000
+      "p50_rmad": 0.001438,
+      "p50_ns": 38816207.000,
+      "p99_ns": 38978646.000
     },
     {
       "scenario": "scan-5k",
       "op": "keystroke",
       "entries": 1576,
       "result": 256,
-      "iters": 416,
-      "samples": 416,
+      "iters": 414,
+      "samples": 414,
       "batch_size": 1,
-      "p50_rmad": 0.010729,
-      "p50_ns": 285302.000,
-      "p99_ns": 337472.000
+      "p50_rmad": 0.014498,
+      "p50_ns": 287564.000,
+      "p99_ns": 315833.000
     },
     {
       "scenario": "map-50k",
@@ -70,9 +70,9 @@
       "iters": 227,
       "samples": 227,
       "batch_size": 1,
-      "p50_rmad": 0.008189,
-      "p50_ns": 2650110.000,
-      "p99_ns": 2749365.000
+      "p50_rmad": 0.004934,
+      "p50_ns": 2645475.000,
+      "p99_ns": 2760110.000
     },
     {
       "scenario": "map-50k",
@@ -82,57 +82,57 @@
       "iters": 100,
       "samples": 100,
       "batch_size": 1,
-      "p50_rmad": 0.010384,
-      "p50_ns": 1673961.000,
-      "p99_ns": 1745001.000
+      "p50_rmad": 0.008327,
+      "p50_ns": 1672942.000,
+      "p99_ns": 1736588.000
     },
     {
       "scenario": "viewport-60",
       "op": "layers",
       "entries": 4518,
       "result": 200,
-      "iters": 2149,
-      "samples": 2149,
+      "iters": 2157,
+      "samples": 2157,
       "batch_size": 1,
-      "p50_rmad": 0.002183,
-      "p50_ns": 55430.000,
-      "p99_ns": 69555.000
+      "p50_rmad": 0.002290,
+      "p50_ns": 55470.000,
+      "p99_ns": 57642.000
     },
     {
       "scenario": "viewport-60",
       "op": "query-and-compose",
       "entries": 30,
       "result": 585,
-      "iters": 654,
-      "samples": 654,
+      "iters": 605,
+      "samples": 605,
       "batch_size": 1,
-      "p50_rmad": 0.007763,
-      "p50_ns": 182025.000,
-      "p99_ns": 208981.000
+      "p50_rmad": 0.018106,
+      "p50_ns": 184303.000,
+      "p99_ns": 304450.000
     },
     {
       "scenario": "diff-256k",
       "op": "diff-paint",
       "entries": 6787,
       "result": 2260,
-      "iters": 45928,
-      "samples": 5741,
-      "batch_size": 8,
-      "p50_rmad": 0.007782,
-      "p50_ns": 2586.250,
-      "p99_ns": 3246.000
+      "iters": 46004,
+      "samples": 3286,
+      "batch_size": 14,
+      "p50_rmad": 0.009721,
+      "p50_ns": 2601.143,
+      "p99_ns": 2752.286
     },
     {
       "scenario": "diff-256k",
       "op": "diff-fold",
       "entries": 6787,
       "result": 6787,
-      "iters": 124032,
-      "samples": 1938,
+      "iters": 124736,
+      "samples": 1949,
       "batch_size": 64,
-      "p50_rmad": 0.007639,
-      "p50_ns": 961.312,
-      "p99_ns": 1199.469
+      "p50_rmad": 0.002004,
+      "p50_ns": 959.047,
+      "p99_ns": 991.984
     }
   ]
 }

@@ -26,7 +26,7 @@ root=$(CDPATH= cd -- "$here/.." && pwd)
 # Must stay in lockstep with .github/workflows/performance.yml
 # "Verify benchmark core" and the runner label k10s-perf-i5-12600k.
 EXPECTED_ARCH=x86_64
-EXPECTED_KERNEL=7.1.8-arch1-3
+EXPECTED_KERNEL=7.2.3-arch1-2
 EXPECTED_RUSTC="rustc 1.97.1 (8bab26f4f 2026-07-14)"
 EXPECTED_CPU="12th Gen Intel(R) Core(TM) i5-12600K"
 EXPECTED_MACHINE=linux-x86_64-i5-12600k

@@ -1,0 +1,368 @@
+//! Bounded, accessible furniture over the Starmap canvas.
+//!
+//! Nothing in this module walks the scene. The map traversal remains the sole
+//! owner of per-node work; chrome receives totals, one resolved hover path and
+//! the current camera, then builds a fixed number of GPUI elements. That keeps
+//! the map calm at idle and keeps cluster size out of interaction cost.
+
+use gpui::{Context, SharedString, rgb};
+use k10s_atlas::Camera;
+use k10s_core::{BUILTIN_KINDS, SceneSnapshot, Severity, Totals};
+use k10s_theme::{Theme, sparkline};
+
+use crate::overlay::{OverlayFrame, OverlayKind, uid_at};
+use crate::text::Grouped;
+use crate::{PickPath, path_rect};
+const HOVER_WIDTH: f32 = 252.0;
+const HOVER_HEIGHT: f32 = 74.0;
+const HOVER_OVERLAY_LINE: f32 = 16.0;
+const HOVER_SPARK: f32 = 22.0;
+const EDGE_MARGIN: f32 = 12.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailBand {
+    Orbit,
+    System,
+    Instance,
+}
+
+impl DetailBand {
+    const ALL: [DetailBand; 3] = [DetailBand::Orbit, DetailBand::System, DetailBand::Instance];
+
+    fn label(self) -> &'static str {
+        match self {
+            DetailBand::Orbit => "Namespaces",
+            DetailBand::System => "Pods",
+            DetailBand::Instance => "Pod details",
+        }
+    }
+}
+
+pub(crate) fn detail_band(displayed_stage: u8) -> DetailBand {
+    match displayed_stage {
+        0 | 1 => DetailBand::Orbit,
+        2 => DetailBand::System,
+        _ => DetailBand::Instance,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Density {
+    Full,
+    Compact,
+    Minimal,
+}
+
+pub(crate) fn density(width: f32, height: f32) -> Density {
+    if width < 500.0 || height < 300.0 {
+        Density::Minimal
+    } else if width < 820.0 || height < 520.0 {
+        Density::Compact
+    } else {
+        Density::Full
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SummaryCache {
+    totals: Option<Totals>,
+    line: SharedString,
+}
+
+impl SummaryCache {
+    pub(crate) fn line(&mut self, totals: Totals) -> SharedString {
+        if self.totals != Some(totals) {
+            self.totals = Some(totals);
+            self.line = format!(
+                "{} namespaces  ·  {} workloads  ·  {} pods",
+                Grouped(totals.regions),
+                Grouped(totals.blocks),
+                Grouped(totals.cells),
+            )
+            .into();
+        }
+        self.line.clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HoverInfo {
+    kind: &'static str,
+    name: SharedString,
+    namespace: Option<SharedString>,
+    owner: Option<SharedString>,
+    status: &'static str,
+    severity: Option<Severity>,
+    overlay_kind: Option<OverlayKind>,
+    overlay_label: Option<SharedString>,
+    overlay_spark: Vec<k10s_theme::Point>,
+    overlay_tint: Option<Severity>,
+}
+
+impl HoverInfo {
+    fn resolve(scene: &SceneSnapshot, path: PickPath) -> Option<Self> {
+        let region = scene.regions.get(path.region as usize)?;
+        let namespace = SharedString::from(&region.label);
+        let owner = || {
+            path.block
+                .and_then(|slot| scene.blocks.get(slot as usize))
+                .map(|node| SharedString::from(&node.label))
+        };
+
+        match path.level() {
+            k10s_core::Level::Region => Some(HoverInfo::new(
+                "Namespace",
+                namespace,
+                None,
+                None,
+                Some(region.ext.rollup),
+            )),
+            k10s_core::Level::Block => {
+                let node = scene.blocks.get(path.block? as usize)?;
+                let mut info = HoverInfo::new(
+                    kind_name(node.ext.kind),
+                    SharedString::from(&node.label),
+                    Some(namespace),
+                    None,
+                    Some(crate::status::workload_severity(
+                        node.children.len(),
+                        node.ext.rollup,
+                    )),
+                );
+                info.status = crate::status::workload_label(node.children.len(), node.ext.rollup);
+                Some(info)
+            }
+            k10s_core::Level::Cell => {
+                let node = scene.cells.get(path.cell? as usize)?;
+                let mut info = HoverInfo::new(
+                    "Pod",
+                    SharedString::from(&node.label),
+                    Some(namespace),
+                    owner(),
+                    Some(node.ext.state.severity),
+                );
+                info.status = crate::status::reason_label(node.ext.state.reason);
+                Some(info)
+            }
+            k10s_core::Level::Sat => {
+                let node = scene.sats.get(path.sat? as usize)?;
+                Some(HoverInfo {
+                    kind: kind_name(node.ext.kind),
+                    name: SharedString::from(&node.label),
+                    namespace: Some(namespace),
+                    owner: owner(),
+                    status: "Attached",
+                    severity: None,
+                    overlay_kind: None,
+                    overlay_label: None,
+                    overlay_spark: Vec::new(),
+                    overlay_tint: None,
+                })
+            }
+        }
+    }
+
+    fn new(
+        kind: &'static str,
+        name: SharedString,
+        namespace: Option<SharedString>,
+        owner: Option<SharedString>,
+        severity: Option<Severity>,
+    ) -> HoverInfo {
+        let status = crate::status::label(severity.unwrap_or(Severity::Unknown));
+        HoverInfo {
+            kind,
+            name,
+            namespace,
+            owner,
+            status,
+            severity,
+            overlay_kind: None,
+            overlay_label: None,
+            overlay_spark: Vec::new(),
+            overlay_tint: None,
+        }
+    }
+
+    fn color(&self, theme: &Theme) -> gpui::Rgba {
+        self.severity.map_or_else(
+            || rgb(theme.shell.text_accent),
+            |severity| theme.map.pod_color(severity),
+        )
+    }
+}
+
+fn kind_name(kind: k10s_core::KindId) -> &'static str {
+    BUILTIN_KINDS
+        .get(kind.0 as usize)
+        .map_or("Resource", |info| info.kind)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HoverAnchor {
+    left: f32,
+    top: f32,
+}
+
+fn hover_card_height(info: &HoverInfo) -> f32 {
+    let mut height = HOVER_HEIGHT;
+    if info.overlay_kind.is_some() || info.overlay_label.is_some() {
+        height += HOVER_OVERLAY_LINE;
+    }
+    if info.overlay_spark.len() >= 2 {
+        height += HOVER_SPARK + 6.0;
+    }
+    height
+}
+
+fn hover_anchor(
+    scene: &SceneSnapshot,
+    path: PickPath,
+    camera: Camera,
+    width: f32,
+    height: f32,
+    card_h: f32,
+) -> Option<HoverAnchor> {
+    if width < HOVER_WIDTH + EDGE_MARGIN * 2.0 || height < card_h + EDGE_MARGIN * 2.0 {
+        return None;
+    }
+    let rect = path_rect(scene, &path)?;
+    let (left, top) = camera.w2s(rect.x, rect.y, width, height);
+    let (right, bottom) = camera.w2s(rect.max_x(), rect.max_y(), width, height);
+    let wanted_left = (left + right) * 0.5 - HOVER_WIDTH * 0.5;
+    let below = bottom + 10.0;
+    let wanted_top = if below + card_h <= height - EDGE_MARGIN {
+        below
+    } else {
+        top - card_h - 10.0
+    };
+    Some(HoverAnchor {
+        left: wanted_left.clamp(
+            EDGE_MARGIN,
+            (width - HOVER_WIDTH - EDGE_MARGIN).max(EDGE_MARGIN),
+        ),
+        top: wanted_top.clamp(
+            EDGE_MARGIN,
+            (height - card_h - EDGE_MARGIN).max(EDGE_MARGIN),
+        ),
+    })
+}
+
+pub(crate) struct Overlay<'a> {
+    pub(crate) scene: &'a SceneSnapshot,
+    pub(crate) camera: Camera,
+    pub(crate) displayed_stage: u8,
+    pub(crate) hud_on: bool,
+    pub(crate) hovered: Option<PickPath>,
+    pub(crate) summary: SharedString,
+    pub(crate) edges_on: bool,
+    pub(crate) legend_on: bool,
+    pub(crate) viewport: (f32, f32),
+    pub(crate) map_overlay: &'a OverlayFrame,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct State {
+    summary: SharedString,
+    band: DetailBand,
+    density: Density,
+    hover: Option<(HoverInfo, HoverAnchor)>,
+    edges_on: bool,
+    legend_on: bool,
+    hud_on: bool,
+    empty: bool,
+    overlay_kind: Option<OverlayKind>,
+}
+
+impl State {
+    fn summary_shown(&self) -> bool {
+        !self.hud_on && self.density != Density::Minimal
+    }
+
+    pub(crate) fn resolve(overlay: Overlay<'_>) -> State {
+        let hover = overlay.hovered.and_then(|path| {
+            let mut info = HoverInfo::resolve(overlay.scene, path)?;
+            if let Some(uid) = uid_at(overlay.scene, path)
+                && let Some(mark) = overlay.map_overlay.get(uid)
+            {
+                info.overlay_kind = overlay.map_overlay.kind;
+                info.overlay_label = mark.label.clone().map(SharedString::from);
+                info.overlay_spark = mark
+                    .sparkline
+                    .as_ref()
+                    .map(|series| sparkline(&series.samples))
+                    .unwrap_or_default();
+                info.overlay_tint = mark.tint;
+            }
+            let card_h = hover_card_height(&info);
+            let anchor = hover_anchor(
+                overlay.scene,
+                path,
+                overlay.camera,
+                overlay.viewport.0,
+                overlay.viewport.1,
+                card_h,
+            )?;
+            Some((info, anchor))
+        });
+        State {
+            summary: overlay.summary,
+            band: detail_band(overlay.displayed_stage),
+            density: density(overlay.viewport.0, overlay.viewport.1),
+            hover,
+            edges_on: overlay.edges_on,
+            legend_on: overlay.legend_on,
+            hud_on: overlay.hud_on,
+            empty: overlay.scene.rev > 1 && overlay.scene.totals.regions == 0,
+            overlay_kind: overlay.map_overlay.kind,
+        }
+    }
+}
+
+impl Default for State {
+    fn default() -> State {
+        State {
+            summary: SharedString::default(),
+            band: DetailBand::Orbit,
+            density: Density::Minimal,
+            hover: None,
+            edges_on: false,
+            legend_on: true,
+            hud_on: false,
+            empty: false,
+            overlay_kind: None,
+        }
+    }
+}
+
+/// A separate reactive boundary for fixed map furniture. Camera frames notify
+/// `MapView`, not this entity, so GPUI can replay the cached toolbar, legend and
+/// summary subtree while only the canvas is rebuilt. State changes are explicit
+/// and bounded: a semantic-band crossing, a toggle, a resize, or a new hover.
+#[derive(Default)]
+pub(crate) struct Chrome {
+    state: State,
+}
+
+impl Chrome {
+    pub(crate) fn sync(&mut self, next: State, cx: &mut Context<Self>) {
+        if self.replace(next) {
+            cx.notify();
+        }
+    }
+
+    fn replace(&mut self, next: State) -> bool {
+        if self.state == next {
+            return false;
+        }
+        self.state = next;
+        true
+    }
+}
+
+#[path = "chrome_view.rs"]
+mod view;
+
+#[cfg(test)]
+#[path = "chrome_test.rs"]
+mod tests;

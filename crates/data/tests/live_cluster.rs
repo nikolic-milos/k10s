@@ -1,0 +1,2046 @@
+//! The live half of §6.7's matrix, for the write path.
+//!
+//! Everything in `scripted_apiserver.rs` is proven against a `tower` service
+//! that *is* the API server, and that server is honest about what it cannot be:
+//! it answers with whatever a test scripted, so it can prove that a dry-run
+//! apply sends the right method, media type, query and bytes -- and it cannot
+//! prove that a real API server *does* with those bytes what the code says it
+//! does. Two claims in `apply.rs` depend entirely on that difference:
+//!
+//! 1. that `metadata.resourceVersion` left in an apply body is an
+//!    optimistic-lock precondition, which is why the payload prune removes it;
+//! 2. that a field-manager conflict names the manager in the first quoted run
+//!    of its cause message, which is where `manager_of` reads it from.
+//!
+//! Both are checked here against a real one, along with the shape of a refusal
+//! of the document itself and an RBAC denial on a write. Two of these tests
+//! exist because running them was the only way to learn what they now assert: a
+//! stale resourceVersion comes back as a 409 with **no** causes, which is a
+//! different state from a field-manager conflict and cannot be forced; and a
+//! misspelled field in an apply is refused by the field manager with a **500**
+//! naming it, not by strict validation with a 400.
+//!
+//! Ignored by default: the unit suites keep the no-network discipline and this
+//! one is a network test. It needs a cluster and a kubeconfig naming two
+//! identities, one of which may not patch:
+//!
+//! ```text
+//! KUBECONFIG=/path/to/kubeconfig cargo test -p k10s-data --test live_cluster -- --ignored --nocapture
+//! ```
+//!
+//! Note `--test-threads=1`, which is not optional: the field-manager conflict
+//! test leaves a manager named `rival` owning `.data.retries` on the shared
+//! ConfigMap, and in parallel that reaches the staleness test as a conflict
+//! instead of as staleness.
+//!
+//! `live_fixtures.sh`, beside this file, creates everything below against
+//! whatever `KUBECONFIG` names. Prefer it to following this list by hand -- the
+//! list used to be shorter than the suite, and each thing missing from it fails
+//! an assertion a long way from the fixture that was absent.
+//!
+//! In `K10S_LIVE_NAMESPACE` (default `g2`):
+//!
+//! - a ConfigMap `settings` from a *client-side* `kubectl apply`, so it carries a
+//!   `last-applied-configuration` for the three-way base, labelled
+//!   `team: platform` and holding a `greeting: hello` key -- the label proves
+//!   that something which is not apply bookkeeping survives into the edited
+//!   document, and the key is read back out of the base;
+//! - a Deployment `web`;
+//! - a Secret `api-token` whose value is `super-secret-value`, for the route
+//!   where a value is in the object itself;
+//! - a Secret `declared-token` from a client-side apply with
+//!   `plaintext-in-the-annotation` as its value, for the subtler route: an
+//!   annotation is `ObjectMeta`, so the declared value survives the
+//!   metadata-only fetch that makes the first route safe;
+//! - a CRD `widgets.k10s.test` with `additionalPrinterColumns`, and one
+//!   `Widget` named `sprocket` with `size: 7` and `flavour: vanilla`;
+//! - a Deployment `usage-probe` whose container declares requests (10m/16Mi)
+//!   and limits (100m/64Mi), the four numbers the usage tests assert against;
+//! - a ClusterRole `k10s-reader-nometrics` bound to ServiceAccount
+//!   `nometrics` -- everything the reader may read except `metrics.k8s.io`,
+//!   for the denial that must arrive as a label.
+//!
+//! `K10S_LIVE_READER_CONTEXT` (default `reader@k10s-lab`) must name a context
+//! whose account can read and cannot patch. `K10S_LIVE_NOMETRICS_CONTEXT`
+//! (default `nometrics@k10s-lab`) must name one wired to that ServiceAccount.
+//!
+//! Three of these tests need a cluster with a *kubelet*, and are skipped rather
+//! than failed where there is none: a standalone API server can serve every
+//! other row here, but port-forward, exec, and log follow terminate at a node.
+//! Set `K10S_LIVE_KUBELET=1` when the cluster has one, and make sure the
+//! `web` Deployment's pod is actually Running -- a Deployment that no kubelet
+//! ever scheduled satisfies the other tests and none of those.
+//!
+//! The usage matrix needs metrics-server initially healthy. Its absent case
+//! temporarily removes `v1beta1.metrics.k8s.io`, verifies the API returns 404,
+//! and restores its registration even if a sample assertion panics. It then
+//! waits for metrics-server usage to recover. This tests an unserved API, not
+//! an installed API whose backing Deployment merely stopped answering.
+//!
+//! Both client-side applies must stay client-side. Server-side apply writes no
+//! `last-applied-configuration`, so a fixture created with `--server-side`
+//! quietly turns two three-way comparisons into two-way ones that still pass.
+//!
+//! Helm, Argo, Flux, overlays, and day-2 live in `live_adapters.rs`. That file
+//! is the other half of the write path: apply is a document, day-2 is a named
+//! click, and this suite still deletes fixtures through kube so a failed
+//! assertion cannot leave a half-applied day-2 behind its own cleanup.
+
+use std::time::Duration;
+
+use k8s_openapi::api::core::v1::Secret;
+use k10s_core::KindId;
+use k10s_data::apply::{ApplyOutcome, ApplyRequest};
+use k10s_data::describe::DescribeRequest;
+use k10s_data::metrics::{
+    Bytes, Millicores, UsageOutcome, UsageRequest, UsageSample, UsageSource, UsageStop, UsageTarget,
+};
+use k10s_data::read::{Fetched, KindRow, Reader};
+use k10s_data::{DEFAULT_EVENT_SINK_CAPACITY, Options, Sync};
+
+const SECRET_PROBE_VALUE: &str = "k10s-live-secret-fixture";
+
+struct SecretProbe {
+    name: String,
+    api: kube::Api<Secret>,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl SecretProbe {
+    fn new(finalizer: bool) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a fixture runtime");
+        let (api, name) = runtime.block_on(async {
+            let client = kube::Client::try_default()
+                .await
+                .expect("the fixture client");
+            let api: kube::Api<Secret> = kube::Api::namespaced(client, &namespace());
+            let declared = serde_json::json!({"stringData": {"token": SECRET_PROBE_VALUE}});
+            let fixture = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "generateName": "k10s-secret-boundary-",
+                    "finalizers": if finalizer { vec!["test.k10s.io/hold"] } else { vec![] },
+                    "annotations": {
+                        "kubectl.kubernetes.io/last-applied-configuration": declared.to_string(),
+                    },
+                },
+                "stringData": {"token": SECRET_PROBE_VALUE},
+            });
+            let fixture: Secret = serde_json::from_value(fixture).expect("a fixture Secret");
+            let created = api
+                .create(&kube::api::PostParams::default(), &fixture)
+                .await
+                .expect("the generated fixture is created");
+            (
+                api,
+                created.metadata.name.expect("the server assigns a name"),
+            )
+        });
+        Self { name, api, runtime }
+    }
+
+    // A full GET is confined to the generated fixture, whose canary this test
+    // supplied. It proves metadata edits leave the stored value untouched.
+    fn read(&self) -> Option<Secret> {
+        self.runtime
+            .block_on(self.api.get_opt(&self.name))
+            .expect("the fixture can be read back")
+    }
+}
+
+impl Drop for SecretProbe {
+    fn drop(&mut self) {
+        let result = self.runtime.block_on(async {
+            let patch = kube::api::Patch::Merge(serde_json::json!({
+                "metadata": {"finalizers": []},
+            }));
+            match self
+                .api
+                .patch_metadata(&self.name, &kube::api::PatchParams::default(), &patch)
+                .await
+            {
+                Ok(_) => {}
+                Err(kube::Error::Api(status)) if status.code == 404 => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            match self
+                .api
+                .delete(&self.name, &kube::api::DeleteParams::default())
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+                Err(error) => Err(error),
+            }
+        });
+        if let Err(error) = result {
+            eprintln!(
+                "fixture cleanup failed for {}/{}: {error}",
+                namespace(),
+                self.name
+            );
+        }
+    }
+}
+
+fn namespace() -> String {
+    std::env::var("K10S_LIVE_NAMESPACE").unwrap_or_else(|_| "g2".to_string())
+}
+
+fn reader_context() -> String {
+    std::env::var("K10S_LIVE_READER_CONTEXT").unwrap_or_else(|_| "reader@k10s-lab".to_string())
+}
+
+// The production cold start, not a shortcut around it: this is the same call the
+// binary makes, so connect, discovery and the RBAC probe are under test too.
+fn connect(context: Option<&str>) -> (k10s_data::DataPlane, Sync) {
+    assert!(
+        std::env::var_os("KUBECONFIG").is_some(),
+        "this test needs KUBECONFIG to name a real cluster; see the module comment"
+    );
+    let (sink, _drain) = crossbeam_channel::bounded(DEFAULT_EVENT_SINK_CAPACITY);
+    // The drain is dropped, so the bounded sink fills and backpressures; the
+    // write path does not read it and the sync only needs it to exist.
+    std::mem::forget(_drain);
+    let plane = k10s_data::spawn(sink).expect("a runtime");
+    let options = Options {
+        context: context.map(str::to_string),
+        kubeconfig: None,
+        probe_namespaces: vec![namespace()],
+        sync_timeout: Duration::from_secs(30),
+    };
+    let sync = plane.sync(&options).expect("the live cluster syncs");
+    (plane, sync)
+}
+
+fn kind(reader: &Reader, display: &str) -> KindRow {
+    reader
+        .kinds()
+        .into_iter()
+        .find(|row| row.display == display)
+        .unwrap_or_else(|| panic!("the cluster serves {display}"))
+}
+
+fn wait<T: Send + 'static>(rx: &std::sync::mpsc::Receiver<T>) -> T {
+    rx.recv_timeout(Duration::from_secs(30))
+        .expect("a reply within the budget")
+}
+
+fn wait_interactive<T: Send + 'static>(rx: &std::sync::mpsc::Receiver<T>, requests: u32) -> T {
+    let budget = k10s_data::connect::INTERACTIVE_DEADLINE * requests + Duration::from_secs(5);
+    rx.recv_timeout(budget)
+        .expect("an interactive reply within its request budgets")
+}
+
+fn manifest(reader: &Reader, kind: KindId, name: &str) -> k10s_data::manifest::Manifest {
+    let (tx, rx) = std::sync::mpsc::channel();
+    reader.fetch_manifest(
+        DescribeRequest {
+            kind,
+            namespace: Some(namespace()),
+            name: name.to_string(),
+            uid: String::new(),
+        },
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    );
+    match wait(&rx) {
+        Fetched::Ok(manifest) => manifest,
+        other => panic!("{name} must resolve: {other:?}"),
+    }
+}
+
+fn table(reader: &Reader, kind: KindId) -> k10s_data::browse::TablePage {
+    let (tx, rx) = std::sync::mpsc::channel();
+    reader.fetch_table(kind, None, move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    match wait(&rx) {
+        Fetched::Ok(page) => page,
+        other => panic!("the table must resolve: {other:?}"),
+    }
+}
+
+fn apply(reader: &Reader, request: ApplyRequest) -> ApplyOutcome {
+    let requests = if request.dry_run { 2 } else { 1 };
+    let (tx, rx) = std::sync::mpsc::channel();
+    reader.apply(request, move |outcome| {
+        let _ = tx.send(outcome);
+    });
+    wait_interactive(&rx, requests)
+}
+
+fn request(kind: KindId, name: &str, yaml: String, dry_run: bool, force: bool) -> ApplyRequest {
+    ApplyRequest {
+        kind,
+        namespace: Some(namespace()),
+        name: name.to_string(),
+        yaml,
+        dry_run,
+        force,
+    }
+}
+
+// The payload the editor would send, built by the same pure prune the shell
+// uses, so what this test puts on the wire is what a person would.
+fn payload(yaml: &str, status_subresource: bool) -> k10s_edit::Payload {
+    let rope = k10s_edit::Rope::from(yaml);
+    let mut syntax = k10s_edit::Syntax::yaml();
+    syntax.reparse(&rope);
+    k10s_edit::apply::payload(&rope, &syntax, 0, status_subresource)
+}
+
+// The bytes are only reachable through `sendable`, which is the point: a
+// payload the prune refused hands back its reasons instead, and nothing in this
+// file may put those bytes on a real cluster.
+fn sent(payload: &k10s_edit::Payload) -> &str {
+    payload
+        .sendable()
+        .expect("these fixtures prune cleanly; a blocked payload is never sent")
+}
+
+// A test that needs an object gone without going through day-2's confirm gate
+// asks kube directly. That keeps cleanup off the path under test: apply is the
+// document write, day-2 is the named click, and this file is about apply.
+fn delete_if_present(name: &str) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let client = kube::Client::try_default()
+            .await
+            .expect("a client from KUBECONFIG");
+        let request =
+            kube::api::Request::new(format!("/api/v1/namespaces/{}/configmaps", namespace()))
+                .delete(name, &kube::api::DeleteParams::default())
+                .expect("a delete request");
+        // A 404 is the state this asks for, so it is not a failure.
+        let _ = client.request::<serde_json::Value>(request).await;
+    });
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_client_side_applied_object_yields_a_three_way_base_and_a_sendable_payload() {
+    let (_plane, sync) = connect(None);
+    let configmaps = kind(&sync.reader, "configmaps");
+    assert!(
+        configmaps.patchable,
+        "a real server serves configmaps with a patch verb"
+    );
+
+    let live = manifest(&sync.reader, configmaps.id, "settings");
+    assert!(
+        !live.yaml.contains("last-applied-configuration"),
+        "apply bookkeeping is not part of the document being edited:\n{}",
+        live.yaml
+    );
+    assert!(
+        !live.yaml.contains("managedFields"),
+        "nor is the field-manager ledger:\n{}",
+        live.yaml
+    );
+    assert!(
+        live.yaml.contains("team: platform"),
+        "an annotation or label that is not bookkeeping stays:\n{}",
+        live.yaml
+    );
+    assert!(
+        !live.status_subresource,
+        "a ConfigMap has no status subresource, so an apply may carry status"
+    );
+
+    let base = live
+        .last_applied
+        .clone()
+        .expect("the fixture was created by a client-side apply, so the annotation is there");
+    assert!(
+        base.starts_with("apiVersion: v1\nkind: ConfigMap\n"),
+        "the base renders through the same emitter as the live object:\n{base}"
+    );
+    assert!(base.contains("greeting: hello"), "{base}");
+
+    // The three-way diff of an untouched buffer against its own live object is
+    // empty, whatever the base says: that is the property that makes "no
+    // differences" trustworthy on a real object rather than a fixture.
+    let unchanged = k10s_edit::three_way(k10s_edit::Sides {
+        base: Some(&base),
+        live: &live.yaml,
+        buffer: &live.yaml,
+    });
+    assert_eq!(
+        unchanged.verdict(),
+        k10s_edit::Verdict::Agreed,
+        "an unedited buffer differs from live nowhere; counts were {:?}",
+        unchanged.counts
+    );
+    assert!(!unchanged.two_way, "a base was found, so this is three-way");
+
+    let built = payload(&live.yaml, live.status_subresource);
+    for owned in ["metadata.resourceVersion", "metadata.uid"] {
+        assert!(
+            built.pruned.iter().any(|field| field == owned),
+            "a live object carries {owned} and the prune must remove it: {:?}",
+            built.pruned
+        );
+    }
+    assert!(
+        built.kept.is_empty(),
+        "nothing was left behind unremovable: {:?}",
+        built.kept
+    );
+
+    let outcome = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            true,
+            false,
+        ),
+    );
+    let ApplyOutcome::DryRun(applied) = outcome else {
+        panic!("a real server accepts the pruned payload as a dry run: {outcome:?}");
+    };
+    assert!(
+        applied.yaml.contains("greeting: hello"),
+        "the server echoes what it would store:\n{}",
+        applied.yaml
+    );
+}
+
+// The claim the scripted server cannot check: the prune removes
+// `metadata.resourceVersion` because leaving it in makes every apply an
+// optimistic-lock precondition. If a real server ignores it instead, the doc
+// comment in `apply.rs` is wrong and this test says so.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_stale_resource_version_in_the_body_is_a_precondition_the_prune_exists_to_avoid() {
+    let (_plane, sync) = connect(None);
+    let configmaps = kind(&sync.reader, "configmaps");
+    let live = manifest(&sync.reader, configmaps.id, "settings");
+
+    let unpruned = live.yaml.clone();
+    assert!(
+        unpruned.contains("resourceVersion:"),
+        "the fetched document carries one"
+    );
+    let stale = unpruned.replace(&resource_version(&unpruned), "1");
+    assert_ne!(stale, unpruned, "the version was replaced with a stale one");
+
+    let outcome = apply(
+        &sync.reader,
+        request(configmaps.id, "settings", stale, true, false),
+    );
+    let ApplyOutcome::Stale { message } = &outcome else {
+        panic!(
+            "the prune's stated reason requires a real server to refuse a stale \
+             resourceVersion, and to refuse it as staleness rather than as a \
+             forceable conflict; it answered {outcome:?} instead, so the comment in \
+             k10s-data/src/apply.rs is wrong and must be corrected"
+        );
+    };
+    println!("a stale resourceVersion in an apply body is refused: {message}");
+    assert!(
+        message.contains("has been modified"),
+        "and says why in the server's own words: {message}"
+    );
+
+    // And the pruned payload of the very same object goes through, which is what
+    // makes the prune the fix rather than a workaround.
+    let built = payload(&live.yaml, live.status_subresource);
+    let outcome = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            true,
+            false,
+        ),
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::DryRun(_)),
+        "the pruned payload is accepted: {outcome:?}"
+    );
+}
+
+fn resource_version(yaml: &str) -> String {
+    yaml.lines()
+        .find_map(|line| line.trim().strip_prefix("resourceVersion: "))
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .expect("the document carries a resourceVersion")
+}
+
+// The document with its `retries` value set, whatever it was.
+fn with_retries(yaml: &str, value: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    for line in yaml.lines() {
+        match line.trim_start().strip_prefix("retries:") {
+            Some(_) => {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push_str(&format!("{indent}retries: \"{value}\""));
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+// A real field-manager conflict, produced by a second manager taking a field,
+// and the message shape `manager_of` reads the manager out of.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_field_manager_conflict_is_previewed_before_force_takes_the_field() {
+    let (plane, sync) = connect(None);
+    let configmaps = kind(&sync.reader, "configmaps");
+
+    // k10s takes ownership of the field first, at a known value: forced, so
+    // whatever an earlier run left and whoever holds the field now, it starts
+    // from the same place.
+    let live = manifest(&sync.reader, configmaps.id, "settings");
+    let built = payload(&with_retries(&live.yaml, "3"), live.status_subresource);
+    let outcome = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            false,
+            true,
+        ),
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Applied(_)),
+        "the first apply establishes k10s as the field's manager: {outcome:?}"
+    );
+
+    // The editor's copy is read now, before the rival's apply: the buffer is
+    // made from a copy the cluster then moves past, which is the case the dry
+    // run's own read exists for.
+    let copy = manifest(&sync.reader, configmaps.id, "settings");
+    assert!(
+        copy.yaml.contains("retries: \"3\""),
+        "the copy holds k10s's value, not the rival's:\n{}",
+        copy.yaml
+    );
+
+    // A rival manager takes the same field, forcing it away from k10s.
+    rival_apply(&plane, &namespace(), "9");
+
+    let contested = with_retries(&copy.yaml, "5");
+    assert_ne!(
+        contested, copy.yaml,
+        "the buffer changes the contested field"
+    );
+    let built = payload(&contested, copy.status_subresource);
+    let outcome = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            true,
+            false,
+        ),
+    );
+    let ApplyOutcome::Conflict {
+        message, causes, ..
+    } = &outcome
+    else {
+        panic!("a contested field is a conflict, not {outcome:?}");
+    };
+    println!("live conflict message: {message}");
+    println!("live conflict causes:  {causes:?}");
+    assert!(!causes.is_empty(), "the server named its causes");
+    assert!(
+        causes.iter().any(|cause| cause.field.contains("retries")),
+        "a cause names the contested field: {causes:?}"
+    );
+    assert!(
+        causes.iter().any(|cause| cause.manager == "rival"),
+        "and the manager holding it, parsed out of the message: {causes:?}"
+    );
+
+    let preview = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            true,
+            true,
+        ),
+    );
+    let ApplyOutcome::DryRun(preview) = preview else {
+        panic!("the forced dry run provides a review: {preview:?}");
+    };
+    assert!(preview.yaml.contains("retries: \"5\""), "{}", preview.yaml);
+    // The review's left side is the object as the server holds it, read with
+    // the dry run: the rival's value, which the buffer's copy never had.
+    let k10s_data::apply::Live::Read { yaml: before, .. } = &preview.live else {
+        panic!("a dry run carries its read: {:?}", preview.live);
+    };
+    assert!(before.contains("retries: \"9\""), "{before}");
+    let unchanged = manifest(&sync.reader, configmaps.id, "settings");
+    assert!(
+        unchanged.yaml.contains("retries: \"9\""),
+        "{}",
+        unchanged.yaml
+    );
+    let still_owned = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            true,
+            false,
+        ),
+    );
+    assert!(
+        matches!(still_owned, ApplyOutcome::Conflict { causes, .. }
+            if causes.iter().any(|cause| cause.manager == "rival" && cause.field.contains("retries"))),
+        "the preview transferred no ownership"
+    );
+
+    // Only the separate real apply takes the field and changes its value.
+    let outcome = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            false,
+            true,
+        ),
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Applied(_)),
+        "force takes the field: {outcome:?}"
+    );
+    let after = manifest(&sync.reader, configmaps.id, "settings");
+    assert!(
+        after.yaml.contains("retries: \"5\""),
+        "and the value is the one that was applied:\n{}",
+        after.yaml
+    );
+}
+
+// A second field manager, spelled out here because `FIELD_MANAGER` is a
+// constant: the point is that the name on the wire is not k10s.
+fn rival_apply(plane: &k10s_data::DataPlane, namespace: &str, retries: &str) {
+    let body = format!(
+        "{{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{{\"name\":\"settings\"}},\"data\":{{\"retries\":\"{retries}\"}}}}"
+    );
+    let path =
+        format!("/api/v1/namespaces/{namespace}/configmaps/settings?fieldManager=rival&force=true");
+    plane.runtime().block_on(async move {
+        let client = kube::Client::try_default()
+            .await
+            .expect("a client from KUBECONFIG");
+        let request = http::Request::patch(path)
+            .header(http::header::CONTENT_TYPE, "application/apply-patch+yaml")
+            .header(http::header::ACCEPT, "application/json")
+            .body(body.into_bytes())
+            .expect("a request");
+        client
+            .request::<serde_json::Value>(request)
+            .await
+            .expect("the rival apply lands");
+    });
+}
+
+// Strict field validation, which the code asks for so a misspelling is a
+// labelled refusal rather than a field silently dropped from a manifest someone
+// believes they applied.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn an_unknown_field_is_refused_by_name_rather_than_dropped() {
+    // Not by strict validation, and not with a 4xx: the field manager cannot
+    // build a typed patch and answers 500. What has to hold is that the field is
+    // named in a sentence a person can act on, rather than dropped silently or
+    // buried inside a flattened error chain.
+    let (_plane, sync) = connect(None);
+    let configmaps = kind(&sync.reader, "configmaps");
+    let live = manifest(&sync.reader, configmaps.id, "settings");
+    let built = payload(&live.yaml, live.status_subresource);
+    let misspelled = format!("{}dataz:\n  oops: yes\n", sent(&built));
+
+    let outcome = apply(
+        &sync.reader,
+        request(configmaps.id, "settings", misspelled, true, false),
+    );
+    let (labelled, detail) = match &outcome {
+        ApplyOutcome::Rejected { message, causes } => (message.clone(), causes.join("; ")),
+        ApplyOutcome::Failed { why, .. } => (why.clone(), String::new()),
+        other => {
+            panic!("an unknown field must be refused, never dropped; the server answered {other:?}")
+        }
+    };
+    println!("live refusal of an unknown field: {labelled} {detail}");
+    assert!(
+        labelled.contains("dataz") || detail.contains("dataz"),
+        "the refusal names the field: {labelled} {detail}"
+    );
+    assert!(
+        !labelled.starts_with("ApiError"),
+        "and it is the server's own sentence, not a flattened error chain: {labelled}"
+    );
+
+    // A real apply of it gets the same 500 with no reason, the answer the same
+    // server gives a write it has stored, so it is unconfirmed in those words:
+    // a 5xx is no verdict. The object is untouched.
+    let before = manifest(&sync.reader, configmaps.id, "settings");
+    let outcome = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            format!("{}dataz:\n  oops: yes\n", sent(&built)),
+            false,
+            false,
+        ),
+    );
+    let ApplyOutcome::Unconfirmed { why } = &outcome else {
+        panic!("a real apply answered 500 is unconfirmed, not {outcome:?}");
+    };
+    assert!(why.contains("field not declared in schema"), "{why}");
+    assert_eq!(
+        manifest(&sync.reader, configmaps.id, "settings").yaml,
+        before.yaml,
+        "nothing was written"
+    );
+}
+
+// The hard rule, against real data rather than a fixture. A Secret written by
+// `kubectl apply` carries its own declared values inside
+// `metadata.annotations` -- and annotations are part of `ObjectMeta`, so they
+// come back from the metadata-only fetch that keeps a Secret's `data` out of the
+// read path. The annotation is what a three-way diff uses as its base document,
+// which is how a plaintext value reaches a panel.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_secrets_values_never_reach_a_document_by_any_of_the_three_routes() {
+    let (_plane, sync) = connect(None);
+    let secrets = kind(&sync.reader, "secrets");
+
+    // Route one: the object itself.
+    let plain = manifest(&sync.reader, secrets.id, "api-token");
+    assert!(
+        !plain.yaml.contains("super-secret-value")
+            && !plain.yaml.contains("c3VwZXItc2VjcmV0LXZhbHVl"),
+        "no value in the document:\n{}",
+        plain.yaml
+    );
+
+    // Route two: the annotation the fetch cannot avoid retrieving.
+    let declared = manifest(&sync.reader, secrets.id, "declared-token");
+    assert!(
+        !declared.yaml.contains("plaintext-in-the-annotation"),
+        "no value in the object:\n{}",
+        declared.yaml
+    );
+    let base = declared
+        .last_applied
+        .clone()
+        .expect("the fixture was client-side applied, so it has a base");
+    assert!(
+        !base.contains("plaintext-in-the-annotation"),
+        "and none in the base document a diff renders:\n{base}"
+    );
+    assert!(
+        base.contains("name: declared-token"),
+        "while the base is still a document worth diffing:\n{base}"
+    );
+
+    // Route three: the metadata returned by apply still carries annotations.
+    if secrets.patchable {
+        let built = payload(&declared.yaml, declared.status_subresource);
+        let outcome = apply(
+            &sync.reader,
+            request(
+                secrets.id,
+                "declared-token",
+                sent(&built).to_string(),
+                true,
+                false,
+            ),
+        );
+        let ApplyOutcome::DryRun(applied) = &outcome else {
+            panic!("the dry run resolves: {outcome:?}");
+        };
+        assert!(
+            !applied.yaml.contains("plaintext-in-the-annotation"),
+            "and none in what the server would store:\n{}",
+            applied.yaml
+        );
+        assert!(
+            applied.yaml.starts_with("# values withheld"),
+            "the note that says so leads it:\n{}",
+            applied.yaml
+        );
+        // And the read the dry run makes with it, the review's left side, is
+        // the same metadata-only document.
+        let k10s_data::apply::Live::Read { yaml: read, .. } = &applied.live else {
+            panic!("a dry run carries its read: {:?}", applied.live);
+        };
+        assert!(
+            !read.contains("plaintext-in-the-annotation")
+                && !read.contains("super-secret-value")
+                && read.starts_with("# values withheld"),
+            "no value in the dry run's read either:\n{read}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn secret_workload_reads_refuse_and_describe_omits_the_declared_canary() {
+    use k10s_data::logs::{LogChunk, WorkloadLogRequest};
+
+    let probe = SecretProbe::new(false);
+    let (_plane, sync) = connect(None);
+    let secrets = kind(&sync.reader, "secrets");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _logs = sync.reader.follow_workload_logs(
+        WorkloadLogRequest {
+            namespace: namespace(),
+            kind: secrets.id,
+            name: probe.name.clone(),
+        },
+        Box::new(move |chunk| {
+            let _ = tx.send(chunk);
+        }),
+    );
+    assert_eq!(
+        wait(&rx),
+        LogChunk::Failed {
+            what: "workload logs",
+            why: "a Secret has no workload logs; its values are withheld".to_string(),
+        }
+    );
+    let (_usage, rx) = poll_usage(
+        &sync.reader,
+        UsageTarget::Workload {
+            kind: secrets.id,
+            name: probe.name.clone(),
+        },
+    );
+    assert_eq!(
+        wait(&rx),
+        UsageOutcome::Absent {
+            why: "a Secret has no pod usage; its values are withheld".to_string(),
+        }
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.fetch_describe(
+        DescribeRequest {
+            kind: secrets.id,
+            namespace: Some(namespace()),
+            name: probe.name.clone(),
+            uid: String::new(),
+        },
+        move |outcome| {
+            let _ = tx.send(outcome);
+        },
+    );
+    let Fetched::Ok(doc) = wait(&rx) else {
+        panic!("the generated Secret's metadata can be described");
+    };
+    let text = doc.lines.join("\n");
+    assert!(text.contains("values withheld"), "{text}");
+    assert!(text.contains(&probe.name), "{text}");
+    assert!(!text.contains(SECRET_PROBE_VALUE), "{text}");
+    assert!(!text.contains("last-applied-configuration"), "{text}");
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn secret_apply_reviews_metadata_and_preserves_the_stored_value() {
+    let probe = SecretProbe::new(false);
+    let original = probe.read().expect("the fixture exists");
+    let (_plane, sync) = connect(None);
+    let secrets = kind(&sync.reader, "secrets");
+    let yaml = format!(
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: {}\n  labels:\n    test.k10s.io/reviewed: verified\n",
+        probe.name,
+    );
+    for dry_run in [true, false] {
+        let outcome = apply(
+            &sync.reader,
+            request(secrets.id, &probe.name, yaml.clone(), dry_run, false),
+        );
+        // A real apply's answer is not rendered, only its uid read; the dry
+        // run's is what a person reviews.
+        match outcome {
+            ApplyOutcome::DryRun(dry) if dry_run => {
+                assert_eq!(dry.uid, original.metadata.uid);
+                assert!(dry.yaml.contains("values withheld"), "{}", dry.yaml);
+                assert!(dry.yaml.contains("kind: Secret"), "{}", dry.yaml);
+                assert!(!dry.yaml.contains(SECRET_PROBE_VALUE), "{}", dry.yaml);
+            }
+            ApplyOutcome::Applied(applied) if !dry_run => {
+                assert_eq!(applied.uid, original.metadata.uid);
+            }
+            other => panic!("the metadata apply succeeds: {other:?}"),
+        }
+        let stored = probe.read().expect("the fixture still exists");
+        assert_eq!(
+            stored.data, original.data,
+            "a metadata edit cannot change the stored token"
+        );
+        let reviewed = stored
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("test.k10s.io/reviewed"));
+        assert_eq!(
+            reviewed.map(String::as_str),
+            if dry_run { None } else { Some("verified") }
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn secret_delete_works_with_and_without_a_finalizer() {
+    use k10s_data::day2::{Caps, Day2Call, Day2Outcome, DeleteRequest};
+
+    let (_plane, sync) = connect(None);
+    let secrets = kind(&sync.reader, "secrets");
+    for finalizer in [false, true] {
+        let probe = SecretProbe::new(finalizer);
+        let (tx, rx) = std::sync::mpsc::channel();
+        sync.reader.day2(
+            secrets.id,
+            Day2Call::Delete(DeleteRequest {
+                namespace: Some(namespace()),
+                name: probe.name.clone(),
+                grace_period_seconds: None,
+                confirm: true,
+                caps: Caps::default(),
+            }),
+            move |outcome| {
+                let _ = tx.send(outcome);
+            },
+        );
+        let outcome = wait_interactive(&rx, 1);
+        assert!(matches!(outcome, Day2Outcome::Applied(_)), "{outcome:?}");
+        let stored = probe.read();
+        if finalizer {
+            let stored = stored.expect("the finalizer holds deletion");
+            assert!(stored.metadata.deletion_timestamp.is_some());
+            let mut request =
+                kube::api::Request::new(format!("/api/v1/namespaces/{}/secrets", namespace()))
+                    .delete(&probe.name, &kube::api::DeleteParams::default())
+                    .expect("the metadata DELETE request");
+            request.headers_mut().insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static(
+                    "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+                ),
+            );
+            let response: serde_json::Value = probe
+                .runtime
+                .block_on(probe.api.clone().into_client().request(request))
+                .expect("the live server negotiates a finalizer-held DELETE response");
+            assert_eq!(response["kind"], "PartialObjectMetadata");
+            assert!(response.get("data").is_none());
+            assert!(response.get("stringData").is_none());
+        } else {
+            assert!(
+                stored.is_none(),
+                "the completed deletion removed the fixture"
+            );
+        }
+    }
+}
+
+// The write half of the RBAC story: an account that may read and may not patch.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn an_account_without_the_patch_verb_gets_a_labelled_denial_not_an_error_string() {
+    let context = reader_context();
+    let (_plane, sync) = connect(Some(&context));
+    let configmaps = kind(&sync.reader, "configmaps");
+    assert!(
+        configmaps.patchable,
+        "the server still serves the verb; this account just may not use it, \
+         and those are different labelled states"
+    );
+
+    let live = manifest(&sync.reader, configmaps.id, "settings");
+    let built = payload(&live.yaml, live.status_subresource);
+    let outcome = apply(
+        &sync.reader,
+        request(
+            configmaps.id,
+            "settings",
+            sent(&built).to_string(),
+            true,
+            false,
+        ),
+    );
+    let ApplyOutcome::Denied { what, why } = &outcome else {
+        panic!("a 403 on a write is a denial, never a flattened error string: {outcome:?}");
+    };
+    assert_eq!(*what, "apply");
+    println!("live write denial: {why}");
+    assert!(
+        why.contains("cannot patch") || why.contains("forbidden"),
+        "and it carries the server's own explanation: {why}"
+    );
+}
+
+// A kind that has a status subresource, so the prune takes status out; the
+// server accepting the result is what says the prune did not remove intent.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_kind_with_a_status_subresource_applies_without_its_status() {
+    let (_plane, sync) = connect(None);
+    let deployments = kind(&sync.reader, "deployments.apps");
+    let live = manifest(&sync.reader, deployments.id, "web");
+    assert!(
+        live.status_subresource,
+        "discovery reports a status subresource for Deployment"
+    );
+    assert!(
+        live.yaml.contains("status:"),
+        "and the fetched document carries one:\n{}",
+        live.yaml
+    );
+
+    let built = payload(&live.yaml, live.status_subresource);
+    assert!(
+        built.pruned.iter().any(|field| field == "status"),
+        "which the prune removes: {:?}",
+        built.pruned
+    );
+    assert!(
+        !sent(&built).contains("\nstatus:"),
+        "so the payload has no status block:\n{}",
+        sent(&built)
+    );
+
+    let outcome = apply(
+        &sync.reader,
+        request(deployments.id, "web", sent(&built).to_string(), true, false),
+    );
+    let ApplyOutcome::DryRun(applied) = outcome else {
+        panic!("the server accepts a Deployment applied without status: {outcome:?}");
+    };
+    let returned = payload(&applied.yaml, live.status_subresource);
+    assert_eq!(
+        sent(&returned),
+        sent(&built),
+        "the server preserves the submitted intent after removing its bookkeeping and status"
+    );
+}
+
+// A server-side apply *creates* what is absent, so a press on a document whose
+// object was deleted between the read and the press brings it back instead of
+// failing -- `kubectl apply`'s behaviour, and not what the person pressing the
+// key is thinking about. The uid is the whole evidence, and only a real server
+// can produce this: nothing scripted mints one.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn an_apply_after_a_delete_creates_a_new_object_rather_than_updating_the_old_one() {
+    let (_plane, sync) = connect(None);
+    let configmaps = kind(&sync.reader, "configmaps");
+    let name = "k10s-recreate-probe";
+    let document = format!(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {}\ndata:\n  probe: \"1\"\n",
+        namespace()
+    );
+
+    // Nothing server-owned is in this document, so the prune is a no-op on it and
+    // the bytes go as written.
+    delete_if_present(name);
+    let outcome = apply(
+        &sync.reader,
+        request(configmaps.id, name, document.clone(), false, false),
+    );
+    let ApplyOutcome::Applied(created) = outcome else {
+        panic!("an apply of an absent object creates it: {outcome:?}");
+    };
+    let first = created.uid.expect("a stored object has a uid");
+    assert_eq!(
+        manifest(&sync.reader, configmaps.id, name).uid.as_deref(),
+        Some(first.as_str()),
+        "the read and the apply agree about which object this is, which is what \
+         makes a disagreement mean something"
+    );
+
+    delete_if_present(name);
+    let outcome = apply(
+        &sync.reader,
+        request(configmaps.id, name, document, false, false),
+    );
+    let ApplyOutcome::Applied(again) = outcome else {
+        panic!("the apply recreates it rather than refusing: {outcome:?}");
+    };
+    let second = again.uid.expect("the new object has a uid too");
+    assert_ne!(
+        first, second,
+        "the object was deleted, so this apply created a new one -- which is the \
+         difference a review has to be able to state"
+    );
+    delete_if_present(name);
+}
+
+// A kind this binary has never heard of, which is the whole open-model claim.
+//
+// §5.1 says arbitrary kinds including CRDs flow through unchanged and §2 says the
+// open model makes that true by construction, and both were argued from the
+// shape of the code rather than from a server that had been asked. A CRD is the
+// one case where every layer has to cooperate without a compiled-in name:
+// discovery has to find it over `/apis`, the browser has to list it through
+// server-side printing it cannot predict the columns of, and the write path has
+// to prune and dry-run an object whose schema arrived at runtime.
+//
+// The printer columns are the sharp part. `additionalPrinterColumns` is the CRD
+// author's choice, so a client that quietly fell back to its own idea of how to
+// render a row would still produce a table -- just not this one. Asserting the
+// CRD's own column names is what tells the two apart.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_custom_resource_is_discovered_listed_and_applied_like_any_other_kind() {
+    let (_plane, sync) = connect(None);
+
+    let widgets = kind(&sync.reader, "widgets.k10s.test");
+    assert!(widgets.namespaced, "the fixture CRD is namespaced");
+    assert!(
+        widgets.patchable,
+        "a served CRD takes a patch, so the write path applies to it"
+    );
+
+    let page = table(&sync.reader, widgets.id);
+    let columns: Vec<&str> = page.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(
+        columns.iter().any(|name| name.eq_ignore_ascii_case("size"))
+            && columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("flavour")),
+        "the CRD's own additionalPrinterColumns reach the browser, rather than a \
+         fallback rendering that would also have produced a table: {columns:?}"
+    );
+    let row = page
+        .rows
+        .iter()
+        .find(|row| row.name == "sprocket")
+        .expect("the fixture widget is listed");
+    assert!(
+        row.cells.iter().any(|cell| cell == "7"),
+        "and the row carries the value the column named: {:?}",
+        row.cells
+    );
+    assert!(!row.uid.is_empty(), "a listed row is identified by uid");
+
+    // The write path, on a kind whose schema this binary learned at runtime.
+    let live = manifest(&sync.reader, widgets.id, "sprocket");
+    assert!(
+        live.yaml.contains("kind: Widget"),
+        "the document is the custom kind:\n{}",
+        live.yaml
+    );
+    let built = payload(&live.yaml, live.status_subresource);
+    for owned in ["metadata.resourceVersion", "metadata.uid"] {
+        assert!(
+            built.pruned.iter().any(|field| field == owned),
+            "the prune is kind-agnostic and must remove {owned}: {:?}",
+            built.pruned
+        );
+    }
+    let outcome = apply(
+        &sync.reader,
+        request(
+            widgets.id,
+            "sprocket",
+            sent(&built).to_string(),
+            true,
+            false,
+        ),
+    );
+    let ApplyOutcome::DryRun(applied) = &outcome else {
+        panic!("a dry run against a custom resource resolves: {outcome:?}");
+    };
+    assert!(
+        applied.yaml.contains("flavour: vanilla"),
+        "and the server's answer is the object it would keep:\n{}",
+        applied.yaml
+    );
+}
+
+// Whether this cluster has a node that can run a container. Port-forward and
+// exec are the only two things here that need one, so they ask rather than
+// assume: a standalone API server serves every other row in this file, and a
+// suite that failed on it would be punishing the wrong setup.
+fn has_kubelet() -> bool {
+    std::env::var("K10S_LIVE_KUBELET").is_ok_and(|value| value == "1")
+}
+
+fn running_pod(reader: &Reader, prefix: &str) -> String {
+    let pods = kind(reader, "pods");
+    let page = table(reader, pods.id);
+    let status = page
+        .columns
+        .iter()
+        .position(|column| column.name == "Status")
+        .expect("the pod table has a Status column");
+    let namespace = namespace();
+    page.rows
+        .iter()
+        .find(|row| {
+            row.namespace.as_deref() == Some(namespace.as_str())
+                && row.name.starts_with(prefix)
+                && row.cells.get(status).is_some_and(|cell| cell == "Running")
+        })
+        .map(|row| row.name.clone())
+        .unwrap_or_else(|| panic!("a pod named {namespace}/{prefix}* is running"))
+}
+
+// Exec, against a kubelet, for the first time.
+//
+// This transport is a WebSocket upgrade, which is exactly what the scripted API
+// server in `scripted_apiserver.rs` cannot script -- `tower` serves requests and
+// responses, and an upgrade stops being either. So everything below the seam has
+// been unproven since it was written: the terminal was tested against a fake
+// transport and the transport against nothing.
+//
+// What is asserted is deliberately the round trip and not the grid. The bytes a
+// remote shell sends back are the one thing no fake can stand in for; how they
+// are laid out is `alacritty_terminal`'s business and is already tested without
+// a cluster.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn exec_reaches_a_container_and_brings_its_output_back() {
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "web-");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let session = sync.reader.start_exec(
+        &k10s_data::exec::ExecRequest {
+            namespace: namespace(),
+            pod,
+            container: None,
+            command: vec!["/bin/sh".to_string()],
+        },
+        Box::new(move |event| {
+            let _ = tx.send(event);
+        }),
+    );
+
+    // A marker rather than a prompt: a shell's prompt depends on the image, and
+    // an assertion on it would be an assertion about nginx's base layer.
+    session.write(b"echo k10s-exec-marker\n");
+
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(k10s_data::exec::ExecEvent::Output(bytes)) => {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+                if seen.contains("k10s-exec-marker") {
+                    break;
+                }
+            }
+            Ok(other) => panic!("the session ended before it answered: {other:?}"),
+            Err(_) => continue,
+        }
+    }
+    assert!(
+        seen.contains("k10s-exec-marker"),
+        "the container never answered through the upgrade; saw {seen:?}"
+    );
+    drop(session);
+}
+
+// Log follow, against a kubelet, for the first time.
+//
+// The stream is an HTTP body the API server proxies from the node, not an
+// upgrade, but a standalone API server still cannot stand in for it: there is
+// no container and nothing writing. The scripted suite proves the client
+// labels an end, a denial, and a cancel; this is the first time the bytes
+// themselves came from a process a kubelet is running.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_log_follow_carries_lines_the_kubelet_already_has() {
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "web-");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = sync.reader.follow_log(
+        k10s_data::logs::LogRequest {
+            namespace: namespace(),
+            pod,
+            container: None,
+            previous: false,
+        },
+        Box::new(move |chunk| {
+            let _ = tx.send(chunk);
+        }),
+    );
+
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(k10s_data::logs::LogChunk::Lines(batch)) => {
+                for line in &batch {
+                    seen.push_str(line);
+                    seen.push('\n');
+                }
+                if seen.contains("start worker") {
+                    break;
+                }
+            }
+            Ok(k10s_data::logs::LogChunk::Denied { what }) => {
+                panic!("the follow was denied: {what}")
+            }
+            Ok(k10s_data::logs::LogChunk::Failed { why, .. }) => {
+                panic!("the follow failed: {why}")
+            }
+            Ok(k10s_data::logs::LogChunk::Ended { .. }) => break,
+            Err(_) => continue,
+        }
+    }
+    drop(stop);
+    assert!(
+        seen.contains("start worker"),
+        "the kubelet never handed the container's log stream; saw {seen:?}"
+    );
+}
+
+// Port-forward, against a kubelet, for the first time.
+//
+// The same upgrade problem as exec, plus a listener: the forward opens a local
+// socket and pumps it, so the only proof that works is to connect to that socket
+// from outside the client and get the remote server's own bytes back. Anything
+// short of that -- a row that says Active, a registry that lists it -- is the
+// bookkeeping this repository already tests against a fake `Forwarder`.
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_port_forward_carries_real_bytes_from_the_pod() {
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    use std::io::{Read, Write};
+
+    let (_plane, sync) = connect(None);
+    // The high-port fixture, not `web`: k10s takes the local port from the
+    // container's own, so a pod on 80 resolves to a local 80 no unprivileged
+    // process may bind. That is a real limitation and it is recorded as one; it
+    // is not what this test is about.
+    let pod = running_pod(&sync.reader, "forward-probe-");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.open_forward(
+        k10s_data::forward::ForwardRequest {
+            namespace: namespace(),
+            name: pod.clone(),
+            service: false,
+            service_port: None,
+            expected_service: None,
+        },
+        move |fetched| {
+            let _ = tx.send(fetched);
+        },
+    );
+    let row = match wait(&rx) {
+        Fetched::Ok(row) => row,
+        other => panic!("the forward must open: {other:?}"),
+    };
+    let owned = OwnedForward(sync.reader.forwards().clone(), row.id);
+    assert_eq!(row.spec.pod, pod);
+    assert_eq!(
+        row.spec.remote_port, 18081,
+        "the container declares one port and the spec took it"
+    );
+
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], row.spec.local_port));
+    for request in 0..2 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("the listener opens within the request budget");
+            match std::net::TcpStream::connect_timeout(
+                &address,
+                remaining.min(Duration::from_millis(250)),
+            ) {
+                Ok(stream) => break stream,
+                Err(error) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "request {request}: the listener never opens: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        };
+        stream
+            .set_write_timeout(Some(
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .expect("the request starts within its budget"),
+            ))
+            .expect("a write timeout");
+        stream
+            .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .expect("the complete request reaches the forward");
+        let mut answer = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            stream
+                .set_read_timeout(Some(
+                    deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .expect("the complete reply arrives within its budget"),
+                ))
+                .expect("a read timeout");
+            let count = stream
+                .read(&mut buffer)
+                .expect("the response ends with EOF");
+            if count == 0 {
+                break;
+            }
+            answer.extend_from_slice(&buffer[..count]);
+        }
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(
+            answer.contains("k10s-forward-probe"),
+            "request {request}: the bytes are the ones that container serves: {answer:?}"
+        );
+        drop(stream);
+        assert!(
+            owned
+                .0
+                .list()
+                .iter()
+                .any(|open| open.id == row.id
+                    && open.state == k10s_data::forward::ForwardState::Active),
+            "request {request}: an ordinary completed request leaves its forward active"
+        );
+    }
+    assert!(owned.0.close(row.id), "and closes by its id");
+    assert!(
+        !sync
+            .reader
+            .forwards()
+            .list()
+            .iter()
+            .any(|open| open.id == row.id),
+        "and is gone from the registry afterwards"
+    );
+}
+
+fn pod_tcp_metadata(
+    runtime: &tokio::runtime::Runtime,
+    api: &kube::Api<k8s_openapi::api::core::v1::Pod>,
+    pod: &str,
+) -> String {
+    use kube::api::AttachParams;
+    use tokio::io::AsyncReadExt;
+
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut attached = api
+                .exec(
+                    pod,
+                    ["cat", "/proc/net/tcp", "/proc/net/tcp6"],
+                    &AttachParams::default(),
+                )
+                .await
+                .expect("the probe's TCP metadata can be read");
+            let mut stdout = attached.stdout().expect("metadata stdout");
+            let mut stderr = attached.stderr().expect("metadata stderr");
+            let status = attached.take_status().expect("the command's exit status");
+            let mut output = String::new();
+            let mut error = String::new();
+            tokio::try_join!(
+                stdout.read_to_string(&mut output),
+                stderr.read_to_string(&mut error)
+            )
+            .expect("both metadata streams end");
+            let status = status.await.expect("the command reports its status");
+            assert_eq!(
+                status.status.as_deref(),
+                Some("Success"),
+                "{status:?}: {error}"
+            );
+            attached.join().await.expect("the metadata exec completes");
+            output
+        })
+        .await
+        .expect("the metadata read finishes within its budget")
+    })
+}
+
+struct OwnedForward(k10s_data::forward::ForwardRegistry, u64);
+
+impl Drop for OwnedForward {
+    fn drop(&mut self) {
+        self.0.close(self.1);
+    }
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn closing_a_port_forward_ends_an_established_remote_connection() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    use k8s_openapi::api::core::v1::Pod;
+    use k10s_data::forward::ForwardRequest;
+    use kube::api::Api;
+
+    assert!(
+        has_kubelet(),
+        "this live proof needs a kubelet and K10S_LIVE_KUBELET=1"
+    );
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "forward-probe-");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a metadata runtime");
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("the live client");
+    let api: Api<Pod> = Api::namespaced(client, &namespace());
+    let probe_port = 18081;
+    let probe_port_hex = format!("{probe_port:04X}");
+    let connections = || {
+        let metadata = pod_tcp_metadata(&runtime, &api, &pod);
+        metadata
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let local = fields.get(1)?;
+                if local.rsplit_once(':')?.1 != probe_port_hex {
+                    return None;
+                }
+                Some((
+                    format!("{local} {} {}", fields.get(2)?, fields.get(9)?),
+                    fields.get(3)?.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = connections();
+    let (tx, rx) = std::sync::mpsc::channel();
+    sync.reader.open_forward(
+        ForwardRequest {
+            namespace: namespace(),
+            name: pod.clone(),
+            service: false,
+            service_port: None,
+            expected_service: None,
+        },
+        move |answer| {
+            let _ = tx.send(answer);
+        },
+    );
+    let row = match wait(&rx) {
+        Fetched::Ok(row) => row,
+        other => panic!("the probe forward opens: {other:?}"),
+    };
+    let owned = OwnedForward(sync.reader.forwards().clone(), row.id);
+    assert_eq!(row.spec.remote_port, probe_port);
+    let address = format!("127.0.0.1:{}", row.spec.local_port);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut connection = loop {
+        match TcpStream::connect(&address) {
+            Ok(connection) => break connection,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the listener never opens: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    };
+    connection
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("an unfinished request reaches the forward");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let remote = loop {
+        let arrived: Vec<_> = connections()
+            .into_iter()
+            .filter(|(key, state)| state == "01" && !before.iter().any(|(old, _)| old == key))
+            .collect();
+        if !arrived.is_empty() {
+            assert_eq!(arrived.len(), 1, "one owned connection reaches the probe");
+            break arrived[0].0.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the upgrade never reaches the probe"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    connection
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("a held-stream timeout");
+    let mut byte = [0u8; 1];
+    let error = connection
+        .read(&mut byte)
+        .expect_err("the incomplete request remains open");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+
+    assert!(owned.0.close(row.id));
+    connection
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a cancellation timeout");
+    assert_eq!(
+        connection.read(&mut byte).expect("the local stream closes"),
+        0
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let _listener = loop {
+        match TcpListener::bind(&address) {
+            Ok(listener) => break listener,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the local port remains held: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while connections().iter().any(|(key, _)| key == &remote) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the remote connection remains open"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn a_port_refusal_after_upgrade_preserves_the_kubelets_sentence() {
+    use std::net::{SocketAddr, TcpStream};
+
+    use k8s_openapi::api::core::v1::Pod;
+    use k10s_data::forward::{ForwardSpec, ForwardState};
+    use kube::api::Api;
+    assert!(
+        has_kubelet(),
+        "this live proof needs a kubelet and K10S_LIVE_KUBELET=1"
+    );
+    struct RemoteForward(kube::api::Portforwarder);
+    impl Drop for RemoteForward {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "forward-probe-");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a refusal runtime");
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("the live client");
+    let api: Api<Pod> = Api::namespaced(client, &namespace());
+    let metadata = pod_tcp_metadata(&runtime, &api, &pod);
+    let occupied: std::collections::BTreeSet<u16> = metadata
+        .lines()
+        .filter_map(|line| {
+            let local = line.split_whitespace().nth(1)?;
+            let (_, port) = local.rsplit_once(':')?;
+            Some(u16::from_str_radix(port, 16).expect("the kernel reports a hexadecimal port"))
+        })
+        .collect();
+    let remote_port = (32768..=u16::MAX)
+        .find(|port| !occupied.contains(port))
+        .expect("the probe has an unbound TCP port");
+    let expected = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut direct = RemoteForward(
+                api.portforward(&pod, &[remote_port])
+                    .await
+                    .expect("the unserved port still upgrades"),
+            );
+            let error = direct
+                .0
+                .take_error(remote_port)
+                .expect("the server error channel");
+            let stream = direct
+                .0
+                .take_stream(remote_port)
+                .expect("the upgraded data stream");
+            let why = error.await.expect("the kubelet refuses the unbound port");
+            drop(stream);
+            why
+        })
+        .await
+        .expect("the actual port refusal arrives within the budget")
+    });
+    assert!(expected.contains("connection refused"), "{expected}");
+    assert!(expected.contains(&remote_port.to_string()), "{expected}");
+
+    let local_port = 18081;
+    let registry = sync.reader.forwards().clone();
+    let row = registry
+        .open(ForwardSpec {
+            namespace: namespace(),
+            pod,
+            local_port,
+            remote_port,
+            expected_service: None,
+        })
+        .expect("the managed refusal is registered");
+    let owned = OwnedForward(registry, row.id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = owned
+            .0
+            .list()
+            .into_iter()
+            .find(|current| current.id == row.id)
+            .expect("the owned forward remains registered");
+        match current.state {
+            ForwardState::Active => break,
+            ForwardState::Dead { why } => panic!("the owned local listener failed: {why}"),
+            ForwardState::Opening => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owned local listener never becomes active"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let address = SocketAddr::from(([127, 0, 0, 1], local_port));
+    let _connection = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .expect("the owned active listener accepts a connection");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let why = loop {
+        let row = owned
+            .0
+            .list()
+            .into_iter()
+            .find(|row| row.id == owned.1)
+            .expect("the failed forward remains visible");
+        if let ForwardState::Dead { why } = row.state {
+            break why;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server refusal was not labelled: {:?}",
+            row.state
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        why, expected,
+        "the actual server sentence survives the managed lifecycle"
+    );
+    assert!(owned.0.close(row.id));
+}
+
+fn nometrics_context() -> String {
+    std::env::var("K10S_LIVE_NOMETRICS_CONTEXT")
+        .unwrap_or_else(|_| "nometrics@k10s-lab".to_string())
+}
+
+fn poll_usage(
+    reader: &Reader,
+    target: UsageTarget,
+) -> (UsageStop, std::sync::mpsc::Receiver<UsageOutcome>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = reader.poll_usage(
+        UsageRequest {
+            namespace: namespace(),
+            target,
+            interval: Duration::from_secs(2),
+        },
+        Box::new(move |outcome| {
+            let _ = tx.send(outcome);
+        }),
+    );
+    (stop, rx)
+}
+
+// Wait out the scrape lag: metrics-server takes tens of seconds to first
+// serve a fresh pod, and the kubelet's counters advance on their own clock.
+// Outcomes that do not match yet are kept for the panic message, because
+// "which wrong thing kept arriving" is the diagnosis.
+fn await_sample(
+    rx: &std::sync::mpsc::Receiver<UsageOutcome>,
+    budget: Duration,
+    what: &str,
+    accept: impl Fn(&UsageSample) -> bool,
+) -> UsageSample {
+    let deadline = std::time::Instant::now() + budget;
+    let mut last: Option<UsageOutcome> = None;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(UsageOutcome::Usage(sample)) if accept(&sample) => return sample,
+            Ok(outcome) => last = Some(outcome),
+            Err(_) => {}
+        }
+    }
+    panic!("{what} never arrived within the budget; last outcome: {last:?}");
+}
+
+// The four declared numbers on the usage-probe fixture, asserted exactly:
+// they come from the pod spec, whichever source carried the usage.
+fn assert_probe_bounds(sample: &UsageSample) {
+    assert_eq!(sample.cpu_request, Some(Millicores(10)));
+    assert_eq!(sample.cpu_limit, Some(Millicores(100)));
+    assert_eq!(sample.memory_request, Some(Bytes(16 * 1024 * 1024)));
+    assert_eq!(sample.memory_limit, Some(Bytes(64 * 1024 * 1024)));
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn pod_usage_renders_from_metrics_server_with_its_requests_and_limits() {
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "usage-probe-");
+
+    let (_stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod });
+    let sample = await_sample(
+        &rx,
+        Duration::from_secs(180),
+        "a metrics-server sample",
+        |sample| sample.source == UsageSource::MetricsServer && sample.memory.is_some(),
+    );
+    println!("live metrics-server sample: {sample:?}");
+    assert!(
+        sample.cpu.is_some(),
+        "metrics-server reports both quantities for a running pod: {sample:?}"
+    );
+    assert_probe_bounds(&sample);
+    assert_eq!((sample.pods_measured, sample.pods_total), (1, 1));
+    assert!(!sample.truncated);
+
+    // The same numbers through the workload door: the deployment's own
+    // selector resolves the pod and the sums land on the same bounds.
+    let deployments = kind(&sync.reader, "deployments.apps");
+    let (_stop, rx) = poll_usage(
+        &sync.reader,
+        UsageTarget::Workload {
+            kind: deployments.id,
+            name: "usage-probe".to_string(),
+        },
+    );
+    let sample = await_sample(
+        &rx,
+        Duration::from_secs(60),
+        "a workload sample",
+        |sample| sample.source == UsageSource::MetricsServer && sample.memory.is_some(),
+    );
+    println!("live workload sample: {sample:?}");
+    assert_probe_bounds(&sample);
+    assert_eq!((sample.pods_measured, sample.pods_total), (1, 1));
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn pod_usage_is_carried_by_the_kubelet_when_the_metrics_api_is_absent() {
+    use k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService;
+    use kube::Api;
+    use kube::api::{DeleteParams, PostParams, Preconditions};
+    use kube::runtime::wait::{await_condition, conditions};
+
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    let (_plane, sync) = connect(None);
+    let pod = running_pod(&sync.reader, "usage-probe-");
+    let (stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod.clone() });
+    await_sample(
+        &rx,
+        Duration::from_secs(180),
+        "a healthy metrics-server before withdrawing its API",
+        |sample| sample.source == UsageSource::MetricsServer && sample.cpu.is_some(),
+    );
+    drop(stop);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let client = runtime
+        .block_on(kube::Client::try_default())
+        .expect("a client");
+    let services: Api<APIService> = Api::all(client.clone());
+    let name = "v1beta1.metrics.k8s.io";
+    let original = runtime
+        .block_on(services.get(name))
+        .expect("metrics API registration");
+    let uid = original
+        .metadata
+        .uid
+        .clone()
+        .expect("the registration has a UID");
+    let assert_absent = || {
+        let request = http::Request::get("/apis/metrics.k8s.io/v1beta1")
+            .body(Vec::new())
+            .expect("a group request");
+        let answer = runtime.block_on(client.request::<serde_json::Value>(request));
+        assert!(
+            matches!(&answer, Err(kube::Error::Api(error)) if error.code == 404),
+            "the API must be absent, not merely unavailable: {answer:?}"
+        );
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            services
+                .delete(
+                    name,
+                    &DeleteParams {
+                        preconditions: Some(Preconditions {
+                            uid: Some(uid.clone()),
+                            resource_version: original.metadata.resource_version.clone(),
+                        }),
+                        ..DeleteParams::default()
+                    },
+                )
+                .await
+                .expect("withdraw the same metrics API registration");
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                await_condition(services.clone(), name, conditions::is_deleted(&uid)),
+            )
+            .await
+            .expect("the registration disappears within the budget")
+            .expect("the registration deletion is observable");
+        });
+        assert_absent();
+        let (_stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod.clone() });
+        let first = await_sample(
+            &rx,
+            Duration::from_secs(60),
+            "a kubelet-carried memory sample",
+            |sample| sample.source == UsageSource::Kubelet && sample.memory.is_some(),
+        );
+        println!("live kubelet sample (memory first): {first:?}");
+        assert_probe_bounds(&first);
+        assert_eq!((first.pods_measured, first.pods_total), (1, 1));
+        assert!(!first.truncated);
+
+        let with_rate = await_sample(
+            &rx,
+            Duration::from_secs(120),
+            "a kubelet CPU rate",
+            |sample| sample.source == UsageSource::Kubelet && sample.cpu.is_some(),
+        );
+        println!("live kubelet sample (with rate): {with_rate:?}");
+        assert_probe_bounds(&with_rate);
+        assert!(with_rate.memory.is_some());
+        assert_eq!((with_rate.pods_measured, with_rate.pods_total), (1, 1));
+        assert_absent();
+    }));
+
+    // Restore before resuming an assertion panic. Do not overwrite a registration
+    // another actor recreated while the test was waiting for a sample.
+    let mut restored = original.clone();
+    restored.metadata.uid = None;
+    restored.metadata.resource_version = None;
+    restored.metadata.creation_timestamp = None;
+    restored.metadata.generation = None;
+    restored.metadata.managed_fields = None;
+    restored.status = None;
+    let registration = runtime.block_on(async {
+        match services
+            .get_opt(name)
+            .await
+            .expect("read the metrics registration for cleanup")
+        {
+            Some(registration) => registration,
+            None => services
+                .create(&PostParams::default(), &restored)
+                .await
+                .expect("restore the metrics API registration"),
+        }
+    });
+    assert_eq!(
+        registration.spec, original.spec,
+        "restore the original metrics route"
+    );
+    assert_eq!(registration.metadata.labels, original.metadata.labels);
+    assert_eq!(
+        registration.metadata.annotations,
+        original.metadata.annotations
+    );
+    let (_stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod });
+    let recovered = await_sample(
+        &rx,
+        Duration::from_secs(180),
+        "metrics-server usage after restoring its API",
+        |sample| sample.source == UsageSource::MetricsServer && sample.cpu.is_some(),
+    );
+    assert_probe_bounds(&recovered);
+    println!("live metrics-server sample after restoration: {recovered:?}");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+#[ignore = "needs a live cluster; see the module comment"]
+fn denied_pod_metrics_is_a_labelled_denial_not_an_error_string() {
+    if !has_kubelet() {
+        eprintln!("skipped: set K10S_LIVE_KUBELET=1 on a cluster with a node");
+        return;
+    }
+    let context = nometrics_context();
+    let (_plane, sync) = connect(Some(&context));
+    let pod = running_pod(&sync.reader, "usage-probe-");
+
+    let (_stop, rx) = poll_usage(&sync.reader, UsageTarget::Pod { name: pod });
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the poll answers");
+    assert_eq!(
+        outcome,
+        UsageOutcome::Denied {
+            what: "pod metrics"
+        },
+        "a 403 on pod metrics is a labelled state, and the kubelet is not \
+         asked to route around it"
+    );
+    println!("live usage denial: {outcome:?}");
+    // Denied ends the poll itself: the sender is gone, so the channel closes
+    // instead of carrying a retry.
+    assert!(
+        matches!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ),
+        "a denial closes the poll instead of retrying or leaving it idle"
+    );
+}

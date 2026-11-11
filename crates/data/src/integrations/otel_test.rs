@@ -1,0 +1,320 @@
+//! Collector CR parse, config never in Debug, 404/403 classification, and
+//! health-path refusal for a metrics-only bind.
+
+use super::*;
+use crate::reach::{Bound, FoundService, ToolAuth, ToolKind, Transport};
+
+const CONFIG_TOKEN: &str = "SECRET_EXPORTER_TOKEN_do_not_print";
+
+fn collector_cr() -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "opentelemetry.io/v1beta1",
+        "kind": "OpenTelemetryCollector",
+        "metadata": {
+            "name": "simplest",
+            "namespace": "observability"
+        },
+        "spec": {
+            "mode": "deployment",
+            "replicas": 2,
+            "image": "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.96.0",
+            "config": {
+                "receivers": { "otlp": { "protocols": { "http": {} } } },
+                "exporters": {
+                    "otlphttp": {
+                        "endpoint": "https://example.invalid",
+                        "headers": { "Authorization": format!("Bearer {CONFIG_TOKEN}") }
+                    }
+                },
+                "service": {
+                    "pipelines": {
+                        "traces": {
+                            "receivers": ["otlp"],
+                            "exporters": ["otlphttp"]
+                        }
+                    }
+                }
+            }
+        },
+        "status": {
+            "image": "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.96.0",
+            "conditions": [
+                { "type": "Ready", "status": "True" }
+            ]
+        }
+    })
+}
+
+fn sidecar_cr() -> serde_json::Value {
+    serde_json::json!({
+        "metadata": { "name": "app-sidecar", "namespace": "prod" },
+        "spec": {
+            "mode": "sidecar",
+            "config": "exporters:\n  debug: {}\n"
+        },
+        "status": {
+            "conditions": [{ "type": "Available", "status": "True" }]
+        }
+    })
+}
+
+fn bound_on(port: u16, port_name: Option<&str>) -> Bound {
+    Bound {
+        kind: ToolKind::OtelCollector,
+        found: Some(FoundService {
+            kind: ToolKind::OtelCollector,
+            namespace: "observability".into(),
+            name: "otel-collector".into(),
+            port,
+            port_name: port_name.map(str::to_string),
+        }),
+        transport: Transport::Proxy {
+            namespace: "observability".into(),
+            service: "otel-collector".into(),
+            port,
+        },
+        auth: ToolAuth::Anonymous,
+    }
+}
+
+#[test]
+fn a_collector_inventory_keeps_metadata_and_labels_unfetched_fields() {
+    let collector = parse_collector(&collector_cr()).expect("the fixture is a collector");
+    assert_eq!(collector.name, "simplest");
+    assert_eq!(collector.namespace, "observability");
+    assert_eq!(collector.mode, "Metadata only");
+    assert_eq!(collector.replicas, None);
+    assert_eq!(collector.ready, "Not fetched");
+    assert!(collector.image.is_empty());
+}
+
+#[test]
+fn a_sidecar_does_not_fetch_config_or_status() {
+    let collector = parse_collector(&sidecar_cr()).expect("sidecar");
+    assert_eq!(collector.mode, "Metadata only");
+    assert_eq!(collector.replicas, None);
+    assert_eq!(collector.ready, "Not fetched");
+    assert!(collector.image.is_empty());
+}
+
+#[test]
+fn a_nameless_object_is_not_an_inventory_row() {
+    assert!(parse_collector(&serde_json::json!({})).is_none());
+}
+
+#[test]
+fn config_bytes_never_appear_in_debug() {
+    let collector = parse_collector(&collector_cr()).expect("collector");
+    let debug = format!("{collector:?}");
+    assert!(
+        !debug.contains(CONFIG_TOKEN),
+        "Debug must not print exporter tokens: {debug}"
+    );
+    assert!(
+        !debug.contains("exporters"),
+        "Debug must not print spec.config: {debug}"
+    );
+    assert!(
+        !debug.contains("Authorization"),
+        "Debug must not print exporter headers: {debug}"
+    );
+
+    let inventory = Inventory {
+        collectors: KindSet::Served {
+            items: vec![collector],
+            truncated: false,
+            unreadable: 0,
+        },
+        ..Inventory::default()
+    };
+    let debug = format!("{inventory:?}");
+    assert!(!debug.contains(CONFIG_TOKEN), "{debug}");
+    assert!(!debug.contains("exporters"), "{debug}");
+}
+
+#[test]
+fn legal_collector_names_keep_distinct_row_keys_beyond_the_display_prefix() {
+    let prefix = format!("{}.{}.{}.", "a".repeat(63), "b".repeat(63), "c".repeat(63));
+    let names = [
+        format!("{prefix}{}x", "d".repeat(60)),
+        format!("{prefix}{}y", "d".repeat(60)),
+    ];
+    let namespace = "n".repeat(MAX_NAMESPACE_BYTES);
+    let items: Vec<_> = names
+        .iter()
+        .map(|name| {
+            assert_eq!(name.len(), MAX_NAME_BYTES);
+            parse_collector(&serde_json::json!({
+                "metadata": {"name":name, "namespace":namespace},
+                "spec": {"config":{"token":CONFIG_TOKEN}}
+            }))
+            .expect("legal full name")
+        })
+        .collect();
+    for (item, name) in items.iter().zip(&names) {
+        assert_eq!(item.name, *name);
+        assert_eq!(item.namespace, namespace);
+    }
+    let page = table_page(&Inventory {
+        collectors: KindSet::Served {
+            items,
+            truncated: false,
+            unreadable: 0,
+        },
+        ..Inventory::default()
+    })
+    .unwrap();
+    assert_eq!(page.rows.len(), 2);
+    for (row, name) in page.rows.iter().zip(&names) {
+        assert_eq!(row.name, *name);
+        assert_eq!(row.namespace.as_deref(), Some(namespace.as_str()));
+        assert_eq!(row.uid, format!("{namespace}/{name}"));
+        assert_eq!(row.cells[0].chars().count(), MAX_FIELD_CHARS + 1);
+        assert!(row.cells[0].ends_with('\u{2026}'));
+    }
+    assert_eq!(page.rows[0].cells[0], page.rows[1].cells[0]);
+    assert_ne!(page.rows[0].uid, page.rows[1].uid);
+    assert!(!format!("{page:?}").contains(CONFIG_TOKEN));
+}
+
+#[test]
+fn oversized_collector_identities_are_unreadable_instead_of_clipped() {
+    for (name, namespace) in [
+        ("n".repeat(MAX_NAME_BYTES + 1), "pilot".into()),
+        ("collector".into(), "n".repeat(MAX_NAMESPACE_BYTES + 1)),
+    ] {
+        assert!(
+            parse_collector(&serde_json::json!({
+                "metadata": {"name":name, "namespace":namespace}
+            }))
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn an_unserved_inventory_has_no_table() {
+    assert!(
+        table_page(&Inventory::default()).is_none(),
+        "a 404 group is absence, not an empty list"
+    );
+}
+
+#[test]
+fn a_denied_kind_is_a_labelled_row_not_an_empty_pane() {
+    let page = table_page(&Inventory {
+        collectors: KindSet::Denied,
+        ..Inventory::default()
+    })
+    .expect("Denied is served, so the table exists");
+    let text = page
+        .rows
+        .iter()
+        .flat_map(|row| row.cells.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("access denied for this account"),
+        "a 403 stays labelled: {text}"
+    );
+}
+
+#[test]
+fn a_served_fixture_is_one_row_per_collector() {
+    let collector = parse_collector(&collector_cr()).expect("collector");
+    let page = table_page(&Inventory {
+        collectors: KindSet::Served {
+            items: vec![collector],
+            truncated: false,
+            unreadable: 0,
+        },
+        ..Inventory::default()
+    })
+    .expect("a served kind is a table");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].name, "simplest");
+    assert_eq!(page.rows[0].cells[2], "Metadata only");
+    assert_eq!(page.rows[0].cells[3], "Unknown");
+    assert_eq!(page.rows[0].cells[4], "Not fetched");
+}
+
+#[test]
+fn an_unreadable_count_is_a_labelled_row_not_a_silently_shorter_list() {
+    let collector = parse_collector(&collector_cr()).expect("collector");
+    let page = table_page(&Inventory {
+        collectors: KindSet::Served {
+            items: vec![collector],
+            truncated: false,
+            unreadable: 2,
+        },
+        ..Inventory::default()
+    })
+    .expect("a served kind is a table");
+    assert_eq!(page.rows.len(), 2);
+    let text = page.rows[1].cells.join(" ");
+    assert!(
+        text.contains("2 collectors could not be decoded and are not shown"),
+        "a partial inventory says what is missing and why: {text}"
+    );
+}
+
+#[test]
+fn a_fully_readable_inventory_has_no_unreadable_row() {
+    let collector = parse_collector(&collector_cr()).expect("collector");
+    let page = table_page(&Inventory {
+        collectors: KindSet::Served {
+            items: vec![collector],
+            truncated: false,
+            unreadable: 0,
+        },
+        ..Inventory::default()
+    })
+    .expect("a served kind is a table");
+    assert_eq!(page.rows.len(), 1);
+}
+
+#[test]
+fn health_path_on_the_extension_ports() {
+    assert_eq!(
+        health_path(&bound_on(HEALTH_PORT, None)).expect("health"),
+        ""
+    );
+    assert_eq!(
+        health_path(&bound_on(ZPAGES_PORT, None)).expect("zpages"),
+        "debug/servicez"
+    );
+    assert_eq!(
+        health_path(&bound_on(4317, Some("health"))).expect("named health"),
+        ""
+    );
+    assert_eq!(
+        health_path(&bound_on(80, Some("zpages"))).expect("named zpages"),
+        "debug/servicez"
+    );
+}
+
+#[test]
+fn a_metrics_bind_is_not_a_health_signal() {
+    let err = health_path(&bound_on(METRICS_PORT, Some("metrics"))).expect_err("metrics");
+    assert!(err.contains("metrics"), "{err}");
+    assert!(err.contains("not a health signal"), "{err}");
+}
+
+#[test]
+fn an_otlp_bind_is_not_a_health_signal() {
+    let err = health_path(&bound_on(OTLP_HTTP_PORT, Some("otlp-http"))).expect_err("otlp");
+    assert!(err.contains("OTLP"), "{err}");
+}
+
+#[test]
+fn a_settings_url_on_the_health_port_is_the_extension() {
+    let bound = Bound {
+        kind: ToolKind::OtelCollector,
+        found: None,
+        transport: Transport::Url {
+            base: "http://127.0.0.1:13133".into(),
+        },
+        auth: ToolAuth::Anonymous,
+    };
+    assert_eq!(health_path(&bound).expect("url health"), "");
+}

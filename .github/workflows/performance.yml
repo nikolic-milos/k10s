@@ -27,6 +27,9 @@ jobs:
     name: i5-12600K baseline
     runs-on: [self-hosted, Linux, X64, k10s-perf-i5-12600k]
     timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: performance-current
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -35,6 +38,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          path: performance-current
 
       - name: Verify pinned toolchain
         run: rustup show
@@ -42,7 +47,7 @@ jobs:
       - name: Verify benchmark core
         run: |
           test "$(uname -m)" = x86_64
-          test "$(uname -r)" = 7.1.8-arch1-3
+          test "$(uname -r)" = 7.2.3-arch1-2
           test "$(rustc --version)" = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
           grep -Fqx '12th Gen Intel(R) Core(TM) i5-12600K' <(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | sort -u)
           test "$(cat "/sys/devices/system/cpu/cpu${PERF_CPU}/cpufreq/scaling_governor")" = powersave
@@ -108,7 +113,7 @@ jobs:
           RUST_MIN_STACK: 67108864
         run: >-
           taskset --cpu-list "$PERF_CPU" cargo run --release --locked
-          --manifest-path tools/k10s-paint-bench/Cargo.toml
+          --manifest-path tools/paint-bench/Cargo.toml
           -- --json > "$RESULT_DIR/map-paint.json"
 
       - name: Compare hardware-labelled baseline
@@ -122,6 +127,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: benchmark-results-i5-12600k
-          path: ${{ env.RESULT_DIR }}/*.json
+          path: performance-current/${{ env.RESULT_DIR }}/*.json
           if-no-files-found: warn
           retention-days: 30

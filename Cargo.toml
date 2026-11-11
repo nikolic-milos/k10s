@@ -1,22 +1,23 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/k10s-atlas",
-    "crates/k10s-core",
-    "crates/k10s-clustergen",
-    "crates/k10s-world",
-    "crates/k10s-theme",
-    "crates/k10s-map",
-    "crates/k10s-shell",
-    "crates/k10s-app",
-    "crates/k10s-data",
-    "crates/k10s-bench",
-    "crates/k10s-edit",
-    "crates/k10s-assets",
+    "crates/atlas",
+    "crates/core",
+    "crates/provider",
+    "crates/clustergen",
+    "crates/world",
+    "crates/theme",
+    "crates/map",
+    "crates/shell",
+    "crates/app",
+    "crates/data",
+    "crates/bench",
+    "crates/edit",
+    "crates/assets",
 ]
 exclude = [
     "third-party/stacksafe-macro",
-    "tools/k10s-paint-bench",
+    "tools/paint-bench",
 ]
 
 [workspace.package]
@@ -29,18 +30,19 @@ authors = ["Miloš Nikolić <milosnikolic@milosnikolic.de>"]
 repository = "https://github.com/nikolic-milos/k10s"
 
 [workspace.dependencies]
-k10s-atlas = { path = "crates/k10s-atlas" }
-k10s-core = { path = "crates/k10s-core" }
-k10s-clustergen = { path = "crates/k10s-clustergen" }
-k10s-world = { path = "crates/k10s-world" }
-k10s-theme = { path = "crates/k10s-theme" }
-k10s-map = { path = "crates/k10s-map" }
-k10s-shell = { path = "crates/k10s-shell" }
-k10s-app = { path = "crates/k10s-app" }
-k10s-data = { path = "crates/k10s-data" }
-k10s-bench = { path = "crates/k10s-bench" }
-k10s-edit = { path = "crates/k10s-edit" }
-k10s-assets = { path = "crates/k10s-assets" }
+k10s-atlas = { path = "crates/atlas" }
+k10s-core = { path = "crates/core" }
+k10s-provider = { path = "crates/provider" }
+k10s-clustergen = { path = "crates/clustergen" }
+k10s-world = { path = "crates/world" }
+k10s-theme = { path = "crates/theme" }
+k10s-map = { path = "crates/map" }
+k10s-shell = { path = "crates/shell" }
+k10s-app = { path = "crates/app" }
+k10s-data = { path = "crates/data" }
+k10s-bench = { path = "crates/bench" }
+k10s-edit = { path = "crates/edit" }
+k10s-assets = { path = "crates/assets", default-features = false }
 
 gpui = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
 gpui_platform = { git = "https://github.com/nikolic-milos/zed", rev = "1997311daedbd90333b6710634d2cfbd81b33306" }
@@ -56,6 +58,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 bevy_ecs = "0.19"
 arc-swap = "1.9"
 crossbeam-channel = "0.5"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 futures = "0.3"
 regex = "1"
 # The embedded terminal: grid, parser, and escape handling, plus the tty
@@ -66,7 +69,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 rustc-hash = "2.1"
 serde = "1"
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # param serves the atlas; fs carries the one fcntl the local terminal needs
 # to hand a blocking PTY fd to its reader thread.
 rustix = { version = "1.1", features = ["param", "fs"] }
@@ -87,9 +90,9 @@ unicode-segmentation = "1"
 
 http = "1"
 # Both already in the lock through kube -- base64 for its own credential
-# handling, flate2 behind its gzip feature -- so reading Helm's release Secrets
-# costs the dependency budget nothing. Helm gzips its release JSON and base64s
-# the result, and neither layer is something to hand-roll.
+# handling, flate2 behind its gzip feature -- so decoding caller-owned Helm
+# release payloads costs the dependency budget nothing. Helm gzips its release
+# JSON and base64s the result, and neither layer is something to hand-roll.
 base64 = "0.22"
 flate2 = "1.1"
 kube = { version = "4.2", features = [
@@ -115,7 +118,7 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macr
 # this costs the dependency budget nothing; they become direct edges only.
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 hyper-timeout = "0.5"
-tower = { version = "0.5", features = ["util", "retry"] }
+tower = { version = "0.5", features = ["util", "retry", "buffer"] }
 tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip", "map-response-body"] }
 http-body-util = "0.1"
 

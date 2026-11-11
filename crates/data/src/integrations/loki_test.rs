@@ -1,0 +1,659 @@
+//! Parsing Loki's query JSON through its caps, and the form a range or
+//! instant query puts on the wire: direction is backward, a limit is always
+//! named, and crossing a cap is counted rather than dropped.
+
+use super::*;
+use crate::read::Fetched;
+
+fn body(result_type: &str, result: &str) -> String {
+    format!(r#"{{"status":"success","data":{{"resultType":"{result_type}","result":{result}}}}}"#)
+}
+
+fn streams(result: &str) -> String {
+    body("streams", result)
+}
+
+fn stream(app: &str, lines: &[(&str, &str)]) -> String {
+    let values: Vec<String> = lines
+        .iter()
+        .map(|(ts, line)| format!(r#"["{ts}","{line}"]"#))
+        .collect();
+    format!(
+        r#"{{"stream":{{"app":"{app}","namespace":"prod"}},"values":[{}]}}"#,
+        values.join(",")
+    )
+}
+
+#[test]
+fn a_stream_keeps_its_labels_and_nanosecond_lines() {
+    let json = streams(&format!(
+        "[{}]",
+        stream(
+            "api",
+            &[
+                ("1594382401000000000", "hello"),
+                ("1594382402000000000", "world")
+            ]
+        )
+    ));
+    let logs = parse(json.as_bytes()).expect("streams parse");
+    assert!(!logs.truncated);
+    assert_eq!(logs.streams.len(), 1);
+    assert_eq!(
+        logs.streams[0].labels,
+        vec![
+            ("app".to_string(), "api".to_string()),
+            ("namespace".to_string(), "prod".to_string()),
+        ]
+    );
+    assert_eq!(logs.streams[0].lines[0].ts_ns, 1_594_382_401_000_000_000);
+    assert_eq!(logs.streams[0].lines[0].line, "hello");
+    assert_eq!(logs.streams[0].lines[1].line, "world");
+}
+
+#[test]
+fn structured_metadata_on_a_value_is_ignored_and_the_line_is_kept() {
+    let json =
+        streams(r#"[{"stream":{"app":"api"},"values":[["10","kept",{"detected_level":"info"}]]}]"#);
+    let logs = parse(json.as_bytes()).expect("a third element is metadata, not a reason to drop");
+    assert_eq!(logs.streams[0].lines[0].line, "kept");
+    assert_eq!(logs.dropped_lines, 0);
+}
+
+fn identity_metadata(metadata: Value) -> String {
+    streams(
+        &serde_json::json!([{
+            "stream": {
+                "k8s_namespace_name": "prod", "k8s_pod_name": "api", "k8s_pod_uid": "current",
+                "trace_id": "0123456789abcdef0123456789abcdef",
+            },
+            "values": [["1", "actual line", metadata]],
+        }])
+        .to_string(),
+    )
+}
+
+#[test]
+fn malformed_entry_identity_never_inherits_current_stream_labels() {
+    for key in [
+        "trace_id",
+        "span_id",
+        "k8s_namespace_name",
+        "k8s_pod_name",
+        "k8s_pod_uid",
+        "k8s_node_name",
+    ] {
+        for value in [
+            Value::Null,
+            serde_json::json!(10),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({"PLANTED": "not retained"}),
+        ] {
+            let metadata = Value::Object(serde_json::Map::from_iter([(key.into(), value)]));
+            let why = parse(identity_metadata(metadata).as_bytes())
+                .expect_err("invalid identity is refused");
+            assert_eq!(
+                why,
+                format!("Loki entry metadata {key} has a non-string identity value")
+            );
+            assert!(!why.contains("PLANTED"));
+        }
+    }
+}
+
+#[test]
+fn entry_identity_byte_boundaries_preserve_complete_utf8_or_refuse() {
+    for key in [
+        "trace_id",
+        "span_id",
+        "k8s_namespace_name",
+        "k8s_pod_name",
+        "k8s_pod_uid",
+        "k8s_node_name",
+    ] {
+        for text in [
+            "x".repeat(MAX_METADATA_VALUE_BYTES),
+            format!("{}x", "界".repeat(85)),
+        ] {
+            assert_eq!(text.len(), MAX_METADATA_VALUE_BYTES);
+            let metadata = Value::Object(serde_json::Map::from_iter([(
+                key.into(),
+                Value::String(text.clone()),
+            )]));
+            let logs =
+                parse(identity_metadata(metadata).as_bytes()).expect("the exact bound is retained");
+            assert!(!logs.truncated);
+            assert_eq!(
+                logs.streams[0].lines[0].metadata,
+                [(key.to_string(), text.clone())]
+            );
+            let metadata = Value::Object(serde_json::Map::from_iter([(
+                key.into(),
+                Value::String(format!("{text}x")),
+            )]));
+            assert_eq!(
+                parse(identity_metadata(metadata).as_bytes()).unwrap_err(),
+                format!("Loki entry metadata {key} exceeds 256 bytes; its identity is refused")
+            );
+        }
+    }
+}
+
+#[test]
+fn absent_empty_and_conflicting_entry_identity_remain_distinct() {
+    for metadata in [
+        Value::Null,
+        serde_json::json!({}),
+        serde_json::json!({"unrelated": {"not": "identity"}}),
+    ] {
+        let logs =
+            parse(identity_metadata(metadata).as_bytes()).expect("no entry identity is valid");
+        assert!(!logs.truncated);
+        assert!(logs.streams[0].lines[0].metadata.is_empty());
+    }
+    for uid in ["", "retired"] {
+        let logs =
+            parse(identity_metadata(serde_json::json!({"k8s_pod_uid": uid})).as_bytes()).unwrap();
+        assert!(!logs.truncated);
+        assert_eq!(
+            logs.streams[0].lines[0].metadata,
+            [("k8s_pod_uid".into(), uid.into())]
+        );
+    }
+}
+
+#[test]
+fn streams_past_sixteen_are_counted_not_silently_dropped() {
+    let items: Vec<String> = (0..=MAX_STREAMS)
+        .map(|i| stream(&format!("s{i}"), &[("1", "line")]))
+        .collect();
+    let logs = parse(streams(&format!("[{}]", items.join(","))).as_bytes()).expect("parses");
+    assert!(logs.truncated, "the cap must be visible");
+    assert_eq!(logs.streams.len(), MAX_STREAMS);
+    assert_eq!(logs.dropped_streams, 1);
+    assert_eq!(
+        logs.dropped_lines, 1,
+        "the seventeenth stream's line is counted with it"
+    );
+}
+
+#[test]
+fn lines_past_two_thousand_are_counted_not_silently_dropped() {
+    let values: Vec<String> = (0..=MAX_LINES)
+        .map(|i| format!(r#"["{i}","line {i}"]"#))
+        .collect();
+    let json = streams(&format!(
+        r#"[{{"stream":{{"app":"api"}},"values":[{}]}}]"#,
+        values.join(",")
+    ));
+    let logs = parse(json.as_bytes()).expect("parses");
+    assert!(logs.truncated);
+    assert_eq!(logs.streams.len(), 1);
+    assert_eq!(logs.streams[0].lines.len(), MAX_LINES);
+    assert_eq!(logs.dropped_lines, 1);
+    assert_eq!(logs.dropped_streams, 0, "the stream itself was kept");
+}
+
+#[test]
+fn exhausting_the_line_cap_drops_later_streams_with_a_count() {
+    let values: Vec<String> = (0..MAX_LINES)
+        .map(|i| format!(r#"["{i}","line {i}"]"#))
+        .collect();
+    let first = format!(
+        r#"{{"stream":{{"app":"first"}},"values":[{}]}}"#,
+        values.join(",")
+    );
+    let second = stream("second", &[("1", "a"), ("2", "b"), ("3", "c")]);
+    let logs = parse(streams(&format!("[{first},{second}]")).as_bytes()).expect("parses");
+    assert!(logs.truncated);
+    assert_eq!(logs.streams.len(), 1);
+    assert_eq!(logs.streams[0].lines.len(), MAX_LINES);
+    assert_eq!(logs.dropped_streams, 1);
+    assert_eq!(logs.dropped_lines, 3);
+}
+
+#[test]
+fn a_line_longer_than_eight_kibibytes_is_clipped_and_the_cap_is_stated() {
+    let huge = "x".repeat(MAX_LINE_BYTES * 64);
+    let json = streams(&format!(
+        r#"[{{"stream":{{"app":"api"}},"values":[["1","{huge}"]]}}]"#
+    ));
+    let logs = parse(json.as_bytes()).expect("parses");
+    assert!(logs.truncated);
+    assert_eq!(logs.clipped_lines, 1);
+    assert_eq!(logs.dropped_lines, 0, "the line is kept, clipped");
+    let line = &logs.streams[0].lines[0].line;
+    assert!(line.ends_with('\u{2026}'), "clipped looks clipped");
+    assert!(
+        line.capacity() <= MAX_LINE_BYTES + '\u{2026}'.len_utf8(),
+        "clipping must release the original line allocation"
+    );
+    assert!(
+        line.len() <= MAX_LINE_BYTES + '\u{2026}'.len_utf8(),
+        "the ellipsis is the only overshoot: {} bytes",
+        line.len()
+    );
+}
+
+#[test]
+fn an_oversize_body_is_refused_not_parsed() {
+    let huge = vec![b'x'; MAX_BODY_BYTES + 1];
+    let err = parse(&huge).expect_err("refused");
+    assert!(
+        err.contains(&MAX_BODY_BYTES.to_string()),
+        "the cap is named: {err}"
+    );
+}
+
+#[test]
+fn a_metric_result_is_refused_rather_than_read_as_empty_logs() {
+    let json = body(
+        "matrix",
+        r#"[{"metric":{"app":"api"},"values":[[1,"0.2"]]}]"#,
+    );
+    let err = parse(json.as_bytes()).expect_err("metrics are not streams");
+    assert!(err.contains("matrix"), "{err}");
+    assert!(
+        !err.to_ascii_lowercase().contains("empty"),
+        "an empty panel would look like no logs: {err}"
+    );
+}
+
+#[test]
+fn an_error_status_is_the_reason_not_an_empty_panel() {
+    let json = r#"{"status":"error","errorType":"bad_data","error":"parse error at line 1"}"#;
+    let err = parse(json.as_bytes()).expect_err("error status");
+    assert_eq!(err, "parse error at line 1");
+}
+
+#[test]
+fn an_empty_stream_list_is_empty_not_a_failure() {
+    let logs = parse(streams("[]").as_bytes()).expect("empty is a result");
+    assert!(logs.streams.is_empty());
+    assert!(!logs.truncated);
+}
+
+#[test]
+fn an_empty_values_array_keeps_its_valid_stream_identity() {
+    let logs = parse(streams(r#"[{"stream":{"app":"api"},"values":[]}]"#).as_bytes())
+        .expect("empty values are a result");
+    assert_eq!(logs.streams.len(), 1);
+    assert_eq!(
+        logs.streams[0].labels,
+        [("app".to_string(), "api".to_string())]
+    );
+    assert!(logs.streams[0].lines.is_empty());
+    assert!(!logs.truncated);
+}
+
+#[test]
+fn malformed_stream_members_are_named_parse_refusals() {
+    for result in [
+        r#"[{}]"#,
+        r#"[{"values":[]}]"#,
+        r#"[{"stream":null,"values":[]}]"#,
+        r#"[{"stream":[],"values":[]}]"#,
+        r#"[{"stream":"api","values":[]}]"#,
+        r#"[{"stream":false,"values":[]}]"#,
+        r#"[{"stream":10,"values":[]}]"#,
+        r#"[null]"#,
+    ] {
+        let why = parse(streams(result).as_bytes()).expect_err("malformed stream is refused");
+        assert_eq!(why, "Loki stream 0 has no object-valued stream member");
+    }
+}
+
+#[test]
+fn malformed_values_members_are_named_parse_refusals() {
+    for result in [
+        r#"[{"stream":{}}]"#,
+        r#"[{"stream":{},"values":null}]"#,
+        r#"[{"stream":{},"values":{}}]"#,
+        r#"[{"stream":{},"values":"line"}]"#,
+        r#"[{"stream":{},"values":false}]"#,
+        r#"[{"stream":{},"values":10}]"#,
+    ] {
+        let why = parse(streams(result).as_bytes()).expect_err("malformed values are refused");
+        assert_eq!(why, "Loki stream 0 has no array-valued values member");
+    }
+}
+
+#[test]
+fn a_non_string_label_is_refused_before_its_scope_can_be_dropped() {
+    let why = parse(streams(r#"[{"stream":{"namespace":10},"values":[]}]"#).as_bytes())
+        .expect_err("malformed scope is refused");
+    assert_eq!(why, "Loki stream 0 has a non-string label value");
+}
+
+#[test]
+fn a_malformed_value_is_counted_rather_than_skipped() {
+    let json =
+        streams(r#"[{"stream":{"app":"api"},"values":[["not-a-ts","x"],["2","ok"],["3"]]}]"#);
+    let logs = parse(json.as_bytes()).expect("the honest line carries the parse");
+    assert!(logs.truncated);
+    assert_eq!(logs.streams[0].lines.len(), 1);
+    assert_eq!(logs.streams[0].lines[0].line, "ok");
+    assert_eq!(logs.dropped_lines, 2);
+}
+
+#[test]
+fn escaped_strings_and_last_duplicate_values_keep_their_identity_order() {
+    let json = streams(
+        r#"[{
+            "stream":null,"stream":{"z":"\u007a","a":"\u0061"},
+            "values":null,"values":[["\u0031","line\n\uD83D\uDE80",{
+                "structuredMetadata":"legacy",
+                "k8s_node_name":"node",
+                "k8s_pod_uid":null,"k8s_pod_uid":"\u0063urrent",
+                "sp\u0061n_id":"span",
+                "trace_id":null,"trace\u005fid":"trace"
+            }]]
+        }]"#,
+    );
+    let logs = parse(json.as_bytes()).expect("the last decoded duplicate value wins");
+    assert_eq!(
+        logs.streams[0].labels,
+        [("a".into(), "a".into()), ("z".into(), "z".into())]
+    );
+    assert_eq!(
+        logs.streams[0].lines,
+        [LogLine {
+            ts_ns: 1,
+            line: "line\n\u{1f680}".into(),
+            metadata: vec![
+                ("k8s_node_name".into(), "node".into()),
+                ("k8s_pod_uid".into(), "current".into()),
+                ("span_id".into(), "span".into()),
+                ("trace_id".into(), "trace".into()),
+            ],
+        }]
+    );
+    assert!(!logs.truncated);
+    let json = streams(
+        r#"[{"stream":{},"values":[["1","line",{
+            "trace_id":"first","trace\u005fid":null
+        }]]}]"#,
+    );
+    assert_eq!(
+        parse(json.as_bytes()).unwrap_err(),
+        "Loki entry metadata trace_id has a non-string identity value"
+    );
+}
+
+#[test]
+fn nested_identity_overrides_malformed_flat_and_parsed_identity() {
+    for (nested, expected) in [
+        (
+            r#"{"k8s_pod_uid":"current"}"#,
+            vec![("k8s_pod_uid".to_string(), "current".to_string())],
+        ),
+        ("{}", Vec::new()),
+    ] {
+        let json = streams(&format!(
+            r#"[{{"stream":{{"k8s_pod_uid":"retired"}},"values":[["1","line",{{
+                "trace_id":null,"k8s_pod_uid":false,
+                "structuredMetadata":{nested},
+                "parsed":{{"trace_id":null,"k8s_pod_uid":"parsed"}}
+            }}]]}}]"#
+        ));
+        let logs = parse(json.as_bytes()).expect("only the nested identity category applies");
+        assert_eq!(logs.streams[0].lines[0].metadata, expected);
+        assert!(!logs.truncated);
+    }
+}
+
+#[test]
+fn malformed_row_prefixes_drop_before_identity_validation() {
+    let json = streams(
+        r#"[{"stream":{},"values":[
+            null,[],
+            ["18446744073709551616","overflow",{"trace_id":null}],
+            ["1",false,{"structuredMetadata":null}],
+            ["2"],
+            ["3","kept",{"trace_id":"trace"},{"ignored":"extra"}]
+        ]}]"#,
+    );
+    let logs = parse(json.as_bytes()).expect("malformed row prefixes are counted drops");
+    assert_eq!(logs.dropped_lines, 5);
+    assert_eq!(logs.dropped_streams, 0);
+    assert!(logs.truncated);
+    assert_eq!(
+        logs.streams[0].lines,
+        [LogLine {
+            ts_ns: 3,
+            line: "kept".into(),
+            metadata: vec![("trace_id".into(), "trace".into())],
+        }]
+    );
+}
+
+#[test]
+fn stream_structure_is_checked_after_either_cap() {
+    let line_cap = format!(
+        r#"{{"stream":{{}},"values":[{}]}}"#,
+        vec![r#"["1","kept"]"#; MAX_LINES].join(",")
+    );
+    let stream_cap = vec![r#"{"stream":{},"values":[]}"#; MAX_STREAMS].join(",");
+    for (prefix, index) in [(line_cap, 1), (stream_cap, MAX_STREAMS)] {
+        for (suffix, why) in [
+            (
+                r#"{"stream":null,"values":[]}"#,
+                "has no object-valued stream member",
+            ),
+            (
+                r#"{"stream":{"app":null},"values":null}"#,
+                "has a non-string label value",
+            ),
+            (
+                r#"{"stream":{},"values":null}"#,
+                "has no array-valued values member",
+            ),
+        ] {
+            let json = streams(&format!("[{prefix},{suffix}]"));
+            assert_eq!(
+                parse(json.as_bytes()).unwrap_err(),
+                format!("Loki stream {index} {why}")
+            );
+        }
+    }
+}
+
+#[test]
+fn identity_outside_the_line_or_stream_cap_is_counted_without_validation() {
+    let discarded = r#"["1","discarded",{"structuredMetadata":null}]"#;
+    let later = format!(r#"{{"stream":{{}},"values":[{discarded}]}}"#);
+    let kept = vec![r#"["1","kept"]"#; MAX_LINES].join(",");
+    let json = streams(&format!(
+        r#"[{{"stream":{{}},"values":[{kept},{discarded}]}},{later}]"#
+    ));
+    let logs = parse(json.as_bytes()).expect("the line budget skips discarded entry identity");
+    assert_eq!(logs.streams.len(), 1);
+    assert_eq!(logs.streams[0].lines.len(), MAX_LINES);
+    assert_eq!(logs.dropped_lines, 2);
+    assert_eq!(logs.dropped_streams, 1);
+    assert!(logs.truncated);
+
+    let first = vec![r#"{"stream":{},"values":[]}"#; MAX_STREAMS].join(",");
+    let json = streams(&format!("[{first},{later}]"));
+    let logs = parse(json.as_bytes()).expect("the stream budget skips discarded entry identity");
+    assert_eq!(logs.streams.len(), MAX_STREAMS);
+    assert_eq!(logs.dropped_lines, 1);
+    assert_eq!(logs.dropped_streams, 1);
+    assert!(logs.truncated);
+}
+
+#[test]
+fn ignored_and_capped_content_still_requires_valid_json() {
+    let nested = format!("{}0{}", "[".repeat(128), "]".repeat(128));
+    let first = vec![r#"{"stream":{},"values":[]}"#; MAX_STREAMS].join(",");
+    for invalid in [r#""\uD800""#, nested.as_str()] {
+        let item = format!(
+            r#"{{"stream":{{}},"values":[["1","line",{{"parsed":{{"ignored":{invalid}}}}}]]}}"#
+        );
+        for result in [format!("[{item}]"), format!("[{first},{item}]")] {
+            let why = parse(streams(&result).as_bytes())
+                .expect_err("ignored and discarded JSON is still validated");
+            assert!(
+                why.starts_with("Loki's answer is not query JSON: "),
+                "{why}"
+            );
+        }
+    }
+}
+
+#[test]
+fn clipping_releases_a_line_allocation_at_a_utf8_boundary() {
+    let prefix = "x".repeat(MAX_LINE_BYTES - 1);
+    let json = streams(&format!(
+        r#"[{{"stream":{{}},"values":[["1","{prefix}界tail"]]}}]"#
+    ));
+    let logs = parse(json.as_bytes()).expect("the partial character is clipped");
+    let line = &logs.streams[0].lines[0].line;
+    assert_eq!(line, &format!("{prefix}\u{2026}"));
+    assert!(line.capacity() <= MAX_LINE_BYTES + '\u{2026}'.len_utf8());
+    assert_eq!(logs.clipped_lines, 1);
+    assert_eq!(logs.dropped_lines, 0);
+    assert!(logs.truncated);
+}
+
+#[test]
+fn query_range_form_asks_for_backward_and_a_limit() {
+    let form = range_form(&RangeQuery {
+        query: r#"{app="api"}"#.into(),
+        start_ns: 100,
+        end_ns: 200,
+        limit: 50,
+    })
+    .expect("valid");
+    assert_eq!(
+        form,
+        "query=%7Bapp%3D%22api%22%7D&start=100&end=200&limit=50&direction=BACKWARD"
+    );
+}
+
+#[test]
+fn a_limit_above_the_cap_is_asked_as_the_cap() {
+    let form = range_form(&RangeQuery {
+        query: "up".into(),
+        start_ns: 1,
+        end_ns: 2,
+        limit: 9_000,
+    })
+    .expect("valid");
+    assert!(form.contains("limit=2000"), "{form}");
+    let zero = range_form(&RangeQuery {
+        query: "up".into(),
+        start_ns: 1,
+        end_ns: 2,
+        limit: 0,
+    })
+    .expect("zero means the cap");
+    assert!(zero.contains("limit=2000"), "{zero}");
+}
+
+#[test]
+fn an_empty_query_is_refused_before_it_is_sent() {
+    let err = range_form(&RangeQuery {
+        query: "  ".into(),
+        start_ns: 1,
+        end_ns: 2,
+        limit: 10,
+    })
+    .expect_err("empty");
+    assert_eq!(err, "the LogQL query is empty");
+}
+
+#[test]
+fn a_range_that_starts_after_it_ends_is_refused() {
+    let err = range_form(&RangeQuery {
+        query: "up".into(),
+        start_ns: 20,
+        end_ns: 10,
+        limit: 10,
+    })
+    .expect_err("inverted");
+    assert!(err.contains("starts after"), "{err}");
+}
+
+#[test]
+fn an_instant_query_omits_time_until_one_is_named() {
+    let open = instant_form(&InstantQuery {
+        query: "up".into(),
+        time_ns: None,
+        limit: 10,
+    })
+    .expect("valid");
+    assert_eq!(open, "query=up&limit=10&direction=BACKWARD");
+    assert!(!open.contains("time="), "{open}");
+    let stamped = instant_form(&InstantQuery {
+        query: "up".into(),
+        time_ns: Some(99),
+        limit: 10,
+    })
+    .expect("valid");
+    assert!(stamped.contains("time=99"), "{stamped}");
+}
+
+#[test]
+fn a_query_longer_than_eight_kibibytes_is_refused_not_truncated() {
+    let err = instant_form(&InstantQuery {
+        query: "a".repeat(MAX_QUERY_BYTES + 1),
+        time_ns: None,
+        limit: 10,
+    })
+    .expect_err("refused");
+    assert!(err.contains(&MAX_QUERY_BYTES.to_string()), "{err}");
+}
+
+#[test]
+fn a_dollar_variable_is_grafana_and_is_not_sent() {
+    let err = instant_form(&InstantQuery {
+        query: r#"{app="$app"} |= "error""#.into(),
+        time_ns: None,
+        limit: 10,
+    })
+    .expect_err("refused");
+    assert!(err.contains("Grafana"), "{err}");
+    instant_form(&InstantQuery {
+        query: r#"{app="api"} |= "error""#.into(),
+        time_ns: None,
+        limit: 10,
+    })
+    .expect("plain LogQL is sent");
+}
+
+#[test]
+fn a_regex_end_anchor_is_logql_not_grafana() {
+    instant_form(&InstantQuery {
+        query: r#"{app="api"} |~ "timeout$""#.into(),
+        time_ns: None,
+        limit: 10,
+    })
+    .expect("a $ regex anchor is everyday LogQL and must be sent");
+}
+
+#[test]
+fn a_denied_fetch_stays_denied_rather_than_becoming_an_empty_log_panel() {
+    assert!(matches!(
+        finish(Fetched::Denied { what: "loki" }),
+        Fetched::Denied { what: "loki" }
+    ));
+    let failed = finish(Fetched::Failed {
+        what: "loki",
+        why: "Loki did not answer within 4 seconds".into(),
+    });
+    assert!(
+        matches!(failed, Fetched::Failed { what: "loki", .. }),
+        "{failed:?}"
+    );
+}
+
+#[test]
+fn finish_parses_a_successful_body() {
+    let json = streams(&format!("[{}]", stream("api", &[("1", "hi")])));
+    match finish(Fetched::Ok(json.into_bytes())) {
+        Fetched::Ok(logs) => assert_eq!(logs.streams[0].lines[0].line, "hi"),
+        other => panic!("expected logs, got {other:?}"),
+    }
+}

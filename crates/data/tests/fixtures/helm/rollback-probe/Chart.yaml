@@ -1,0 +1,5 @@
+apiVersion: v2
+name: rollback-probe
+description: A release whose stored manifest the live suite applies back.
+type: application
+version: 0.1.0

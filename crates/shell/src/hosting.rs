@@ -1,0 +1,1871 @@
+//! Putting an item in a pane, finding it again, and taking it out.
+//!
+//! Every hosted view arrives the same way: a tag says which item it is, a place
+//! says where its shape belongs, and [`Workspace::open_item`] does the rest. The
+//! two rules that used to be the first line of fifteen separate methods live
+//! there once -- a bench window hosts nothing but the map, and asking for a
+//! document twice activates the tab already open rather than stacking another
+//! copy of the same question. Five kinds of item do not fit that shape, because
+//! reopening them means telling the view that exists something new: a diff
+//! re-compares, the forwards registry starts another forward, the file panel
+//! re-roots, Observe installs an investigation, and the terminal toggles.
+//! Those stay written out.
+
+use gpui::{
+    AppContext as _, Context, Entity, EventEmitter, FocusHandle, SharedString, Subscription, Window,
+};
+
+use k10s_core::kind_short;
+use k10s_map::MapView;
+
+use crate::browse::{BrowseEvent, BrowseView, LocalCommand};
+use crate::config_schema;
+use crate::day2::Day2View;
+use crate::diff;
+use crate::ecosystem::EcosystemView;
+use crate::editor::{self, EditorEvent, EditorView};
+use crate::files::{FilesEvent, FilesView};
+use crate::finder::PickerMode;
+use crate::forwards::ForwardsView;
+use crate::helm_values::HelmReportView;
+use crate::item::{Item, ItemHandle};
+use crate::lists::{InventoryEvent, InventoryView};
+use crate::observe::{ObserveEntry, ObserveEvent, ObserveView};
+use crate::tag::ItemTag;
+use crate::term::TerminalView;
+use crate::text::TextView;
+use crate::traces::TracesView;
+use crate::workspace::{PickerPurpose, Workspace};
+use k10s_provider::{
+    DescribeRequest, DocOutcome, ExecRequest, ForwardRequest, HelmReveal, HelmRevealOutcome,
+    HelmRollbackOutcome, LogRequest, WorkloadLogRequest,
+};
+
+// The map is an item like any other hosted view: erasing it behind the same
+// handle is what lets the center row treat "the starmap" and "a describe
+// document" identically.
+impl Item for MapView {
+    fn title(&self) -> SharedString {
+        "Starmap".into()
+    }
+
+    fn focus_handle(&self) -> FocusHandle {
+        MapView::focus_handle(self)
+    }
+}
+
+// One hosted view: the dedup tag the workspace finds it by, the type-erased
+// handle it renders and focuses through, and whatever subscription keeps its
+// events flowing. New panel kinds cost an `Item` impl and nothing here.
+pub(crate) struct Tab {
+    pub(crate) tag: ItemTag,
+    pub(crate) view: Box<dyn ItemHandle>,
+    _subscription: Option<Subscription>,
+}
+
+impl Tab {
+    pub(crate) fn new(tag: ItemTag, view: impl ItemHandle + 'static) -> Tab {
+        Tab {
+            tag,
+            view: Box::new(view),
+            _subscription: None,
+        }
+    }
+
+    pub(crate) fn with_subscription(
+        tag: ItemTag,
+        view: impl ItemHandle + 'static,
+        subscription: Subscription,
+    ) -> Tab {
+        Tab {
+            tag,
+            view: Box::new(view),
+            _subscription: Some(subscription),
+        }
+    }
+}
+
+/// An item lives where its shape belongs: documents in the centre row,
+/// navigation on the left, panel-shaped feeds and sessions on the bottom.
+#[derive(Clone, Copy)]
+pub(crate) enum Place {
+    Center,
+    Left,
+    Bottom,
+}
+
+/// Which of the two config files a command is asking for. An enum rather than
+/// the boolean this used to take, because `open_config(true, ..)` at a call site
+/// says nothing about which file it opens.
+#[derive(Clone, Copy)]
+pub(crate) enum ConfigFile {
+    Settings,
+    Keymap,
+}
+
+impl Workspace {
+    /// Activate the item this tag names if one is already open; otherwise build
+    /// one and put it where its shape belongs.
+    ///
+    /// The builder hands back a view and whatever subscription keeps it alive,
+    /// and the tag is applied here rather than by the caller: an item filed
+    /// under a tag other than the one it was looked up by would never be found
+    /// again, and this makes that unrepresentable instead of a thing to notice.
+    fn open_item<V: ItemHandle + 'static>(
+        &mut self,
+        tag: ItemTag,
+        place: Place,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> (V, Option<Subscription>),
+    ) {
+        if self.bench || self.activate_existing(&tag, window, cx) {
+            return;
+        }
+        let (view, subscription) = build(self, window, cx);
+        let tab = match subscription {
+            Some(subscription) => Tab::with_subscription(tag, view, subscription),
+            None => Tab::new(tag, view),
+        };
+        match place {
+            Place::Center => self.open_center(tab, window, cx),
+            Place::Left => self.open_left(tab, window, cx),
+            Place::Bottom => self.open_bottom(tab, window, cx),
+        }
+    }
+
+    pub(crate) fn focus_item(&self, tab: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&tab.view.focus_handle(cx), cx);
+    }
+
+    pub(crate) fn activate_center(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index != self.center.active_index() && self.center.get(index).is_some() {
+            if let Some(tab) = self.center.active() {
+                tab.view.set_visible(false, cx);
+            }
+        }
+        if !self.center.activate(index) {
+            return;
+        }
+        if let Some(tab) = self.center.active() {
+            tab.view.set_visible(true, cx);
+            let focus = tab.view.focus_handle(cx);
+            self.rebase_modal_focus(&focus, cx);
+            if !self.has_modal() {
+                window.focus(&focus, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn activate_left(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.left.activate(index);
+        if let Some(tab) = self.left.active() {
+            window.focus(&tab.view.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn activate_bottom(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.bottom.activate(index);
+        if let Some(tab) = self.bottom.active() {
+            window.focus(&tab.view.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    fn activate_existing(
+        &mut self,
+        tag: &ItemTag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(index) = self.center.find(|tab| &tab.tag == tag) {
+            self.activate_center(index, window, cx);
+            return true;
+        }
+        if let Some(index) = self.left.find(|tab| &tab.tag == tag) {
+            self.activate_left(index, window, cx);
+            return true;
+        }
+        if let Some(index) = self.bottom.find(|tab| &tab.tag == tag) {
+            self.activate_bottom(index, window, cx);
+            return true;
+        }
+        false
+    }
+
+    fn open_center(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.center.active() {
+            previous.view.set_visible(false, cx);
+        }
+        let index = self.center.push(tab);
+        self.activate_center(index, window, cx);
+    }
+
+    pub(crate) fn open_left(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.left.push(tab);
+        self.activate_left(index, window, cx);
+    }
+
+    pub(crate) fn open_bottom(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.bottom.push(tab);
+        self.activate_bottom(index, window, cx);
+    }
+
+    pub(crate) fn subscribe_browse(
+        &mut self,
+        view: &Entity<BrowseView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            view,
+            window,
+            |this, _, event: &BrowseEvent, window, cx| match event {
+                BrowseEvent::OpenDoc(request) => this.open_doc(request.clone(), window, cx),
+                BrowseEvent::OpenEdit(request) => this.open_editor(request.clone(), window, cx),
+                BrowseEvent::OpenLogs { namespace, pod } => {
+                    this.open_logs(namespace.clone(), pod.clone(), window, cx)
+                }
+                BrowseEvent::OpenWorkloadLogs {
+                    namespace,
+                    kind,
+                    name,
+                } => this.open_workload_logs(
+                    WorkloadLogRequest {
+                        namespace: namespace.clone(),
+                        kind: *kind,
+                        name: name.clone(),
+                    },
+                    window,
+                    cx,
+                ),
+                BrowseEvent::StartForward(request) => {
+                    this.open_forwards(Some(request.clone()), window, cx)
+                }
+                BrowseEvent::OpenExec { namespace, pod } => {
+                    this.open_terminal(namespace.clone(), pod.clone(), window, cx)
+                }
+                BrowseEvent::OpenLocalCommand(command) => {
+                    this.open_local_command(command.clone(), window, cx)
+                }
+            },
+        )
+    }
+
+    pub(crate) fn open_browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Browse,
+            Place::Left,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| BrowseView::kinds(provider, cx));
+                let subscription = this.subscribe_browse(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_nodes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Nodes,
+            Place::Left,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| BrowseView::nodes(provider, cx));
+                let subscription = this.subscribe_browse(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn show_map(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.center.find(|tab| tab.tag == ItemTag::Map) {
+            self.activate_center(index, window, cx);
+        }
+    }
+
+    pub(crate) fn left_showing(&self, tag: &ItemTag) -> bool {
+        self.left.is_open() && self.left.active().is_some_and(|tab| &tab.tag == tag)
+    }
+
+    pub(crate) fn bottom_showing(&self, tag: &ItemTag) -> bool {
+        self.bottom.is_open() && self.bottom.active().is_some_and(|tab| &tab.tag == tag)
+    }
+
+    pub(crate) fn toggle_or_open_left(
+        &mut self,
+        tag: ItemTag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        open: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>),
+    ) {
+        if self.left_showing(&tag) {
+            self.left.set_open(false);
+            cx.notify();
+            return;
+        }
+        open(self, window, cx);
+    }
+
+    pub(crate) fn open_surface(
+        &mut self,
+        id: crate::activity::ActivityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::activity::ActivityId;
+        match id {
+            ActivityId::Starmap => self.show_map(window, cx),
+            ActivityId::Resources => self.open_browse(window, cx),
+            ActivityId::Nodes => self.open_nodes(window, cx),
+            ActivityId::Find => self.open_cluster_finder(window, cx),
+            ActivityId::Releases => self.open_releases(window, cx),
+            ActivityId::Argo => self.open_argo(window, cx),
+            ActivityId::Flux => self.open_flux(window, cx),
+            ActivityId::Day2 => self.open_day2(window, cx),
+            ActivityId::Observe => {
+                if let Some(index) = self.center.find(|tab| tab.tag == ItemTag::Observe) {
+                    self.activate_center(index, window, cx);
+                } else {
+                    self.open_observe(window, cx);
+                }
+            }
+            ActivityId::Traces => self.show_traces(window, cx),
+            ActivityId::Collectors => self.open_collectors(window, cx),
+            ActivityId::Policy => self.open_policy(window, cx),
+            ActivityId::Ecosystem => self.open_ecosystem(window, cx),
+            ActivityId::Forwards => self.open_forwards(None, window, cx),
+            ActivityId::Terminal => {
+                if let Some(index) = self.bottom.find(|tab| tab.tag == ItemTag::LocalTerm) {
+                    self.activate_bottom(index, window, cx);
+                } else {
+                    self.toggle_terminal(window, cx);
+                }
+            }
+            ActivityId::Inspector => {
+                if !self.inspector_open {
+                    self.toggle_inspector(cx);
+                }
+            }
+            ActivityId::Settings => self.open_config(ConfigFile::Settings, window, cx),
+        }
+    }
+
+    pub(crate) fn activate_activity(
+        &mut self,
+        id: crate::activity::ActivityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::activity::ActivityId;
+        match id {
+            ActivityId::Starmap => self.show_map(window, cx),
+            ActivityId::Resources => {
+                self.toggle_or_open_left(ItemTag::Browse, window, cx, Self::open_browse)
+            }
+            ActivityId::Nodes => {
+                self.toggle_or_open_left(ItemTag::Nodes, window, cx, Self::open_nodes)
+            }
+            ActivityId::Find => self.open_cluster_finder(window, cx),
+            ActivityId::Releases => {
+                self.toggle_center_list(ItemTag::Releases, window, cx, Self::open_releases)
+            }
+            ActivityId::Argo => self.toggle_center_list(ItemTag::Argo, window, cx, Self::open_argo),
+            ActivityId::Flux => self.toggle_center_list(ItemTag::Flux, window, cx, Self::open_flux),
+            ActivityId::Day2 => self.toggle_center_list(ItemTag::Day2, window, cx, Self::open_day2),
+            ActivityId::Observe => {
+                self.toggle_center_list(ItemTag::Observe, window, cx, Self::open_observe)
+            }
+            ActivityId::Traces => self.open_traces(window, cx),
+            ActivityId::Collectors => {
+                self.toggle_center_list(ItemTag::Collectors, window, cx, Self::open_collectors)
+            }
+            ActivityId::Policy => {
+                self.toggle_center_list(ItemTag::Policy, window, cx, Self::open_policy)
+            }
+            ActivityId::Ecosystem => {
+                self.toggle_center_list(ItemTag::Ecosystem, window, cx, Self::open_ecosystem)
+            }
+            ActivityId::Forwards => {
+                if self.bottom_showing(&ItemTag::Forwards) {
+                    self.bottom.set_open(false);
+                    cx.notify();
+                } else {
+                    self.open_forwards(None, window, cx);
+                }
+            }
+            ActivityId::Terminal => self.toggle_terminal(window, cx),
+            ActivityId::Inspector => self.toggle_inspector(cx),
+            ActivityId::Settings => self.open_config(ConfigFile::Settings, window, cx),
+        }
+    }
+
+    pub(crate) fn rail_state(&self) -> crate::activity::RailState {
+        use crate::activity::{BottomSlot, LeftSlot, RailState};
+        let map_active = self
+            .center
+            .active()
+            .is_none_or(|tab| tab.tag == ItemTag::Map);
+        let left = self
+            .left
+            .is_open()
+            .then(|| match self.left.active().map(|tab| &tab.tag) {
+                Some(ItemTag::Browse) => Some(LeftSlot::Resources),
+                Some(ItemTag::Nodes) => Some(LeftSlot::Nodes),
+                _ => None,
+            })
+            .flatten();
+        let bottom = self
+            .bottom
+            .is_open()
+            .then(|| match self.bottom.active().map(|tab| &tab.tag) {
+                Some(ItemTag::LocalTerm) => Some(BottomSlot::Terminal),
+                Some(ItemTag::Forwards) => Some(BottomSlot::Forwards),
+                _ => None,
+            })
+            .flatten();
+        let center = match self.center.active().map(|tab| &tab.tag) {
+            Some(ItemTag::Releases) => Some(crate::activity::CenterSlot::Releases),
+            Some(ItemTag::Argo) => Some(crate::activity::CenterSlot::Argo),
+            Some(ItemTag::Flux) => Some(crate::activity::CenterSlot::Flux),
+            Some(ItemTag::Day2) => Some(crate::activity::CenterSlot::Day2),
+            Some(ItemTag::Observe) => Some(crate::activity::CenterSlot::Observe),
+            Some(ItemTag::Traces) => Some(crate::activity::CenterSlot::Traces),
+            Some(ItemTag::Collectors) => Some(crate::activity::CenterSlot::Collectors),
+            Some(ItemTag::Policy) => Some(crate::activity::CenterSlot::Policy),
+            Some(ItemTag::Ecosystem) => Some(crate::activity::CenterSlot::Ecosystem),
+            _ => None,
+        };
+        RailState {
+            map_active,
+            left,
+            bottom,
+            center,
+            inspector_open: self.inspector_open,
+        }
+    }
+
+    fn toggle_center_list(
+        &mut self,
+        tag: ItemTag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        open: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>),
+    ) {
+        if self.center.active().is_some_and(|tab| tab.tag == tag) {
+            self.show_map(window, cx);
+        } else {
+            open(self, window, cx);
+        }
+    }
+
+    fn subscribe_inventory(
+        &mut self,
+        view: &Entity<InventoryView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        let source = self.slot.current();
+        cx.subscribe_in(
+            view,
+            window,
+            move |this, _, event: &InventoryEvent, window, cx| {
+                if !std::rc::Rc::ptr_eq(&source, &this.slot.current()) {
+                    return;
+                }
+                match event {
+                    InventoryEvent::Presence { tag, presence } => {
+                        this.set_observability_presence(tag, *presence, cx);
+                        cx.notify();
+                    }
+                    InventoryEvent::RevealPod { namespace, pod } => {
+                        this.reveal_alert_pod(namespace, pod, window, cx);
+                    }
+                    InventoryEvent::NotServed { tag, what } => {
+                        this.set_observability_presence(
+                            tag,
+                            k10s_provider::ToolPresence::Missing,
+                            cx,
+                        );
+                        this.close_tagged(tag, window, cx);
+                        this.status_notes
+                            .set_general(Some(format!("{what} is not served by this cluster")));
+                        cx.notify();
+                    }
+                    InventoryEvent::RevealRelease {
+                        namespace,
+                        name,
+                        revision,
+                    } => {
+                        this.reveal_release(namespace.clone(), name.clone(), *revision, window, cx)
+                    }
+                    InventoryEvent::DiffRelease {
+                        namespace,
+                        name,
+                        from,
+                        to,
+                    } => this.diff_release(namespace.clone(), name.clone(), *from, *to, window, cx),
+                    InventoryEvent::RollbackRelease {
+                        namespace,
+                        name,
+                        revision,
+                    } => this.rollback_release(
+                        namespace.clone(),
+                        name.clone(),
+                        *revision,
+                        window,
+                        cx,
+                    ),
+                }
+            },
+        )
+    }
+
+    fn close_tagged(&mut self, tag: &ItemTag, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.center.find(|tab| &tab.tag == tag) {
+            self.center.remove(index);
+            self.activate_center(0, window, cx);
+        }
+    }
+
+    // One tab, reused: the inventory is a whole-cluster answer, so a second
+    // press activates the one that is open rather than fetching it again.
+    pub(crate) fn open_releases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Releases,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let flight = this.helm_in_flight.clone();
+                let view = cx.new(|cx| {
+                    let mut view = InventoryView::helm(provider, cx);
+                    if let Some(flight) = flight {
+                        view.resume_rollback(
+                            flight.namespace.as_deref(),
+                            &flight.name,
+                            flight.revision,
+                        );
+                    }
+                    view
+                });
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_argo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Argo,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| InventoryView::argo(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_flux(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Flux,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| InventoryView::flux(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_collectors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Collectors,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| InventoryView::collectors(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_day2(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(ItemTag::Day2, Place::Center, window, cx, |this, _, cx| {
+            let provider = this.provider();
+            let selection = this.selection.clone();
+            let context = this.context.clone();
+            (
+                cx.new(|cx| Day2View::new(provider, selection.as_ref(), context, cx)),
+                None,
+            )
+        });
+    }
+
+    fn subscribe_inventory_events<V: EventEmitter<InventoryEvent>>(
+        &mut self,
+        view: &Entity<V>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            view,
+            window,
+            |this, _, event: &InventoryEvent, window, cx| match event {
+                InventoryEvent::NotServed { tag, what } => {
+                    this.close_tagged(tag, window, cx);
+                    this.status_notes
+                        .set_general(Some(format!("{what} is not served by this cluster")));
+                    cx.notify();
+                }
+                InventoryEvent::RevealPod { namespace, pod } => {
+                    this.reveal_alert_pod(namespace, pod, window, cx)
+                }
+                _ => {}
+            },
+        )
+    }
+
+    fn reveal_alert_pod(
+        &mut self,
+        namespace: &str,
+        pod: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.map.read(cx).snapshot();
+        let found = crate::alerts::pod_uid(&snapshot, namespace, pod).is_some_and(|uid| {
+            self.map
+                .update(cx, |map, cx| map.select_and_reveal(&uid, window, cx))
+        });
+        if found {
+            self.activate_center(0, window, cx);
+            self.status_notes.set_general(None);
+        } else {
+            self.status_notes.set_general(Some(format!(
+                "the alert names {namespace}/{pod}, which is not on this cluster's map"
+            )));
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_silence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection.as_ref() else {
+            self.status_notes.set_general(Some(
+                "pick a namespace or pod to silence its alerts".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let matchers = match crate::alerts::matchers(selection) {
+            Ok(matchers) => matchers,
+            Err(why) => {
+                self.status_notes.set_general(Some(why));
+                cx.notify();
+                return;
+            }
+        };
+        let tag = ItemTag::Silence(selection.uid.to_string());
+        // Pin the provider as well as the endpoint. A context swap must never
+        // redirect a reviewed write through the shared slot.
+        let provider = self.slot.current();
+        let context = self.context.clone();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        provider.bind_alertmanager(Box::new(move |outcome| {
+            let _ = tx.send(outcome);
+        }));
+        self.status_notes
+            .set_general(Some("looking for Alertmanager...".to_string()));
+        cx.notify();
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                let outcome = rx.await.unwrap_or_else(|_| {
+                    k10s_provider::AlertmanagerOutcome::Failed(
+                        "the Alertmanager lookup was dropped".to_string(),
+                    )
+                });
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if !std::rc::Rc::ptr_eq(&provider, &this.slot.current()) {
+                        return;
+                    }
+                    match outcome {
+                        k10s_provider::AlertmanagerOutcome::Ready(endpoint) => {
+                            this.status_notes.set_general(None);
+                            this.open_item(tag, Place::Center, window, cx, |_, _, cx| {
+                                (
+                                    cx.new(|cx| {
+                                        crate::alerts::SilenceView::new(
+                                            provider, context, endpoint, matchers, cx,
+                                        )
+                                    }),
+                                    None,
+                                )
+                            });
+                        }
+                        k10s_provider::AlertmanagerOutcome::Absent => {
+                            this.status_notes.set_general(Some(
+                                "Alertmanager is not served by this cluster".to_string(),
+                            ))
+                        }
+                        k10s_provider::AlertmanagerOutcome::Failed(why) => {
+                            this.status_notes.set_general(Some(why))
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+    }
+
+    pub(crate) fn open_observe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_observe_entry(ObserveEntry::General, window, cx);
+    }
+
+    pub(crate) fn open_observe_entry(
+        &mut self,
+        entry: ObserveEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bench {
+            return;
+        }
+        if let Some(index) = self.center.find(|tab| tab.tag == ItemTag::Observe) {
+            if let Ok(view) = self
+                .center
+                .get(index)
+                .expect("found tab")
+                .view
+                .to_any()
+                .downcast::<ObserveView>()
+            {
+                view.update(cx, |view, cx| view.prepare_entry(entry, cx));
+                self.activate_center(index, window, cx);
+            }
+            return;
+        }
+        self.open_item(
+            ItemTag::Observe,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let selection = this.selection.clone();
+                let view =
+                    cx.new(|cx| ObserveView::for_entry(provider, selection.as_ref(), entry, cx));
+                let source = this.slot.current();
+                let subscription = cx.subscribe_in(
+                    &view,
+                    window,
+                    move |this, _, event: &ObserveEvent, window, cx| {
+                        if !std::rc::Rc::ptr_eq(&source, &this.slot.current()) {
+                            return;
+                        }
+                        match event {
+                            ObserveEvent::Presence(presence) => {
+                                this.set_observability_presence(&ItemTag::Observe, *presence, cx);
+                                cx.notify();
+                            }
+                            ObserveEvent::TracePresence(presence) => {
+                                this.set_observability_presence(&ItemTag::Traces, *presence, cx);
+                                cx.notify();
+                            }
+                            ObserveEvent::Metrics { uid, data } => {
+                                if this
+                                    .selection
+                                    .as_ref()
+                                    .is_some_and(|selection| selection.uid.as_ref() == uid)
+                                {
+                                    if this.set_observe_samples(data.clone(), cx) {
+                                        cx.notify();
+                                    }
+                                }
+                            }
+                            ObserveEvent::Trace { id, scope } => {
+                                if scope.as_ref().is_some_and(|scope| {
+                                    this.selection
+                                        .as_ref()
+                                        .map(|selection| selection.describe_request())
+                                        .as_ref()
+                                        != Some(&scope.request)
+                                }) {
+                                    return;
+                                }
+                                this.show_traces(window, cx);
+                                if let Some(index) =
+                                    this.center.find(|tab| tab.tag == ItemTag::Traces)
+                                {
+                                    if let Ok(view) = this
+                                        .center
+                                        .get(index)
+                                        .expect("found tab")
+                                        .view
+                                        .to_any()
+                                        .downcast::<TracesView>()
+                                    {
+                                        view.update(cx, |view, cx| {
+                                            view.open_link(id.clone(), scope.clone(), cx)
+                                        });
+                                    }
+                                }
+                            }
+                            ObserveEvent::GrafanaRoute { request, path } => {
+                                this.open_forwards(None, window, cx);
+                                if let Some(index) =
+                                    this.bottom.find(|tab| tab.tag == ItemTag::Forwards)
+                                {
+                                    if let Ok(view) = this
+                                        .bottom
+                                        .get(index)
+                                        .expect("found tab")
+                                        .view
+                                        .to_any()
+                                        .downcast::<ForwardsView>()
+                                    {
+                                        view.update(cx, |view, cx| {
+                                            view.open_browser(request.clone(), path.clone(), cx)
+                                        });
+                                    }
+                                }
+                            }
+                            ObserveEvent::CatalogDetails(notices) => {
+                                this.open_notice(
+                                    "Grafana notice details",
+                                    notices.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            ObserveEvent::QueryDetails(notices) => {
+                                this.open_notice("Query details", notices.clone(), window, cx);
+                            }
+                            ObserveEvent::ScopeDetails(notices) => {
+                                this.open_notice("Scope details", notices.clone(), window, cx);
+                            }
+                            ObserveEvent::SourceDetails(notices) => {
+                                this.open_notice("Source details", notices.clone(), window, cx);
+                            }
+                            ObserveEvent::NotServed => {
+                                this.set_observability_presence(
+                                    &ItemTag::Observe,
+                                    k10s_provider::ToolPresence::Missing,
+                                    cx,
+                                );
+                                this.close_tagged(&ItemTag::Observe, window, cx);
+                                this.status_notes.set_general(Some(
+                                    "Grafana, Prometheus and Loki are not served by this cluster"
+                                        .into(),
+                                ));
+                                cx.notify();
+                            }
+                        }
+                    },
+                );
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_ecosystem(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Ecosystem,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| EcosystemView::new(provider, cx));
+                let subscription = this.subscribe_inventory_events(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_policy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Policy,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| InventoryView::policy(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_harbor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_center_list(ItemTag::Harbor, window, cx, Self::show_harbor);
+    }
+
+    fn show_harbor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Harbor,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| InventoryView::harbor(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_mesh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_center_list(ItemTag::Mesh, window, cx, Self::show_mesh);
+    }
+
+    fn show_mesh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Mesh,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| InventoryView::mesh(provider, cx));
+                let subscription = this.subscribe_inventory(&view, window, cx);
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    pub(crate) fn open_traces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_center_list(ItemTag::Traces, window, cx, Self::show_traces);
+    }
+
+    fn show_traces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_item(
+            ItemTag::Traces,
+            Place::Center,
+            window,
+            cx,
+            |this, window, cx| {
+                let provider = this.provider();
+                let view = cx.new(|cx| TracesView::new(provider, cx));
+                let source = this.slot.current();
+                let subscription = cx.subscribe_in(
+                    &view,
+                    window,
+                    move |this, _, event: &crate::traces::TraceEvent, window, cx| {
+                        if !std::rc::Rc::ptr_eq(&source, &this.slot.current()) {
+                            return;
+                        }
+                        match event {
+                            crate::traces::TraceEvent::Presence(presence) => {
+                                this.set_observability_presence(&ItemTag::Traces, *presence, cx);
+                                cx.notify();
+                            }
+                            crate::traces::TraceEvent::Logs { query, scope } => {
+                                if scope.as_ref().is_some_and(|scope| {
+                                    this.selection
+                                        .as_ref()
+                                        .map(|selection| selection.describe_request())
+                                        .as_ref()
+                                        != Some(&scope.request)
+                                }) {
+                                    return;
+                                }
+                                this.open_observe_entry(
+                                    ObserveEntry::SpanLogs(query.clone()),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            crate::traces::TraceEvent::NotServed => {
+                                this.set_observability_presence(
+                                    &ItemTag::Traces,
+                                    k10s_provider::ToolPresence::Missing,
+                                    cx,
+                                );
+                                this.close_tagged(&ItemTag::Traces, window, cx);
+                                this.status_notes.set_general(Some(
+                                    "Tempo and Jaeger are not served by this cluster".into(),
+                                ));
+                                cx.notify();
+                            }
+                        }
+                    },
+                );
+                (view, Some(subscription))
+            },
+        );
+    }
+
+    fn reveal_release(
+        &mut self,
+        namespace: Option<String>,
+        name: String,
+        revision: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let provider = self.provider();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        provider.reveal_helm(
+            namespace,
+            name.clone(),
+            revision,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        self.status_notes
+            .set_general(Some(format!("revealing {name} revision {revision}")));
+        cx.notify();
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                if let Ok(outcome) = rx.await {
+                    let _ = this.update_in(cx, |this, window, cx| match outcome {
+                        HelmRevealOutcome::Revealed(reveal) => {
+                            this.open_helm_scratches(reveal, window, cx);
+                        }
+                        HelmRevealOutcome::Denied(what) => {
+                            this.status_notes.set_general(Some(format!(
+                                "{what}: access denied for this account"
+                            )));
+                            cx.notify();
+                        }
+                        HelmRevealOutcome::Failed(why) => {
+                            this.status_notes.set_general(Some(why));
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .detach();
+    }
+
+    fn open_helm_scratches(
+        &mut self,
+        reveal: HelmReveal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let HelmReveal {
+            name,
+            namespace,
+            revision,
+            config,
+            chart_values,
+            manifest,
+        } = reveal;
+        // The namespace is part of the identity: the same release name at
+        // the same revision can exist in two namespaces, and the scratch
+        // tag must not hand one of them the other's buffer.
+        self.open_helm_scratch(
+            &format!("{namespace}-{name}-r{revision}-values.yaml"),
+            &config,
+            window,
+            cx,
+        );
+        self.open_helm_scratch(
+            &format!("{namespace}-{name}-r{revision}-chart.yaml"),
+            &chart_values,
+            window,
+            cx,
+        );
+        self.open_helm_scratch(
+            &format!("{namespace}-{name}-r{revision}-manifest.yaml"),
+            &manifest,
+            window,
+            cx,
+        );
+        self.status_notes.set_general(Some(format!(
+            "revealed {namespace}/{name} revision {revision}"
+        )));
+        cx.notify();
+    }
+
+    fn open_helm_scratch(
+        &mut self,
+        title: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Reveal, not Edit: revealed values and manifests are the cluster's
+        // secrets, and the Edit exemption from retirement must not carry
+        // them across a cluster switch.
+        let tag = ItemTag::Reveal(format!("scratch:{title}"));
+        if self.activate_existing(&tag, window, cx) {
+            return;
+        }
+        let provider = self.provider();
+        let schema = self.schema.clone();
+        let fs = self.fs.clone();
+        let title = title.to_string();
+        let view = cx.new(|cx| {
+            let mut view = EditorView::scratch(provider, fs, schema, title, cx);
+            if !text.is_empty() {
+                view.insert_text(text, cx);
+                // The seeded text is the buffer's clean state: scratch()
+                // marked clean at the empty version, and a reveal the user
+                // never edited must not open dirty.
+                view.dirty.mark_clean(view.buffer.version(), None);
+            }
+            view
+        });
+        let subscription = self.subscribe_editor(&view, window, cx);
+        self.open_center(Tab::with_subscription(tag, view, subscription), window, cx);
+    }
+
+    fn diff_release(
+        &mut self,
+        namespace: Option<String>,
+        name: String,
+        from: u32,
+        to: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let provider = self.provider();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        provider.diff_helm(
+            namespace.clone(),
+            name.clone(),
+            from,
+            to,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        self.status_notes
+            .set_general(Some(format!("diffing {name} revision {from} against {to}")));
+        cx.notify();
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                if let Ok(outcome) = rx.await {
+                    let _ = this.update_in(cx, |this, window, cx| match outcome {
+                        DocOutcome::Doc { title, lines } => {
+                            let id = format!(
+                                "{}/{name}/{from}-{to}",
+                                namespace.as_deref().unwrap_or("")
+                            );
+                            this.open_helm_report(id, title, lines, window, cx);
+                        }
+                        DocOutcome::Denied(what) => {
+                            this.status_notes.set_general(Some(format!(
+                                "{what}: access denied for this account"
+                            )));
+                            cx.notify();
+                        }
+                        DocOutcome::Failed(why) => {
+                            this.status_notes.set_general(Some(why));
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .detach();
+    }
+
+    fn rollback_release(
+        &mut self,
+        namespace: Option<String>,
+        name: String,
+        revision: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.helm_in_flight = Some(HelmInFlight {
+            namespace: namespace.clone(),
+            name: name.clone(),
+            revision,
+        });
+        let provider = self.provider();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        provider.rollback_helm(
+            namespace.clone(),
+            name.clone(),
+            revision,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        self.status_notes.set_general(Some(format!(
+            "applying {name} revision {revision}: not helm rollback (hooks will not run)"
+        )));
+        cx.notify();
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                let answer = rx.await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.helm_in_flight = None;
+                    let note = match answer {
+                        Ok(HelmRollbackOutcome::Report { note, lines }) => {
+                            let id = format!(
+                                "{}/{name}/{revision}/rollback",
+                                namespace.as_deref().unwrap_or("")
+                            );
+                            this.open_helm_report(id, "helm rollback".into(), lines, window, cx);
+                            note
+                        }
+                        Ok(HelmRollbackOutcome::Denied(what)) => {
+                            format!("{what}: access denied for this account")
+                        }
+                        Ok(HelmRollbackOutcome::Failed(why)) => why,
+                        Err(_) => "no answer arrived; the apply may have landed; read the \
+                                   release's objects before retrying"
+                            .to_string(),
+                    };
+                    this.rollback_answered(note.clone().into(), cx);
+                    this.status_notes.set_general(Some(note));
+                    cx.notify();
+                });
+            })
+            .detach();
+    }
+
+    // The answer settles whichever Releases view is open now, found by its tag
+    // rather than by a handle taken at dispatch: the tab may have been closed
+    // and reopened while the write was out.
+    fn rollback_answered(&mut self, answer: SharedString, cx: &mut Context<Self>) {
+        let live = self
+            .center
+            .find(|tab| tab.tag == ItemTag::Releases)
+            .and_then(|index| self.center.get(index))
+            .and_then(|tab| tab.view.to_any().downcast::<InventoryView>().ok());
+        if let Some(view) = live {
+            view.update(cx, |view, cx| view.rollback_answered(answer, cx));
+        }
+    }
+
+    fn open_helm_report(
+        &mut self,
+        id: String,
+        title: String,
+        lines: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = ItemTag::HelmReport(id);
+        // A report is a per-run answer: a rollback re-run to the same
+        // revision produces different apply outcomes, so an open tab with
+        // this tag is stale and must be replaced, never re-activated.
+        self.close_tagged(&tag, window, cx);
+        self.open_item(tag, Place::Center, window, cx, |_, _, cx| {
+            (cx.new(|cx| HelmReportView::new(title, lines, cx)), None)
+        });
+    }
+
+    pub(crate) fn open_doc(
+        &mut self,
+        request: DescribeRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = ItemTag::Doc(format!("{}/{}", request.uid, request.name));
+        self.open_item(tag, Place::Center, window, cx, |this, _, cx| {
+            let provider = this.provider();
+            (cx.new(|cx| TextView::doc(provider, request, cx)), None)
+        });
+    }
+
+    // Every editor tab routes its events the same way: a save-as request
+    // opens the picker aimed back at this editor, and a state change (dirty,
+    // saved, renamed) repaints the tab strip so the dot is honest.
+    pub(crate) fn subscribe_editor(
+        &mut self,
+        view: &Entity<EditorView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            view,
+            window,
+            |this, editor, event: &EditorEvent, window, cx| match event {
+                EditorEvent::SaveAsRequested => {
+                    let seed = this.picker_seed(editor.read(cx).source());
+                    let purpose = PickerPurpose::Save(editor.downgrade());
+                    this.open_picker(seed, PickerMode::Save, purpose, window, cx);
+                }
+                EditorEvent::DiffRequested { dry_run } => {
+                    this.open_diff(editor, *dry_run, window, cx);
+                }
+                EditorEvent::StateChanged => {
+                    let tag = Self::editor_tag(editor.read(cx).source());
+                    let tag = if tag == ItemTag::Edit(String::new()) {
+                        None
+                    } else {
+                        Some(tag)
+                    };
+                    let id = editor.entity_id();
+                    if let Some(tag) = tag
+                        && let Some(tab) =
+                            this.center.iter_mut().find(|tab| tab.view.item_id() == id)
+                    {
+                        tab.tag = tag;
+                    }
+                    cx.notify();
+                }
+            },
+        )
+    }
+
+    // A diff belongs to the buffer that asked for it: asking twice re-compares
+    // in the tab that is already open rather than stacking copies of the same
+    // question, and re-asking with a dry run upgrades that comparison in place.
+    pub(crate) fn open_diff(
+        &mut self,
+        editor: &Entity<EditorView>,
+        dry_run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sources) = editor.read(cx).diff_sources() else {
+            self.status_notes.set_general(Some(
+                "this buffer was not read from the cluster, so there is no copy to compare it with"
+                    .to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        if self.bench {
+            return;
+        }
+        let tag = ItemTag::Diff(format!("{}/{}", sources.request.uid, sources.request.name));
+        if let Some(index) = self.center.find(|tab| tab.tag == tag) {
+            let existing = self
+                .center
+                .get(index)
+                .and_then(|tab| tab.view.to_any().downcast::<diff::DiffView>().ok());
+            if let Some(existing) = existing {
+                existing.update(cx, |view, cx| view.refresh(sources, dry_run, cx));
+                self.activate_center(index, window, cx);
+                return;
+            }
+        }
+        let provider = self.provider();
+        let weak = editor.downgrade();
+        let context = self.context.clone();
+        let view = cx.new(|cx| diff::DiffView::new(provider, weak, sources, dry_run, context, cx));
+        self.open_center(Tab::new(tag, view), window, cx);
+    }
+
+    // One tag per document identity, so a scratch buffer saved to disk stops
+    // being a scratch buffer and cannot be opened again beside itself.
+    pub(crate) fn editor_tag(source: &editor::EditorSource) -> ItemTag {
+        match source {
+            editor::EditorSource::Cluster(request) => {
+                ItemTag::Edit(format!("cluster:{}/{}", request.uid, request.name))
+            }
+            editor::EditorSource::File(path) => ItemTag::Edit(format!("file:{}", path.display())),
+            // A scratch buffer has no identity to collide with, so it keeps
+            // the tag it opened with until a save gives it a path.
+            editor::EditorSource::Scratch => ItemTag::Edit(String::new()),
+        }
+    }
+
+    pub(crate) fn open_editor(
+        &mut self,
+        request: DescribeRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = Self::editor_tag(&editor::EditorSource::Cluster(request.clone()));
+        self.open_item(tag, Place::Center, window, cx, |this, window, cx| {
+            let provider = this.provider();
+            let schema = this.schema.clone();
+            let fs = this.fs.clone();
+            let view = cx.new(|cx| EditorView::cluster(provider, fs, schema, request, cx));
+            let subscription = this.subscribe_editor(&view, window, cx);
+            (view, Some(subscription))
+        });
+    }
+
+    // A path is whatever it is on disk: a folder opens the files panel, a
+    // file opens an editor. One entry point so the picker, the finder, the
+    // panel, and the command line all agree.
+    pub(crate) fn open_path(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Asking what the path is costs a stat, and a stat on a dead network
+        // mount costs seconds, so the question is asked off this thread and the
+        // answer opens the item one turn later.
+        let fs = self.fs.clone();
+        let probe = path.clone();
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                let folder = cx
+                    .background_executor()
+                    .spawn(async move { fs.is_dir(&probe) })
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if folder {
+                        this.open_folder(path, window, cx);
+                    } else {
+                        this.open_file(path, window, cx);
+                    }
+                });
+            })
+            .detach();
+    }
+
+    fn open_file(&mut self, path: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let tag = Self::editor_tag(&editor::EditorSource::File(path.clone()));
+        self.open_item(tag, Place::Center, window, cx, |this, window, cx| {
+            let provider = this.provider();
+            let schema = this.schema.clone();
+            let fs = this.fs.clone();
+            let view = cx.new(|cx| EditorView::file(provider, fs, schema, path, cx));
+            let subscription = this.subscribe_editor(&view, window, cx);
+            (view, Some(subscription))
+        });
+    }
+
+    pub(crate) fn open_folder(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bench {
+            return;
+        }
+        self.files_root = Some(path.clone());
+        let existing = self
+            .left
+            .panels()
+            .find(|(_, tab)| tab.tag == ItemTag::Files)
+            .and_then(|(_, tab)| tab.view.to_any().downcast::<FilesView>().ok());
+        if let Some(existing) = existing {
+            existing.update(cx, |view, cx| view.set_root(path, cx));
+            self.activate_existing(&ItemTag::Files, window, cx);
+            cx.notify();
+            return;
+        }
+        let fs = self.fs.clone();
+        let view = cx.new(|cx| FilesView::new(fs, path, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &FilesEvent, window, cx| match event {
+                FilesEvent::OpenFile(path) => this.open_file(path.clone(), window, cx),
+            },
+        );
+        self.open_left(
+            Tab::with_subscription(ItemTag::Files, view, subscription),
+            window,
+            cx,
+        );
+    }
+
+    // The one opener that does not go through `open_item`: a scratch buffer has
+    // no identity to collide with, so there is nothing to look up and every
+    // press is meant to produce another one.
+    pub(crate) fn new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench {
+            return;
+        }
+        self.scratch_counter += 1;
+        let title = format!("untitled-{}.yaml", self.scratch_counter);
+        let tag = ItemTag::Edit(format!("scratch:{title}"));
+        let provider = self.provider();
+        let schema = self.schema.clone();
+        let fs = self.fs.clone();
+        let view = cx.new(|cx| EditorView::scratch(provider, fs, schema, title, cx));
+        let subscription = self.subscribe_editor(&view, window, cx);
+        self.open_center(Tab::with_subscription(tag, view, subscription), window, cx);
+    }
+
+    // Settings and keymap are ordinary editor tabs over the real files, with
+    // the schema this binary defines. There is no separate settings panel:
+    // ctrl-, opens settings.json in the editor we have, comments stay because
+    // the loader is JSONC, and saving is what applies them -- the config
+    // poller notices the write and reloads.
+    pub(crate) fn open_config(
+        &mut self,
+        which: ConfigFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config) = self.config.clone() else {
+            if !self.bench {
+                self.status_notes.set_general(Some(
+                    "no config directory on this platform, so there is no file to edit".to_string(),
+                ));
+                cx.notify();
+            }
+            return;
+        };
+        let (path, template, root) = match which {
+            ConfigFile::Keymap => (
+                config.keymap,
+                config_schema::KEYMAP_TEMPLATE,
+                config_schema::keymap_root(cx),
+            ),
+            ConfigFile::Settings => (
+                config.settings,
+                config_schema::SETTINGS_TEMPLATE,
+                config_schema::settings_root(
+                    k10s_theme::registry(cx),
+                    &cx.text_system().all_font_names(),
+                ),
+            ),
+        };
+        let tag = Self::editor_tag(&editor::EditorSource::File(path.clone()));
+        self.open_item(tag, Place::Center, window, cx, |this, window, cx| {
+            let provider = this.provider();
+            let schema = this.schema.clone();
+            let fs = this.fs.clone();
+            let view = cx.new(|cx| {
+                EditorView::file_or_template(provider, fs, schema, path, template, cx)
+                    .with_schema_root(root)
+            });
+            let subscription = this.subscribe_editor(&view, window, cx);
+            (view, Some(subscription))
+        });
+    }
+
+    pub(crate) fn open_logs(
+        &mut self,
+        namespace: String,
+        pod: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = ItemTag::Logs(format!("{namespace}/{pod}"));
+        self.open_item(tag, Place::Bottom, window, cx, |this, _, cx| {
+            let provider = this.provider();
+            let request = LogRequest {
+                namespace,
+                pod,
+                container: None,
+                previous: false,
+            };
+            (cx.new(|cx| TextView::logs(provider, request, cx)), None)
+        });
+    }
+
+    // One forwards item; a start request lands on the existing view rather
+    // than opening a second registry window.
+    pub(crate) fn open_forwards(
+        &mut self,
+        start: Option<ForwardRequest>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bench {
+            return;
+        }
+        if let Some(index) = self.bottom.find(|tab| tab.tag == ItemTag::Forwards) {
+            if let Some(request) = start
+                && let Some(view) = self
+                    .bottom
+                    .get(index)
+                    .and_then(|tab| tab.view.to_any().downcast::<ForwardsView>().ok())
+            {
+                view.update(cx, |view, cx| view.start(request, cx));
+            }
+            self.activate_bottom(index, window, cx);
+            return;
+        }
+        let slot = self.slot.clone();
+        let view = cx.new(|cx| ForwardsView::new(slot, start, cx));
+        self.open_bottom(Tab::new(ItemTag::Forwards, view), window, cx);
+    }
+
+    // The shell we ask a container for: bash when the image has one, else
+    // sh. A container with neither answers inside the terminal itself.
+    pub(crate) fn shell_command() -> Vec<String> {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "command -v bash >/dev/null 2>&1 && exec bash || exec sh".to_string(),
+        ]
+    }
+
+    pub(crate) fn open_terminal(
+        &mut self,
+        namespace: String,
+        pod: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = ItemTag::Term(format!("{namespace}/{pod}"));
+        self.open_item(tag, Place::Bottom, window, cx, |this, _, cx| {
+            let provider = this.provider();
+            let request = ExecRequest {
+                namespace,
+                pod,
+                container: None,
+                command: Self::shell_command(),
+                attach: false,
+            };
+            (cx.new(|cx| TerminalView::exec(provider, request, cx)), None)
+        });
+    }
+
+    pub(crate) fn open_local_command(
+        &mut self,
+        command: LocalCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = ItemTag::Term(format!("local:{}", command.title));
+        self.open_item(tag, Place::Bottom, window, cx, |_, _, cx| {
+            (
+                cx.new(|cx| {
+                    TerminalView::command(command.title, command.program, command.args, cx)
+                }),
+                None,
+            )
+        });
+    }
+
+    pub(crate) fn open_attach(
+        &mut self,
+        namespace: String,
+        pod: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = ItemTag::Term(format!("attach:{namespace}/{pod}"));
+        self.open_item(tag, Place::Bottom, window, cx, |this, _, cx| {
+            let provider = this.provider();
+            let request = ExecRequest {
+                namespace,
+                pod,
+                container: None,
+                command: Vec::new(),
+                attach: true,
+            };
+            (
+                cx.new(|cx| TerminalView::attach(provider, request, cx)),
+                None,
+            )
+        });
+    }
+
+    // Zed's terminal toggle semantics: create lazily on first use, focus it
+    // when it is visible but unfocused, hide the dock when it already holds
+    // focus. Lazy on purpose -- a shell nobody asked for yet must not spend
+    // a process, an fd, or a paint at startup.
+    pub(crate) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench {
+            return;
+        }
+        let found = self.bottom.find(|tab| tab.tag == ItemTag::LocalTerm);
+        let holds_focus = self
+            .bottom
+            .active()
+            .is_some_and(|tab| tab.view.focus_handle(cx).contains_focused(window, cx));
+        match terminal_toggle(
+            found,
+            self.bottom.is_open(),
+            self.bottom.active_index(),
+            holds_focus,
+        ) {
+            TerminalToggle::Hide => {
+                self.bottom.set_open(false);
+                self.activate_center(self.center.active_index(), window, cx);
+            }
+            TerminalToggle::Show(index) => self.activate_bottom(index, window, cx),
+            TerminalToggle::Spawn => {
+                let view = cx.new(TerminalView::local);
+                self.open_bottom(Tab::new(ItemTag::LocalTerm, view), window, cx);
+            }
+        }
+    }
+
+    pub(crate) fn open_workload_logs(
+        &mut self,
+        request: WorkloadLogRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = ItemTag::Logs(format!(
+            "{}/{}/{}",
+            request.namespace,
+            kind_short(request.kind),
+            request.name
+        ));
+        self.open_item(tag, Place::Bottom, window, cx, |this, _, cx| {
+            let provider = this.provider();
+            (
+                cx.new(|cx| TextView::workload_logs(provider, request, cx)),
+                None,
+            )
+        });
+    }
+
+    // ctrl-w closes whatever has focus, if it is closable: a bottom panel, a
+    // left panel, or a center tab that is not the map. Dropping the item
+    // drops its entity: a log follow's stop guard or an exec session goes
+    // with it.
+    pub(crate) fn close_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused_in =
+            |tab: &Tab, cx: &Context<Self>| tab.view.focus_handle(cx).contains_focused(window, cx);
+        let center_active = self.center.active_index();
+        let (active_dirty, active_focused) = self
+            .center
+            .active()
+            .map(|tab| (tab.view.is_dirty(cx), focused_in(tab, cx)))
+            .unwrap_or((false, false));
+        let target = close_target(
+            self.bottom.active().is_some_and(|tab| focused_in(tab, cx)),
+            self.left.active().is_some_and(|tab| focused_in(tab, cx)),
+            center_active,
+            self.center.len(),
+            active_dirty,
+            active_focused,
+        );
+        match target {
+            CloseTarget::Bottom => {
+                self.bottom.remove(self.bottom.active_index());
+                match self.bottom.active() {
+                    Some(next) => self.focus_item(next, window, cx),
+                    None => self.activate_center(center_active, window, cx),
+                }
+                cx.notify();
+            }
+            CloseTarget::Left => {
+                self.left.remove(self.left.active_index());
+                match self.left.active() {
+                    Some(next) => self.focus_item(next, window, cx),
+                    None => self.activate_center(center_active, window, cx),
+                }
+                cx.notify();
+            }
+            CloseTarget::WarnDirty => {
+                if let Some(tab) = self.center.active() {
+                    let handle = tab.view.focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+                self.status_notes.set_general(Some(
+                    "unsaved changes; ctrl-w again to discard them".to_string(),
+                ));
+                cx.notify();
+            }
+            CloseTarget::Center(land_on) => {
+                self.center.remove(center_active);
+                self.activate_center(land_on, window, cx);
+            }
+            CloseTarget::Nothing => {}
+        }
+    }
+}
+
+// Whether tapping the terminal key hides, reveals, or spawns: hiding demands
+// all three of open AND active AND focused, so a terminal that is merely
+// somewhere in the dock is brought forward rather than dismissed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalToggle {
+    Hide,
+    Show(usize),
+    Spawn,
+}
+
+pub(crate) fn terminal_toggle(
+    found: Option<usize>,
+    dock_open: bool,
+    active_index: usize,
+    holds_focus: bool,
+) -> TerminalToggle {
+    match found {
+        None => TerminalToggle::Spawn,
+        Some(index) if dock_open && active_index == index && holds_focus => TerminalToggle::Hide,
+        Some(index) => TerminalToggle::Show(index),
+    }
+}
+
+// What ctrl-w closes, decided as a value before any window is touched. The
+// precedence is bottom, then left, then the centre; index zero is the map,
+// which never closes, and that is also what keeps the row non-empty. An item
+// holding unsaved work is never closed by a keystroke aimed somewhere else:
+// it is focused instead, so the next ctrl-w reaches its own guard and the
+// user sees what they are discarding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseTarget {
+    Bottom,
+    Left,
+    WarnDirty,
+    // Closing a centre tab lands on whichever tab slid into its place, i.e.
+    // the one to its right, clamped to the end of the row. That is
+    // deliberately not what the docks do -- `Pane::remove` keeps the selection
+    // on the left neighbour -- so the landing index is carried here rather
+    // than taken from the pane.
+    Center(usize),
+    Nothing,
+}
+
+pub(crate) fn close_target(
+    bottom_focused: bool,
+    left_focused: bool,
+    center_active: usize,
+    center_len: usize,
+    active_dirty: bool,
+    active_focused: bool,
+) -> CloseTarget {
+    if bottom_focused {
+        return CloseTarget::Bottom;
+    }
+    if left_focused {
+        return CloseTarget::Left;
+    }
+    if center_active == 0 || center_len <= 1 {
+        return CloseTarget::Nothing;
+    }
+    if active_dirty && !active_focused {
+        return CloseTarget::WarnDirty;
+    }
+    CloseTarget::Center(center_active.min(center_len.saturating_sub(2)))
+}
+
+/// The stored-manifest apply that is out, resumed by a reopened Releases view.
+#[derive(Clone)]
+pub(crate) struct HelmInFlight {
+    pub(crate) namespace: Option<String>,
+    pub(crate) name: String,
+    pub(crate) revision: u32,
+}
+
+#[cfg(test)]
+#[path = "hosting_test.rs"]
+mod tests;

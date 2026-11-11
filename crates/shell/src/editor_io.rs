@@ -1,0 +1,555 @@
+//! What the editor reads, what it writes, and the schema it fetches.
+//!
+//! The three dispatchers [`crate::editor::EditorSource`] exists for: reload,
+//! save, and schema scope. A new kind of source extends that enum and these
+//! three, and touches nothing else.
+//!
+//! A cluster reload replaces only the buffer revision it started from,
+//! preserving edits made while it waited.
+//!
+//! Nothing here blocks the UI thread. Reads, writes, and even the conflict
+//! stamp run on the background executor, and every non-`Ok` outcome becomes a
+//! labelled note rather than a silent absence. A schema fetch that fails gives
+//! its once-only flag back and an answer is dropped unless the store still
+//! belongs to the connection it was asked of, so one expired token cannot leave
+//! the window validating blind and the previous cluster cannot fill the store
+//! that replaced it. A load that never landed leaves nothing to lose, and says
+//! so, rather than warning about unsaved changes in an empty buffer. Writes go
+//! through [`crate::saves::SaveQueue`] -- one in flight, only the newest text
+//! queued behind it -- because a write per keypress leaves the order to the
+//! executor, and an older write can land last on a buffer already marked clean.
+
+use std::path::PathBuf;
+
+use gpui::Context;
+
+use k10s_edit::complete::doc_meta;
+use k10s_edit::{Buffer, DocMeta, LanguageKind, Syntax};
+
+use crate::dirty::{CloseStep, SaveStep};
+use crate::editor::{EditorEvent, EditorSource, EditorView, SchemaStore, file_title};
+use crate::fs::Stamp;
+use crate::saves::PendingSave;
+use k10s_provider::{
+    DescribeRequest, ManifestOutcome, Reply, SchemaCatalogOutcome, SchemaTextOutcome,
+};
+
+impl EditorView {
+    // Fetch the source into the buffer. A buffer that has never been loaded is
+    // dirty by definition -- it has no clean point yet -- so opening must not go
+    // through the guard below, or every file opens empty behind a warning about
+    // unsaved changes it does not have.
+    pub(crate) fn load(&mut self, cx: &mut Context<Self>) {
+        match self.source.clone() {
+            EditorSource::Cluster(request) => self.reload_cluster(request, cx),
+            EditorSource::File(path) => self.reload_file(path, cx),
+            EditorSource::Scratch => {
+                self.status = Some("this buffer has no file to reload from".to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    // The reload action, which throws unsaved work away and so asks first. It
+    // also empties the save queue: a save queued behind the in-flight one holds
+    // the text the user has just chosen to discard, and writing it afterwards
+    // would put the discarded version on disk.
+    pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
+        if self.is_dirty() && self.dirty.reload_step(self.buffer.version()) == CloseStep::Warn {
+            self.status = Some("unsaved changes; reload again to discard them".to_string());
+            cx.notify();
+            return;
+        }
+        self.saves.abandon();
+        self.load(cx);
+    }
+
+    fn reload_cluster(&mut self, request: DescribeRequest, cx: &mut Context<Self>) {
+        self.generation += 1;
+        let generation = self.generation;
+        let stamp = self.buffer_stamp();
+        self.status = Some("loading...".to_string());
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let reply: Reply<ManifestOutcome> = Box::new(move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        self.provider.fetch_manifest(&request, reply);
+        cx.spawn(async move |this, cx| {
+            if let Ok(outcome) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return;
+                    }
+                    match outcome {
+                        ManifestOutcome::Manifest {
+                            title,
+                            yaml,
+                            api_version,
+                            kind,
+                            last_applied,
+                            patchable,
+                            status_subresource,
+                            uid,
+                        } => {
+                            // A reload can start with an unchanged buffer and
+                            // receive its answer after another edit.
+                            if this.buffer_stamp() != stamp {
+                                this.status = Some(
+                                    "the buffer changed while loading; it was left as it is"
+                                        .to_string(),
+                                );
+                                cx.notify();
+                                return;
+                            }
+                            this.title = title.into();
+                            this.buffer = Buffer::new(&yaml);
+                            this.syntax.reparse(this.buffer.rope());
+                            this.live = Some(yaml);
+                            this.base = last_applied;
+                            this.uid = uid;
+                            this.patchable = patchable;
+                            this.status_subresource = status_subresource;
+                            this.meta = DocMeta {
+                                api_version: Some(api_version),
+                                kind: Some(kind),
+                            };
+                            this.dirty.mark_clean(this.buffer.version(), None);
+                            this.scroll_top = 0;
+                            this.status = None;
+                            this.resync_search();
+                            this.publish_state(cx);
+                            this.ensure_schema(cx);
+                            this.schedule_validation(cx);
+                        }
+                        ManifestOutcome::Denied(what) => {
+                            this.status = Some(format!("{what}: access denied for this account"));
+                            this.clean_if_never_loaded(cx);
+                        }
+                        ManifestOutcome::Failed(why) => {
+                            this.status = Some(why);
+                            this.clean_if_never_loaded(cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn reload_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.generation += 1;
+        let generation = self.generation;
+        self.status = Some("loading...".to_string());
+        let fs = self.fs.clone();
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let text = fs.read_to_string(&path)?;
+                    let stamp = fs.stamp(&path)?;
+                    Ok::<(String, Stamp), std::io::Error>((text, stamp))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                match loaded {
+                    Ok((text, stamp)) => {
+                        this.buffer = Buffer::new(&text);
+                        this.syntax.reparse(this.buffer.rope());
+                        this.refresh_meta();
+                        this.dirty.mark_clean(this.buffer.version(), Some(stamp));
+                        this.scroll_top = 0;
+                        this.status = None;
+                        this.resync_search();
+                        this.publish_state(cx);
+                        this.ensure_schema(cx);
+                        this.schedule_validation(cx);
+                    }
+                    // A file that is not there yet is not a failure when the
+                    // caller brought a template for exactly that case.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match this.template {
+                            Some(template) => {
+                                this.buffer = Buffer::new(template);
+                                this.syntax.reparse(this.buffer.rope());
+                                this.refresh_meta();
+                                this.dirty.forget_disk();
+                                this.scroll_top = 0;
+                                this.status = Some("new file; ctrl-s writes it".to_string());
+                                this.resync_search();
+                                this.publish_state(cx);
+                                this.ensure_schema(cx);
+                                this.schedule_validation(cx);
+                            }
+                            None => {
+                                this.status = Some(format!("open failed: {error}"));
+                                this.clean_if_never_loaded(cx);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        this.status = Some(format!("open failed: {error}"));
+                        this.clean_if_never_loaded(cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn refresh_meta(&mut self) {
+        let cursor = self.buffer.primary_selection().head;
+        let document = self.syntax.document_index_at(self.buffer.rope(), cursor);
+        self.meta = doc_meta(self.buffer.rope(), &self.syntax, document);
+    }
+
+    pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
+        match self.source.clone() {
+            EditorSource::File(path) => self.save_to(path, cx),
+            EditorSource::Scratch => {
+                cx.emit(EditorEvent::SaveAsRequested);
+            }
+            // A cluster document is never written blind: ctrl-s asks the server
+            // what it would store and opens that answer as a diff, and the
+            // apply is a second, deliberate press inside it.
+            EditorSource::Cluster(_) => {
+                cx.emit(EditorEvent::DiffRequested { dry_run: true });
+            }
+        }
+    }
+
+    // The picker hands back a path: the buffer adopts it as its file, takes
+    // its language from the extension, and saves.
+    pub fn assign_path_and_save(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.title = file_title(&path).into();
+        let language = LanguageKind::from_file_name(&self.title);
+        if language != self.syntax.language() {
+            self.syntax = Syntax::new(language);
+            self.syntax.reparse(self.buffer.rope());
+            self.schedule_validation(cx);
+        }
+        self.source = EditorSource::File(path.clone());
+        // A fixed root is bound to a file's identity: once this buffer is a
+        // different file, the settings or keymap schema is not its schema.
+        self.schema_root = None;
+        // The identity changed, so anything already in flight describes the
+        // previous file and must not answer for this one.
+        self.generation += 1;
+        self.dirty.forget_disk();
+        self.save_to(path, cx);
+        self.reported_dirty = self.is_dirty();
+        cx.emit(EditorEvent::StateChanged);
+    }
+
+    pub(crate) fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let request = PendingSave {
+            path,
+            text: self.buffer.text(),
+            version: self.buffer.version(),
+            generation: self.generation,
+            ticket: 0,
+        };
+        // A save already running owns the file, and it already answered the
+        // conflict question; this text queues behind it.
+        let Some(start) = self.saves.request(request) else {
+            self.status = Some("saving...".to_string());
+            cx.notify();
+            return;
+        };
+        self.begin_save(start, cx);
+    }
+
+    pub(crate) fn begin_save(&mut self, save: PendingSave, cx: &mut Context<Self>) {
+        let fs = self.fs.clone();
+        self.status = Some("saving...".to_string());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            // Stamping the file is a syscall, and on a network mount it is not
+            // one a frame can wait for, so even the conflict check happens off
+            // the UI thread.
+            let stamped = {
+                let fs = fs.clone();
+                let path = save.path.clone();
+                cx.background_executor()
+                    .spawn(async move { fs.stamp(&path).ok() })
+                    .await
+            };
+            let cleared = this.update(cx, |this, cx| {
+                if save.generation != this.generation {
+                    // The buffer this text came from is gone, so its conflict
+                    // question is not one to ask. Whatever was asked for since
+                    // owns the queue.
+                    if let Some(next) = this.saves.finished(save.ticket) {
+                        this.begin_save(next, cx);
+                    }
+                    return false;
+                }
+                match this.dirty.save_step(stamped) {
+                    SaveStep::Confirm(reason) => {
+                        // The user answers before anything is written, and the
+                        // queue empties so the answer is a deliberate press
+                        // rather than whatever was typed ahead.
+                        this.saves.abandon();
+                        this.status = Some(reason.note().to_string());
+                        cx.notify();
+                        false
+                    }
+                    SaveStep::Write => true,
+                }
+            });
+            if !matches!(cleared, Ok(true)) {
+                return;
+            }
+            let written = {
+                let path = save.path.clone();
+                let text = save.text.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        fs.write(&path, &text)?;
+                        // The write is what mattered; a stamp we cannot read
+                        // only costs us the conflict check on the next save.
+                        Ok::<Option<Stamp>, std::io::Error>(fs.stamp(&path).ok())
+                    })
+                    .await
+            };
+            let _ = this.update(cx, |this, cx| {
+                // Save-as adopts a new path, and a reload replaces the buffer,
+                // while the previous write is still in flight. That write was
+                // asked for and is correct, but its result describes a document
+                // this view is no longer showing: marking that version clean
+                // hands the tab a false answer, and adopting the old file's
+                // stamp invents a conflict on the next save.
+                let still_ours = save.generation == this.generation
+                    && matches!(&this.source, EditorSource::File(path) if *path == save.path);
+                match written {
+                    Ok(stamp) if still_ours => {
+                        this.dirty.mark_clean(save.version, stamp);
+                        this.status = stamp.is_none().then(|| {
+                            "saved, but the file cannot be stamped; the next save will \
+                             ask before overwriting"
+                                .to_string()
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => this.status = Some(format!("save failed: {error}")),
+                }
+                this.publish_state(cx);
+                cx.notify();
+                if let Some(next) = this.saves.finished(save.ticket) {
+                    this.begin_save(next, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn ensure_schema(&mut self, cx: &mut Context<Self>) {
+        if self.schema_root.is_some() {
+            return;
+        }
+        let (epoch, fetch_catalog, fetch_crds) = {
+            let mut store = self.schema.borrow_mut();
+            (
+                store.epoch(),
+                !std::mem::replace(&mut store.requested_catalog, true),
+                !std::mem::replace(&mut store.requested_crds, true),
+            )
+        };
+        if fetch_catalog {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let reply: Reply<SchemaCatalogOutcome> = Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            });
+            self.provider.fetch_schema_catalog(reply);
+            cx.spawn(async move |this, cx| {
+                if let Ok(outcome) = rx.await {
+                    let _ = this.update(cx, |this, cx| {
+                        {
+                            absorb_catalog(&mut this.schema.borrow_mut(), outcome, epoch);
+                        }
+                        this.ensure_documents(cx);
+                        this.schedule_validation(cx);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+        if fetch_crds {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let reply: Reply<SchemaTextOutcome> = Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            });
+            self.provider.fetch_crd_schemas(reply);
+            cx.spawn(async move |this, cx| {
+                if let Ok(outcome) = rx.await {
+                    let _ = this.update(cx, |this, cx| {
+                        {
+                            absorb_schema_text(
+                                &mut this.schema.borrow_mut(),
+                                outcome,
+                                &SchemaDoc::CrdList,
+                                epoch,
+                            );
+                        }
+                        this.schedule_validation(cx);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+        self.ensure_documents(cx);
+    }
+
+    pub(crate) fn ensure_documents(&mut self, cx: &mut Context<Self>) {
+        let Some(api_version) = self.meta.api_version.clone() else {
+            return;
+        };
+        let (epoch, url) = {
+            let mut store = self.schema.borrow_mut();
+            let epoch = store.epoch();
+            let Some(url) = next_document_url(&mut store, &api_version) else {
+                return;
+            };
+            (epoch, url)
+        };
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let reply: Reply<SchemaTextOutcome> = Box::new(move |outcome| {
+            let _ = tx.send(outcome);
+        });
+        self.provider.fetch_schema_document(&url, reply);
+        cx.spawn(async move |this, cx| {
+            if let Ok(outcome) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    {
+                        absorb_schema_text(
+                            &mut this.schema.borrow_mut(),
+                            outcome,
+                            &SchemaDoc::OpenApi(api_version),
+                            epoch,
+                        );
+                    }
+                    this.schedule_validation(cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// A buffer whose load never landed has nothing to lose, and a close that
+    /// warns about unsaved changes in an empty buffer teaches people to press
+    /// through the warning that matters. Only ever called where the load
+    /// failed: a buffer that has loaded once keeps its own clean point.
+    fn clean_if_never_loaded(&mut self, cx: &mut Context<Self>) {
+        if self.dirty.never_loaded() {
+            self.dirty.mark_clean(self.buffer.version(), None);
+            self.publish_state(cx);
+        }
+    }
+}
+
+// How a catalog answer lands in the store: every source's group version is
+// registered with the index BEFORE the catalog is stored, so a document the
+// index cannot name is never offered for fetching; and a denial is worded for
+// the person reading the notes, not for the transport.
+//
+// An answer from the cluster the window has left is dropped on its epoch, and a
+// fetch that did not arrive gives its flag back: a token that expired once must
+// not leave this workspace validating blind until it is restarted.
+pub(crate) fn absorb_catalog(store: &mut SchemaStore, outcome: SchemaCatalogOutcome, epoch: u64) {
+    if store.epoch() != epoch {
+        return;
+    }
+    match outcome {
+        SchemaCatalogOutcome::Catalog(sources) => {
+            for source in &sources {
+                store.index.add_api_version(&source.group_version);
+            }
+            store.catalog = sources;
+        }
+        SchemaCatalogOutcome::Denied(what) => {
+            store.requested_catalog = false;
+            store.note(format!("{what}: access denied for this account"))
+        }
+        SchemaCatalogOutcome::Failed(why) => {
+            store.requested_catalog = false;
+            store.note(why)
+        }
+    }
+}
+
+// Which schema text an answer carries; the Denied and Failed arms are shared
+// and only the destination of the Text arm differs. The OpenAPI document names
+// the group version it was asked for, because that is the flag a failure has to
+// give back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SchemaDoc {
+    OpenApi(String),
+    CrdList,
+}
+
+pub(crate) fn absorb_schema_text(
+    store: &mut SchemaStore,
+    outcome: SchemaTextOutcome,
+    kind: &SchemaDoc,
+    epoch: u64,
+) {
+    if store.epoch() != epoch {
+        return;
+    }
+    match outcome {
+        SchemaTextOutcome::Text(json) => {
+            let landed = match kind {
+                SchemaDoc::OpenApi(_) => store.index.add_openapi_document(&json),
+                SchemaDoc::CrdList => store.index.add_crd_list(&json),
+            };
+            if let Err(why) = landed {
+                store.note(match kind {
+                    SchemaDoc::OpenApi(_) => format!("schema document: {why}"),
+                    SchemaDoc::CrdList => format!("CRD schemas: {why}"),
+                });
+            }
+        }
+        SchemaTextOutcome::Denied(what) => {
+            forget_request(store, kind);
+            store.note(format!("{what}: access denied for this account"))
+        }
+        SchemaTextOutcome::Failed(why) => {
+            forget_request(store, kind);
+            store.note(why)
+        }
+    }
+}
+
+/// A fetch that failed was never answered, so the flag that says it was asked
+/// for is a lie the next editor would believe.
+fn forget_request(store: &mut SchemaStore, kind: &SchemaDoc) {
+    match kind {
+        SchemaDoc::OpenApi(group_version) => {
+            store.requested_documents.remove(group_version);
+        }
+        SchemaDoc::CrdList => store.requested_crds = false,
+    }
+}
+
+// The document fetch a group version still owes, at most once per store: the
+// store is per-workspace precisely so a second editor on the same group
+// version fetches nothing, and `requested_documents` is where that promise is
+// kept.
+pub(crate) fn next_document_url(store: &mut SchemaStore, api_version: &str) -> Option<String> {
+    let source = store
+        .catalog
+        .iter()
+        .find(|source| source.group_version == api_version)
+        .cloned()?;
+    store
+        .requested_documents
+        .insert(source.group_version)
+        .then_some(source.url)
+}

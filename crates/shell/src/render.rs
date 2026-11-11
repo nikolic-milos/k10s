@@ -1,0 +1,751 @@
+//! Assembling the window, and the one element every command is listened for on.
+//!
+//! Two things are deliberate here. The action listeners all hang off the
+//! workspace element rather than off the map: an `.on_action` costs allocations
+//! on every paint, and the map's element build sits inside the full-GPUI-paint
+//! allocation ratchet, so the map keeps only its `key_context` and the commands
+//! are heard here. And the whole of the chrome is skipped under `bench` -- a
+//! measurement window is the map and nothing else, so a flight is timing the
+//! thing it claims to be timing.
+
+use gpui::{
+    Context, DragMoveEvent, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, Role,
+    SharedString, StyleRefinement, Styled, Window, canvas, div, prelude::*, px, rgb,
+};
+
+use crate::chrome::{DockEdge, DraggedDockResize};
+use crate::finder::PickerMode;
+use crate::hosting::ConfigFile;
+use crate::selection::{LogTarget, Selection};
+use crate::tag::ItemTag;
+use crate::ui::{
+    DockSizes, MODAL_TOP, STATUS_BAR_BORDER, STATUS_BAR_HEIGHT, activity_bar_width, key_hint,
+    status_bar_geometry,
+};
+use crate::workspace::{PickerPurpose, Workspace};
+use crate::{
+    AttachSelection, ChooseCluster, ClearSelection, CloseItem, DescribeSelection, EditSelection,
+    ExecSelection, FindCluster, FindFile, LoadSavedView, LogsSelection, NewFile, NextItem,
+    OpenArgo, OpenBrowser, OpenCollectors, OpenDay2, OpenEcosystem, OpenFile, OpenFlux, OpenFolder,
+    OpenForwards, OpenHarbor, OpenInspectorChartDetails, OpenKeymap, OpenMesh, OpenNodes,
+    OpenObserve, OpenPalette, OpenPolicy, OpenReleases, OpenSettings, OpenStatusDetails,
+    OpenSurfaces, OpenTraces, PrevItem, Quit, RetainedLogsSelection, ShowStarmap, SilenceSelection,
+    ToggleBottomDock, ToggleInspector, ToggleLeftDock, ToggleRightDock, ToggleTerminal,
+};
+
+// The reader is a child of the workspace, so its own actions run first. Every
+// workspace bubble handler goes through this listener: a custom keymap can bind
+// an action in any context, so keymap suppressors cannot provide this boundary.
+// Commands that replace the reader and Quit remain available.
+fn workspace_action_allowed(notice_open: bool, action: &dyn gpui::Action) -> bool {
+    if !notice_open {
+        return true;
+    }
+    let action = action.as_any();
+    action.is::<OpenPalette>()
+        || action.is::<OpenSurfaces>()
+        || action.is::<ChooseCluster>()
+        || action.is::<OpenFile>()
+        || action.is::<OpenFolder>()
+        || action.is::<FindFile>()
+        || action.is::<FindCluster>()
+        || action.is::<LoadSavedView>()
+        || action.is::<Quit>()
+}
+
+fn guard_action<A: gpui::Action>(
+    cx: &Context<Workspace>,
+    handler: impl Fn(&mut Workspace, &A, &mut Window, &mut Context<Workspace>) + 'static,
+) -> impl Fn(&A, &mut Window, &mut gpui::App) + 'static {
+    cx.listener(move |this, action: &A, window, cx| {
+        if workspace_action_allowed(this.notice.is_open(), action) {
+            handler(this, action, window, cx);
+        }
+    })
+}
+
+impl Render for Workspace {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = k10s_theme::active(cx).clone();
+        let fonts = k10s_theme::typography(cx).clone();
+        let requested = self.requested_dock_sizes(cx);
+        let (status_line_height, status_height) = if self.bench {
+            (gpui::phi(), STATUS_BAR_HEIGHT)
+        } else {
+            status_bar_geometry(&fonts, window)
+        };
+        let workspace = cx.entity();
+        let mut layout_viewport = self.viewport;
+        if !self.bench {
+            layout_viewport.width =
+                (layout_viewport.width - activity_bar_width(self.viewport.width)).max(0.0);
+        }
+        let sizes = DockSizes::resolve(
+            layout_viewport,
+            requested,
+            self.left.is_open(),
+            self.inspector_open,
+            self.bottom.is_open(),
+            status_height,
+        );
+        let map_active = self
+            .center
+            .active()
+            .is_none_or(|tab| tab.tag == ItemTag::Map);
+        let map_chrome = (!self.bench && map_active).then(|| {
+            self.map.read(cx).chrome_view().cached(
+                StyleRefinement::default()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .left_0(),
+            )
+        });
+        let content: gpui::AnyElement = self
+            .center
+            .active()
+            .map(Self::item_view)
+            .unwrap_or_else(|| self.map.clone().into_any_element());
+        let left = (!self.bench && self.left.is_open()).then(|| {
+            div()
+                .id("left-dock")
+                .w(px(sizes.left))
+                .h_full()
+                .relative()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(rgb(theme.shell.panel_background))
+                .border_r_1()
+                .border_color(rgb(theme.shell.border))
+                .role(Role::Complementary)
+                .aria_label("Left dock")
+                .children(self.dock_tabs(
+                    &self.left,
+                    "left-dock-tabs",
+                    Self::activate_left,
+                    &theme,
+                    &fonts,
+                    cx,
+                ))
+                .children(
+                    self.left
+                        .active()
+                        .map(|tab| div().flex_1().min_h(px(0.0)).child(Self::item_view(tab))),
+                )
+                .child(Self::resize_handle(DockEdge::Left))
+        });
+        let bottom = (!self.bench && self.bottom.is_open()).then(|| {
+            div()
+                .id("bottom-dock")
+                .h(px(sizes.bottom))
+                .w_full()
+                .relative()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(rgb(theme.shell.panel_background))
+                .border_t_1()
+                .border_color(rgb(theme.shell.border))
+                .role(Role::Complementary)
+                .aria_label("Bottom dock")
+                .children(self.dock_tabs(
+                    &self.bottom,
+                    "bottom-dock-tabs",
+                    Self::activate_bottom,
+                    &theme,
+                    &fonts,
+                    cx,
+                ))
+                .children(
+                    self.bottom
+                        .active()
+                        .map(|tab| div().flex_1().min_h(px(0.0)).child(Self::item_view(tab))),
+                )
+                .child(Self::resize_handle(DockEdge::Bottom))
+        });
+        let right = (!self.bench && self.inspector_open).then(|| {
+            self.inspector(
+                &theme,
+                &fonts,
+                sizes.right,
+                self.selection.clone(),
+                self.retained_loki,
+                cx,
+            )
+        });
+        let status = (!self.bench).then(|| {
+            div()
+                .id("status-bar")
+                .h(px(status_height))
+                .line_height(status_line_height)
+                .w_full()
+                .flex_none()
+                .px(px(8.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .bg(rgb(theme.shell.status_bar_background))
+                .border_t(px(STATUS_BAR_BORDER))
+                .border_color(rgb(theme.shell.border))
+                .text_size(px(fonts.small()))
+                .text_color(rgb(theme.shell.text_muted))
+                .role(Role::Toolbar)
+                .aria_label("Status bar")
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(SharedString::from(self.status_line())),
+                )
+                .children(self.status_notes.any().then(|| {
+                    div()
+                        .id("status-details-button")
+                        .flex_none()
+                        .px(px(6.0))
+                        .cursor_pointer()
+                        .role(Role::Button)
+                        .aria_label("Open status details")
+                        .aria_description(
+                            "Use Ctrl Alt S outside text input, or open status details from Commands",
+                        )
+                        .aria_keyshortcuts("Ctrl+Alt+S")
+                        .hover(|style| style.bg(rgb(theme.shell.element_hover)))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_status_notice(window, cx);
+                        }))
+                        .child("Details  Ctrl Alt S")
+                }))
+                .child(key_hint(&theme, &fonts, "Ctrl Shift P", "Commands"))
+        });
+        let viewport_observer = (!self.bench).then(|| {
+            canvas(
+                move |bounds, _, cx| {
+                    let _ = workspace.update(cx, |this, cx| {
+                        this.resize(
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                            cx,
+                        );
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+        });
+        let center = div()
+            .h_full()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .children((!self.bench).then(|| self.tab_bar(&theme, &fonts, cx)))
+            .child(
+                div()
+                    .id("workspace-content")
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .role(Role::Main)
+                    .aria_label("Workspace")
+                    .child(content)
+                    .children(map_chrome),
+            )
+            .children(bottom);
+        let title_bar = (!self.bench).then(|| self.title_bar(&theme, &fonts, window, cx));
+        let app_menu = (self.app_menu_open && !self.bench)
+            .then(|| self.app_menu(&theme, &fonts, window, cx).into_any_element());
+        let palette = self.palette.view().map(|view| {
+            let surfaces = view.read(cx).is_surface_picker();
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .when(surfaces, |scrim| {
+                    scrim.flex().items_center().justify_center().p(px(24.0))
+                })
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.close_palette(window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .when(!surfaces, |position| {
+                            position.absolute().top(px(MODAL_TOP)).left_0().right_0()
+                        })
+                        .flex()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(view.clone()),
+                )
+        });
+        // The picker and the finder share the palette's scrim, dismissal,
+        // and placement: three modals, one chrome.
+        let picker = self.picker.view().map(|view| {
+            Self::modal_scrim(
+                view.clone().into_any_element(),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.close_picker(window, cx);
+                }),
+            )
+        });
+        let finder = self.finder.view().map(|view| {
+            Self::modal_scrim(
+                view.clone().into_any_element(),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.close_finder(window, cx);
+                }),
+            )
+        });
+        let cluster_finder = self.cluster_finder.view().map(|view| {
+            Self::modal_scrim(
+                view.clone().into_any_element(),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.close_cluster_finder(window, cx);
+                }),
+            )
+        });
+        let notice = self.notice.view().map(|view| {
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .p(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.close_notice(window, cx);
+                    }),
+                )
+                .child(view.clone())
+        });
+        // The chooser stands down while it is asking for a file: two sheets at
+        // the same place is one sheet with a lid on it. It is only unpainted, not
+        // closed, so dismissing the picker brings back the list and the highlight
+        // exactly as they were.
+        let launch = self
+            .launch
+            .view()
+            .filter(|_| !self.picker.is_open())
+            .map(|view| {
+                Self::modal_scrim(
+                    view.clone().into_any_element(),
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.dismiss_launch(window, cx);
+                    }),
+                )
+            });
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(theme.shell.background))
+            .font_family(fonts.ui_family.clone())
+            .text_size(px(fonts.ui_size))
+            .text_color(rgb(theme.shell.text))
+            .key_context("Workspace")
+            .when(!self.bench && self.status_notes.any(), |workspace| {
+                workspace.on_action(guard_action(
+                    cx,
+                    |this, _: &OpenStatusDetails, window, cx| {
+                        this.open_status_notice(window, cx);
+                    },
+                ))
+            })
+            .when(
+                !self.bench && self.inspector_chart_details_available(),
+                |workspace| {
+                    workspace.on_action(guard_action(
+                        cx,
+                        |this, _: &OpenInspectorChartDetails, window, cx| {
+                            this.open_inspector_chart_details(window, cx);
+                        },
+                    ))
+                },
+            )
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DraggedDockResize>, window, cx| {
+                    this.resize_dock(event, window, cx);
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &OpenPalette, window, cx| {
+                this.toggle_palette(window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenSurfaces, window, cx| {
+                this.toggle_surface_picker(window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &ChooseCluster, window, cx| {
+                this.toggle_launch(window, cx);
+            }))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ToggleChurn, _, cx| {
+                    this.map.update(cx, |map, cx| map.toggle_churn(cx));
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ToggleEdges, _, cx| {
+                    this.map.update(cx, |map, cx| map.toggle_edges(cx));
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &k10s_map::ToggleHud, _, cx| {
+                this.map.update(cx, |map, cx| map.toggle_hud(cx));
+            }))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ToggleLegend, _, cx| {
+                    this.map.update(cx, |map, cx| map.toggle_legend(cx));
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::CycleOverlay, _, cx| {
+                    this.cycle_overlay(cx);
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::FitView, window, cx| {
+                    this.map.update(cx, |map, cx| map.fit(window, cx));
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ZoomIn, window, cx| {
+                    this.map.update(cx, |map, cx| map.zoom_in(window, cx));
+                },
+            ))
+            .on_action(guard_action(
+                cx,
+                |this, _: &k10s_map::ZoomOut, window, cx| {
+                    this.map.update(cx, |map, cx| map.zoom_out(window, cx));
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &ToggleInspector, _, cx| {
+                this.toggle_inspector(cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &ToggleLeftDock, _, cx| {
+                this.left.toggle();
+                cx.notify();
+            }))
+            .on_action(guard_action(cx, |this, _: &ToggleRightDock, _, cx| {
+                this.toggle_inspector(cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &ToggleBottomDock, _, cx| {
+                this.bottom.toggle();
+                cx.notify();
+            }))
+            .on_action(guard_action(cx, |this, _: &ClearSelection, _, cx| {
+                if this.app_menu_open {
+                    this.app_menu_open = false;
+                    cx.notify();
+                    return;
+                }
+                if this.map.update(cx, |map, cx| map.cancel_flight(cx)) {
+                    return;
+                }
+                if this.selection.take().is_some() {
+                    this.inspector_open = false;
+                    this.refresh_detail(cx);
+                    this.map.update(cx, |map, cx| map.set_selection(None, cx));
+                    cx.notify();
+                }
+            }))
+            .on_action(guard_action(cx, |_, _: &Quit, _, cx| cx.quit()))
+            .on_action(guard_action(cx, |this, _: &ShowStarmap, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Starmap, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenBrowser, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Resources, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenNodes, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Nodes, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenForwards, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Forwards, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenReleases, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Releases, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenArgo, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Argo, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenFlux, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Flux, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenDay2, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Day2, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenObserve, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Observe, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenCollectors, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Collectors, window, cx);
+            }))
+            .on_action(guard_action(
+                cx,
+                |this, _: &RetainedLogsSelection, window, cx| {
+                    this.open_retained_logs(window, cx);
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &OpenPolicy, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Policy, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenHarbor, window, cx| {
+                this.open_harbor(window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenMesh, window, cx| {
+                this.open_mesh(window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenTraces, window, cx| {
+                this.open_traces(window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenEcosystem, window, cx| {
+                this.activate_activity(crate::activity::ActivityId::Ecosystem, window, cx);
+            }))
+            .on_action(guard_action(
+                cx,
+                |this, _: &SilenceSelection, window, cx| {
+                    this.open_silence(window, cx);
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &ToggleTerminal, window, cx| {
+                this.toggle_terminal(window, cx);
+            }))
+            .on_action(guard_action(
+                cx,
+                |this, _: &DescribeSelection, window, cx| {
+                    if let Some(selection) = this.selection.clone() {
+                        this.open_doc(selection.describe_request(), window, cx);
+                    }
+                },
+            ))
+            .on_action(guard_action(cx, |this, _: &EditSelection, window, cx| {
+                if let Some(selection) = this.selection.clone() {
+                    this.open_editor(selection.describe_request(), window, cx);
+                }
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenFile, window, cx| {
+                this.status_notes.set_general(None);
+                let seed = crate::workspace::seed_dir(this.files_root.as_deref());
+                this.open_picker(seed, PickerMode::OpenFile, PickerPurpose::Open, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenFolder, window, cx| {
+                this.status_notes.set_general(None);
+                let seed = crate::workspace::seed_dir(this.files_root.as_deref());
+                this.open_picker(
+                    seed,
+                    PickerMode::OpenFolder,
+                    PickerPurpose::Open,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(guard_action(cx, |this, _: &FindFile, window, cx| {
+                this.open_finder(window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &FindCluster, window, cx| {
+                this.open_cluster_finder(window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &NewFile, window, cx| {
+                this.status_notes.set_general(None);
+                this.new_file(window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &LoadSavedView, window, cx| {
+                this.open_saved_view_picker(window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenSettings, window, cx| {
+                this.open_config(ConfigFile::Settings, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &OpenKeymap, window, cx| {
+                this.open_config(ConfigFile::Keymap, window, cx);
+            }))
+            .on_action(guard_action(cx, |this, _: &LogsSelection, window, cx| {
+                match this.selection.as_ref().and_then(Selection::log_target) {
+                    Some(LogTarget::Pod { namespace, name }) => {
+                        this.open_logs(namespace, name, window, cx)
+                    }
+                    // A workload's logs are the merged follows of its pods;
+                    // a kind without a pod selector answers with a labelled
+                    // failure from the data plane, not a guess here.
+                    Some(LogTarget::Workload(request)) => {
+                        this.open_workload_logs(request, window, cx)
+                    }
+                    None => {}
+                }
+            }))
+            .on_action(guard_action(cx, |this, _: &ExecSelection, window, cx| {
+                if let Some((namespace, name)) = this.selection.as_ref().and_then(Selection::pod) {
+                    this.open_terminal(namespace, name, window, cx);
+                } else {
+                    this.note_needs_a_pod("exec", cx);
+                }
+            }))
+            .on_action(guard_action(cx, |this, _: &AttachSelection, window, cx| {
+                if let Some((namespace, name)) = this.selection.as_ref().and_then(Selection::pod) {
+                    this.open_attach(namespace, name, window, cx);
+                } else {
+                    this.note_needs_a_pod("attach", cx);
+                }
+            }))
+            .on_action(guard_action(cx, |this, _: &NextItem, window, cx| {
+                if let Some(next) = this.center.next_index() {
+                    this.activate_center(next, window, cx);
+                }
+            }))
+            .on_action(guard_action(cx, |this, _: &PrevItem, window, cx| {
+                if let Some(previous) = this.center.previous_index() {
+                    this.activate_center(previous, window, cx);
+                }
+            }))
+            .on_action(guard_action(cx, |this, _: &CloseItem, window, cx| {
+                this.close_focused(window, cx);
+            }))
+            .children(viewport_observer)
+            .children(title_bar)
+            .child({
+                let rail = (!self.bench)
+                    .then(|| self.activity_rail(&theme, &fonts, cx).into_any_element());
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .flex_row()
+                    .overflow_hidden()
+                    .children(rail)
+                    .children(left)
+                    .child(center)
+                    .children(right)
+            })
+            .children(status)
+            .children(app_menu)
+            .children(palette)
+            .children(launch)
+            .children(picker)
+            .children(finder)
+            .children(cluster_finder)
+            .children(notice)
+    }
+}
+
+impl Workspace {
+    // The right dock *is* the inspector, and two actions open it: the `i`
+    // mnemonic and the dock chord. One place to flip it, so a rule added to one
+    // of them cannot go missing from the other -- a closed inspector must not
+    // keep a usage poll alive under it.
+    pub(crate) fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        self.inspector_open = !self.inspector_open;
+        self.refresh_detail(cx);
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Action, KeyBinding, KeyContext, Keymap, Keystroke};
+
+    fn contexts() -> [KeyContext; 2] {
+        [
+            KeyContext::parse("Workspace").expect("workspace context"),
+            KeyContext::parse("NoticeDetails").expect("reader context"),
+        ]
+    }
+
+    #[test]
+    fn reader_blocks_default_workspace_actions_without_disabling_them_elsewhere() {
+        let keymap = Keymap::new(crate::keybindings());
+        for (key, expected) in [
+            ("b", "k10s_shell::OpenBrowser"),
+            ("l", "k10s_shell::LogsSelection"),
+            ("s", "k10s_shell::ExecSelection"),
+            ("shift-g", "k10s_shell::OpenObserve"),
+            ("ctrl-w", "k10s_shell::CloseItem"),
+            ("ctrl-tab", "k10s_shell::NextItem"),
+            ("ctrl-shift-tab", "k10s_shell::PrevItem"),
+        ] {
+            let bindings = keymap
+                .bindings_for_input(&[Keystroke::parse(key).expect("shortcut")], &contexts())
+                .0;
+            let action = bindings.first().expect("workspace action").action();
+            assert_eq!(action.name(), expected);
+            assert!(!workspace_action_allowed(true, action), "{key}");
+            assert!(workspace_action_allowed(false, action), "{key}");
+        }
+    }
+
+    #[test]
+    fn reader_policy_applies_after_unscoped_and_compound_keymap_resolution() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-alt-y", CloseItem, None),
+            KeyBinding::new("ctrl-alt-v", NextItem, Some("Workspace > NoticeDetails")),
+            KeyBinding::new(
+                "ctrl-alt-r",
+                EditSelection,
+                Some("NoticeDetails && !Typing"),
+            ),
+            KeyBinding::new("ctrl-alt-p", OpenPalette, None),
+            KeyBinding::new("ctrl-alt-q", Quit, Some("Workspace > NoticeDetails")),
+        ]);
+        for (key, expected, allowed) in [
+            ("ctrl-alt-y", "k10s_shell::CloseItem", false),
+            ("ctrl-alt-v", "k10s_shell::NextItem", false),
+            ("ctrl-alt-r", "k10s_shell::EditSelection", false),
+            ("ctrl-alt-p", "k10s_shell::OpenPalette", true),
+            ("ctrl-alt-q", "k10s_shell::Quit", true),
+        ] {
+            let bindings = keymap
+                .bindings_for_input(&[Keystroke::parse(key).expect("shortcut")], &contexts())
+                .0;
+            let action = bindings.first().expect("custom action").action();
+            assert_eq!(action.name(), expected);
+            assert_eq!(workspace_action_allowed(true, action), allowed, "{key}");
+            assert!(workspace_action_allowed(false, action), "{key}");
+        }
+    }
+
+    #[test]
+    fn reader_policy_allows_commands_that_close_or_replace_it_and_quit() {
+        let allowed: &[&dyn Action] = &[
+            &OpenPalette,
+            &OpenSurfaces,
+            &ChooseCluster,
+            &OpenFile,
+            &OpenFolder,
+            &FindFile,
+            &FindCluster,
+            &LoadSavedView,
+            &Quit,
+        ];
+        for action in allowed {
+            assert!(workspace_action_allowed(true, *action), "{}", action.name());
+        }
+        for action in [&CloseItem as &dyn Action, &NewFile, &ToggleTerminal] {
+            assert!(!workspace_action_allowed(true, action), "{}", action.name());
+        }
+    }
+}

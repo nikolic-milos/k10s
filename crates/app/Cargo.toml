@@ -1,0 +1,45 @@
+[package]
+name = "k10s-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "k10s"
+path = "src/main.rs"
+
+[dependencies]
+# The global allocator. Construction, not paint, is the dominant large-scene
+# cost, and construction is many small allocations across threads, the case
+# glibc's allocator serves worst. Measured with the startup bench on the
+# labelled host: the million-object scene's content phase 184.9 to 121.9 ms
+# and its first useful frame 295.4 to 225.2 ms. Two packages, budgeted.
+mimalloc = "0.1"
+k10s-core.workspace = true
+k10s-provider.workspace = true
+k10s-clustergen.workspace = true
+k10s-data.workspace = true
+k10s-world.workspace = true
+k10s-map.workspace = true
+k10s-theme.workspace = true
+k10s-assets = { workspace = true, features = ["application"] }
+k10s-shell.workspace = true
+gpui.workspace = true
+crossbeam-channel.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { workspace = true, features = ["font-kit"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform = { workspace = true }
